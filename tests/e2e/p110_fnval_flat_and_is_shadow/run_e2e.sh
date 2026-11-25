@@ -32,7 +32,7 @@ export PION_CACHE_DIR="$TMP_DIR/cas"
 mkdir -p "$PION_CACHE_DIR"
 cp -R "$DIR/xpkg" "$TMP_DIR/xpkg"
 XAPP="$TMP_DIR/xpkg/app"
-XEXP="b2 b2 b2 b2,h:b2 p:a1 t:a1 t:a1 111"
+XEXP="b2 b2 b2 b2,h:b2 p:a1 t:a1 t:a1 111 11"
 
 check() {
   if ! diff -u "$DIR/expected.txt" "$2"; then

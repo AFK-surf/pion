@@ -5421,3 +5421,115 @@ test "wave_l0: nested tuple patterns, Array is_empty/truncate, Double methods/ha
   let (ok_m12b, json_m12b, _) = check_one(mat12_bad)
   assert_true(!ok_m12b && json_m12b.contains("E_NON_EXHAUSTIVE"), json_m12b)
 }
+
+///|
+test "xpkg qualify_fn_info bounds: methods, static methods, generic fn-values, no_io preservation & alias isolation" {
+  let dep_src =
+    "pub trait ViewEq { fn view_eq(self : Self, other : Self) -> Bool }\n" +
+    "impl ViewEq for Int { fn view_eq(self : Int, other : Int) -> Bool { self == other } }\n" +
+    "pub struct View { v : Int }\n" +
+    "#no_io\n" +
+    "pub fn View::memo[T : ViewEq](self : View, a : T, b : T) -> Int { if a.view_eq(b) { self.v } else { 0 } }\n" +
+    "pub fn View::each[K : ViewEq](a : K, b : K) -> Int { if a.view_eq(b) { 1 } else { 0 } }\n" +
+    "#no_io\n" +
+    "pub fn check_eq[T : ViewEq](a : T, b : T) -> Bool { a.view_eq(b) }\n"
+  let dep_cr = check_source_files_with_imports("dep", ["dep.pion"], [dep_src], [], true)
+  assert_true(dep_cr.diagnostics.length() == 0, check_result_to_json(dep_cr.diagnostics))
+
+  let decoy_src =
+    "pub trait ViewEq { fn view_eq(self : Self, other : Self) -> Bool }\n" +
+    "pub fn noop() -> Int { 0 }\n"
+  let decoy_cr = check_source_files_with_imports("decoy", ["decoy.pion"], [decoy_src], [], true)
+  assert_true(decoy_cr.diagnostics.length() == 0, check_result_to_json(decoy_cr.diagnostics))
+
+  let imported = [
+    imported_pkg_new("dep", dep_cr.tc),
+    imported_pkg_new("decoy", decoy_cr.tc),
+  ]
+
+  // Positive: instance method, static method, generic fn-values, generic caller bound forwarding,
+  // `#no_io` preserved across qualified `type_bounds`, and caller `import "decoy" as dep` cannot hijack `@canon:dep::ViewEq`.
+  let ok_app =
+    "import \"dep\" as v\n" +
+    "import \"decoy\" as dep\n" +
+    "#no_io\n" +
+    "fn render_step[U : v::ViewEq](vw : v::View, x : U, y : U) -> Int {\n" +
+    "  let _ = v::check_eq(x, y)\n" +
+    "  vw.memo(x, y)\n" +
+    "}\n" +
+    "pub fn run() -> Int {\n" +
+    "  let _ = dep::noop()\n" +
+    "  let vw = v::View::{ v: 7 }\n" +
+    "  let f : (Int, Int) -> Int = v::View::each\n" +
+    "  let g : (Int, Int) -> Bool = v::check_eq\n" +
+    "  let r1 = vw.memo(3, 3)\n" +
+    "  let r2 = v::View::each(4, 4)\n" +
+    "  let r3 = f(5, 5)\n" +
+    "  let r4 = if g(6, 6) { 1 } else { 0 }\n" +
+    "  let r5 = render_step(vw, 8, 8)\n" +
+    "  r1 + r2 + r3 + r4 + r5\n" +
+    "}\n"
+  let ok_cr = check_source_files_with_imports("app", ["app.pion"], [ok_app], imported, true)
+  assert_true(ok_cr.diagnostics.length() == 0, check_result_to_json(ok_cr.diagnostics))
+
+  // Negative 1: unsatisfied instance method bound
+  let bad_meth =
+    "import \"dep\" as v\n" +
+    "pub fn bad() -> Int { let vw = v::View::{ v: 1 }; vw.memo(\"a\", \"b\") }\n"
+  let bm_cr = check_source_files_with_imports("app_bm", ["app.pion"], [bad_meth], imported, true)
+  assert_true(
+    bm_cr.diagnostics.length() >= 1 && bm_cr.diagnostics[0].code == "E_TRAIT_NOT_IMPLEMENTED",
+    check_result_to_json(bm_cr.diagnostics),
+  )
+
+  // Negative 2: unsatisfied static method generic fn-value bound
+  let bad_fnval =
+    "import \"dep\" as v\n" +
+    "pub fn bad() -> Int { let f : (String, String) -> Int = v::View::each; f(\"a\", \"b\") }\n"
+  let bf_cr = check_source_files_with_imports("app_bf", ["app.pion"], [bad_fnval], imported, true)
+  assert_true(
+    bf_cr.diagnostics.length() >= 1 && bf_cr.diagnostics[0].code == "E_TRAIT_NOT_IMPLEMENTED",
+    check_result_to_json(bf_cr.diagnostics),
+  )
+
+  // Verify `qualify_fn_info` preserves `no_io` on imported bounded methods/fns (regression for old `qualify_fn_bounds` `no_io: false`)
+  match ok_cr.tc.methods.get("dep::View::memo") {
+    Some(mi) => assert_true(mi.decl.no_io, "expected dep::View::memo to preserve no_io=true")
+    None => assert_true(false, "expected dep::View::memo in ok_cr.tc.methods")
+  }
+  match ok_cr.tc.methods.get("dep::View::each") {
+    Some(mi) => assert_true(!mi.decl.no_io, "expected dep::View::each to preserve no_io=false")
+    None => assert_true(false, "expected dep::View::each in ok_cr.tc.methods")
+  }
+  match dep_cr.tc.fns.get("check_eq") {
+    Some(fi) => {
+      let qfi = qualify_fn_info(imported[0], fi)
+      assert_true(qfi.decl.no_io, "expected qualify_fn_info(dep::check_eq) to preserve no_io=true")
+    }
+    None => assert_true(false, "expected dep::check_eq in dep_cr.tc.fns")
+  }
+
+  // Transitive 3-package check (`app -> mid -> dep`) with aliased import in `mid` and decoy alias in `app`
+  let mid_src =
+    "import \"dep\" as d\n" +
+    "pub struct Wrapper { n : Int }\n" +
+    "pub fn Wrapper::wrap[T : d::ViewEq](self : Wrapper, a : T, b : T) -> Int { if d::check_eq(a, b) { self.n } else { 0 } }\n"
+  let mid_cr = check_source_files_with_imports("mid", ["mid.pion"], [mid_src], [imported[0]], true)
+  assert_true(mid_cr.diagnostics.length() == 0, check_result_to_json(mid_cr.diagnostics))
+  let app3_src =
+    "import \"mid\" as m\n" +
+    "import \"decoy\" as dep\n" +
+    "pub fn run() -> Int {\n" +
+    "  let _ = dep::noop()\n" +
+    "  let w = m::Wrapper::{ n: 9 }\n" +
+    "  w.wrap(1, 1)\n" +
+    "}\n"
+  let app3_cr = check_source_files_with_imports(
+    "app3",
+    ["app3.pion"],
+    [app3_src],
+    [imported_pkg_new("mid", mid_cr.tc), imported[1]],
+    true,
+  )
+  assert_true(app3_cr.diagnostics.length() == 0, check_result_to_json(app3_cr.diagnostics))
+}
