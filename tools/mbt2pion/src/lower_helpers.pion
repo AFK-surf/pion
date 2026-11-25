@@ -2579,9 +2579,9 @@ pub fn run_neg_probe_pass(
 }
 
 // 7. Wave M2-E2 (§E2-1): `pub using` ABI Canonical Re-Exports
-fn resolve_dep_pkg_alias(raw_pkg : String, pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], known_pkgs : Map[String, Bool]) -> String {
+fn resolve_dep_pkg_alias(raw_pkg : String, pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], _known_pkgs : Map[String, Bool]) -> String {
   match pkg_aliases.get(raw_pkg) { Some(p) => return p, None => () }
-  match moon_import_paths.get(raw_pkg) { Some(fp) => { let d = moon_import_default_alias(fp); if !known_pkgs.contains(raw_pkg) && d.length() > 0 { return d } }, None => () }
+  match moon_import_paths.get(raw_pkg) { Some(fp) => { let d = moon_import_default_alias(fp); if d.length() > 0 { return d } }, None => () }
   raw_pkg
 }
 fn build_dep_pub_index(dep_doc_jsons : Array[String], dep_abis : Array[(String, PackageAbi)]) -> (Map[String, Map[String, Bool]], Map[String, Map[String, Bool]], Map[String, Bool], Map[String, Map[String, AbiReexport]]) {
@@ -2745,8 +2745,9 @@ struct ErrLowerState {
   file : String; is_test : Bool
   suberror_names : Map[String, Bool]; suberror_ctors : Map[String, String]
   pkg_raise_fns : Map[String, String]; pkg_raise_methods : Map[String, String]
+  pkg_raise_method_names : Map[String, Bool]; pkg_fn_ret_types : Map[String, String]; pkg_all_fns : Map[String, Bool]
   cat_a_approved : Map[String, Bool]; cat_a_rejected : Map[String, Bool]
-  failure_enum : String; outcome_enum : String
+  failure_enum : String; outcome_enum : String; used_idents : Map[String, Bool]
   frames : Array[ErrFrame]; lex_raise_closures : Array[Map[String, String]]; lex_var_types : Array[Map[String, String]]
   diags : Array[Diag]; mut need_failure : Bool; mut need_outcome : Bool; mut tmp_seq : Int
 }
@@ -2755,6 +2756,22 @@ fn is_kw_or_id(t : Token, s : String) -> Bool { (t.kind == TokenKind::Keyword ||
 fn err_step_d(k : TokenKind, d : Int) -> Int { if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d + 1 } else if (k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace) && d > 0 { d - 1 } else { d } }
 fn err_unsup(st : ErrLowerState, ln : Int, col : Int, msg : String) -> Unit { st.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", st.file, ln, col, msg)) }
 fn err_alloc_unique(used : Map[String, Bool], base : String) -> String { let mut nm = base; let mut k = 1; while used.contains(nm) { nm = base + "_" + k.to_string(); k = k + 1 }; used[nm] = true; nm }
+fn err_base_upper_ident(ty : String) -> String {
+  let s = ty.trim(); if s.length() == 0 { return "" }
+  let c0 = s.code_unit_at(0); if c0 < 65 || c0 > 90 { return "" }
+  let mut i = 1; while i < s.length() { let c = s.code_unit_at(i); if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 { i = i + 1 } else { break } }
+  s.slice(0, i)
+}
+fn err_is_lex_bound(st : ErrLowerState, name : String) -> Bool {
+  let mut i = st.lex_raise_closures.length() - 1
+  while i >= 0 { if st.lex_raise_closures[i].contains(name) || st.lex_var_types[i].contains(name) { return true }; i = i - 1 }
+  false
+}
+fn err_is_builtin_fail(st : ErrLowerState, tokens : Array[Token], i : Int, start : Int, end : Int) -> Bool {
+  tokens[i].kind == TokenKind::Ident && tokens[i].raw == "fail" && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen &&
+  !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
+  !st.pkg_all_fns.contains("fail") && !err_is_lex_bound(st, "fail")
+}
 fn err_lookup_raise_fn(st : ErrLowerState, name : String) -> Option[String] {
   let mut i = st.lex_raise_closures.length() - 1
   while i >= 0 { match st.lex_raise_closures[i].get(name) { Some(v) => return if v.length() > 0 { Some(v) } else { None }, None => () }; i = i - 1 }
@@ -2776,7 +2793,7 @@ fn err_active_raise_stmt(st : ErrLowerState, err_expr : String, line : Int, col 
 }
 fn err_enclosing_source_ret_ty(frames : Array[ErrFrame]) -> String { let mut i = frames.length() - 1; while i >= 0 { match frames[i] { ErrFrame::SourceFn(rty, _) => return rty, ErrFrame::TryBlk(_, _) => () }; i = i - 1 }; "Unit" }
 fn err_wrap_call(st : ErrLowerState, call_expr : String, line : Int, col : Int) -> String {
-  let seq = st.tmp_seq; st.tmp_seq = seq + 1; let vv = "__mbt_cv_" + seq.to_string(); let ev = "__mbt_ce_" + seq.to_string()
+  let seq = st.tmp_seq; st.tmp_seq = seq + 1; let vv = err_alloc_unique(st.used_idents, "__mbt_cv_" + seq.to_string()); let ev = err_alloc_unique(st.used_idents, "__mbt_ce_" + seq.to_string())
   "(match " + call_expr + " { Ok(" + vv + ") => " + vv + "; Err(" + ev + ") => " + err_active_raise_stmt(st, ev, line, col) + " })"
 }
 fn err_is_builtin_stdlib_try(tokens : Array[Token], start : Int, catch_i : Int) -> Bool {
@@ -2798,6 +2815,9 @@ fn err_scan_try_body(tokens : Array[Token], s : Int, e : Int) -> (Bool, Bool) {
     else if t.kind == TokenKind::RBrace { if bd > 0 { bd = bd - 1 }; while lbds.length() > 0 && lbds[lbds.length() - 1] == bd { let _ = lbds.pop(); if ld > 0 { ld = ld - 1 } } }
     else if t.kind == TokenKind::Keyword && t.raw == "return" { has_ret = true }
     else if t.kind == TokenKind::Keyword && (t.raw == "break" || t.raw == "continue") && ld == 0 { has_bc = true }
+    else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) { if p.is_expr { let ht = lex_moonbit(p.text); let (hr, hbc) = err_scan_try_body(ht, 0, ht.length() - 1); if hr { has_ret = true }; if hbc && ld == 0 { has_bc = true } } }
+    }
     i = i + 1
   }
   (has_ret, has_bc)
@@ -2867,9 +2887,16 @@ fn err_infer_body_err_ty(st : ErrLowerState, tokens : Array[Token], s : Int, e :
   let mut found = ""; let mut mixed = false; let mut i = s
   while i < e {
     let t = tokens[i]; let mut cand = ""
+    if is_kw_or_id(t, "try") { let te = err_try_body_end(tokens, i, e); if te > i { i = te + 1; continue } }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) { if p.is_expr { let ht = lex_moonbit(p.text); let (hf, hm) = err_infer_body_err_ty(st, ht, 0, ht.length() - 1); if hm { mixed = true }; if hf.length() > 0 { if found.length() == 0 { found = hf } else if found != hf { mixed = true } } } }
+      i = i + 1; continue
+    }
     if is_kw_or_id(t, "raise") && i + 1 < e && tokens[i + 1].kind == TokenKind::UpperIdent { cand = if tokens[i + 1].raw == "Failure" { "Failure" } else { match st.suberror_ctors.get(tokens[i + 1].raw) { Some(en) => en, None => "" } } }
-    else if t.kind == TokenKind::Ident && t.raw == "fail" && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen { cand = "Failure" }
-    else if t.kind == TokenKind::Ident && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen && !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) { match err_lookup_raise_fn(st, t.raw) { Some(et) => cand = et, None => () } }
+    else if err_is_builtin_fail(st, tokens, i, s, e) { cand = "Failure" }
+    else if t.kind == TokenKind::Ident && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen && !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      match err_lookup_raise_fn(st, t.raw) { Some(et) => cand = et, None => { let cp = find_matching_delim(tokens, i + 1); if cp + 3 < e && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].kind == TokenKind::Ident && tokens[cp + 3].kind == TokenKind::LParen { match st.pkg_fn_ret_types.get(t.raw) { Some(rt) => match st.pkg_raise_methods.get(rt + "::" + tokens[cp + 2].raw) { Some(et) => cand = et, None => () }, None => () } } } }
+    }
     else if t.kind == TokenKind::UpperIdent && i + 3 < e && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen { match st.pkg_raise_methods.get(t.raw + "::" + tokens[i + 2].raw) { Some(et) => cand = et, None => () } }
     else if t.kind == TokenKind::Ident && i + 3 < e && tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen { let rty = err_lookup_var_type(st, t.raw); if rty.length() > 0 { match st.pkg_raise_methods.get(rty + "::" + tokens[i + 2].raw) { Some(et) => cand = et, None => () } } }
     if cand.length() > 0 { let cn = if cand == st.failure_enum { "Failure" } else { cand }; if found.length() == 0 { found = cn } else if found != cn { mixed = true } }
@@ -2920,7 +2947,16 @@ fn lower_err_range(st : ErrLowerState, src : String, tokens : Array[Token], star
           }
           let rhs_end = err_find_stmt_expr_end(tokens, eq_i + 1, end)
           sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + lower_err_range(st, src, tokens, eq_i + 1, rhs_end))
-          if ann_ty.length() == 0 && eq_i + 2 < rhs_end && tokens[eq_i + 1].kind == TokenKind::UpperIdent && tokens[eq_i + 2].kind == TokenKind::ColonColon { ann_ty = tokens[eq_i + 1].raw }
+          if ann_ty.length() == 0 && eq_i + 1 < rhs_end {
+            let r1 = tokens[eq_i + 1]
+            if r1.kind == TokenKind::UpperIdent && eq_i + 2 < rhs_end && tokens[eq_i + 2].kind == TokenKind::ColonColon {
+              ann_ty = if eq_i + 3 < rhs_end && tokens[eq_i + 3].kind == TokenKind::Ident { match st.pkg_fn_ret_types.get(r1.raw + "::" + tokens[eq_i + 3].raw) { Some(rt) => rt, None => r1.raw } } else { r1.raw }
+            } else if r1.kind == TokenKind::Ident && eq_i + 2 < rhs_end && tokens[eq_i + 2].kind == TokenKind::LParen {
+              match st.pkg_fn_ret_types.get(r1.raw) { Some(rt) => ann_ty = rt, None => () }
+            } else if r1.kind == TokenKind::Ident && eq_i + 4 < rhs_end && tokens[eq_i + 2].kind == TokenKind::Dot && tokens[eq_i + 3].kind == TokenKind::Ident && tokens[eq_i + 4].kind == TokenKind::LParen {
+              let xr = err_lookup_var_type(st, r1.raw); if xr.length() > 0 { match st.pkg_fn_ret_types.get(xr + "::" + tokens[eq_i + 3].raw) { Some(rt) => ann_ty = rt, None => () } }
+            }
+          }
           st.lex_raise_closures[st.lex_raise_closures.length() - 1][vname] = ""; st.lex_var_types[st.lex_var_types.length() - 1][vname] = ann_ty; i = rhs_end; continue
         }
       }
@@ -2953,7 +2989,8 @@ fn lower_err_range(st : ErrLowerState, src : String, tokens : Array[Token], star
       let raw_et = if body_et.length() > 0 { body_et } else { catch_et }; if raw_et.length() == 0 { err_unsup(st, t.line, t.col, "cannot infer concrete closed error type for `try`") }
       if st.diags.length() > diag_before { sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte)); i = catch_rb + 1; continue }
       let canon_et = err_canon_ty(st, raw_et); if has_ret { st.need_outcome = true }
-      let seq = st.tmp_seq; st.tmp_seq = seq + 1; let fn_v = "__mbt_try_" + seq.to_string(); let val_v = "__mbt_tval_" + seq.to_string(); let vv = "__mbt_tv_" + seq.to_string(); let ev = "__mbt_te_" + seq.to_string(); let rv = "__mbt_tr_" + seq.to_string(); let src_ret = err_enclosing_source_ret_ty(st.frames)
+      let seq = st.tmp_seq; st.tmp_seq = seq + 1
+      let fn_v = err_alloc_unique(st.used_idents, "__mbt_try_" + seq.to_string()); let val_v = err_alloc_unique(st.used_idents, "__mbt_tval_" + seq.to_string()); let vv = err_alloc_unique(st.used_idents, "__mbt_tv_" + seq.to_string()); let ev = err_alloc_unique(st.used_idents, "__mbt_te_" + seq.to_string()); let rv = err_alloc_unique(st.used_idents, "__mbt_tr_" + seq.to_string()); let src_ret = err_enclosing_source_ret_ty(st.frames)
       st.frames.push(ErrFrame::TryBlk(canon_et, has_ret)); st.lex_raise_closures.push(Map()); st.lex_var_types.push(Map())
       let lb_txt = lower_err_range(st, src, tokens, body_s, body_e); let _ = st.lex_var_types.pop(); let _ = st.lex_raise_closures.pop(); let _ = st.frames.pop()
       let lc_txt = lower_err_range(st, src, tokens, catch_lb + 1, catch_rb); let unwrap_v = "match " + val_v + " { Some(" + vv + ") => " + vv + "; None => abort(\"unreachable\") }"
@@ -2970,7 +3007,7 @@ fn lower_err_range(st : ErrLowerState, src : String, tokens : Array[Token], star
         i = ee; continue
       }
     }
-    if t.kind == TokenKind::Ident && t.raw == "fail" && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) && st.frames.length() > 0 && st.failure_enum.length() > 0 {
+    if err_is_builtin_fail(st, tokens, i, start, end) && st.frames.length() > 0 && st.failure_enum.length() > 0 {
       let active_et = match st.frames[st.frames.length() - 1] { ErrFrame::TryBlk(et, _) => et, ErrFrame::SourceFn(_, Some(et)) => et, _ => "" }
       if active_et == st.failure_enum { let cp = find_matching_delim(tokens, i + 1); sb.write_string(t.leading_trivia + err_active_raise_stmt(st, "Failure(" + lower_err_range(st, src, tokens, i + 2, cp) + ")", t.line, t.col)); i = cp + 1; continue }
     }
@@ -2979,19 +3016,51 @@ fn lower_err_range(st : ErrLowerState, src : String, tokens : Array[Token], star
       if st.pkg_raise_methods.contains(qk) {
         if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen { let cp = find_matching_delim(tokens, i + 3); sb.write_string(t.leading_trivia + err_wrap_call(st, qk + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")", t.line, t.col)); i = cp + 1; continue }
         err_unsup(st, t.line, t.col, "raising method `" + qk + "` cannot be used as a function value")
+      } else if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
+        let cp = find_matching_delim(tokens, i + 3)
+        if cp + 3 < end && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].kind == TokenKind::Ident && tokens[cp + 3].kind == TokenKind::LParen && st.pkg_raise_method_names.contains(tokens[cp + 2].raw) {
+          let mn = tokens[cp + 2].raw; let cp2 = find_matching_delim(tokens, cp + 3)
+          let rt = match st.pkg_fn_ret_types.get(qk) { Some(v) => v, None => "" }
+          if rt.length() > 0 {
+            let call_s = qk + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")." + mn + "(" + lower_err_range(st, src, tokens, cp + 4, cp2) + ")"
+            sb.write_string(t.leading_trivia + (if st.pkg_raise_methods.contains(rt + "::" + mn) { err_wrap_call(st, call_s, t.line, t.col) } else { call_s })); i = cp2 + 1; continue
+          }
+          err_unsup(st, tokens[cp + 2].line, tokens[cp + 2].col, "cannot resolve chained receiver type for potentially raising method `." + mn + "()`")
+        }
       }
     }
     if t.kind == TokenKind::Ident && i + 3 < end && tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
-      let rty = err_lookup_var_type(st, t.raw)
-      if rty.length() > 0 && st.pkg_raise_methods.contains(rty + "::" + tokens[i + 2].raw) { let cp = find_matching_delim(tokens, i + 3); sb.write_string(t.leading_trivia + err_wrap_call(st, t.raw + "." + tokens[i + 2].raw + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+      let mn = tokens[i + 2].raw; let rty = err_lookup_var_type(st, t.raw)
+      if rty.length() > 0 && st.pkg_raise_methods.contains(rty + "::" + mn) { let cp = find_matching_delim(tokens, i + 3); sb.write_string(t.leading_trivia + err_wrap_call(st, t.raw + "." + mn + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+      else if rty.length() == 0 && st.pkg_raise_method_names.contains(mn) { err_unsup(st, tokens[i + 2].line, tokens[i + 2].col, "cannot resolve receiver type for potentially raising method `." + mn + "()`") }
     }
     if t.kind == TokenKind::Ident && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) && !(i + 1 < end && (tokens[i + 1].kind == TokenKind::Colon || tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::Tilde)) {
       match err_lookup_raise_fn(st, t.raw) {
         Some(_) =>
         if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen { let cp = find_matching_delim(tokens, i + 1); sb.write_string(t.leading_trivia + err_wrap_call(st, t.raw + "(" + lower_err_range(st, src, tokens, i + 2, cp) + ")", t.line, t.col)); i = cp + 1; continue }
         else { err_unsup(st, t.line, t.col, "raising function `" + t.raw + "` cannot be used as a function value") }
-        None => ()
+        None =>
+        if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+          let cp = find_matching_delim(tokens, i + 1)
+          if cp + 3 < end && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].kind == TokenKind::Ident && tokens[cp + 3].kind == TokenKind::LParen && st.pkg_raise_method_names.contains(tokens[cp + 2].raw) {
+            let mn = tokens[cp + 2].raw; let cp2 = find_matching_delim(tokens, cp + 3)
+            let rt = match st.pkg_fn_ret_types.get(t.raw) { Some(v) => v, None => "" }
+            if rt.length() > 0 {
+              let call_s = t.raw + "(" + lower_err_range(st, src, tokens, i + 2, cp) + ")." + mn + "(" + lower_err_range(st, src, tokens, cp + 4, cp2) + ")"
+              sb.write_string(t.leading_trivia + (if st.pkg_raise_methods.contains(rt + "::" + mn) { err_wrap_call(st, call_s, t.line, t.col) } else { call_s })); i = cp2 + 1; continue
+            }
+            err_unsup(st, tokens[cp + 2].line, tokens[cp + 2].col, "cannot resolve chained receiver type for potentially raising method `." + mn + "()`")
+          }
+        }
       }
+    }
+    if t.kind == TokenKind::Dot && i + 2 < end && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 2].kind == TokenKind::LParen && i > start && (tokens[i - 1].kind == TokenKind::RParen || tokens[i - 1].kind == TokenKind::RBracket || tokens[i - 1].kind == TokenKind::RBrace) && st.pkg_raise_method_names.contains(tokens[i + 1].raw) {
+      err_unsup(st, tokens[i + 1].line, tokens[i + 1].col, "cannot resolve chained receiver type for potentially raising method `." + tokens[i + 1].raw + "()`")
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let is_ml = t.kind == TokenKind::InterpMultiline; let isb = StringBuilder(); isb.write_string(if is_ml { "$|" } else { "\"" })
+      for p in split_interp_string(t.raw, is_ml) { if p.is_expr { let ht = lex_moonbit(p.text); isb.write_string("\\{" + lower_err_range(st, p.text, ht, 0, ht.length() - 1) + "}") } else { isb.write_string(p.text) } }
+      if !is_ml { isb.write_string("\"") }; sb.write_string(t.leading_trivia + isb.to_string()); i = i + 1; continue
     }
     sb.write_string(t.leading_trivia + t.raw); i = i + 1
   }
@@ -3021,6 +3090,7 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
   let failure_enum = err_alloc_unique(used_idents, "MbtFailure"); let outcome_enum = err_alloc_unique(used_idents, "MbtTryOutcome")
   let suberror_names : Map[String, Bool] = Map(); let suberror_ctors : Map[String, String] = Map()
   let pkg_raise_fns : Map[String, String] = Map(); let pkg_raise_methods : Map[String, String] = Map()
+  let pkg_raise_method_names : Map[String, Bool] = Map(); let pkg_fn_ret_types : Map[String, String] = Map(); let pkg_all_fns : Map[String, Bool] = Map()
   let cat_a_cands : Map[String, (String, Int, Int)] = Map(); let cat_a_rejected : Map[String, Bool] = Map()
   let fn_callees : Map[String, Array[String]] = Map(); let called_in_try : Map[String, Bool] = Map()
 
@@ -3049,7 +3119,7 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
       if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "fn" {
         let is_pub = (i > 0 && toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "pub") || (i >= 4 && toks[i - 1].kind == TokenKind::RParen && toks[i - 3].kind == TokenKind::LParen && toks[i - 4].kind == TokenKind::Keyword && toks[i - 4].raw == "pub")
         match err_parse_fn_header(sf.content, toks, i, n) {
-          Some((fname, _, _, _, has_r, ety, has_rp, lb)) => {
+          Some((fname, _, _, rty, has_r, ety, has_rp, lb)) => {
             let rb = find_matching_delim(toks, lb); let callees : Array[String] = []; let mut k = lb + 1; let mut td = 0; let t_ends : Array[Int] = []; let mut body_err = false
             while k < rb {
               while t_ends.length() > 0 && k >= t_ends[t_ends.length() - 1] { let _ = t_ends.pop(); if td > 0 { td = td - 1 } }
@@ -3059,12 +3129,12 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
               if kt.kind == TokenKind::Ident && k + 1 < rb && toks[k + 1].kind == TokenKind::LParen && !(k > lb + 1 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) { callees.push(kt.raw); if td > 0 { called_in_try[kt.raw] = true } }
               k = k + 1
             }
-            if fname.length() > 0 { fn_callees[fname] = callees }
+            if fname.length() > 0 { fn_callees[fname] = callees; pkg_all_fns[fname] = true; let rt = err_base_upper_ident(rty); if rt.length() > 0 { pkg_fn_ret_types[fname] = rt } }
             if has_r || has_rp {
               if is_pub { diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", sf.rel_path, t.line, t.col, "public `raise` function `" + fname + "` is unsupported")); cat_a_rejected[fname] = true }
               else if has_rp || ety == "Error" || (ety.length() == 0 && (!sf.is_test || body_err)) || (ety.length() > 0 && ety != "Failure" && !suberror_names.contains(ety)) { diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", sf.rel_path, t.line, t.col, "unsupported `raise` signature on `" + fname + "`")); cat_a_rejected[fname] = true }
               else if ety.length() == 0 { cat_a_cands[fname] = (sf.rel_path, t.line, t.col) }
-              else { let ce = if ety == "Failure" { failure_enum } else { ety }; if str_has(fname, "::") { pkg_raise_methods[fname] = ce } else { pkg_raise_fns[fname] = ce } }
+              else { let ce = if ety == "Failure" { failure_enum } else { ety }; let cc = fname.index_of("::"); if cc > 0 { pkg_raise_methods[fname] = ce; pkg_raise_method_names[fname.slice(cc + 2, fname.length())] = true } else { pkg_raise_fns[fname] = ce } }
             }
             i = rb + 1; continue
           }
@@ -3086,6 +3156,7 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
       while i < toks.length() - 1 {
         let t = toks[i]
         if t.kind == TokenKind::Ident && cat_a_cands.contains(t.raw) && !(i > 0 && ((toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "fn") || toks[i - 1].kind == TokenKind::Dot || toks[i - 1].kind == TokenKind::ColonColon)) && !(i + 1 < toks.length() - 1 && (toks[i + 1].kind == TokenKind::LParen || toks[i + 1].kind == TokenKind::Colon || toks[i + 1].kind == TokenKind::Eq)) { cat_a_val[t.raw] = true }
+        if t.kind == TokenKind::UpperIdent && i + 2 < toks.length() - 1 && toks[i + 1].kind == TokenKind::ColonColon && toks[i + 2].kind == TokenKind::Ident { let qk = t.raw + "::" + toks[i + 2].raw; if cat_a_cands.contains(qk) && !(i > 0 && toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "fn") && !(i + 3 < toks.length() - 1 && toks[i + 3].kind == TokenKind::LParen) { cat_a_val[qk] = true } }
         i = i + 1
       }
       fi = fi + 1
@@ -3101,7 +3172,7 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
   let out_sources : Array[SourceFile] = []; let mut any_fail = false; let mut any_out = false; fi = 0
   while fi < sources.length() {
     let sf = sources[fi]; let src = sf.content; let toks = all_toks[fi]; let n = toks.length() - 1
-    let st = ErrLowerState::{ file: sf.rel_path, is_test: sf.is_test, suberror_names: suberror_names, suberror_ctors: suberror_ctors, pkg_raise_fns: pkg_raise_fns, pkg_raise_methods: pkg_raise_methods, cat_a_approved: cat_a_approved, cat_a_rejected: cat_a_rejected, failure_enum: failure_enum, outcome_enum: outcome_enum, frames: [], lex_raise_closures: [Map()], lex_var_types: [Map()], diags: diags, need_failure: false, need_outcome: false, tmp_seq: 0 }
+    let st = ErrLowerState::{ file: sf.rel_path, is_test: sf.is_test, suberror_names: suberror_names, suberror_ctors: suberror_ctors, pkg_raise_fns: pkg_raise_fns, pkg_raise_methods: pkg_raise_methods, pkg_raise_method_names: pkg_raise_method_names, pkg_fn_ret_types: pkg_fn_ret_types, pkg_all_fns: pkg_all_fns, cat_a_approved: cat_a_approved, cat_a_rejected: cat_a_rejected, failure_enum: failure_enum, outcome_enum: outcome_enum, used_idents: used_idents, frames: [], lex_raise_closures: [Map()], lex_var_types: [Map()], diags: diags, need_failure: false, need_outcome: false, tmp_seq: 0 }
     let edits : Array[(Int, Int, String)] = []; let mut i = 0; let mut depth = 0
     while i < n {
       let t = toks[i]

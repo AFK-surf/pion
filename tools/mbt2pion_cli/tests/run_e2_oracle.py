@@ -11,8 +11,10 @@ ORIG_MBT = r'''
 pub(all) enum Side { Left(w~ : Int, h~ : Int); Right }
 pub fn Side::area(self : Side) -> Int { match self { Left(w~, h~) => w * h; Right => 0 } }
 pub fn rect(a : Int, b : Int) -> Int { a * 10 + b }
+pub fn alt_val() -> Int { 11 }
 '''
-MID_MBT = 'pub using @orig { type Side, rect }\npub fn mid_tag() -> Int { 42 }\n'
+OTHER_MBT = 'pub fn alt_val() -> Int { 22 }\n'
+MID_MBT = 'pub using @real { type Side, rect }\npub using @orig { alt_val }\npub fn mid_tag() -> Int { 42 }\n'
 LEAF_MBT = r'''
 using @m { type Side }
 priv suberror Bad
@@ -40,8 +42,12 @@ pub fn run_case3() -> String {
 }
 priv struct A { x : Int }
 priv struct B { x : Int }
+priv suberror Other
 fn A::parse(self : A) -> Int raise Bad { if self.x < 0 { raise Bad }; self.x * 2 }
+fn make_a() -> A { { x: -1 } }
 fn B::parse(self : B) -> Int { self.x + 100 }
+fn B::fail(self : B) -> Int { self.x }
+fn other_err() -> Int raise Other { raise Other }
 pub fn run_case4() -> String {
   let a1 : A = { x: 5 }; let a2 : A = { x: -1 }; let b1 : B = { x: 7 }
   let r1 = try { a1.parse() } catch { Bad => -9 }
@@ -50,12 +56,20 @@ pub fn run_case4() -> String {
   let ok = fn(v : Int) -> Int raise Bad { if v < 0 { raise Bad }; v + 1 }
   let r4 = try { ok(4) } catch { Bad => -1 }
   let r5 = { let ok = fn(v : Int) -> Int { v * 10 }; ok(4) }
-  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string()
+  let p = make_a()
+  let r6 = try { let _ = p.parse(); 10 } catch { Bad => 9 }
+  let r7 = try { let _ = make_a().parse(); 10 } catch { Bad => 9 }
+  let r8 = try { let s = "\{ { let _ = bad(); 3 } }"; s.length() + 10 } catch { Bad => 9 }
+  let r9 = try { let x = try { other_err() } catch { Other => 7 }; if x < 0 { raise Bad }; x + 1 } catch { Bad => -1 }
+  let fail = fn(s : String) -> Int { s.length() }
+  let r10 = fail("abc")
+  let r11 = try { let _ = b1.fail(); bad() } catch { Bad => 7 }
+  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string() + "," + r8.to_string() + "," + r9.to_string() + "," + r10.to_string() + "," + r11.to_string()
 }
 pub fn run_case5() -> String {
   let s : Side = @m.Side::Left(h=4, w=3)
   let a = @m.Side::area(s); let rect = 99; let r = @m.rect(2, 5)
-  "a=\{a},loc=\{rect},r=\{r},i=\{@m.rect(3, 6)},m=\{@m.mid_tag()}"
+  "a=\{a},loc=\{rect},r=\{r},i=\{@m.rect(3, 6)},m=\{@m.mid_tag()},alt=\{@m.alt_val()}"
 }
 pub fn run_all() -> String {
   "E2-1:" + run_case1().to_string() + "\nE2-2:" + run_case2().to_string() + "\nE2-3:" + run_case3() + "\nE2-4:" + run_case4() + "\nE2-5:" + run_case5()
@@ -78,21 +92,24 @@ def main():
         bin_path = os.path.join(work, "mbt2pion")
         run_cmd([args.pionc, "build", CLI_DIR, "-o", bin_path])
         md = os.path.join(work, "moon_proj")
-        for sub in ("orig", "mid", "leaf", "cmd"): os.makedirs(os.path.join(md, sub))
-        for rel, txt in [("moon.mod", 'name = "e2/oracle"\n'), ("orig/moon.pkg", "\n"), ("orig/orig.mbt", ORIG_MBT), ("mid/moon.pkg", 'import { "e2/oracle/orig" }\n'), ("mid/mid.mbt", MID_MBT), ("leaf/moon.pkg", 'import { "e2/oracle/mid" @m }\n'), ("leaf/leaf.mbt", LEAF_MBT), ("cmd/moon.pkg", 'import { "e2/oracle/leaf" }\npkgtype(kind: "executable")\n'), ("cmd/main.mbt", 'fn main { println(@leaf.run_all()) }\n')]:
+        for sub in ("orig", "other", "mid", "leaf", "cmd"): os.makedirs(os.path.join(md, sub))
+        for rel, txt in [("moon.mod", 'name = "e2/oracle"\n'), ("orig/moon.pkg", "\n"), ("orig/orig.mbt", ORIG_MBT), ("other/moon.pkg", "\n"), ("other/other.mbt", OTHER_MBT), ("mid/moon.pkg", 'import { "e2/oracle/orig" @real, "e2/oracle/other" @orig }\n'), ("mid/mid.mbt", MID_MBT), ("leaf/moon.pkg", 'import { "e2/oracle/mid" @m }\n'), ("leaf/leaf.mbt", LEAF_MBT), ("cmd/moon.pkg", 'import { "e2/oracle/leaf" }\npkgtype(kind: "executable")\n'), ("cmd/main.mbt", 'fn main { println(@leaf.run_all()) }\n')]:
             open(os.path.join(md, rel), "w").write(txt)
         moon_out = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=md)
-        po, pm, pl = os.path.join(work, "p_orig"), os.path.join(work, "p_mid"), os.path.join(work, "p_leaf")
-        for d in (po, pm, pl): os.makedirs(os.path.join(d, "src"))
+        po, p2, pm, pl = os.path.join(work, "p_orig"), os.path.join(work, "p_other"), os.path.join(work, "p_mid"), os.path.join(work, "p_leaf")
+        for d in (po, p2, pm, pl): os.makedirs(os.path.join(d, "src"))
         open(os.path.join(po, "pion.toml"), "w").write(f'[package]\nname = "orig"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
         run_cmd([bin_path, "--src", os.path.join(md, "orig"), "--out", os.path.join(po, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
-        open(os.path.join(pm, "pion.toml"), "w").write(f'[package]\nname = "mid"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\norig = {{ path = "{po}" }}\n')
-        run_cmd([bin_path, "--src", os.path.join(md, "mid"), "--out", os.path.join(pm, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"orig={po}", "--pionc", args.pionc])
-        run_cmd([bin_path, "--src", os.path.join(md, "leaf"), "--out", os.path.join(pl, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"orig={po}", "--dep", f"mid={pm}", "--pionc", args.pionc])
-        open(os.path.join(pl, "pion.toml"), "w").write(f'[package]\nname = "leaf"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\norig = {{ path = "{po}" }}\nmid = {{ path = "{pm}" }}\n')
+        open(os.path.join(p2, "pion.toml"), "w").write(f'[package]\nname = "other"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(md, "other"), "--out", os.path.join(p2, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        open(os.path.join(pm, "pion.toml"), "w").write(f'[package]\nname = "mid"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\norig = {{ path = "{po}" }}\nother = {{ path = "{p2}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(md, "mid"), "--out", os.path.join(pm, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"orig={po}", "--dep", f"other={p2}", "--pionc", args.pionc])
+        assert '"name":"alt_val","kind":"value","target_pkg":"other","target_name":"alt_val"' in open(os.path.join(pm, "src", "mbt2pion_abi.json")).read()
+        run_cmd([bin_path, "--src", os.path.join(md, "leaf"), "--out", os.path.join(pl, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"orig={po}", "--dep", f"other={p2}", "--dep", f"mid={pm}", "--pionc", args.pionc])
+        open(os.path.join(pl, "pion.toml"), "w").write(f'[package]\nname = "leaf"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\norig = {{ path = "{po}" }}\nother = {{ path = "{p2}" }}\nmid = {{ path = "{pm}" }}\n')
         open(os.path.join(pl, "src", "main.pion"), "w").write('pub fn main(w : World) -> Int { io_println(w, run_all()); 0 }\n')
         pion_native, pion_wasm = run_cmd([args.pionc, "run", pl]), run_cmd([args.pionc, "run", "--target", "wasm32", pl])
-        expected = "E2-1:8\nE2-2:77\nE2-3:33,-1,-1\nE2-4:10,-9,107,5,40\nE2-5:a=12,loc=99,r=25,i=36,m=42"
+        expected = "E2-1:8\nE2-2:77\nE2-3:33,-1,-1\nE2-4:10,-9,107,5,40,9,9,9,8,3,7\nE2-5:a=12,loc=99,r=25,i=36,m=42,alt=22"
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, f"MISMATCH:\nM:{moon_out}\nN:{pion_native}\nW:{pion_wasm}"
         print("[e2-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
     finally:

@@ -51,6 +51,9 @@ neg_cases = [
     ("failure_m", "a.mbt", 'fn f() -> Int raise Failure { fail("boom") }\npub fn g() -> Int { try { f() } catch { Failure(m) => m.length() } }\n', []),
     ("noraise", "a.mbt", 'priv suberror E\nfn f() -> Int raise E { raise E }\npub fn g() -> Int { try { f() } catch { E => 0 } noraise { v => v } }\n', []),
     ("pub_raise", "a.mbt", 'priv suberror E\npub fn f() -> Int raise E { raise E }\n', []),
+    ("unknown_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\npub fn f() -> Int { let a = [P::{ x: 1 }]; try { let _ = a[0].bad(); 1 } catch { Bad => 0 } }\n', []),
+    ("interp_meth_val", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\npub fn f() -> String { "\\{ { let g = P::bad; let _ = g; 3 } }" }\n', []),
+    ("cat_a_meth_val", "t_wbtest.mbt", 'struct P { x : Int }\nfn P::check1(self : P) -> Unit raise { assert_eq(self.x, 1) }\ntest { let g = P::check1; g(P::{ x: 1 }) }\n', ["--with-tests"]),
 ]
 for tag, fn, code, extra in neg_cases:
     sd = os.path.join(work, "n_" + tag); os.makedirs(sd)
