@@ -780,6 +780,32 @@ fn is_type_arg_brackets(
   false
 }
 
+///| Lexer-accurate check for nested `__mbt_ufcs_dispatch` placeholders inside `[start, end)`
+///| (including inside `InterpString`/`InterpMultiline` `\{...}` expressions, while ignoring plain string literals).
+fn has_nested_ufcs_dispatch(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Ident && tk.raw == "__mbt_ufcs_dispatch" {
+      return true
+    }
+    if (tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline) &&
+    str_has(tk.raw, "__mbt_ufcs_dispatch") {
+      let parts = split_interp_string(tk.raw, tk.kind == TokenKind::InterpMultiline)
+      for p in parts {
+        if p.is_expr && str_has(p.text, "__mbt_ufcs_dispatch") {
+          let itoks = lex_moonbit(p.text)
+          if has_nested_ufcs_dispatch(itoks, 0, itoks.length() - 1) {
+            return true
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
 ///| Instrument a single Pion file with `mbt_*_probe` calls for one pass.
 ///| Supports chained/complex receivers (`self.text.length()`, `f().length()`, `arr[i].length()`,
 ///| `(a + b) / n`, `self.r.val`, `"{d}"`, and slice placeholders) while skipping already-proven safe offsets.
@@ -821,8 +847,13 @@ fn instrument_probes_for_file_with_safe(
   str_has(content, "__mbt_slice_ro_join") || str_has(content, "__mbt_slice_ro_show") ||
   str_has(content, "__mbt_match_scrut") || str_has(content, "__mbt_ufcs_dispatch") {
     let mut si = 0
-    while si + 3 < n {
-      if tokens[si].kind == TokenKind::Ident && tokens[si].raw == "mbt_compat" &&
+    while si < n {
+      if (tokens[si].kind == TokenKind::InterpString || tokens[si].kind == TokenKind::InterpMultiline) &&
+      str_has(tokens[si].raw, "__mbt_ufcs_dispatch") {
+        slice_only_pass = true
+        break
+      }
+      if si + 3 < n && tokens[si].kind == TokenKind::Ident && tokens[si].raw == "mbt_compat" &&
       tokens[si + 1].kind == TokenKind::ColonColon &&
       (tokens[si + 2].raw == "__mbt_slice_owned" || tokens[si + 2].raw == "__mbt_slice_borrow" ||
         tokens[si + 2].raw == "__mbt_slice_ro_join" || tokens[si + 2].raw == "__mbt_slice_ro_show" ||
@@ -987,6 +1018,7 @@ fn instrument_probes_for_file_with_safe(
       let close_p = find_matching_delim(tokens, i + 3)
       if close_p > i + 3 && !safe_offsets.contains(base_offset + tokens[i + 2].start_byte) {
         let u_args : Array[String] = []
+        let u_arg_spans : Array[(Int, Int)] = []
         let mut ai = i + 4
         while ai < close_p {
           if tokens[ai].kind == TokenKind::Comma { ai = ai + 1; continue }
@@ -1000,11 +1032,68 @@ fn instrument_probes_for_file_with_safe(
             ae = ae + 1
           }
           if ae > ai {
-            u_args.push(content.slice(tokens[ai].start_byte, tokens[ae - 1].end_byte).trim())
+            let asb = tokens[ai].start_byte
+            let aeb = tokens[ae - 1].end_byte
+            u_args.push(content.slice(asb, aeb).trim())
+            u_arg_spans.push((asb, aeb))
           }
           ai = ae + 1
         }
-        if u_args.length() >= 3 && !str_has(u_args[0], "__mbt_ufcs_dispatch") {
+        if u_args.length() >= 3 && has_nested_ufcs_dispatch(tokens, i + 4, close_p) {
+          // Resolve inner `__mbt_ufcs_dispatch` first; wrap outer call in a neutral block in the probe buffer
+          // so `unknown static function __mbt_ufcs_dispatch` cannot suppress inner probe diagnostics.
+          let wrap_sb = StringBuilder()
+          wrap_sb.write_string("({ ")
+          let mut wi = 0
+          while wi < u_arg_spans.length() {
+            if wi == 0 || wi >= 3 {
+              let (asb, aeb) = u_arg_spans[wi]
+              let arg_txt = content.slice(asb, aeb)
+              let (inst_arg, inner_sites) = instrument_probes_for_file_with_safe(
+                file,
+                arg_txt,
+                safe_offsets,
+                base_offset + asb,
+                declared_values,
+                declared_types,
+                qual_values,
+                qual_types,
+                val_placeholders,
+              )
+              for isite in inner_sites {
+                sites.push(ProbeSite::{
+                  probe_id: "",
+                  file: file,
+                  probe_kind: isite.probe_kind,
+                  start_byte: asb + isite.start_byte,
+                  end_byte: asb + isite.end_byte,
+                  op_byte: isite.op_byte,
+                  line: isite.line,
+                  col: isite.col,
+                  lhs_expr: isite.lhs_expr,
+                  rhs_expr: isite.rhs_expr,
+                  assign_op: isite.assign_op,
+                  slice_hi: isite.slice_hi,
+                  divisor_is_zero: isite.divisor_is_zero,
+                  rhs_has_lit: isite.rhs_has_lit,
+                  rhs_is_neg: isite.rhs_is_neg,
+                  rhs_u64: isite.rhs_u64,
+                  rhs_overflow: isite.rhs_overflow,
+                })
+              }
+              wrap_sb.write_string("let _ = (" + inst_arg + "); ")
+            }
+            wi = wi + 1
+          }
+          wrap_sb.write_string("0 })")
+          let start_b = t.start_byte
+          let end_b = tokens[close_p].end_byte
+          edits.push((start_b, end_b, wrap_sb.to_string()))
+          covered_end = end_b
+          i = close_p + 1
+          continue
+        }
+        if u_args.length() >= 3 {
           let mname_raw = u_args[1]
           let fwd_raw = u_args[2]
           let mname = if mname_raw.length() >= 2 && mname_raw.starts_with("\"") && mname_raw.ends_with("\"") {
@@ -1125,7 +1214,7 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    if slice_only_pass {
+    if slice_only_pass && !((t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline) && str_has(t.raw, "__mbt_")) {
       i = i + 1
       continue
     }
@@ -1183,7 +1272,7 @@ fn instrument_probes_for_file_with_safe(
           } else {
             let et = p.text.trim()
             let show_op_byte = base_offset + expr_start_byte
-            if !safe_offsets.contains(show_op_byte) &&
+            if !slice_only_pass && !safe_offsets.contains(show_op_byte) &&
             et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
               any_interp_probe = true
               sites.push(ProbeSite::{
@@ -1217,6 +1306,10 @@ fn instrument_probes_for_file_with_safe(
       if any_interp_probe {
         edits.push((t.start_byte, t.end_byte, rebuilt.to_string()))
         covered_end = t.end_byte
+        i = i + 1
+        continue
+      }
+      if slice_only_pass {
         i = i + 1
         continue
       }

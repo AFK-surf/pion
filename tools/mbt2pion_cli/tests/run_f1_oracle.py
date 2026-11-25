@@ -304,12 +304,26 @@ fn[T : Price] read_choose(v : T, p : &Price) -> Int {
   Price::cost(choose_first(v, p))
 }
 
+fn make_len_item(s : String) -> &Price {
+  let it : Item = { value: s.length() - 1 }
+  it as &Price
+}
+
+fn[T : Price] read_nested_interp(x : T) -> Int {
+  Price::cost(make_len_item("cost=\{Price::cost(x)}"))
+}
+
+fn[T] read_literal_sentinel(_m : T) -> Int {
+  Price::cost(make_len_item("__mbt_ufcs_dispatch"))
+}
+
 pub fn case6_dyn_trait_and_split_impl() -> String {
   let c : Counter = { total: 5 }
   let dyn_c : &Accum = (c as &Accum)
   drive(dyn_c, 2, 7)
   let it : Item = { value: 2 }
   let it2 : Item = { value: 9 }
+  let it41 : Item = { value: 41 }
   let p_trait = Price::cost(it)
   let p_inherent = it.cost()
   let p_dyn_cond = pick_price_cost(true, it as &Price, it2 as &Price)
@@ -318,6 +332,8 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let p_field = read_field(0, ph)
   let p_ret = read_ret(0)
   let p_choose = read_choose(it, it as &Price)
+  let p_nested = read_nested_interp(it41)
+  let p_sentinel = read_literal_sentinel(0)
   let __mbt_ufcs_0 = 999
   let __mbt_ufcs_Grow_grow = 888
   let _keep = __mbt_ufcs_0 + __mbt_ufcs_Grow_grow
@@ -331,7 +347,7 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let rs_pair = ReadSelf::row_id(row).v * 10 + ReadSelf_row::id(row).v
   let q : Sq = { s: 3 }
   let a_str = show_area(q as &Area)
-  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "," + p_gen.to_string() + "," + p_field.to_string() + "," + p_ret.to_string() + "," + p_choose.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "," + interp_hyg + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
+  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "," + p_gen.to_string() + "," + p_field.to_string() + "," + p_ret.to_string() + "," + p_choose.to_string() + "," + p_nested.to_string() + "," + p_sentinel.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "," + interp_hyg + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
 }
 
 pub fn run_all() -> String {
