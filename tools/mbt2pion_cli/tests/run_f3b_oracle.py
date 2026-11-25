@@ -200,9 +200,19 @@ pub fn run_f3b_7() -> String {
   "[" + a + "][" + b + "][" + c + "][" + d + "][" + e + "][" + f + "]" + f.length().to_string()
 }
 
+fn items(k : Int) -> Array[Int] {
+  [k, k + 1, k + 3]
+}
+
+pub fn run_f3b_8() -> String {
+  let g = fn(k) { let mut n = 0; for x in items(k) { n = n + x }; n }
+  g(1).to_string()
+}
+
 pub fn run_all() -> String {
   "F3b-1:" + run_f3b_1() + "\nF3b-2:" + run_f3b_2() + "\nF3b-3:" + run_f3b_3() + "\nF3b-4:" + run_f3b_4() +
-  "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7()
+  "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7() +
+  "\nF3b-8:" + run_f3b_8()
 }
 '''
 
@@ -263,6 +273,20 @@ pub fn field_case() -> Int {
 
 fn[X] consume(_v : X, wide~ : Int64) -> Unit {
   ignore(wide)
+}
+
+priv struct Child {
+  n : Int
+}
+
+fn Child::touch(self : Child, v : Int) -> Int {
+  self.n + v
+}
+
+pub fn sibling_case() -> Int {
+  let r : Decoy = { n: 0 }
+  let g = fn(k, r : Child) { let neg = (k + 1) < 0; let _ = r.touch(k); if neg { 1 } else { 0 } }
+  g(2147483647, { n: 0 }) + r.n
 }
 
 pub fn named_case() -> Int {
@@ -329,7 +353,8 @@ def main():
             "F3b-4:Serif|Named(Inter)|42|1.5|0.30000000000000004|ab\n"
             "F3b-5:11,22,12\n"
             "F3b-6:314104,2502,2302\n"
-            "F3b-7:[ab][abc][][héllo][xé][A]1"
+            "F3b-7:[ab][abc][][héllo][xé][A]1\n"
+            "F3b-8:7"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -364,12 +389,12 @@ def main():
                         "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", os.path.join(work, "cneg.json")],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
         gen = open(os.path.join(cout, "neg.pion"), encoding="utf-8").read()
-        assert gen.count("let g = fn(k) {") == 3 and "k : Int64" not in gen, (
-            "closure params must stay unannotated in all 3 negative cases:\n" + gen
+        assert gen.count("let g = fn(k) {") == 3 and "let g = fn(k : Int, r : Child) {" in gen and "k : Int64" not in gen, (
+            "shadow/field/named closure params must stay unannotated and the sibling one must use `r : Child`:\n" + gen
         )
 
         print("[f3b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
-        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; 3 closure params not inferred)")
+        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; 3 closure params not inferred; sibling param never reads outer `r`)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
