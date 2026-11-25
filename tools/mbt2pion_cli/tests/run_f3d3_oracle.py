@@ -378,6 +378,11 @@ priv struct OpRow {
   c : Int
 }
 
+priv struct JFloatItem {
+  x : Double
+  ok : Bool
+}
+
 let val_ : Int = 9
 
 pub fn run_f3d3_7() -> String {
@@ -433,11 +438,22 @@ pub fn run_f3d3_7() -> String {
   }
   let gs_r = gs_fn(Some({ x: "__MBT_GUARD_LEAF_TUPLE__" }))
 
+  // Opus P1: `Json::array(fs.map(fn(f) { { "x": ..., "ok": ... } }))` (both with `: Json` and standalone)
+  let jfs : Array[JFloatItem] = [{ x: 1.5, ok: true }, { x: 2.0, ok: false }]
+  let j1 : Json = {
+    "floating": Json::array(jfs.map(fn(f) {
+      { "x": Json::number(f.x), "ok": Json::boolean(f.ok) }
+    })),
+  }
+  let j2 = Json::array(jfs.map(fn(f) {
+    { "x": Json::number(f.x) }
+  }))
+
   t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
   op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "," + g3t.a.to_string() + "," + cr1.a.to_string() + "|" +
   n_p.to_string() + "|" +
   vb_pkg.to_string() + "," + vb2.to_string() + "|" +
-  vf_r.to_string() + "|" + gs_r
+  vf_r.to_string() + "|" + gs_r + "|" + j1.stringify() + "|" + j2.stringify()
 }
 
 pub fn run_all() -> String {
@@ -662,7 +678,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            "F3d3-7:9,9,88,7,9,9,8,6,5|1|19,12|19|hit"
+            'F3d3-7:9,9,88,7,9,9,8,6,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]'
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
