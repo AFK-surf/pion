@@ -57,6 +57,20 @@ struct Amd64Op {
 	char lflag;
 };
 
+/* Isolated conversions do not justify an extra instruction on all CPUs.
+ * A group of conversions can repeatedly merge unused destination lanes. */
+static inline int
+amd64_grouped_cvt(const Blk *b)
+{
+	uint count = 0;
+
+	for (uint n = 0; n < b->nins; n++)
+		if (b->ins[n].op == Oswtof || b->ins[n].op == Osltof)
+			if (++count == 2)
+				return 1;
+	return 0;
+}
+
 /* targ.c */
 extern Amd64Op amd64_op[];
 

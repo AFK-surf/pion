@@ -23,6 +23,7 @@ import PionProofs.QbeInlineRcSpeedOpts
 import PionProofs.QbeParallelRcSpeedOpts
 import PionProofs.QbeRuntimeOpts3
 import PionProofs.QbeBigUnitSpeedOpts
+import PionProofs.QbeAmd64FpOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -653,3 +654,16 @@ import PionProofs.QbeBigUnitSpeedOpts
 #print axioms PionQbeBigUnitSpeedOpts.Signature.bufferedEnough
 #print axioms PionQbeBigUnitSpeedOpts.Signature.insertionAsMerge
 #print axioms PionQbeBigUnitSpeedOpts.Signature.orderedMerge
+#print axioms PionQbeAmd64FpOpts.ScalarLanes.copyEquiv
+#print axioms PionQbeAmd64FpOpts.ScalarLanes.convertEquiv
+#print axioms PionQbeAmd64FpOpts.ScalarLanes.guardedEquiv
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.count_cons
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.scan_spec
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.groupedSpec
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.noneFalse
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.singleFalse
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.groupedTrue
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.count_append
+#print axioms PionQbeAmd64FpOpts.GroupedCvt.groupedAppend
+#print axioms PionQbeAmd64FpOpts.SpillWidth.explicitWidth
+#print axioms PionQbeAmd64FpOpts.SpillWidth.widthMatters

@@ -639,6 +639,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p110_fnval_flat_and_is_shadow/run_e2e.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC"
 # P112: native bounded integer string format in hot loops + QBE gcm groupconverts (SSA + Native + Wasm32 + ASan, -d G order, 8 x 625 C reference).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC"
+# P113: AMD64 movaps XMM copies + grouped-conversion xorps + cvtsi2{ss,sd}{l,q} text width (Native + Wasm32 + ASan, --obj == as, C driver).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
