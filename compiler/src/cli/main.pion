@@ -575,14 +575,14 @@ fn drv_find_pion_rt_c(world : World) -> String {
 }
 
 ///|
-fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
+fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Result[Option[String], String] {
   let rt_c = drv_find_pion_rt_c(world)
   if rt_c.length() == 0 {
-    return None
+    return Ok(None)
   }
   let c_txt = match fs_read(world, rt_c) {
     Ok(t) => t
-    Err(_) => return None
+    Err(_) => return Ok(None)
   }
   let c_hash = sha256_hex(c_txt)
   let rt_h = drv_join_path(drv_parent_dir(rt_c), "pion_rt.h")
@@ -599,7 +599,7 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let obj_path = cache_dir + "/obj/pion_rt_msvc_" + key + ".o"
   if drv_is_nonempty_regular_file(world, obj_path) {
-    return Some(obj_path)
+    return Ok(Some(obj_path))
   }
   let stamp = drv_tmp_tag(world, obj_path)
   let obj_tmp = obj_path + ".tmp." + stamp
@@ -617,10 +617,10 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
   let rc = proc_exec(world, argv)
   if rc != 0 {
     let _ = fs_remove(world, obj_tmp)
-    return None
+    return Ok(None)
   }
   if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
-    return None
+    return Err("failed to publish CAS runtime: " + obj_path)
   }
   let sz = fs_size(world, obj_path)
   drv_cas_record_and_evict(
@@ -629,7 +629,7 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
     "pion_rt_msvc_" + key,
     if sz > 0L { sz } else { 0L },
   )
-  Some(obj_path)
+  Ok(Some(obj_path))
 }
 
 ///|
@@ -637,14 +637,14 @@ fn drv_ensure_cross_rt_lib(
   world : World,
   qbe_target : String,
   sysroot : String,
-) -> Option[String] {
+) -> Result[Option[String], String] {
   let rt_c = drv_find_pion_rt_c(world)
   if rt_c.length() == 0 {
-    return None
+    return Ok(None)
   }
   let c_txt = match fs_read(world, rt_c) {
     Ok(t) => t
-    Err(_) => return None
+    Err(_) => return Ok(None)
   }
   let c_hash = sha256_hex(c_txt)
   let rt_h = drv_join_path(drv_parent_dir(rt_c), "pion_rt.h")
@@ -675,11 +675,15 @@ fn drv_ensure_cross_rt_lib(
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let ar_path = cache_dir + "/obj/pion_rt_" + qbe_target + "_" + key + ".a"
   if drv_is_nonempty_regular_file(world, ar_path) {
-    return Some(ar_path)
+    return Ok(Some(ar_path))
   }
   let stamp = drv_tmp_tag(world, ar_path)
-  let obj_tmp = ar_path + ".o.tmp." + stamp
-  let ar_tmp = ar_path + ".a.tmp." + stamp
+  // Compile under a private directory with a fixed file name, so the archive
+  // member is always `pion_rt.o` and two cold CAS produce the same archive.
+  let tmp_dir = cache_dir + "/obj/.rt_tmp_" + stamp
+  let obj_tmp = tmp_dir + "/pion_rt.o"
+  let ar_tmp = ar_path + ".tmp." + stamp
+  let _ = fs_mkdir_p(world, tmp_dir)
   let argv : Array[String] = [cc_bin]
   let mut fi = 0
   while fi < tflags.length() {
@@ -698,20 +702,20 @@ fn drv_ensure_cross_rt_lib(
   argv.push(obj_tmp)
   let rc = proc_exec(world, argv)
   if rc != 0 {
-    let _ = fs_remove(world, obj_tmp)
-    return None
+    let _ = drv_remove_tree_nofollow(world, tmp_dir)
+    return Ok(None)
   }
-  match drv_archive_static_lib(world, qbe_target, [obj_tmp], ar_tmp) {
+  let archived = drv_archive_static_lib(world, qbe_target, [obj_tmp], ar_tmp)
+  let _ = drv_remove_tree_nofollow(world, tmp_dir)
+  match archived {
     Err(_) => {
-      let _ = fs_remove(world, obj_tmp)
       let _ = fs_remove(world, ar_tmp)
-      return None
+      return Ok(None)
     }
     Ok(_) => ()
   }
-  let _ = fs_remove(world, obj_tmp)
   if !drv_publish_tmp(world, ar_tmp, ar_path, true) {
-    return None
+    return Err("failed to publish CAS runtime: " + ar_path)
   }
   let sz = fs_size(world, ar_path)
   drv_cas_record_and_evict(
@@ -720,11 +724,12 @@ fn drv_ensure_cross_rt_lib(
     "pion_rt_" + qbe_target + "_" + key,
     if sz > 0L { sz } else { 0L },
   )
-  Some(ar_path)
+  Ok(Some(ar_path))
 }
 
 ///|
-fn drv_resolve_rt_lib(world : World, qbe_target : String) -> String {
+/// The runtime library to link for `qbe_target` (see `drv_resolve_rt_lib_for`).
+fn drv_resolve_rt_lib(world : World, qbe_target : String) -> Result[String, String] {
   drv_resolve_rt_lib_for(world, qbe_target, "")
 }
 
@@ -733,44 +738,48 @@ fn drv_resolve_rt_lib_for(
   world : World,
   qbe_target : String,
   sysroot : String,
-) -> String {
+) -> Result[String, String] {
   let env_rt = drv_env_str(world, "PION_RT_LIB")
   if env_rt.length() > 0 {
-    return env_rt
+    return Ok(env_rt)
   }
   if drv_target_is_windows(qbe_target) {
     let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
     if drv_is_windows_msvc_cc(world, qbe_target, cc_bin) {
       match drv_ensure_msvc_rt_obj(world, cc_bin) {
-        Some(obj_path) => return obj_path
-        None => ()
+        Err(e) => return Err(e)
+        Ok(Some(obj_path)) => return Ok(obj_path)
+        Ok(None) => ()
       }
     }
   }
   if qbe_target != drv_resolve_qbe_target(world) && !drv_target_is_wasm(qbe_target) {
+    // A runtime that was compiled but could not be published is an error,
+    // never a reason to fall back to the host library below.
     match drv_ensure_cross_rt_lib(world, qbe_target, sysroot) {
-      Some(ar_path) => return ar_path
-      None => ()
+      Err(e) => return Err(e)
+      Ok(Some(ar_path)) => return Ok(ar_path)
+      Ok(None) => ()
     }
   }
   let exe_dir = drv_self_exe_dir(world)
   if exe_dir.length() > 0 {
     let r1 = drv_parent_rel(exe_dir, "lib/libpionrt.a")
     if fs_exists(world, r1) {
-      return r1
+      return Ok(r1)
     }
     let r2 = drv_join_path(exe_dir, "libpionrt.a")
     if fs_exists(world, r2) {
-      return r2
+      return Ok(r2)
     }
   }
   if fs_exists(world, "out/libpionrt.a") {
-    return "out/libpionrt.a"
+    return Ok("out/libpionrt.a")
   }
   if fs_exists(world, "../out/libpionrt.a") {
-    return "../out/libpionrt.a"
+    return Ok("../out/libpionrt.a")
   }
-  "out/libpionrt.a"
+  Ok("out/libpionrt.a")
 }
 
 ///|
@@ -1675,6 +1684,14 @@ fn drv_publish_unit_objs(world : World, tmps : Array[String], objs : Array[Strin
     j = j + 1
   }
   ""
+}
+
+///|
+/// A CAS text entry (`.pionsig`, `.pionstub`, unit `.sig` / `.stub`, which may
+/// legitimately be empty) counts as present only as a regular file: never a
+/// directory, symlink or other file type left at its path.
+fn drv_is_regular_file(path : String) -> Bool {
+  drv_lstat_kind(path) == 1
 }
 
 ///|
@@ -5935,7 +5952,10 @@ fn drv_build_nodes_objects_entry(
     Ok(_) => ()
   }
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
+  let rt_lib = match drv_resolve_rt_lib_for(world, qbe_target, sysroot) {
+    Err(e) => return Err(e)
+    Ok(p) => p
+  }
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib, qbe_target, sysroot)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -6047,8 +6067,8 @@ fn drv_build_nodes_objects_entry(
 
     let mut cas_hit = false
     if drv_is_nonempty_regular_file(world, obj_path) &&
-      fs_exists(world, sig_path) &&
-      fs_exists(world, stub_path) {
+      drv_is_regular_file(sig_path) &&
+      drv_is_regular_file(stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
           sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
@@ -6396,9 +6416,9 @@ fn drv_build_wasm_targets(
           let stub_path = cache_dir + "/sig/" + key + ".pionstub"
           let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
           let mut cas_hit = false
-          if fs_exists(world, sig_path) &&
-            fs_exists(world, stub_path) &&
-            fs_exists(world, ssa_path) {
+          if drv_is_regular_file(sig_path) &&
+            drv_is_regular_file(stub_path) &&
+            drv_is_nonempty_regular_file(world, ssa_path) {
             match (fs_read(world, sig_path), fs_read(world, stub_path)) {
               (Ok(sig_text), Ok(stub_text)) => {
                 sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
@@ -6885,7 +6905,10 @@ fn drv_build_targets(
           }
           li = li + 1
         }
-        let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
+        let rt_lib = match drv_resolve_rt_lib_for(world, qbe_target, sysroot) {
+          Err(e) => return Err(e)
+          Ok(p) => p
+        }
         if emit_cdylib_path != "" {
           return drv_link_shared_lib(
             world,
@@ -6959,7 +6982,14 @@ fn drv_build_targets(
   let qbe_target = drv_pick_target(world, target_override)
   let qbe_arch = drv_target_qbe_arch(qbe_target)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib_fp = if only_text_emit { "" } else { drv_resolve_rt_lib(world, qbe_target) }
+  let rt_lib_fp = if only_text_emit {
+    ""
+  } else {
+    match drv_resolve_rt_lib(world, qbe_target) {
+      Err(e) => return Err(e)
+      Ok(p) => p
+    }
+  }
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib_fp, qbe_target, sysroot)
   let fp_pre = drv_prefix16(compiler_fp)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
@@ -6988,7 +7018,7 @@ fn drv_build_targets(
     while ui < n_units {
       let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
       let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
-      if fs_exists(world, usig_p) && fs_exists(world, ustub_p) {
+      if drv_is_regular_file(usig_p) && drv_is_regular_file(ustub_p) {
         match fs_read(world, usig_p) {
           Ok(sig_txt) => {
             has_usig.push(true)
@@ -7052,10 +7082,10 @@ fn drv_build_targets(
       while ui < n_units {
         let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
         let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
-        if !fs_exists(world, usig_p) {
+        if !drv_is_regular_file(usig_p) {
           let _ = drv_write_cas_text_atomic(world, usig_p, emit_file_sig_entries(prep.pkg.files[ui]))
         }
-        if !fs_exists(world, ustub_p) {
+        if !drv_is_regular_file(ustub_p) {
           let _ = drv_write_cas_text_atomic(world, ustub_p, emit_file_stub(prep.pkg.files[ui]))
         }
         ui = ui + 1
@@ -7199,10 +7229,10 @@ fn drv_build_targets(
             if !has_usig[ui] {
               let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
               let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
-              if !fs_exists(world, usig_p) {
+              if !drv_is_regular_file(usig_p) {
                 let _ = drv_write_cas_text_atomic(world, usig_p, file_sigs[ui])
               }
-              if !fs_exists(world, ustub_p) {
+              if !drv_is_regular_file(ustub_p) {
                 let _ = drv_write_cas_text_atomic(world, ustub_p, emit_file_stub(sel.pkg.files[ui]))
               }
             }
@@ -7502,7 +7532,10 @@ fn drv_build_targets(
     if out_bin_arg != "" {
       drv_ensure_parent_dir(world, out_bin_arg)
     }
-    let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
+    let rt_lib = match drv_resolve_rt_lib_for(world, qbe_target, sysroot) {
+      Err(e) => return Err(e)
+      Ok(p) => p
+    }
     return drv_link_objects(
       world,
       qbe_target,
@@ -7549,10 +7582,10 @@ fn drv_build_targets(
   let ssa_only = only_text_emit && emit_asm_path == ""
   let mut has_main = true
   let cache_hit = drv_is_nonempty_regular_file(world, obj_path) &&
-    fs_exists(world, ssa_path) &&
-    fs_exists(world, sig_path)
+    drv_is_nonempty_regular_file(world, ssa_path) &&
+    drv_is_regular_file(sig_path)
 
-  if ssa_only && fs_exists(world, ssa_path) {
+  if ssa_only && drv_is_nonempty_regular_file(world, ssa_path) {
     drv_ensure_parent_dir(world, emit_ssa_path)
     match fs_read(world, ssa_path) {
       Err(msg) => return Err("failed to read cached ssa: " + msg)
@@ -7564,7 +7597,7 @@ fn drv_build_targets(
     return Ok(emit_ssa_path)
   }
 
-  if asm_only && fs_exists(world, ssa_path) {
+  if asm_only && drv_is_nonempty_regular_file(world, ssa_path) {
     if emit_ssa_path != "" {
       drv_ensure_parent_dir(world, emit_ssa_path)
       match fs_read(world, ssa_path) {
@@ -7759,7 +7792,10 @@ fn drv_build_targets(
   if emit_staticlib_path != "" {
     return drv_archive_static_lib(world, qbe_target, [obj_path], emit_staticlib_path)
   }
-  let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
+  let rt_lib = match drv_resolve_rt_lib_for(world, qbe_target, sysroot) {
+    Err(e) => return Err(e)
+    Ok(p) => p
+  }
   if emit_cdylib_path != "" {
     return drv_link_shared_lib(
       world,
@@ -8006,7 +8042,10 @@ fn drv_exec_test_jobs(
   let _ = fs_mkdir_p(world, tb_dir)
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+  let rt_lib = match drv_resolve_rt_lib(world, qbe_target) {
+    Err(e) => return Err(e)
+    Ok(p) => p
+  }
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib, qbe_target, "")
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -8480,7 +8519,10 @@ fn drv_build_needed_objects(
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+  let rt_lib = match drv_resolve_rt_lib(world, qbe_target) {
+    Err(e) => return Err(e)
+    Ok(p) => p
+  }
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib, qbe_target, "")
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -8535,8 +8577,8 @@ fn drv_build_needed_objects(
     let stub_path = cache_dir + "/sig/" + key + ".pionstub"
     let mut cas_hit = false
     if drv_is_nonempty_regular_file(world, obj_path) &&
-      fs_exists(world, sig_path) &&
-      fs_exists(world, stub_path) {
+      drv_is_regular_file(sig_path) &&
+      drv_is_regular_file(stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
           sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
@@ -9346,7 +9388,13 @@ fn drv_run_ws_tests(
   }
   let t_built = clock_now_ms(world)
   let qbe_target = drv_resolve_qbe_target(world)
-  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+  let rt_lib = match drv_resolve_rt_lib(world, qbe_target) {
+    Err(msg) => {
+      io_eprintln(world, msg)
+      return 1
+    }
+    Ok(p) => p
+  }
   let cache_dir = drv_resolve_cache_dir(world)
   let need_cstub : Array[Bool] = []
   let pkg_cstub_objs : Array[Array[String]] = []
@@ -12487,7 +12535,7 @@ fn drv_ws_diagnostics_cached(
     let sig_path = cache_dir + "/sig/" + key + ".pionsig"
     let stub_path = cache_dir + "/sig/" + key + ".pionstub"
     let mut cas_hit = false
-    if !any_dep_err && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
+    if !any_dep_err && drv_is_regular_file(sig_path) && drv_is_regular_file(stub_path) {
       match fs_read(world, sig_path) {
         Ok(sig_text) => {
           sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
@@ -13915,7 +13963,10 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
   let qbe_resolved = drv_find_tool_path(world, qbe_raw)
   let qbe_exists = qbe_resolved.length() > 0
   let qbe_path = if qbe_exists { qbe_resolved } else { qbe_raw }
-  let rt_lib_path = drv_resolve_rt_lib(world, host_target)
+  let rt_lib_path = match drv_resolve_rt_lib(world, host_target) {
+    Err(_) => ""
+    Ok(p) => p
+  }
   let rt_lib_exists = fs_exists(world, rt_lib_path)
   let rt_lib_bytes = if rt_lib_exists {
     let sz = fs_size(world, rt_lib_path)
