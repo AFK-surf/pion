@@ -209,10 +209,42 @@ pub fn run_f3b_8() -> String {
   g(1).to_string()
 }
 
+priv struct Reading {
+  f : Float
+}
+
+impl Show for Reading with output(self, logger) {
+  logger.write_string(self.f.to_string())
+}
+
+priv struct ReadingBytes {
+  b : Bytes
+}
+
+impl Show for ReadingBytes with output(self, logger) {
+  logger.write_string(self.b.to_string())
+}
+
+pub fn run_f3b_9() -> String {
+  let r : Reading = { f: 0.1 }
+  let rb : ReadingBytes = { b: b"abc" }
+  let fs : Array[Float] = [1.0e-7, 1.0e21, 3.4028235e38, 0.33333334]
+  let parts : Array[String] = []
+  for f in fs {
+    parts.push(f.to_string())
+  }
+  let half : Float = 2.5
+  let nz : Float = -0.0
+  let by : Byte = b'a'
+  Show::to_string(r) + "|" + Show::to_string(rb) + "|" + Show::to_string((0.1 : Float)) + "|" +
+  Show::to_string(b"abc") + "|" + Show::to_string(b'a') + "|" + parts.join(",") + "|" + "\{half}" + "|" +
+  nz.to_string() + "|" + b"a\"b\\c\n".to_string() + "|" + by.to_string() + "|" + "\{by}"
+}
+
 pub fn run_all() -> String {
   "F3b-1:" + run_f3b_1() + "\nF3b-2:" + run_f3b_2() + "\nF3b-3:" + run_f3b_3() + "\nF3b-4:" + run_f3b_4() +
   "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7() +
-  "\nF3b-8:" + run_f3b_8()
+  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9()
 }
 '''
 
@@ -235,17 +267,16 @@ pub fn copy_alias() -> Int {
 '''
 
 NEG_SHOW_MBT = r'''
-pub fn show_float() -> String {
-  let f : Float = 0.1
-  Show::to_string(f)
+pub fn show_array() -> String {
+  Show::to_string([1, 2])
 }
 
-pub fn show_bytes() -> String {
-  Show::to_string(b"abc")
+fn[T : Show] show_generic(x : T) -> String {
+  Show::to_string(x)
 }
 
-pub fn show_byte() -> String {
-  Show::to_string(b'a')
+pub fn show_generic_use() -> String {
+  show_generic(1)
 }
 '''
 
@@ -470,7 +501,8 @@ def main():
             "F3b-5:11,22,12\n"
             "F3b-6:314104,2502,2302\n"
             "F3b-7:[ab][abc][][héllo][xé][A]1\n"
-            "F3b-8:7"
+            "F3b-8:7\n"
+            "F3b-9:0.1|b\"abc\"|0.1|b\"abc\"|97|1e-7,1e+21,3.4028235e+38,0.33333334|2.5|0|b\"a\\x22b\\x5cc\\x0a\"|97|97"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -492,8 +524,8 @@ def main():
         )
         assert not os.listdir(nout), "blocked publish must not write --out"
 
-        # Negative 1b: `Show::to_string` on types whose Pion `to_string` differs from MoonBit's `Show`
-        # (Moon prints `0.1`, `b"abc"`, `b'\x61'`) must block publish instead of silently changing output.
+        # Negative 1b: `Show::to_string` on a container or an unconstrained generic parameter has no exact
+        # lowering and must block publish instead of silently changing output.
         sneg = os.path.join(md, "f3sneg")
         os.makedirs(sneg)
         with open(os.path.join(sneg, "moon.pkg"), "w") as fh:
@@ -506,7 +538,7 @@ def main():
                             "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
         sl = (p.stdout + p.stderr)
-        for ty in ("Float", "Bytes", "Byte"):
+        for ty in ("Array[Int]", "T"):
             assert "on type `" + ty + "` has no MoonBit-exact lowering" in sl, f"Show::to_string({ty}) must fail closed:\n{sl}"
         assert p.returncode != 0 and not os.listdir(sout), f"Show::to_string negatives must block publish:\n{sl}"
 
@@ -562,7 +594,7 @@ def main():
         )
 
         print("[f3b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
-        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; Show::to_string on Float/Bytes/Byte and inherent-to_string types blocked; 8 closure params not inferred; sibling param never reads outer `r`)")
+        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; Show::to_string on Array/generic and inherent-to_string types blocked; 8 closure params not inferred; sibling param never reads outer `r`)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
