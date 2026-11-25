@@ -74,6 +74,21 @@ pub fn tag_b(role : Role) -> String {
 '''
 
 F3D2_MBT = r'''
+pub fn astra_cap_alias_collide_demo() -> Int {
+  let x : Int = 42
+  fn pick(n : Int) -> Int {
+    if n == 0 {
+      x
+    } else {
+      pick(n - 1)
+    }
+  }
+  {
+    let __mbt_cap_1_x = 5
+    pick(__mbt_cap_1_x - 5)
+  }
+}
+
 pub enum Dim {
   Pt(Double)
   Auto
@@ -331,11 +346,25 @@ pub fn astra_interp_capture_demo() -> String {
   pick(1)
 }
 
+pub fn astra_mut_interp_demo() -> String {
+  let mut x : Int = 42
+  fn pick(n : Int) -> String {
+    if n == 0 {
+      "\{x}"
+    } else {
+      pick(n - 1)
+    }
+  }
+  x = 9
+  pick(1)
+}
+
 pub fn run_all() -> String {
   "F3d2-1:" + shown_across_demo() +
     "\nF3d2-2:" + capture_semantics_demo() +
     "\nF3d2-3:" + ctor_expect_demo() +
-    "\nF3d2-4:" + astra_callsite_shadow_demo().to_string() + "," + astra_interp_capture_demo()
+    "\nF3d2-4:" + astra_callsite_shadow_demo().to_string() + "," + astra_interp_capture_demo() +
+    "\nF3d2-5:" + astra_mut_interp_demo() + "," + astra_cap_alias_collide_demo().to_string()
 }
 '''
 
@@ -465,7 +494,8 @@ def main():
             "F3d2-1:1:13:87\n"
             "F3d2-2:100,20,true,16,26\n"
             "F3d2-3:S:sp:Ri|B::C|bR|1L3A|C|true|LE\n"
-            "F3d2-4:42,42"
+            "F3d2-4:42,42\n"
+            "F3d2-5:9,42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
