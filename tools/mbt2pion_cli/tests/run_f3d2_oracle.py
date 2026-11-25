@@ -73,8 +73,26 @@ pub fn tag_b(role : Role) -> String {
 }
 '''
 
+EXTRA_LIB_MBT = r'''
+let __mbt_cap_2_x : Int = 5
+'''
+
 F3D2_MBT = r'''
-pub fn astra_cap_alias_collide_demo() -> Int {
+pub fn astra_cap_alias_collide_demo() -> String {
+  let x : Int = 42
+  let __mbt_cap_1_x = 0
+  fn pick(n : Int) -> Int {
+    if n == 0 {
+      x
+    } else {
+      pick(n - 1)
+    }
+  }
+  let _ = __mbt_cap_1_x
+  "\{{ let __mbt_cap_1_x_1 = 5; pick(__mbt_cap_1_x_1 - 5) }}"
+}
+
+pub fn astra_cross_file_cap_demo() -> String {
   let x : Int = 42
   fn pick(n : Int) -> Int {
     if n == 0 {
@@ -83,10 +101,7 @@ pub fn astra_cap_alias_collide_demo() -> Int {
       pick(n - 1)
     }
   }
-  {
-    let __mbt_cap_1_x = 5
-    pick(__mbt_cap_1_x - 5)
-  }
+  "\{__mbt_cap_2_x}:\{pick(1)}"
 }
 
 pub enum Dim {
@@ -364,7 +379,7 @@ pub fn run_all() -> String {
     "\nF3d2-2:" + capture_semantics_demo() +
     "\nF3d2-3:" + ctor_expect_demo() +
     "\nF3d2-4:" + astra_callsite_shadow_demo().to_string() + "," + astra_interp_capture_demo() +
-    "\nF3d2-5:" + astra_mut_interp_demo() + "," + astra_cap_alias_collide_demo().to_string()
+    "\nF3d2-5:" + astra_mut_interp_demo() + "," + astra_cap_alias_collide_demo() + "," + astra_cross_file_cap_demo()
 }
 '''
 
@@ -449,6 +464,7 @@ def main():
             ("dep_b/moon.pkg", "\n"),
             ("dep_b/dep_b.mbt", DEP_B_MBT),
             ("lib/moon.pkg", 'import {\n  "f3d2/oracle/dep_a",\n  "f3d2/oracle/dep_b",\n}\n'),
+            ("lib/extra.mbt", EXTRA_LIB_MBT),
             ("lib/f3d2.mbt", F3D2_MBT),
             ("cmd/moon.pkg", 'import { "f3d2/oracle/lib" }\npkgtype(kind: "executable")\n'),
             ("cmd/main.mbt", 'fn main { println(@lib.run_all()) }\n'),
@@ -495,7 +511,7 @@ def main():
             "F3d2-2:100,20,true,16,26\n"
             "F3d2-3:S:sp:Ri|B::C|bR|1L3A|C|true|LE\n"
             "F3d2-4:42,42\n"
-            "F3d2-5:9,42"
+            "F3d2-5:9,42,5:42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
