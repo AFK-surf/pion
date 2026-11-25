@@ -161,6 +161,9 @@ def main : IO Unit := do
   report "match_guarded_enum" diff_cases.c_match_guarded_enum
   report "match_single_ctor_guard" diff_cases.c_match_single_ctor_guard
   report "match_const_pat" diff_cases.c_match_const_pat
+  report "match_wild_tail" diff_cases.c_match_wild_tail
+  report "match_is_single_ctor" diff_cases.c_match_is_single_ctor
+  report "match_peeled_dead_arm" diff_cases.c_match_peeled_dead_arm
 
 end PionDiff
 
