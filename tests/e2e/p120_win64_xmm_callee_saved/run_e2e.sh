@@ -139,6 +139,44 @@ case "$HOST_S/$HOST_M" in
   Linux/x86_64|Linux/amd64) RUN=elf ;;
   MINGW*/x86_64|MSYS*/x86_64|CYGWIN*/x86_64) RUN=pe ;;
 esac
+# Discover Clang (for `--seh` associative COFF COMDAT assembly) and lld-link
+# (for linked PE32+ `/OPT:REF` verification), including standard Windows LLVM
+# install paths used alongside MSYS2 (matching p98_section_gc).
+CLANG_BIN=""
+printf '.section .text$p,"xr",one_only,p\n.globl p\np:\n\tret\n' > "$TMP_DIR/clang_probe.s"
+for cand in clang "/c/Program Files/LLVM/bin/clang.exe"; do
+  _cbin=""
+  if command -v "$cand" >/dev/null 2>&1; then
+    _cbin="$(command -v "$cand")"
+  elif [ -x "$cand" ]; then
+    _cbin="$cand"
+  fi
+  if [ -n "$_cbin" ]; then
+    if "$_cbin" --target=x86_64-pc-windows-msvc -c "$TMP_DIR/clang_probe.s" -o "$TMP_DIR/clang_probe.obj" 2>/dev/null; then
+      CLANG_BIN="$_cbin"
+      break
+    fi
+  fi
+done
+LLD_LINK=""
+for cand in lld-link lld-link-21 lld-link-20 lld-link-19 lld-link-18 \
+    /usr/lib/llvm-21/bin/lld-link /usr/lib/llvm-19/bin/lld-link /usr/lib/llvm-18/bin/lld-link \
+    "/c/Program Files/LLVM/bin/lld-link.exe"; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    LLD_LINK="$(command -v "$cand")"
+    break
+  elif [ -x "$cand" ]; then
+    LLD_LINK="$cand"
+    break
+  fi
+done
+if command -v cygpath >/dev/null 2>&1; then
+  TMP_NAT="$(cygpath -w "$TMP_DIR")"
+  NAT_SEP='\'
+else
+  TMP_NAT="$TMP_DIR"
+  NAT_SEP='/'
+fi
 DRV_SAN=""
 if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=undefined -fno-sanitize-recover=all \
   -o "$TMP_DIR/ubsan_probe" 2>/dev/null && "$TMP_DIR/ubsan_probe"; then
@@ -191,14 +229,20 @@ PYEOF
     fail "driver accepted a function that clobbers xmm6"
   fi
   printf '%s\n' "$MOUT" | tr -d '\r' | grep -q '^BAD p120_leaf seed 1: xmm6 ' || { echo "$MOUT" >&2; fail "runtime mutant: no xmm6 report"; }
-  if [ "$RUN" = pe ] && command -v clang >/dev/null 2>&1; then
-    # --seh emits MSVC/Clang inline COMDAT (`,one_only,<sym>`) for associative
-    # .pdata/.xdata; assemble with clang when present on Windows.
-    clang -target x86_64-pc-windows-msvc -c "$TMP_DIR/winseh.s" -o "$TMP_DIR/winseh.s.o" || fail "clang assemble winseh.s"
-    # shellcheck disable=SC2086
-    "$CC_BIN" $DRV_SAN "$TMP_DIR/driver.o" "$TMP_DIR/harness.o" "$TMP_DIR/winseh.s.o" -o "$TMP_DIR/p120 drvseh" || fail "link winseh"
-    OUT=$("$TMP_DIR/p120 drvseh") || { echo "$OUT" >&2; fail "Win64 --seh execution"; }
-    [ "$(printf '%s\n' "$OUT" | tr -d '\r' | tail -n 1)" = "p120 calls $NCALLS bad 0" ] || { echo "$OUT" >&2; fail "unexpected --seh driver output"; }
+  if [ "$RUN" = pe ]; then
+    if [ -n "$CLANG_BIN" ]; then
+      # --seh emits MSVC/Clang inline COMDAT (`,one_only,<sym>`) for associative
+      # .pdata/.xdata; assemble with clang and run natively on Windows too.
+      "$CLANG_BIN" -target x86_64-pc-windows-msvc -c "$TMP_DIR/winseh.s" -o "$TMP_DIR/winseh.s.o" || fail "clang assemble winseh.s"
+      # shellcheck disable=SC2086
+      "$CC_BIN" $DRV_SAN "$TMP_DIR/driver.o" "$TMP_DIR/harness.o" "$TMP_DIR/winseh.s.o" -o "$TMP_DIR/p120 drvseh" || fail "link winseh"
+      OUT=$("$TMP_DIR/p120 drvseh") || { echo "$OUT" >&2; fail "Win64 --seh execution"; }
+      LAST_SEH=$(printf '%s\n' "$OUT" | tr -d '\r' | tail -n 1)
+      echo "p120 --seh: $LAST_SEH"
+      [ "$LAST_SEH" = "p120 calls $NCALLS bad 0" ] || { echo "$OUT" >&2; fail "unexpected --seh driver output"; }
+    elif [ "${PION_REQUIRE_COFF:-0}" = 1 ]; then
+      fail "needs clang for Win64 --seh native execution (PION_REQUIRE_COFF=1)"
+    fi
   fi
   if MOUT=$(build_run "$TMP_DIR/mut_misalign.s" "$TMP_DIR/p120 mis"); then
     fail "driver accepted misaligned alloc16 slots"
@@ -220,23 +264,6 @@ fi
 #     live functions keep exact 12-byte RUNTIME_FUNCTION records while dead
 #     global & static functions (and their unwind tables) are GC'd, and two
 #     same-named static functions in separate objects stay isolated.
-CLANG_BIN=""
-if command -v clang >/dev/null 2>&1; then
-  if printf '.section .text$p,"xr",one_only,p\n.globl p\np:\n\tret\n' | \
-     clang -target x86_64-pc-windows-msvc -x assembler -c - -o "$TMP_DIR/clang_probe.obj" 2>/dev/null; then
-    CLANG_BIN="clang"
-  fi
-fi
-LLD_LINK=""
-for cand in lld-link lld-link-21 lld-link-20 lld-link-19 lld-link-18 /usr/lib/llvm-21/bin/lld-link /usr/lib/llvm-19/bin/lld-link /usr/lib/llvm-18/bin/lld-link; do
-  if command -v "$cand" >/dev/null 2>&1; then
-    LLD_LINK="$(command -v "$cand")"
-    break
-  elif [ -x "$cand" ]; then
-    LLD_LINK="$cand"
-    break
-  fi
-done
 GAS_AS=""
 if [ "$RUN" = pe ]; then
   GAS_AS="$CC_BIN -c"
@@ -287,10 +314,12 @@ SSAEOF
   "$QBE" -t amd64_win -o "$TMP_DIR/pe_gc_def.s" "$TMP_DIR/pe_gc.ssa"
   "$CLANG_BIN" -target x86_64-pc-windows-msvc -c "$TMP_DIR/pe_gc_seh.s" -o "$TMP_DIR/pe_gc_seh.obj"
   "$CLANG_BIN" -target x86_64-pc-windows-msvc -c "$TMP_DIR/pe_gc_def.s" -o "$TMP_DIR/pe_gc_def.obj"
-  "$LLD_LINK" /entry:entry /nodefaultlib /subsystem:console /opt:ref /map:"$TMP_DIR/pe_gc_seh.map" /out:"$TMP_DIR/pe_gc_seh.exe" "$TMP_DIR/pe_gc_seh.obj"
+  MSYS2_ARG_CONV_EXCL="*" "$LLD_LINK" /NOLOGO /entry:entry /nodefaultlib /subsystem:console /opt:ref \
+    "/map:${TMP_NAT}${NAT_SEP}pe_gc_seh.map" "/out:${TMP_NAT}${NAT_SEP}pe_gc_seh.exe" "${TMP_NAT}${NAT_SEP}pe_gc_seh.obj"
   python3 -E "$DIR/check_unwind.py" --pe-link "$TMP_DIR/pe_gc_seh.exe" "$TMP_DIR/pe_gc_seh.map" "$TMP_DIR/pe_gc_seh.s" \
     --live entry --dead unused,local_dead --expect-entries 1 || fail "PE /OPT:REF --seh"
-  "$LLD_LINK" /entry:entry /nodefaultlib /subsystem:console /opt:ref /map:"$TMP_DIR/pe_gc_def.map" /out:"$TMP_DIR/pe_gc_def.exe" "$TMP_DIR/pe_gc_def.obj"
+  MSYS2_ARG_CONV_EXCL="*" "$LLD_LINK" /NOLOGO /entry:entry /nodefaultlib /subsystem:console /opt:ref \
+    "/map:${TMP_NAT}${NAT_SEP}pe_gc_def.map" "/out:${TMP_NAT}${NAT_SEP}pe_gc_def.exe" "${TMP_NAT}${NAT_SEP}pe_gc_def.obj"
   python3 -E "$DIR/check_unwind.py" --pe-link "$TMP_DIR/pe_gc_def.exe" "$TMP_DIR/pe_gc_def.map" "$TMP_DIR/pe_gc_def.s" \
     --live entry --dead unused,local_dead --expect-entries 0 || fail "PE /OPT:REF default"
 
@@ -342,7 +371,9 @@ SSAEOF
   "$QBE" --seh -t amd64_win -o "$TMP_DIR/pe_obj2.s" "$TMP_DIR/pe_obj2.ssa"
   "$CLANG_BIN" -target x86_64-pc-windows-msvc -c "$TMP_DIR/pe_obj1.s" -o "$TMP_DIR/pe_obj1.obj"
   "$CLANG_BIN" -target x86_64-pc-windows-msvc -c "$TMP_DIR/pe_obj2.s" -o "$TMP_DIR/pe_obj2.obj"
-  "$LLD_LINK" /entry:entry /nodefaultlib /subsystem:console /opt:ref /map:"$TMP_DIR/pe_two.map" /out:"$TMP_DIR/pe_two.exe" "$TMP_DIR/pe_obj1.obj" "$TMP_DIR/pe_obj2.obj"
+  MSYS2_ARG_CONV_EXCL="*" "$LLD_LINK" /NOLOGO /entry:entry /nodefaultlib /subsystem:console /opt:ref \
+    "/map:${TMP_NAT}${NAT_SEP}pe_two.map" "/out:${TMP_NAT}${NAT_SEP}pe_two.exe" \
+    "${TMP_NAT}${NAT_SEP}pe_obj1.obj" "${TMP_NAT}${NAT_SEP}pe_obj2.obj"
   python3 -E "$DIR/check_unwind.py" --pe-link "$TMP_DIR/pe_two.exe" "$TMP_DIR/pe_two.map" "$TMP_DIR/pe_obj1.s,$TMP_DIR/pe_obj2.s" \
     --live entry,call_obj2,local_same:2 --dead unused,local_dead,local_dead2 --expect-entries 4 || fail "PE two-obj /OPT:REF --seh"
   echo "p120 PE /OPT:REF: single-obj exc_dir=0x0c (1 entry, dead GC'd) + two-obj static isolation exc_dir=0x30 (4 entries, 0 collisions)"

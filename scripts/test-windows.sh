@@ -330,7 +330,11 @@ fi
 
 sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
 # P120: Win64 nonvolatile xmm6..xmm15 save/restore, executed natively (harness.S + driver.c).
-sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
+if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
+  PION_REQUIRE_COFF=1 PION_REQUIRE_PE_LINK=1 sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
+else
+  sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
+fi
 
 # Windows directory junction collision regression for --emit-web-rt
 JUNC_BASE="$TMP_DIR/junc_web_rt"
