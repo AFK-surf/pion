@@ -675,6 +675,7 @@ pub struct TypeChecker {
   mut in_pass3 : Bool
   mut expansive_ready : Bool
   expansive_defs : Map[String, Bool]
+  expansive_params : Map[String, Bool]
   eq_uses : Array[EqUse]
   /// `span_key` of a method call on a `TParam` with trait bounds -> canonical bound trait name.
   resolved_trait_methods : Map[String, String]
@@ -2070,6 +2071,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
   }
   tc.expansive_ready = false
   tc.expansive_defs.clear()
+  tc.expansive_params.clear()
   let mut ei = 0
   while ei < ipkg.tc.eq_keys.length() {
     let ek = ipkg.tc.eq_keys[ei]
@@ -4321,6 +4323,10 @@ fn tc_ty_mentions_param_map_rec(tc : TypeChecker, t : Ty, seen_defs : Map[String
 
 ///|
 fn tc_expansive_def_mentions_param_map(tc : TypeChecker, is_struct : Bool, name : String) -> Bool {
+  if !tc.expansive_ready {
+    tc_build_expansive_cache(tc)
+  }
+  let dk_base = eq_nominal_key(tc, is_struct, name)
   let seen_defs : Map[String, Bool] = Map([])
   if is_struct {
     match tc_lookup_struct_info(tc, name) {
@@ -4329,8 +4335,13 @@ fn tc_expansive_def_mentions_param_map(tc : TypeChecker, is_struct : Bool, name 
         let abs_args : Array[Ty] = []
         let mut mi = 0
         while mi < sinfo.decl.type_params.length() {
-          mask_sb.write_string("1")
-          abs_args.push(TParam("__p"))
+          if tc.expansive_params.contains(dk_base + "#" + mi.to_string()) {
+            mask_sb.write_string("1")
+            abs_args.push(TParam("__p"))
+          } else {
+            mask_sb.write_string("0")
+            abs_args.push(TInt)
+          }
           mi = mi + 1
         }
         seen_defs.set("S:" + name + "|" + mask_sb.to_string(), true)
@@ -4353,8 +4364,13 @@ fn tc_expansive_def_mentions_param_map(tc : TypeChecker, is_struct : Bool, name 
         let abs_args : Array[Ty] = []
         let mut mi = 0
         while mi < einfo.decl.type_params.length() {
-          mask_sb.write_string("1")
-          abs_args.push(TParam("__p"))
+          if tc.expansive_params.contains(dk_base + "#" + mi.to_string()) {
+            mask_sb.write_string("1")
+            abs_args.push(TParam("__p"))
+          } else {
+            mask_sb.write_string("0")
+            abs_args.push(TInt)
+          }
           mi = mi + 1
         }
         seen_defs.set("E:" + name + "|" + mask_sb.to_string(), true)
@@ -4497,6 +4513,7 @@ fn tc_add_all_param_edges(
 /// belongs to an SCC containing a 1-weight (compound-wrapped) edge.
 fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
   tc.expansive_defs.clear()
+  tc.expansive_params.clear()
   let def_ids : Map[String, Int] = Map([])
   let def_is_struct : Array[Bool] = []
   let def_names : Array[String] = []
@@ -4574,6 +4591,7 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
   }
   let node_base : Array[Int] = []
   let node_def_key : Array[String] = []
+  let node_param_idx : Array[Int] = []
   let mut total_v = 0
   let mut di = 0
   while di < def_names.length() {
@@ -4581,6 +4599,7 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
     let mut pi = 0
     while pi < def_tparams[di].length() {
       node_def_key.push(def_keys[di])
+      node_param_idx.push(pi)
       total_v = total_v + 1
       pi = pi + 1
     }
@@ -4702,15 +4721,107 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
     }
     k = k + 1
   }
+  let node_exp : Array[Bool] = []
+  let exp_q : Array[Int] = []
   vi = 0
   while vi < total_v {
     let c = comp[vi]
     if c >= 0 && scc_exp[c] {
+      node_exp.push(true)
+      exp_q.push(vi)
+    } else {
+      node_exp.push(false)
+    }
+    vi = vi + 1
+  }
+  // Propagate expansiveness forward along parameter-flow edges in O(V + E):
+  // if param T grows unboundedly and flows into param K (e.g. `E[Array[T], T]`),
+  // K also receives unboundedly growing types.
+  let mut qh = 0
+  while qh < exp_q.length() {
+    let u = exp_q[qh]
+    qh = qh + 1
+    let mut ei2 = 0
+    while ei2 < adj[u].length() {
+      let w = adj[u][ei2]
+      if !node_exp[w] {
+        node_exp[w] = true
+        exp_q.push(w)
+      }
+      ei2 = ei2 + 1
+    }
+  }
+  vi = 0
+  while vi < total_v {
+    if node_exp[vi] {
       tc.expansive_defs.set(node_def_key[vi], true)
+      tc.expansive_params.set(node_def_key[vi] + "#" + node_param_idx[vi].to_string(), true)
     }
     vi = vi + 1
   }
   tc.expansive_ready = true
+}
+
+///|
+fn ty_ast_size(t : Ty) -> Int {
+  match t {
+    TImmArray(e) | TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      1 + ty_ast_size(e)
+    TResult(a, b) | TMap(a, b) => 1 + ty_ast_size(a) + ty_ast_size(b)
+    TTuple(es) => {
+      let mut s = 1
+      let mut i = 0
+      while i < es.length() {
+        s = s + ty_ast_size(es[i])
+        i = i + 1
+      }
+      s
+    }
+    TFn(ps, ret) => {
+      let mut s = 1 + ty_ast_size(ret)
+      let mut i = 0
+      while i < ps.length() {
+        s = s + ty_ast_size(ps[i])
+        i = i + 1
+      }
+      s
+    }
+    TStruct(_, args) | TEnum(_, args) => {
+      let mut s = 1
+      let mut i = 0
+      while i < args.length() {
+        s = s + ty_ast_size(args[i])
+        i = i + 1
+      }
+      s
+    }
+    _ => 1
+  }
+}
+
+///|
+fn tc_expansive_proj_key(tc : TypeChecker, is_struct : Bool, name : String, args : Array[Ty]) -> String {
+  if !tc.expansive_ready {
+    tc_build_expansive_cache(tc)
+  }
+  let dk_base = eq_nominal_key(tc, is_struct, name)
+  let sb = StringBuilder()
+  sb.write_string(dk_base)
+  sb.write_string("[")
+  let mut i = 0
+  while i < args.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    if tc.expansive_params.contains(dk_base + "#" + i.to_string()) {
+      sb.write_string("__exp")
+    } else {
+      sb.write_string(ty_to_string(args[i]))
+    }
+    i = i + 1
+  }
+  sb.write_string("]")
+  sb.to_string()
 }
 
 ///|
@@ -4727,19 +4838,19 @@ fn collect_eq_trait_obligations_rec(
   t : Ty,
   out_obs : Array[TraitObligation],
   visited : Map[String, Bool],
-  active_expansive : Map[String, Bool],
+  active_exp_sz : Map[String, Int],
 ) -> Unit {
   match t {
     TImmArray(e) | TArray(e) | TFixedArray(e) | TOption(e) =>
-      collect_eq_trait_obligations_rec(tc, e, out_obs, visited, active_expansive)
+      collect_eq_trait_obligations_rec(tc, e, out_obs, visited, active_exp_sz)
     TResult(a, b) => {
-      collect_eq_trait_obligations_rec(tc, a, out_obs, visited, active_expansive)
-      collect_eq_trait_obligations_rec(tc, b, out_obs, visited, active_expansive)
+      collect_eq_trait_obligations_rec(tc, a, out_obs, visited, active_exp_sz)
+      collect_eq_trait_obligations_rec(tc, b, out_obs, visited, active_exp_sz)
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        collect_eq_trait_obligations_rec(tc, es[i], out_obs, visited, active_expansive)
+        collect_eq_trait_obligations_rec(tc, es[i], out_obs, visited, active_exp_sz)
         i = i + 1
       }
     }
@@ -4758,7 +4869,7 @@ fn collect_eq_trait_obligations_rec(
             while bi < btrs.length() {
               let tr = btrs[bi]
               if tr == "@builtin:Eq" {
-                collect_eq_trait_obligations_rec(tc, sargs[i], out_obs, visited, active_expansive)
+                collect_eq_trait_obligations_rec(tc, sargs[i], out_obs, visited, active_exp_sz)
               } else {
                 out_obs.push(TraitObligation::{ target_ty: sargs[i], trait_name: tr })
               }
@@ -4770,28 +4881,39 @@ fn collect_eq_trait_obligations_rec(
         }
         None => ()
       }
-      let nk = "S:" + name
       let is_exp = sargs.length() > 0 && tc_def_is_expansive(tc, true, name)
-      if is_exp && active_expansive.contains(nk) {
-        return
+      let mut pk = ""
+      let mut prev_sz = -1
+      if is_exp {
+        pk = tc_expansive_proj_key(tc, true, name, sargs)
+        let sz = ty_ast_size(t)
+        prev_sz = match active_exp_sz.get(pk) {
+          Some(v) => v
+          None => -1
+        }
+        if prev_sz >= 0 && sz >= prev_sz {
+          return
+        }
+        active_exp_sz.set(pk, sz)
       }
       visited.set(key, true)
-      if is_exp {
-        active_expansive.set(nk, true)
-      }
       match tc_lookup_struct_info(tc, name) {
         Some(sinfo) => {
           let subst = make_subst(sinfo.decl.type_params, sargs)
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
-            collect_eq_trait_obligations_rec(tc, subst_ty(sinfo.field_tys[fi], subst), out_obs, visited, active_expansive)
+            collect_eq_trait_obligations_rec(tc, subst_ty(sinfo.field_tys[fi], subst), out_obs, visited, active_exp_sz)
             fi = fi + 1
           }
         }
         None => ()
       }
       if is_exp {
-        active_expansive.remove(nk)
+        if prev_sz >= 0 {
+          active_exp_sz.set(pk, prev_sz)
+        } else {
+          active_exp_sz.remove(pk)
+        }
       }
     }
     TEnum(name, eargs) => {
@@ -4809,7 +4931,7 @@ fn collect_eq_trait_obligations_rec(
             while bi < btrs.length() {
               let tr = btrs[bi]
               if tr == "@builtin:Eq" {
-                collect_eq_trait_obligations_rec(tc, eargs[i], out_obs, visited, active_expansive)
+                collect_eq_trait_obligations_rec(tc, eargs[i], out_obs, visited, active_exp_sz)
               } else {
                 out_obs.push(TraitObligation::{ target_ty: eargs[i], trait_name: tr })
               }
@@ -4821,15 +4943,22 @@ fn collect_eq_trait_obligations_rec(
         }
         None => ()
       }
-      let nk = "E:" + name
       let is_exp = eargs.length() > 0 && tc_def_is_expansive(tc, false, name)
-      if is_exp && active_expansive.contains(nk) {
-        return
+      let mut pk = ""
+      let mut prev_sz = -1
+      if is_exp {
+        pk = tc_expansive_proj_key(tc, false, name, eargs)
+        let sz = ty_ast_size(t)
+        prev_sz = match active_exp_sz.get(pk) {
+          Some(v) => v
+          None => -1
+        }
+        if prev_sz >= 0 && sz >= prev_sz {
+          return
+        }
+        active_exp_sz.set(pk, sz)
       }
       visited.set(key, true)
-      if is_exp {
-        active_expansive.set(nk, true)
-      }
       match tc_lookup_enum_info_qualified(tc, name) {
         Some(einfo) => {
           let subst = make_subst(einfo.decl.type_params, eargs)
@@ -4838,7 +4967,7 @@ fn collect_eq_trait_obligations_rec(
             let v = einfo.variants[vi]
             let mut fi = 0
             while fi < v.field_tys.length() {
-              collect_eq_trait_obligations_rec(tc, subst_ty(v.field_tys[fi], subst), out_obs, visited, active_expansive)
+              collect_eq_trait_obligations_rec(tc, subst_ty(v.field_tys[fi], subst), out_obs, visited, active_exp_sz)
               fi = fi + 1
             }
             vi = vi + 1
@@ -4847,7 +4976,11 @@ fn collect_eq_trait_obligations_rec(
         None => ()
       }
       if is_exp {
-        active_expansive.remove(nk)
+        if prev_sz >= 0 {
+          active_exp_sz.set(pk, prev_sz)
+        } else {
+          active_exp_sz.remove(pk)
+        }
       }
     }
     _ => ()
@@ -4890,7 +5023,7 @@ fn record_map_key_tparams_in_ty_rec(
   fn_key : String,
   t : Ty,
   visited : Map[String, Bool],
-  active_expansive : Map[String, Bool],
+  active_exp_sz : Map[String, Int],
 ) -> Unit {
   if fn_key == "" {
     return
@@ -4898,61 +5031,72 @@ fn record_map_key_tparams_in_ty_rec(
   match t {
     TMap(k, v) => {
       record_map_key_tparams(tc, fn_key, k)
-      record_map_key_tparams_in_ty_rec(tc, fn_key, k, visited, active_expansive)
-      record_map_key_tparams_in_ty_rec(tc, fn_key, v, visited, active_expansive)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, k, visited, active_exp_sz)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, v, visited, active_exp_sz)
     }
     TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
-      record_map_key_tparams_in_ty_rec(tc, fn_key, e, visited, active_expansive)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, e, visited, active_exp_sz)
     TResult(a, b) => {
-      record_map_key_tparams_in_ty_rec(tc, fn_key, a, visited, active_expansive)
-      record_map_key_tparams_in_ty_rec(tc, fn_key, b, visited, active_expansive)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, a, visited, active_exp_sz)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, b, visited, active_exp_sz)
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        record_map_key_tparams_in_ty_rec(tc, fn_key, es[i], visited, active_expansive)
+        record_map_key_tparams_in_ty_rec(tc, fn_key, es[i], visited, active_exp_sz)
         i = i + 1
       }
     }
     TFn(ps, ret) => {
       let mut i = 0
       while i < ps.length() {
-        record_map_key_tparams_in_ty_rec(tc, fn_key, ps[i], visited, active_expansive)
+        record_map_key_tparams_in_ty_rec(tc, fn_key, ps[i], visited, active_exp_sz)
         i = i + 1
       }
-      record_map_key_tparams_in_ty_rec(tc, fn_key, ret, visited, active_expansive)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, ret, visited, active_exp_sz)
     }
     TStruct(name, args) => {
       let mut i = 0
       while i < args.length() {
-        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, active_expansive)
+        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, active_exp_sz)
         i = i + 1
       }
       if args.length() > 0 {
         let vk = "S:" + ty_to_string(t)
         if !visited.contains(vk) {
-          let nk = "S:" + name
           let is_exp = tc_def_is_expansive(tc, true, name)
-          if is_exp && active_expansive.contains(nk) {
-            return
+          let mut pk = ""
+          let mut prev_sz = -1
+          if is_exp {
+            pk = tc_expansive_proj_key(tc, true, name, args)
+            let sz = ty_ast_size(t)
+            prev_sz = match active_exp_sz.get(pk) {
+              Some(v) => v
+              None => -1
+            }
+            if prev_sz >= 0 && sz >= prev_sz {
+              return
+            }
+            active_exp_sz.set(pk, sz)
           }
           visited.set(vk, true)
-          if is_exp {
-            active_expansive.set(nk, true)
-          }
           match tc_lookup_struct_info(tc, name) {
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, args)
               let mut fi = 0
               while fi < sinfo.field_tys.length() {
-                record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), visited, active_expansive)
+                record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), visited, active_exp_sz)
                 fi = fi + 1
               }
             }
             None => ()
           }
           if is_exp {
-            active_expansive.remove(nk)
+            if prev_sz >= 0 {
+              active_exp_sz.set(pk, prev_sz)
+            } else {
+              active_exp_sz.remove(pk)
+            }
           }
         }
       }
@@ -4960,21 +5104,28 @@ fn record_map_key_tparams_in_ty_rec(
     TEnum(name, args) => {
       let mut i = 0
       while i < args.length() {
-        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, active_expansive)
+        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, active_exp_sz)
         i = i + 1
       }
       if args.length() > 0 {
         let vk = "E:" + ty_to_string(t)
         if !visited.contains(vk) {
-          let nk = "E:" + name
           let is_exp = tc_def_is_expansive(tc, false, name)
-          if is_exp && active_expansive.contains(nk) {
-            return
+          let mut pk = ""
+          let mut prev_sz = -1
+          if is_exp {
+            pk = tc_expansive_proj_key(tc, false, name, args)
+            let sz = ty_ast_size(t)
+            prev_sz = match active_exp_sz.get(pk) {
+              Some(v) => v
+              None => -1
+            }
+            if prev_sz >= 0 && sz >= prev_sz {
+              return
+            }
+            active_exp_sz.set(pk, sz)
           }
           visited.set(vk, true)
-          if is_exp {
-            active_expansive.set(nk, true)
-          }
           match tc_lookup_enum_info_qualified(tc, name) {
             Some(einfo) => {
               let subst = make_subst(einfo.decl.type_params, args)
@@ -4983,7 +5134,7 @@ fn record_map_key_tparams_in_ty_rec(
                 let v = einfo.variants[vi]
                 let mut fi = 0
                 while fi < v.field_tys.length() {
-                  record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), visited, active_expansive)
+                  record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), visited, active_exp_sz)
                   fi = fi + 1
                 }
                 vi = vi + 1
@@ -4992,7 +5143,11 @@ fn record_map_key_tparams_in_ty_rec(
             None => ()
           }
           if is_exp {
-            active_expansive.remove(nk)
+            if prev_sz >= 0 {
+              active_exp_sz.set(pk, prev_sz)
+            } else {
+              active_exp_sz.remove(pk)
+            }
           }
         }
       }
@@ -6737,7 +6892,7 @@ fn tc_check_map_keys_in_ty_rec(
   sp : Span,
   check_all_invalid : Bool,
   visited : Map[String, Bool],
-  active_expansive : Map[String, Bool],
+  active_exp_sz : Map[String, Int],
 ) -> Unit {
   match t {
     TMap(k, v) => {
@@ -6770,72 +6925,83 @@ fn tc_check_map_keys_in_ty_rec(
           )
         }
       }
-      tc_check_map_keys_in_ty_rec(tc, fn_key, k, sp, check_all_invalid, visited, active_expansive)
-      tc_check_map_keys_in_ty_rec(tc, fn_key, v, sp, check_all_invalid, visited, active_expansive)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, k, sp, check_all_invalid, visited, active_exp_sz)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, v, sp, check_all_invalid, visited, active_exp_sz)
     }
     TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
-      tc_check_map_keys_in_ty_rec(tc, fn_key, e, sp, check_all_invalid, visited, active_expansive)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, e, sp, check_all_invalid, visited, active_exp_sz)
     TResult(ok, err) => {
-      tc_check_map_keys_in_ty_rec(tc, fn_key, ok, sp, check_all_invalid, visited, active_expansive)
-      tc_check_map_keys_in_ty_rec(tc, fn_key, err, sp, check_all_invalid, visited, active_expansive)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, ok, sp, check_all_invalid, visited, active_exp_sz)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, err, sp, check_all_invalid, visited, active_exp_sz)
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        tc_check_map_keys_in_ty_rec(tc, fn_key, es[i], sp, check_all_invalid, visited, active_expansive)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, es[i], sp, check_all_invalid, visited, active_exp_sz)
         i = i + 1
       }
     }
     TFn(ps, ret) => {
       let mut i = 0
       while i < ps.length() {
-        tc_check_map_keys_in_ty_rec(tc, fn_key, ps[i], sp, check_all_invalid, visited, active_expansive)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, ps[i], sp, check_all_invalid, visited, active_exp_sz)
         i = i + 1
       }
-      tc_check_map_keys_in_ty_rec(tc, fn_key, ret, sp, check_all_invalid, visited, active_expansive)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, ret, sp, check_all_invalid, visited, active_exp_sz)
     }
     TStruct(name, args) => {
       let mut i = 0
       while i < args.length() {
-        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, active_expansive)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, active_exp_sz)
         i = i + 1
       }
       if args.length() > 0 {
         let vk = "S:" + ty_to_string(t)
         if !visited.contains(vk) {
-          let nk = "S:" + name
           let is_exp = tc_def_is_expansive(tc, true, name)
-          if is_exp && active_expansive.contains(nk) {
-            if tc_expansive_def_mentions_param_map(tc, true, name) {
-              tc_err(
-                tc,
-                sp,
-                "E_MAP_KEY_TYPE",
-                "non-regular polymorphic recursion in `" + ty_to_string(t) + "` prevents validating nested `Map` key types",
-                "regular generic type",
-                ty_to_string(t),
-                "avoid expansive polymorphic recursion around `Map` keys",
-              )
+          let mut pk = ""
+          let mut prev_sz = -1
+          if is_exp {
+            pk = tc_expansive_proj_key(tc, true, name, args)
+            let sz = ty_ast_size(t)
+            prev_sz = match active_exp_sz.get(pk) {
+              Some(v) => v
+              None => -1
             }
-            return
+            if prev_sz >= 0 && sz >= prev_sz {
+              if tc_expansive_def_mentions_param_map(tc, true, name) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_MAP_KEY_TYPE",
+                  "non-regular polymorphic recursion in `" + ty_to_string(t) + "` prevents validating nested `Map` key types",
+                  "regular generic type",
+                  ty_to_string(t),
+                  "avoid expansive polymorphic recursion around `Map` keys",
+                )
+              }
+              return
+            }
+            active_exp_sz.set(pk, sz)
           }
           visited.set(vk, true)
-          if is_exp {
-            active_expansive.set(nk, true)
-          }
           match tc_lookup_struct_info(tc, name) {
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, args)
               let mut fi = 0
               while fi < sinfo.field_tys.length() {
-                tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), sp, true, visited, active_expansive)
+                tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), sp, true, visited, active_exp_sz)
                 fi = fi + 1
               }
             }
             None => ()
           }
           if is_exp {
-            active_expansive.remove(nk)
+            if prev_sz >= 0 {
+              active_exp_sz.set(pk, prev_sz)
+            } else {
+              active_exp_sz.remove(pk)
+            }
           }
         }
       }
@@ -6843,32 +7009,39 @@ fn tc_check_map_keys_in_ty_rec(
     TEnum(name, args) => {
       let mut i = 0
       while i < args.length() {
-        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, active_expansive)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, active_exp_sz)
         i = i + 1
       }
       if args.length() > 0 {
         let vk = "E:" + ty_to_string(t)
         if !visited.contains(vk) {
-          let nk = "E:" + name
           let is_exp = tc_def_is_expansive(tc, false, name)
-          if is_exp && active_expansive.contains(nk) {
-            if tc_expansive_def_mentions_param_map(tc, false, name) {
-              tc_err(
-                tc,
-                sp,
-                "E_MAP_KEY_TYPE",
-                "non-regular polymorphic recursion in `" + ty_to_string(t) + "` prevents validating nested `Map` key types",
-                "regular generic type",
-                ty_to_string(t),
-                "avoid expansive polymorphic recursion around `Map` keys",
-              )
+          let mut pk = ""
+          let mut prev_sz = -1
+          if is_exp {
+            pk = tc_expansive_proj_key(tc, false, name, args)
+            let sz = ty_ast_size(t)
+            prev_sz = match active_exp_sz.get(pk) {
+              Some(v) => v
+              None => -1
             }
-            return
+            if prev_sz >= 0 && sz >= prev_sz {
+              if tc_expansive_def_mentions_param_map(tc, false, name) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_MAP_KEY_TYPE",
+                  "non-regular polymorphic recursion in `" + ty_to_string(t) + "` prevents validating nested `Map` key types",
+                  "regular generic type",
+                  ty_to_string(t),
+                  "avoid expansive polymorphic recursion around `Map` keys",
+                )
+              }
+              return
+            }
+            active_exp_sz.set(pk, sz)
           }
           visited.set(vk, true)
-          if is_exp {
-            active_expansive.set(nk, true)
-          }
           match tc_lookup_enum_info_qualified(tc, name) {
             Some(einfo) => {
               let subst = make_subst(einfo.decl.type_params, args)
@@ -6877,7 +7050,7 @@ fn tc_check_map_keys_in_ty_rec(
                 let v = einfo.variants[vi]
                 let mut fi = 0
                 while fi < v.field_tys.length() {
-                  tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), sp, true, visited, active_expansive)
+                  tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), sp, true, visited, active_exp_sz)
                   fi = fi + 1
                 }
                 vi = vi + 1
@@ -6886,7 +7059,11 @@ fn tc_check_map_keys_in_ty_rec(
             None => ()
           }
           if is_exp {
-            active_expansive.remove(nk)
+            if prev_sz >= 0 {
+              active_exp_sz.set(pk, prev_sz)
+            } else {
+              active_exp_sz.remove(pk)
+            }
           }
         }
       }
@@ -22545,6 +22722,7 @@ fn check_package_with_imports_mapped_plan(
     in_pass3: false,
     expansive_ready: false,
     expansive_defs: Map([]),
+    expansive_params: Map([]),
     eq_uses: [],
     resolved_trait_methods: Map([]),
     edit_keys: Map([]),
