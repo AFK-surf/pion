@@ -149,6 +149,190 @@ layout_cold_blocks(Fn *fn)
 	}
 }
 
+/* Counted-loop expansion. A single-block loop whose only phi is an integer
+ * induction variable with a constant start, a constant add/sub stride and an
+ * exit test against a constant (optionally through extsw/extuw) is evaluated
+ * at compile time; when it leaves after 1..MaxTrips iterations, its body is
+ * replaced by that many straight-line copies (in order, so loads and stores
+ * keep their sequence) and the back edge is dropped. Only the induction and
+ * its exit test are simulated: the body may touch memory. The last copy keeps
+ * the original SSA names, so uses outside the loop need no rewriting; the phi
+ * becomes a copy of the last entry value.
+ * Every fold result is checked to be a CBits constant, physical registers
+ * (< Tmp0) are never renamed or relied on, and the rename map is bounded by
+ * the temporary count it was allocated for. */
+enum { MaxTrips = 8, MaxExpanded = 96 };
+
+static Ref
+subst(Ref r, Ref *map, uint mapcap)
+{
+	if (rtype(r) == RTmp && (uint)r.val < mapcap && !req(map[r.val], R))
+		return map[r.val];
+	return r;
+}
+
+static int
+constantbits(Fn *fn, Ref r)
+{
+	return rtype(r) == RCon && fn->con[r.val].type == CBits;
+}
+
+static int
+virtualtmp(Ref r)
+{
+	return rtype(r) != RTmp || r.val >= Tmp0;
+}
+
+/* Number of iterations (1..MaxTrips) of the counted loop b, with the entry
+ * value of the induction variable of each iteration in inputs; 0 when b is
+ * not such a loop or runs longer. */
+static int
+trips(Fn *fn, Blk *b, Ref inputs[MaxTrips])
+{
+	Phi *p = b->phi;
+	Ins *inc, *cmp, *ext = 0, i;
+	Ref next, r, iv, test;
+	int n, k, back;
+
+	if (b->jmp.type != Jjnz || (b->s1 == b) == (b->s2 == b)
+	|| !p || p->link || p->narg != 2 || KBASE(p->cls)
+	|| p->blk[0] == p->blk[1])
+		return 0;
+	back = p->blk[1] == b;
+	if (p->blk[back] != b)
+		return 0;
+	iv = p->arg[!back];
+	next = p->arg[back];
+	if (!constantbits(fn, iv) || rtype(next) != RTmp
+	|| rtype(b->jmp.arg) != RTmp || rtype(p->to) != RTmp
+	|| p->to.val < Tmp0 || next.val < Tmp0 || b->jmp.arg.val < Tmp0)
+		return 0;
+	inc = fn->tmp[next.val].def;
+	cmp = fn->tmp[b->jmp.arg.val].def;
+	if (!inc || !cmp || fn->tmp[next.val].bid != b->id
+	|| fn->tmp[b->jmp.arg.val].bid != b->id || inc->cls != p->cls
+	|| (inc->op != Oadd && inc->op != Osub)
+	|| !req(inc->arg[0], p->to) || !constantbits(fn, inc->arg[1])
+	|| !INRANGE(cmp->op, Ocmpw, Ocmpl1))
+		return 0;
+	k = constantbits(fn, cmp->arg[0]);
+	r = cmp->arg[k];
+	if (!constantbits(fn, cmp->arg[!k]))
+		return 0;
+	if (!req(r, next)) {
+		if (rtype(r) != RTmp || r.val < Tmp0
+		|| fn->tmp[r.val].bid != b->id
+		|| !(ext = fn->tmp[r.val].def)
+		|| (ext->op != Oextsw && ext->op != Oextuw)
+		|| !req(ext->arg[0], next))
+			return 0;
+	}
+	for (n=0; n<MaxTrips; n++) {
+		inputs[n] = iv;
+		i = *inc;
+		i.arg[0] = iv;
+		iv = foldref(fn, &i);
+		if (!constantbits(fn, iv))
+			return 0;
+		test = iv;
+		if (ext) {
+			i = *ext;
+			i.arg[0] = iv;
+			test = foldref(fn, &i);
+			if (!constantbits(fn, test))
+				return 0;
+		}
+		i = *cmp;
+		i.arg[k] = test;
+		r = foldref(fn, &i);
+		if (!constantbits(fn, r))
+			return 0;
+		if ((fn->con[r.val].bits.i != 0) != (b->s1 == b))
+			return n + 1;
+	}
+	return 0;
+}
+
+static int
+expandable(Ins *i)
+{
+	int o = i->op;
+
+	if (!isload(o) && !isstore(o) && !isext(o)
+	&& !INRANGE(o, Ocmpw, Ocmpl1) && o != Ocopy
+	&& o != Oadd && o != Osub && o != Oshl && o != Omul)
+		return 0;
+	return virtualtmp(i->to) && virtualtmp(i->arg[0])
+		&& virtualtmp(i->arg[1]);
+}
+
+static int
+expandloops(Fn *fn)
+{
+	Blk *b;
+	Ins *dst, op;
+	Ref *map = 0, orig, iv[MaxTrips];
+	uint n, j, mapcap = 0;
+	int t, count, changed = 0, budget = 2 * MaxExpanded;
+
+	for (b=fn->start; b; b=b->link) {
+		if (b->nins > MaxExpanded || !(count = trips(fn, b, iv))
+		|| b->nins * count > MaxExpanded || b->nins * count > (uint)budget)
+			continue;
+		for (n=0; n<b->nins; n++)
+			if (!expandable(&b->ins[n]))
+				break;
+		if (n != b->nins)
+			continue;
+		if (!map) {
+			mapcap = (uint)fn->ntmp;
+			map = alloc(mapcap * sizeof *map);
+			for (n=0; n<mapcap; n++)
+				map[n] = R;
+		}
+		dst = vnew(1 + b->nins * count, sizeof *dst, PFn);
+		dst[0] = (Ins){.op=Ocopy, .cls=b->phi->cls, .to=b->phi->to,
+			.arg={iv[count-1], R}};
+		j = 1;
+		for (t=0; t<count; t++) {
+			if ((uint)b->phi->to.val < mapcap)
+				map[b->phi->to.val] = iv[t];
+			for (n=0; n<b->nins; n++) {
+				op = b->ins[n];
+				op.arg[0] = subst(op.arg[0], map, mapcap);
+				op.arg[1] = subst(op.arg[1], map, mapcap);
+				if (rtype(op.to) == RTmp) {
+					orig = op.to;
+					if (t+1 != count)
+						op.to = newtmp("unroll", op.cls, fn);
+					if ((uint)orig.val < mapcap)
+						map[orig.val] = op.to;
+				}
+				dst[j++] = op;
+			}
+		}
+		if ((uint)b->phi->to.val < mapcap)
+			map[b->phi->to.val] = R;
+		for (n=0; n<b->nins; n++)
+			if (rtype(b->ins[n].to) == RTmp
+			&& (uint)b->ins[n].to.val < mapcap)
+				map[b->ins[n].to.val] = R;
+		if (debug['G'])
+			fprintf(stderr, "\n> Expanded counted loop @%s: %d trips, %u ins\n",
+				b->name, count, j - 1);
+		budget -= j - 1;
+		b->phi = 0;
+		b->ins = dst;
+		b->nins = j;
+		b->s1 = b->s1 == b ? b->s2 : b->s1;
+		b->s2 = 0;
+		b->jmp.type = Jjmp;
+		b->jmp.arg = R;
+		changed = 1;
+	}
+	return changed;
+}
+
 static void
 func(Fn *fn)
 {
@@ -184,6 +368,19 @@ func(Fn *fn)
 	gcm(fn);
 	filluse(fn);
 	ssacheck(fn);
+	for (int round=0; round<2 && expandloops(fn); round++) {
+		fillcfg(fn);
+		filluse(fn);
+		filldom(fn);
+		gvn(fn);
+		fillcfg(fn);
+		simplcfg(fn);
+		filluse(fn);
+		filldom(fn);
+		gcm(fn);
+		filluse(fn);
+		ssacheck(fn);
+	}
 	if (T.cansel) {
 		ifconvert(fn);
 		fillcfg(fn);

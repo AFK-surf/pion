@@ -1,0 +1,396 @@
+#!/bin/sh
+# P117: QBE counted-loop expansion (vendor/qbe/main.c `trips` / `expandloops`,
+# run after GCM; Lean: tests/lean/proofs/QbeCountedLoopUnroll.lean).
+# A single-block loop whose only phi is an integer induction with a constant
+# start, a constant add/sub stride and an exit test against a constant
+# (optionally through extsw/extuw) is evaluated at compile time; 1..8 trips of
+# a body of loads, stores, extensions, comparisons, copies, add/sub/shl/mul
+# (at most 96 expanded instructions per loop, 192 per function) become
+# straight-line copies. `-d G` reports `Expanded counted loop @blk: N trips`.
+# Verifies:
+#   1. loops.ssa: the exact expansions (block, trips) of every function on
+#      amd64_sysv, amd64_apple, arm64, arm64_apple and rv64: positive /
+#      negative stride, true / false back edge, 32-bit wrap, signed bound
+#      crossing, unsigned bound, extsw / extuw tests, 1 and 8 trips, a 64-bit
+#      induction, aliasing loads and stores, three loops in one function (two
+#      expanded, the 9-trip one kept), a nested loop expanded in the second
+#      round; none for 9 trips, a call, a division, a variable start or a
+#      second phi.
+#   2. Host differential: `qbe` + `cc -c` (no assembler warning) and, on
+#      x86-64 ELF / AArch64 Mach-O, `qbe --obj`, linked with driver.c and the
+#      independent C oracle.c: 19 functions x 40 memory layouts (separate,
+#      identical, shifted dst/src) compare the return value and the whole
+#      buffer, `total 760 bad 0`, identical on both routes.
+#   3. Linux x86-64: the executable sections of `--obj` equal those of the
+#      assembled text byte for byte (relocated fields compared as relocations),
+#      or as canonical instruction streams where the pre-existing --obj-only
+#      differences apply (loop-header NOP padding spelling, elf.c's flags-dead
+#      mov+add -> lea rewrite); the 13 fully expanded functions have no
+#      backward branch, the others exactly one.
+#   4. benchmarks/pion/fannkuchredux.pion dev and --release print the C
+#      result (`73196 38` for n = 10) and the release SSA expands loops.
+#   5. An ASan + UBSan QBE (when the compiler can build one) replays loops.ssa
+#      and the fannkuchredux SSA on four targets (text and, where supported,
+#      --obj) with halt_on_error, with the same expansions and the same host
+#      output as the regular QBE.
+set -eu
+
+PIONC="${1:?usage: run_e2e.sh <pionc>}"
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+DIR="$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll"
+QBE="${PION_QBE:-$ROOT_DIR/out/qbe}"
+CC_BIN="${CC:-cc}"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+export PION_CACHE_DIR="$TMP_DIR/cas"
+mkdir -p "$PION_CACHE_DIR"
+
+if [ ! -x "$QBE" ]; then
+  echo "FAIL: QBE binary not found at $QBE" >&2
+  exit 1
+fi
+
+# expansions DUMP TARGET: the `-d G` expansions of loops.ssa against the table.
+expansions() {
+  python3 -E - "$1" "$2" <<'PYEOF'
+import re, sys
+WANT = {
+    'up4': [('body', 4)], 'down4': [('body', 4)], 'falseback5': [('body', 5)],
+    'wrap3': [('body', 3)], 'signcross2': [('body', 2)], 'udown4': [('body', 4)],
+    'extsw5': [('body', 5)], 'extuw3': [('body', 3)], 'once1': [('body', 1)],
+    'eight8': [('body', 8)], 'nine9': [], 'long7': [('body', 7)],
+    'alias6': [('body', 6)], 'multi': [('l1', 4), ('l2', 5)],
+    'nested': [('inner', 3), ('outer', 2)],
+    'callbody': [], 'divbody': [], 'varstart': [], 'twophi': [],
+}
+text = open(sys.argv[1]).read()
+parts = re.split(r'\*\*\*\* Function (\S+) \*\*\*\*', text)
+got = {}
+for name, body in zip(parts[1::2], parts[2::2]):
+    if name in got:
+        raise SystemExit(f"FAIL: p117 {sys.argv[2]}: {name} dumped twice")
+    got[name] = [(b, int(n)) for b, n in re.findall(r'> Expanded counted loop @(\S+): (\d+) trips, \d+ ins', body)]
+if got != WANT:
+    raise SystemExit(f"FAIL: p117 {sys.argv[2]} expansions\n got  {got}\n want {WANT}")
+n = sum(1 for v in WANT.values() if v)
+print(f"p117 {sys.argv[2]}: {n} functions expanded ({sum(len(v) for v in WANT.values())} loops), "
+      f"{len(WANT) - n} kept, as expected")
+PYEOF
+}
+
+# 1. Expansions on every target.
+for T in amd64_sysv amd64_apple arm64 arm64_apple rv64; do
+  "$QBE" -t "$T" -d G -o /dev/null "$DIR/loops.ssa" 2> "$TMP_DIR/g_$T.txt"
+  expansions "$TMP_DIR/g_$T.txt" "$T"
+done
+
+# 2. Host differential through text assembly and --obj.
+"$CC_BIN" -O0 -c "$DIR/oracle.c" -o "$TMP_DIR/oracle.o"
+"$CC_BIN" -O1 -c "$DIR/driver.c" -o "$TMP_DIR/driver.o"
+run_driver() { # $1 label, $2 object
+  "$CC_BIN" "$TMP_DIR/driver.o" "$TMP_DIR/oracle.o" "$2" -o "$TMP_DIR/run_$1"
+  # A failing run is reported by the exact-output check below (which prints
+  # the MISMATCH lines), never by a silent `set -e` exit.
+  "$TMP_DIR/run_$1" > "$TMP_DIR/$1.out" || echo "exit status $?" >> "$TMP_DIR/$1.out"
+  python3 -E - "$TMP_DIR/$1.out" "$1" <<'PYEOF'
+import sys
+NAMES = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5',
+         'extuw3', 'once1', 'eight8', 'nine9', 'alias6', 'multi', 'nested',
+         'callbody', 'divbody', 'varstart', 'twophi', 'long7']
+want = ''.join(f'{n} 40\n' for n in NAMES) + f'total {40 * len(NAMES)} bad 0\n'
+got = open(sys.argv[1]).read()
+if got != want or len(NAMES) != 19:
+    raise SystemExit(f"FAIL: p117 {sys.argv[2]} driver output\n{got}")
+print(f"p117 {sys.argv[2]}: 19 functions x 40 layouts = 760 calls equal the C oracle")
+PYEOF
+}
+asm() { # $1 qbe, $2 input, $3 output object (fails on any assembler message)
+  "$1" -o "$3.s" "$2"
+  if ! "$CC_BIN" -c "$3.s" -o "$3" 2> "$3.log" || [ -s "$3.log" ]; then
+    cat "$3.log" >&2
+    echo "FAIL: p117 assembler diagnostics for $2" >&2
+    exit 1
+  fi
+}
+asm "$QBE" "$DIR/loops.ssa" "$TMP_DIR/text.o"
+run_driver text "$TMP_DIR/text.o"
+HOST="$(uname -s)/$(uname -m)"
+OBJ=0
+case "$HOST" in
+  Linux/x86_64|Linux/amd64|Darwin/arm64|Darwin/aarch64) OBJ=1 ;;
+esac
+if [ "$OBJ" = 1 ]; then
+  "$QBE" --obj -o "$TMP_DIR/direct.o" "$DIR/loops.ssa"
+  run_driver obj "$TMP_DIR/direct.o"
+  cmp "$TMP_DIR/text.out" "$TMP_DIR/obj.out"
+else
+  echo "NOTE: no direct object route on $HOST; text assembly only"
+fi
+
+# 3. Linux x86-64: --obj == as (byte for byte, or canonically), and no back edge left.
+case "$HOST" in
+  Linux/x86_64|Linux/amd64)
+  objdump -d --no-show-raw-insn "$TMP_DIR/direct.o" > "$TMP_DIR/direct.dis"
+  objdump -d --no-show-raw-insn "$TMP_DIR/text.o" > "$TMP_DIR/text.dis"
+  python3 -E - "$TMP_DIR/direct.o" "$TMP_DIR/text.o" "$TMP_DIR/direct.dis" "$TMP_DIR/text.dis" <<'PYEOF'
+import re, struct, sys
+# Every function must be identical byte for byte, or differ only by the two
+# known, pre-existing differences of the direct object route: the padding in
+# front of an aligned loop header (one 10-byte `cs nopw` from as, `nopw` +
+# `nop` from --obj) and amd64/elf.c's flags-dead `mov a, d; add v, d` ->
+# `lea v(a), d` rewrite. Those functions are compared as canonical
+# instruction streams (NOPs dropped, the as pair fused into the lea, branch
+# targets as instruction indices).
+R64 = {}
+for n in 'ax bx cx dx si di bp sp'.split():
+    R64['e' + n] = R64['r' + n] = 'r' + n
+for k in range(8, 16):
+    for suf in ('', 'd'):
+        R64[f'r{k}{suf}'] = f'r{k}'
+def r64(r):
+    return R64.get(r.lstrip('%'), r)
+def canon(path):
+    out, cur = {}, None
+    for ln in open(path).read().split('\n'):
+        m = re.match(r'^[0-9a-f]+ <(\w+)>:', ln)
+        if m:
+            cur = m.group(1)
+            out[cur] = []
+            continue
+        m = re.match(r'^\s*([0-9a-f]+):\s+(.*?)\s*$', ln)
+        if m and cur:
+            out[cur].append((int(m.group(1), 16), re.sub(r'\s+', ' ', m.group(2))))
+    res = {}
+    for fn, ins in out.items():
+        ins = [(a, t) for a, t in ins if not re.match(r'^((cs |ds |data16 )*nop[wl]?\b|xchg %ax,%ax$)', t)]
+        seq, k = [], 0
+        while k < len(ins):
+            a, t = ins[k]
+            m1 = re.match(r'^mov (%\w+),(%\w+)$', t)
+            m2 = k + 1 < len(ins) and re.match(r'^add (\$0x[0-9a-f]+|%\w+),(%\w+)$', ins[k + 1][1])
+            if m1 and m2 and m1.group(2) == m2.group(2):
+                d, v = m1.group(2).lstrip('%'), m2.group(1)
+                if v.startswith('$'):
+                    w = 64 if d.startswith('r') and not d.endswith('d') else 32
+                    seq.append((a, f'lea {int(v[1:], 16) % (1 << w)} {r64(m1.group(1))} {d}'))
+                else:
+                    seq.append((a, f'lea 0 {"+".join(sorted([r64(m1.group(1)), r64(v)]))} {d}'))
+                k += 2
+                continue
+            m = re.match(r'^lea (-?0x[0-9a-f]+)?\((%\w+)(?:,(%\w+),1)?\),(%\w+)$', t)
+            if m:
+                d = m.group(4).lstrip('%')
+                w = 64 if d.startswith('r') and not d.endswith('d') else 32
+                disp = int(m.group(1), 16) % (1 << w) if m.group(1) else 0
+                regs = [r64(m.group(2))] + ([r64(m.group(3))] if m.group(3) else [])
+                seq.append((a, f'lea {disp} {"+".join(sorted(regs))} {d}'))
+            else:
+                seq.append((a, t))
+            k += 1
+        index = {a: n for n, (a, _) in enumerate(seq)}
+        def target(m):
+            addr = int(m.group(1), 16)
+            nxt = min((x for x in index if x >= addr), default=None)
+            return f'@{index[nxt]}' if nxt is not None else '@end'
+        res[fn] = [re.sub(r'\b([0-9a-f]+) <\w+(?:\+0x[0-9a-f]+)?>', target, t) for _, t in seq]
+    return res
+def need(ok, msg):
+    if not ok:
+        raise SystemExit("FAIL: p117 ELF " + msg)
+def exec_sections(path):
+    # Executable sections with the 4-byte fields their RELA relocations patch
+    # zeroed (the linker ignores them; as and --obj may leave different
+    # placeholders), plus those relocations as (offset, type, symbol, addend).
+    data = open(path, 'rb').read()
+    need(data[:4] == b'\x7fELF' and data[4] == 2 and data[5] == 1, f"{path}: not ELF64 LE")
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 0x3a)
+    secs = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + k * shentsize) for k in range(shnum)]
+    def cstr(tab, off):
+        s = data[secs[tab][4] + off:]
+        return s[:s.index(b'\0')].decode()
+    out, idx = {}, {}
+    for k, sh in enumerate(secs):
+        sh_name, sh_type, flags, _, off, size = sh[:6]
+        if flags & 4 and size:  # SHF_EXECINSTR
+            n = cstr(shstrndx, sh_name)
+            need(n not in out, f"{path}: duplicate section {n}")
+            out[n] = [bytearray(data[off:off + size] if sh_type != 8 else b'\0' * size), []]
+            idx[k] = n
+    for sh in secs:
+        if sh[1] != 4 or sh[7] not in idx:  # SHT_RELA on an executable section
+            continue
+        symtab = secs[sh[6]]
+        ent = out[idx[sh[7]]]
+        for r in range(sh[5] // 24):
+            r_off, info, addend = struct.unpack_from('<QQq', data, sh[4] + r * 24)
+            st_name, = struct.unpack_from('<I', data, symtab[4] + (info >> 32) * 24)
+            shndx, = struct.unpack_from('<H', data, symtab[4] + (info >> 32) * 24 + 6)
+            # Unnamed (section) symbols are compared by the section they name.
+            sym = cstr(symtab[6], st_name) if st_name else "section " + cstr(shstrndx, secs[shndx][0])
+            need(r_off + 4 <= len(ent[0]), f"{path}: relocation past {idx[sh[7]]}")
+            ent[0][r_off:r_off + 4] = b'\0\0\0\0'
+            ent[1].append((r_off, info & 0xffffffff, sym, addend))
+    return {n: (bytes(b), sorted(r)) for n, (b, r) in out.items()}
+a, b = exec_sections(sys.argv[1]), exec_sections(sys.argv[2])
+CAN_A, CAN_B = canon(sys.argv[3]), canon(sys.argv[4])
+exact, rewritten = 0, []
+need(len(a) == 19, f"want 19 function sections, got {sorted(a)}")
+need(sorted(a) == sorted(b), f"section sets differ: {sorted(a)} vs {sorted(b)}")
+total = nrel = 0
+for n in sorted(a):
+    (ab, ar), (bb, br) = a[n], b[n]
+    fn = n[len('.text.'):]
+    if ab != bb:
+        k = next((i for i in range(min(len(ab), len(bb))) if ab[i] != bb[i]), min(len(ab), len(bb)))
+        ca, cb = CAN_A.get(fn), CAN_B.get(fn)
+        need(ca is not None and ca == cb,
+             f"{n}: --obj and as differ at byte {k} ({len(ab)} vs {len(bb)} bytes) beyond NOP padding and the lea rewrite:\n"
+             + "\n".join(f"  {x!r:40} {y!r}" for x, y in zip(ca or [], cb or []) if x != y))
+        rewritten.append(fn)
+    else:
+        exact += 1
+    need(ar == br, f"{n}: relocations differ: {ar} vs {br}")
+    total += len(ab)
+    nrel += len(ar)
+# The 13 functions left without a loop must match byte for byte.
+LOOPFREE = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5', 'extuw3',
+            'once1', 'eight8', 'long7', 'alias6', 'nested']
+need(not set(LOOPFREE) & set(rewritten), f"expanded functions differ: {sorted(set(LOOPFREE) & set(rewritten))}")
+need(sorted(rewritten) == ['callbody', 'multi', 'nine9', 'twophi', 'varstart'], f"unexpected canonical-only set {rewritten}")
+print(f"p117 --obj == as: {len(a)} function sections ({total} bytes, {nrel} relocations): {exact} byte-identical, "
+      f"{len(rewritten)} equal up to NOP padding / the --obj lea rewrite ({', '.join(rewritten) or '-'})")
+PYEOF
+  python3 -E - "$TMP_DIR/direct.dis" <<'PYEOF'
+import re, sys
+BACK = {'nine9': 1, 'multi': 1, 'callbody': 1, 'divbody': 1, 'varstart': 1, 'twophi': 1}
+FUNCS = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5', 'extuw3',
+         'once1', 'eight8', 'nine9', 'long7', 'alias6', 'multi', 'nested',
+         'callbody', 'divbody', 'varstart', 'twophi']
+cur, back = None, {}
+for ln in open(sys.argv[1]):
+    m = re.match(r'^[0-9a-f]+ <(\w+)>:', ln)
+    if m:
+        cur = m.group(1)
+        back[cur] = 0
+        continue
+    m = re.match(r'^\s*([0-9a-f]+):\s+(j\w+)\s+([0-9a-f]+) <', ln)
+    if m and cur and int(m.group(3), 16) <= int(m.group(1), 16):
+        back[cur] += 1
+if sorted(back) != sorted(FUNCS):
+    raise SystemExit(f"FAIL: p117 disassembly functions {sorted(back)}")
+bad = {f: back[f] for f in FUNCS if back[f] != BACK.get(f, 0)}
+if bad:
+    raise SystemExit(f"FAIL: p117 backward branches {bad}, want {BACK} (0 elsewhere)")
+print(f"p117 --obj: {len(FUNCS) - len(BACK)} expanded functions without a back edge, "
+      f"{len(BACK)} with exactly one")
+PYEOF
+  ;;
+  *) echo "NOTE: p117 byte and back-edge checks need Linux x86-64 (host $HOST)" ;;
+esac
+
+# 4. fannkuchredux: dev and --release equal C, and its loops expand.
+FK="$ROOT_DIR/benchmarks/pion/fannkuchredux.pion"
+"$CC_BIN" -O2 -o "$TMP_DIR/fk_c" "$ROOT_DIR/benchmarks/c/fannkuchredux.c"
+"$TMP_DIR/fk_c" > "$TMP_DIR/fk_c.out"
+if [ "$(cat "$TMP_DIR/fk_c.out")" != "73196 38" ]; then
+  echo "FAIL: p117 C fannkuchredux printed '$(cat "$TMP_DIR/fk_c.out")'" >&2
+  exit 1
+fi
+for MODE in dev release; do
+  FLAG=""
+  [ "$MODE" = "release" ] && FLAG="--release"
+  "$PIONC" build $FLAG --emit-ssa "$TMP_DIR/fk_$MODE.ssa" -o "$TMP_DIR/fk_$MODE" "$FK"
+  "$TMP_DIR/fk_$MODE" > "$TMP_DIR/fk_$MODE.out"
+  if ! diff -u "$TMP_DIR/fk_c.out" "$TMP_DIR/fk_$MODE.out" >&2; then
+    echo "FAIL: p117 fannkuchredux $MODE differs from C" >&2
+    exit 1
+  fi
+  "$QBE" -d G -o /dev/null "$TMP_DIR/fk_$MODE.ssa" 2> "$TMP_DIR/fk_$MODE.g"
+  N=$(grep -c '^> Expanded counted loop ' "$TMP_DIR/fk_$MODE.g" || true)
+  echo "p117 fannkuchredux $MODE: $(cat "$TMP_DIR/fk_$MODE.out") (= C), $N loops expanded"
+done
+if [ "$N" -lt 1 ]; then
+  echo "FAIL: p117 fannkuchredux --release expands no loop" >&2
+  exit 1
+fi
+
+# 5. ASan + UBSan QBE over every QBE input above.
+if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -o "$TMP_DIR/san_probe" 2>/dev/null \
+  && "$TMP_DIR/san_probe"; then
+  mkdir -p "$TMP_DIR/sanq"
+  # The host's default target, as scripts/build-qbe.sh picks it (the replays
+  # below pass -t; the default matters for the host differential run).
+  case "$HOST" in
+    Darwin/arm64|Darwin/aarch64) DEFTGT=T_arm64_apple ;;
+    Darwin/*) DEFTGT=T_amd64_apple ;;
+    */aarch64|*/arm64) DEFTGT=T_arm64 ;;
+    */riscv64) DEFTGT=T_rv64 ;;
+    *) DEFTGT=T_amd64_sysv ;;
+  esac
+  printf '#define Deftgt %s\n' "$DEFTGT" > "$TMP_DIR/sanq/config.h"
+  (
+    cd "$ROOT_DIR/vendor/qbe"
+    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
+      o="$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
+      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$o"
+    done
+  )
+  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
+  SAN_ENV="ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+  # san ARGS: run the sanitized QBE; any exit status or diagnostic fails.
+  san() {
+    if ! env $SAN_ENV "$TMP_DIR/sanq/qbe" "$@" 2> "$TMP_DIR/sanq/err" || [ -s "$TMP_DIR/sanq/err" ]; then
+      cat "$TMP_DIR/sanq/err" >&2
+      echo "FAIL: p117 sanitized QBE $*" >&2
+      exit 1
+    fi
+  }
+  # san_dump ARGS: same with a -d dump on stderr (printed to stdout); a
+  # sanitizer report ends the process with a non-zero status.
+  san_dump() {
+    if ! env $SAN_ENV "$TMP_DIR/sanq/qbe" "$@" 2> "$TMP_DIR/sanq/err"; then
+      tail -40 "$TMP_DIR/sanq/err" >&2
+      echo "FAIL: p117 sanitized QBE $*" >&2
+      exit 1
+    fi
+    if grep -q 'Sanitizer\|runtime error' "$TMP_DIR/sanq/err"; then
+      grep -A20 'Sanitizer\|runtime error' "$TMP_DIR/sanq/err" >&2
+      echo "FAIL: p117 sanitized QBE $*" >&2
+      exit 1
+    fi
+    cat "$TMP_DIR/sanq/err"
+  }
+  RUNS=0
+  for IN in "$DIR/loops.ssa" "$TMP_DIR/fk_dev.ssa" "$TMP_DIR/fk_release.ssa"; do
+    for T in amd64_sysv amd64_apple arm64 arm64_apple; do
+      san -t "$T" -o "$TMP_DIR/sanq/out.s" "$IN"
+      san_dump -t "$T" -d G -o /dev/null "$IN" > "$TMP_DIR/sanq/g_$T.txt"
+      RUNS=$((RUNS + 2))
+      case "$T" in
+        amd64_sysv|arm64_apple)
+          san -t "$T" --obj -o "$TMP_DIR/sanq/out.o" "$IN"
+          RUNS=$((RUNS + 1))
+          ;;
+      esac
+      "$QBE" -t "$T" -o "$TMP_DIR/sanq/plain.s" "$IN"
+      cmp "$TMP_DIR/sanq/out.s" "$TMP_DIR/sanq/plain.s"
+      "$QBE" -t "$T" -d G -o /dev/null "$IN" 2> "$TMP_DIR/sanq/plain_g.txt"
+      cmp "$TMP_DIR/sanq/g_$T.txt" "$TMP_DIR/sanq/plain_g.txt"
+      if [ "$IN" = "$DIR/loops.ssa" ]; then
+        expansions "$TMP_DIR/sanq/g_$T.txt" "ASan+UBSan $T" > /dev/null
+      fi
+    done
+  done
+  asm "$TMP_DIR/sanq/qbe" "$DIR/loops.ssa" "$TMP_DIR/san_text.o"
+  run_driver "asan-ubsan-text" "$TMP_DIR/san_text.o"
+  echo "p117 ASan+UBSan QBE: 3 inputs x 4 targets, $RUNS runs clean (same expansions and assembly as the plain QBE)"
+elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
+  echo "FAIL: p117 needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one" >&2
+  exit 1
+else
+  echo "NOTE: $CC_BIN -fsanitize=address,undefined unavailable; skipping the sanitized QBE replay"
+fi
+
+echo "PASS: p117_qbe_counted_loop_unroll"
