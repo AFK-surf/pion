@@ -30,6 +30,7 @@ import PionProofs.QbeCountedLoopUnroll
 import PionProofs.QbeJtblIdxAndWideCmp
 import PionProofs.QbeAmd64FpRhsLoadFold
 import PionProofs.QbeWin64XmmCalleeSaved
+import PionProofs.QbeAmd64GuardedExchange
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -747,3 +748,10 @@ import PionProofs.QbeWin64XmmCalleeSaved
 #print axioms PionQbeWin64XmmCalleeSaved.scannerCovers
 #print axioms PionQbeWin64XmmCalleeSaved.writtenSaved
 #print axioms PionQbeWin64XmmCalleeSaved.callerView
+#print axioms PionQbeAmd64GuardedExchange.sameTrace
+#print axioms PionQbeAmd64GuardedExchange.fastBounds
+#print axioms PionQbeAmd64GuardedExchange.noEarlyStop
+#print axioms PionQbeAmd64GuardedExchange.finalInduction
+#print axioms PionQbeAmd64GuardedExchange.emptyNoSwap
+#print axioms PionQbeAmd64GuardedExchange.singleSelfSwap
+#print axioms PionQbeAmd64GuardedExchange.stepCount

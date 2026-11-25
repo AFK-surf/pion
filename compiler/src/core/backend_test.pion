@@ -694,7 +694,9 @@ test "qbe_p5p_local_immut_w_to_l_ext_prop" {
     #|    fi = fi + 1
     #|  }
     #|}
-  let pkg = parse_package("test", ["w2l_local.pion"], [src])
+  // Keep exercising scalar index extension when the stores do more than swap.
+  let scalar_src = src.replace("= tmp", "= tmp + 1")
+  let pkg = parse_package("test", ["w2l_local.pion"], [scalar_src])
   let res = emit_qbe_package(pkg, true)
   let fn_s = match t_str_find(res.ssa, "$pion_fn_rev_swap") {
     Some(idx) => t_str_from(res.ssa, idx)
@@ -725,6 +727,95 @@ test "qbe_p5p_local_immut_w_to_l_ext_prop" {
   }
   // Only 4 index extsw (perm[fi], perm[fi], perm[k-fi], perm[k-fi]); 0 value extsw for `tmp` or `perm[k-fi]`
   assert_eq(ext_cnt, 4)
+  assert_eq(fast_region.contains("@exchange_"), false)
+
+  let cr = check_source_files_full("test", ["exchange.pion"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let arm = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, true, "arm64_apple")
+  assert_eq(arm.ssa.contains("@exchange_done_"), false)
+  let exchange = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, true, "amd64_sysv")
+  assert_eq(exchange.ssa.contains(" =l phi @wh_fast_"), true)
+  assert_eq(exchange.ssa.contains("@exchange_done_"), true)
+  let loop_start = match t_str_find(exchange.ssa, "\n@exchange_") {
+    Some(pos) => pos
+    None => 0
+  }
+  let tail = t_str_from(exchange.ssa, loop_start + 1)
+  let loop_end = match t_str_find(tail, "\n@exchange_done_") {
+    Some(pos) => pos
+    None => 0
+  }
+  let hot = t_str_to(tail, loop_end)
+  assert_eq(hot.contains("=l extsw "), false)
+  assert_eq(hot.contains("pion_panic_oob"), false)
+  assert_eq(hot.contains("storew "), true)
+  assert_eq(t_str_from(tail, loop_end).contains("pion_panic_oob"), true)
+}
+
+///|
+fn t_guarded_exchange_ssa(src : String, release : Bool, target : String) -> String {
+  let cr = check_source_files_full("test", ["exchange.pion"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  emit_qbe_package_with_tc_target(cr.pkg, cr.tc, release, target).ssa
+}
+
+///|
+test "qbe_amd64_guarded_exchange_scope" {
+  let src =
+    #|pub fn rev(perm : Array[Int], other : Array[Int], k : Int, st : Int) -> Int {
+    #|  let n = perm.length()
+    #|  if k >= n || k >= other.length() {
+    #|    return 0
+    #|  }
+    #|  let mut fi = 0
+    #|  while fi < k {
+    #|    let tmp = perm[fi]
+    #|    perm[fi] = perm[k - fi]
+    #|    perm[k - fi] = tmp
+    #|    fi = fi + 1
+    #|  }
+    #|  fi
+    #|}
+  let hit = t_guarded_exchange_ssa(src, true, "amd64_sysv")
+  assert_eq(hit.contains("@exchange_done_"), true)
+  // The exit writes the bound back to the induction slot before @wh_e.
+  let done = match t_str_find(hit, "\n@exchange_done_") {
+    Some(pos) => t_str_from(hit, pos + 1)
+    None => ""
+  }
+  let done_end = match t_str_find(done, "\n@") {
+    Some(pos) => pos
+    None => done.length()
+  }
+  let done_blk = t_str_to(done, done_end)
+  assert_eq(done_blk.contains("storew "), true)
+  assert_eq(done_blk.contains("jmp @wh_e_"), true)
+  // Other targets and debug builds keep the indexed loop.
+  for target in ["arm64_apple", "arm64", "rv64", "amd64_win", "amd64_apple", ""] {
+    assert_eq(t_guarded_exchange_ssa(src, true, target).contains("@exchange_"), false)
+  }
+  assert_eq(t_guarded_exchange_ssa(src, false, "amd64_sysv").contains("@exchange_"), false)
+  // Shapes outside the recognised exchange keep the indexed loop.
+  let variants = [
+    // extra loop condition
+    src.replace("while fi < k {", "while fi < k && fi < 100 {"),
+    // constant step other than one
+    src.replace("fi = fi + 1", "fi = fi + 2"),
+    // variable step
+    src.replace("fi = fi + 1", "fi = fi + st"),
+    // the temporary shadows the axis
+    src.replace("let tmp = perm[fi]", "let k = perm[fi]").replace("= tmp", "= k"),
+    // the mirror element comes from a different array
+    src.replace("perm[fi] = perm[k - fi]", "perm[fi] = other[k - fi]"),
+    // the second store writes a different value
+    src.replace("= tmp", "= tmp + 1"),
+    // left and right stores in the other order
+    src.replace("perm[fi] = perm[k - fi]\n    perm[k - fi] = tmp", "perm[k - fi] = tmp\n    perm[fi] = perm[k - fi]"),
+  ]
+  for v in variants {
+    assert_not_eq(v, src)
+    assert_eq(t_guarded_exchange_ssa(v, true, "amd64_sysv").contains("@exchange_"), false)
+  }
 }
 
 ///|

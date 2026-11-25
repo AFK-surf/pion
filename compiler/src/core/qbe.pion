@@ -47635,6 +47635,97 @@ fn qbe_try_emit_borrowed_arr_elem_let(
 }
 
 ///|
+// Strength-reduce the two indices of an integer array exchange after both
+// ranges have been checked. The slow loop retains its source evaluation order.
+fn qbe_emit_guarded_exchange(
+  g : QbeGen, body : Array[Stmt], iv : String, bound : String,
+  iv_slot : String, start : String, limit : String, final_iv : String,
+  guards : Array[QbeBceGuard], entry : String, exit_lbl : String,
+) -> Bool {
+  if !g.release || g.target_name != "amd64_sysv" || body.length() != 4 || bound == "" {
+    return false
+  }
+  let (tmp, arr) = match body[0] {
+    SLet(t, false, TyMissing(_), EIndex(EIdent(a, _), EIdent(i, _), _), _) =>
+      if i == iv { (t, a) } else { return false }
+    _ => return false
+  }
+  let axis = match body[1] {
+    SAssign(EIndex(EIdent(a, _), EIdent(i, _), _),
+      EIndex(EIdent(b, _), EBinary("-", EIdent(k, _), EIdent(j, _), _), _), _) =>
+      if a == arr && b == arr && i == iv && j == iv { k } else { return false }
+    _ => return false
+  }
+  match body[2] {
+    SAssign(EIndex(EIdent(a, _), EBinary("-", EIdent(k, _), EIdent(i, _), _), _),
+      EIdent(t, _), _) =>
+      if a != arr || k != axis || i != iv || t != tmp { return false }
+    _ => return false
+  }
+  if tmp == "_" || tmp == arr || tmp == axis || tmp == iv || tmp == bound ||
+    axis == iv || g.boxed_mut_vars.contains(tmp) { return false }
+  let axis_slot = match (qbe_lookup_local(g, arr), qbe_lookup_local(g, axis),
+      qbe_lookup_local(g, iv), qbe_lookup_local(g, bound)) {
+    (Some(a), Some(k), Some(i), Some(b)) => {
+      if a.is_cell || k.is_cell || i.is_cell || b.is_cell ||
+        a.ref_slot != "" || k.ref_slot != "" || i.ref_slot != "" || b.ref_slot != "" {
+        return false
+      }
+      match (a.ty, k.ty, i.ty, b.ty) {
+        (TArray(TInt), TInt, TInt, TInt) => k.slot
+        _ => return false
+      }
+    }
+    _ => return false
+  }
+  let dp = match g.hoisted_arr_dp.get(arr) {
+    Some(reg) => reg
+    None => return false
+  }
+  let mut left_safe = false
+  let mut right_safe = false
+  for gd in guards {
+    if gd.arr == arr {
+      if gd.kind == 0 { left_safe = true }
+      if gd.kind == 2 && gd.vname == axis { right_safe = true }
+    }
+  }
+  if !left_safe || !right_safe { return false }
+  let kw = qbe_tmp(g)
+  let kl = qbe_tmp(g)
+  let reverse_start = qbe_tmp(g)
+  qbe_emit(g, kw + " =w loadsw " + axis_slot)
+  qbe_emit(g, kl + " =l extsw " + kw)
+  qbe_emit(g, reverse_start + " =l sub " + kl + ", " + start)
+  let first = qbe_emit_arr_ep_ty(g, dp, start, TInt)
+  let last = qbe_emit_arr_ep_ty(g, dp, reverse_start, TInt)
+  let stop = qbe_emit_arr_ep_ty(g, dp, limit, TInt)
+  let loop_lbl = qbe_lbl(g, "exchange")
+  let done_lbl = qbe_lbl(g, "exchange_done")
+  let left = qbe_tmp(g)
+  let right = qbe_tmp(g)
+  let next_left = qbe_tmp(g)
+  let next_right = qbe_tmp(g)
+  qbe_emit_term(g, "jmp " + loop_lbl)
+  qbe_emit_lbl(g, loop_lbl)
+  qbe_emit(g, left + " =l phi " + entry + " " + first + ", " + loop_lbl + " " + next_left)
+  qbe_emit(g, right + " =l phi " + entry + " " + last + ", " + loop_lbl + " " + next_right)
+  let x = qbe_load_arr_elem(g, left, TInt)
+  let y = qbe_load_arr_elem(g, right, TInt)
+  qbe_store_arr_elem(g, y, left, TInt)
+  qbe_store_arr_elem(g, x, right, TInt)
+  qbe_emit(g, next_left + " =l add " + left + ", 4")
+  qbe_emit(g, next_right + " =l sub " + right + ", 4")
+  let more = qbe_tmp(g)
+  qbe_emit(g, more + " =w cnel " + next_left + ", " + stop)
+  qbe_emit_term(g, "jnz " + more + ", " + loop_lbl + ", " + done_lbl)
+  qbe_emit_lbl(g, done_lbl)
+  qbe_emit(g, "storew " + final_iv + ", " + iv_slot)
+  qbe_emit_term(g, "jmp " + exit_lbl)
+  true
+}
+
+///|
 fn qbe_try_emit_while_bce_versioned(
   g : QbeGen,
   cond : Expr,
@@ -48369,23 +48460,28 @@ fn qbe_try_emit_while_bce_versioned(
   }
   qbe_emit_lbl(g, l_fast)
   let loop_depth = g.scopes.length()
-  g.loop_breaks.push(l_end)
-  g.loop_conts.push(l_fcond)
-  g.loop_depths.push(loop_depth)
-  g.hot_loop_depth = g.hot_loop_depth + 1
-  qbe_scope_push(g)
-  let fbv = qbe_emit_stmts(g, body, None)
-  if !g.block_term {
-    qbe_rc_dec(g, fbv.reg, fbv.ty)
+  let exchanged = !do_swar && !do_unroll4 && step_slot == "" && extra_cond is None &&
+    qbe_emit_guarded_exchange(g, body, iv, bound_name, iv_slot, iv0_l, bnd_l, bnd_w,
+      guards, l_fast, l_end)
+  if !exchanged {
+    g.loop_breaks.push(l_end)
+    g.loop_conts.push(l_fcond)
+    g.loop_depths.push(loop_depth)
+    g.hot_loop_depth = g.hot_loop_depth + 1
+    qbe_scope_push(g)
+    let fbv = qbe_emit_stmts(g, body, None)
+    if !g.block_term {
+      qbe_rc_dec(g, fbv.reg, fbv.ty)
+    }
+    qbe_scope_pop(g)
+    let _ = g.loop_breaks.pop()
+    let _ = g.loop_conts.pop()
+    let _ = g.loop_depths.pop()
+    qbe_emit_term(g, "jmp " + l_fcond)
+    qbe_emit_lbl(g, l_fcond)
+    qbe_emit_cond_branch(g, cond, l_fast, l_end)
+    g.hot_loop_depth = g.hot_loop_depth - 1
   }
-  qbe_scope_pop(g)
-  let _ = g.loop_breaks.pop()
-  let _ = g.loop_conts.pop()
-  let _ = g.loop_depths.pop()
-  qbe_emit_term(g, "jmp " + l_fcond)
-  qbe_emit_lbl(g, l_fcond)
-  qbe_emit_cond_branch(g, cond, l_fast, l_end)
-  g.hot_loop_depth = g.hot_loop_depth - 1
 
   // Clear fast-path BCE keys before emitting slow path
   let mut ki = 0
@@ -59078,6 +59174,7 @@ pub fn cli_compile_qbe_entry_opts(
   entry_symbol : String,
   no_main : Bool,
   j2_disable_mask : Int,
+  native_target~ : String = "",
 ) -> Result[CompileQbeOut, String] {
   let checked = check_source_files_full(pkg_name, paths, sources)
   if checked.diagnostics.length() > 0 {
@@ -59091,7 +59188,7 @@ pub fn cli_compile_qbe_entry_opts(
     true,
     [],
     target_wasm,
-    "",
+    native_target,
     entry_symbol,
     no_main,
     j2_disable_mask,
