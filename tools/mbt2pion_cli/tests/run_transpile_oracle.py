@@ -104,7 +104,7 @@ CASES = {
     "transpile_core": ("ok", 7),
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
-    "transpile_upper_tier": ("ok", 26),
+    "transpile_upper_tier": ("ok", 30),
 }
 
 MOON_TRAPS = {
@@ -1634,20 +1634,6 @@ pub fn ut_json_hex_and_extremes() -> (Bool, Bool, Bool, Bool) {
   (ok1, ok2, ok3, ok4)
 }
 
-pub fn ut_retain_filter_map_mut() -> (Int, Int, Int, Int, Int) {
-  let a1 = [1, 2, 3]
-  a1.retain(fn(x) { if x == 1 { let _ = a1.pop() }; true })
-  let a2 = [1, 2, 3]
-  a2.retain(fn(x) { if x == 1 { let _ = a2.pop() }; x != 2 })
-  let a3 = [1, 2]
-  a3.retain(fn(x) { if x == 1 { a3.push(99) }; true })
-  let a4 = [1, 2]
-  a4.retain(fn(x) { if x == 1 { a4.push(99) }; x != 2 })
-  let a5 = [1, 2, 3]
-  let fm = a5.filter_map(fn(x) { if x == 1 { let _ = a5.pop() }; Option::Some(x * 10) })
-  (a1.length() * 10 + a1[1], a2.length() * 10 + a2[1], a3.length() * 100 + a3[2], a4.length() * 10 + a4[0], fm.length() * 100 + fm[2])
-}
-
 pub(all) struct UtKwCollision {
   val : Int
   val_ : Int
@@ -1773,6 +1759,39 @@ pub fn ut_r3_kw_patterns() -> (Int, Int, Int) {
     { val: val, val_: val_ } => val * 10 + val_
   }
   (r_tup, r_arr, r_st)
+}
+
+// Astra P0-2 & P0-3 final regressions
+pub(all) struct UtInnerItems {
+  items : Array[UtShadowVal]
+}
+
+pub(all) struct UtOuterHolder {
+  inner : UtInnerItems
+}
+
+pub(all) struct UtOtherItems {
+  items : Array[Ref[Int]]
+}
+
+fn get_ut_outer() -> UtOuterHolder {
+  UtOuterHolder::{ inner: UtInnerItems::{ items: [UtShadowVal::{ val: 1, v: 9 }] } }
+}
+
+pub fn ut_r4_nested_index_val() -> (Int, Int) {
+  let inner : UtOtherItems = UtOtherItems::{ items: [Ref(7)] }
+  let _ = inner
+  let h = get_ut_outer()
+  (h.inner.items[0].val, get_ut_outer().inner.items[0].val)
+}
+
+pub fn ut_r4_nested_kw_params(val~ : Int, val_~ : Int) -> (Int, Int, Int, Int) {
+  let f = fn(val : Int) -> Int { val * 10 + val_ }
+  let g = (val : Int) => val * 10 + val_
+  fn inner(val : Int) -> Int {
+    val * 10 + val_
+  }
+  (f(1), g(1), inner(1), val * 10 + val_)
 }
 '''
 
@@ -2330,13 +2349,10 @@ fn main {
     check("ut.surrogate_len", elen == 2)
     check("ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
     let (jh1, jh2, jh3, jh4) = @m12.ut_json_hex_and_extremes()
-    let (rm1, rm2, rm3, rm4, rm5) = @m12.ut_retain_filter_map_mut()
     let (kc1, kc2) = @m12.ut_kw_collision_demo()
     let (ta1, ta2, sc1) = @m12.ut_tup_arr_and_set_ctor()
-    trace("ut10", "\{jh1}:\{jh2}:\{jh3}:\{jh4},\{rm1}:\{rm2}:\{rm3}:\{rm4}:\{rm5},\{kc1}:\{kc2},\{ta1}:\{ta2}:\{sc1}")
+    trace("ut10", "\{jh1}:\{jh2}:\{jh3}:\{jh4},\{kc1}:\{kc2},\{ta1}:\{ta2}:\{sc1}")
     check("ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
-    check("ut.p0_4_retain_pop", rm1 == 22 && rm2 == 23)
-    check("ut.p0_4_retain_push_fm", rm3 == 399 && rm4 == 11 && rm5 == 330)
     check("ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
     check("ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
     check("ut.p1_4_set_ctor", sc1 == 2)
@@ -2346,7 +2362,9 @@ fn main {
     let fms = @m12.ut_r3_f_match_shadow(val=1, val_=2)
     let gs = @m12.ut_r3_g_shadow(2)
     let (kpt, kpa, kps) = @m12.ut_r3_kw_patterns()
-    trace("utr3", "\{va}:\{vb}:\{va2}:\{vb2}:\{vs},\{so1}:\{so2}:\{sp1}:\{sp2},\{fls}:\{fms}:\{gs},\{kpt}:\{kpa}:\{kps}")
+    let (ni1, ni2) = @m12.ut_r4_nested_index_val()
+    let (nk1, nk2, nk3, nk4) = @m12.ut_r4_nested_kw_params(val=8, val_=9)
+    trace("utr3", "\{va}:\{vb}:\{va2}:\{vb2}:\{vs},\{so1}:\{so2}:\{sp1}:\{sp2},\{fls}:\{fms}:\{gs},\{kpt}:\{kpa}:\{kps},\{ni1}:\{ni2},\{nk1}:\{nk2}:\{nk3}:\{nk4}")
     check("ut.r3_val_mut_compound", va == 11 && vb == 7)
     check("ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
     check("ut.r3_global_ref_shadow", vs == 42)
@@ -2355,6 +2373,12 @@ fn main {
     check("ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
     check("ut.r3_kw_pat_tup", kpt == 19)
     check("ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
+    check("ut.r4_nested_index_val_shadow", ni1 == 1)
+    check("ut.r4_call_chain_index_val", ni2 == 1)
+    check("ut.r4_closure_kw_param", nk1 == 19)
+    check("ut.r4_arrow_kw_param", nk2 == 19)
+    check("ut.r4_local_fn_kw_param", nk3 == 19)
+    check("ut.r4_outer_kw_preserved", nk4 == 89)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2928,13 +2952,10 @@ pub fn main(w : World) -> Int {
     check(w, "ut.surrogate_len", elen == 2)
     check(w, "ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
     let (jh1, jh2, jh3, jh4) = m12::ut_json_hex_and_extremes()
-    let (rm1, rm2, rm3, rm4, rm5) = m12::ut_retain_filter_map_mut()
     let (kc1, kc2) = m12::ut_kw_collision_demo()
     let (ta1, ta2, sc1) = m12::ut_tup_arr_and_set_ctor()
-    trace(w, "ut10", jh1.to_string() + ":" + jh2.to_string() + ":" + jh3.to_string() + ":" + jh4.to_string() + "," + rm1.to_string() + ":" + rm2.to_string() + ":" + rm3.to_string() + ":" + rm4.to_string() + ":" + rm5.to_string() + "," + kc1.to_string() + ":" + kc2.to_string() + "," + ta1.to_string() + ":" + ta2.to_string() + ":" + sc1.to_string())
+    trace(w, "ut10", jh1.to_string() + ":" + jh2.to_string() + ":" + jh3.to_string() + ":" + jh4.to_string() + "," + kc1.to_string() + ":" + kc2.to_string() + "," + ta1.to_string() + ":" + ta2.to_string() + ":" + sc1.to_string())
     check(w, "ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
-    check(w, "ut.p0_4_retain_pop", rm1 == 22 && rm2 == 23)
-    check(w, "ut.p0_4_retain_push_fm", rm3 == 399 && rm4 == 11 && rm5 == 330)
     check(w, "ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
     check(w, "ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
     check(w, "ut.p1_4_set_ctor", sc1 == 2)
@@ -2944,7 +2965,9 @@ pub fn main(w : World) -> Int {
     let fms = m12::ut_r3_f_match_shadow(val_1=1, val_=2)
     let gs = m12::ut_r3_g_shadow(2)
     let (kpt, kpa, kps) = m12::ut_r3_kw_patterns()
-    trace(w, "utr3", va.to_string() + ":" + vb.to_string() + ":" + va2.to_string() + ":" + vb2.to_string() + ":" + vs.to_string() + "," + so1.to_string() + ":" + so2.to_string() + ":" + sp1.to_string() + ":" + sp2.to_string() + "," + fls.to_string() + ":" + fms.to_string() + ":" + gs.to_string() + "," + kpt.to_string() + ":" + kpa.to_string() + ":" + kps.to_string())
+    let (ni1, ni2) = m12::ut_r4_nested_index_val()
+    let (nk1, nk2, nk3, nk4) = m12::ut_r4_nested_kw_params(val_1=8, val_=9)
+    trace(w, "utr3", va.to_string() + ":" + vb.to_string() + ":" + va2.to_string() + ":" + vb2.to_string() + ":" + vs.to_string() + "," + so1.to_string() + ":" + so2.to_string() + ":" + sp1.to_string() + ":" + sp2.to_string() + "," + fls.to_string() + ":" + fms.to_string() + ":" + gs.to_string() + "," + kpt.to_string() + ":" + kpa.to_string() + ":" + kps.to_string() + "," + ni1.to_string() + ":" + ni2.to_string() + "," + nk1.to_string() + ":" + nk2.to_string() + ":" + nk3.to_string() + ":" + nk4.to_string())
     check(w, "ut.r3_val_mut_compound", va == 11 && vb == 7)
     check(w, "ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
     check(w, "ut.r3_global_ref_shadow", vs == 42)
@@ -2953,6 +2976,12 @@ pub fn main(w : World) -> Int {
     check(w, "ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
     check(w, "ut.r3_kw_pat_tup", kpt == 19)
     check(w, "ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
+    check(w, "ut.r4_nested_index_val_shadow", ni1 == 1)
+    check(w, "ut.r4_call_chain_index_val", ni2 == 1)
+    check(w, "ut.r4_closure_kw_param", nk1 == 19)
+    check(w, "ut.r4_arrow_kw_param", nk2 == 19)
+    check(w, "ut.r4_local_fn_kw_param", nk3 == 19)
+    check(w, "ut.r4_outer_kw_preserved", nk4 == 89)
   } else {
     panic("abort: unknown case " + kase)
   }

@@ -2506,7 +2506,42 @@ assert len(len_disps) >= 1 and all(p.get("file") == "v.mbt" and p.get("line") ==
     f"P1-5 probe origin hijacked by redacted comment! got: {len_disps}"
 )
 
-print("[e2e] PASS: Upper-tier E2E suite (verified ABI, tamper fail-closed, multi-dep Bars, readonly pub enum, raising callbacks, [comments] redaction, P0-3 mutable tail gate, P1-5 structured init origin)")
+# 8. Astra P0-1: Array::retain / Array::filter_map callback mutating receiver (direct, alias, boxed alias, local closure/helper, global helper) MUST fail-closed
+p01_cases = [
+    ("retain_set_pop", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { a[2] = 9; let _ = a.pop(); x > 0 })\n}\n'),
+    ("retain_push_set", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { a.push(4); a[2] = 9; x > 0 })\n}\n'),
+    ("retain_pop", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { if x == 1 { let _ = a.pop() }; true })\n}\n'),
+    ("retain_push", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { if x == 1 { a.push(4) }; true })\n}\n'),
+    ("retain_set", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { if x == 1 { a[2] = 9 }; x != 2 })\n}\n'),
+    ("retain_alias", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let b = a\n  a.retain(fn(x) { let _ = b.pop(); x > 0 })\n}\n'),
+    ("retain_box_alias", 'struct BoxA { arr : Array[Int] }\npub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let bx = BoxA::{ arr: a }\n  a.retain(fn(x) { let _ = bx.arr.pop(); x > 0 })\n}\n'),
+    ("retain_local_cb", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let cb = fn(x) { let _ = a.pop(); x > 0 }\n  a.retain(cb)\n}\n'),
+    ("retain_local_helper", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let b = a\n  fn helper() -> Unit { let _ = b.pop() }\n  a.retain(fn(x) { helper(); x > 0 })\n}\n'),
+    ("retain_global_helper", 'let g_arr : Array[Int] = [1, 2, 3]\nfn bump_g() -> Unit { g_arr.push(9) }\npub fn f() -> Unit {\n  g_arr.retain(fn(x) { bump_g(); x > 0 })\n}\n'),
+    ("fm_set_pop", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { a[2] = 9; let _ = a.pop(); Some(x) })\n}\n'),
+    ("fm_push_set", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { a.push(4); a[2] = 9; Some(x) })\n}\n'),
+    ("fm_pop", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { let _ = a.pop(); Some(x) })\n}\n'),
+    ("fm_push", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { a.push(4); Some(x) })\n}\n'),
+    ("fm_set", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { a[2] = 9; Some(x) })\n}\n'),
+    ("fm_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let b = a\n  a.filter_map(fn(x) { let _ = b.pop(); Some(x) })\n}\n'),
+    ("fm_local_cb", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let cb = fn(x) { let _ = a.pop(); Some(x) }\n  a.filter_map(cb)\n}\n'),
+]
+for tag, code in p01_cases:
+    p_src = os.path.join(ut_root, f"p01_{tag}_src")
+    p_out = os.path.join(ut_root, f"p01_{tag}_out")
+    os.makedirs(p_src, exist_ok=True)
+    with open(os.path.join(p_src, "a.mbt"), "w") as f:
+        f.write(code)
+    r_p01 = subprocess.run(
+        [bin_path, "--src", p_src, "--out", p_out,
+         "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+        capture_output=True, text=True
+    )
+    assert r_p01.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in (r_p01.stdout + r_p01.stderr), (
+        f"Astra P0-1 {tag} MUST fail-closed with MBT2PION_UNSUPPORTED_SYNTAX, got rc={r_p01.returncode}\n{r_p01.stdout}\n{r_p01.stderr}"
+    )
+
+print("[e2e] PASS: Upper-tier E2E suite (verified ABI, tamper fail-closed, multi-dep Bars, readonly pub enum, raising callbacks, [comments] redaction, P0-3 mutable tail gate, P1-5 structured init origin, Astra P0-1 retain/filter_map receiver-mutation gate)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

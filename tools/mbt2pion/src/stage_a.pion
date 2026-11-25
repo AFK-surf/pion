@@ -1155,7 +1155,21 @@ fn lower_param_list(
   file : String,
   autofill_loc : Bool,
 ) -> (String, String, Bool) {
-  // Pre-collect raw param names so colliding keyword params (e.g. `val~` + `val_~`) get collision-free names.
+  let (s, pre, has_opt, _) = lower_param_list_scoped(ctx, tokens, open_p, close_p, file, autofill_loc, false)
+  (s, pre, has_opt)
+}
+
+fn lower_param_list_scoped(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  file : String,
+  autofill_loc : Bool,
+  use_outer_scope : Bool,
+) -> (String, String, Bool, Map[String, String]) {
+  // Pre-collect raw param names so colliding keyword params (e.g. `val~` + `val_~`, or nested `fn(val)`
+  // inside an outer scope with `val_` / `val_1`) get collision-free names.
   let raw_pnames_for_rename : Array[String] = []
   let mut rpi = open_p + 1
   while rpi < close_p {
@@ -1174,7 +1188,11 @@ fn lower_param_list(
     }
     rpi = rpe + 1
   }
-  let local_param_renames = compute_param_renames(raw_pnames_for_rename)
+  let local_param_renames = if use_outer_scope {
+    compute_scoped_binder_renames(ctx, raw_pnames_for_rename)
+  } else {
+    compute_param_renames(raw_pnames_for_rename)
+  }
 
   let params : Array[ParsedParam] = []
   let mut i = open_p + 1
@@ -1291,7 +1309,7 @@ fn lower_param_list(
     }
     pi = pi + 1
   }
-  (sig_sb.to_string(), prelude_sb.to_string(), has_opt_default)
+  (sig_sb.to_string(), prelude_sb.to_string(), has_opt_default, local_param_renames)
 }
 
 ///| Lower an interpolated string `"..."` or `$|...` by recursively lowering each `\{...}` expression
@@ -1526,6 +1544,81 @@ fn extract_tuple_elem_type(ty : String, idx : Int) -> String {
   if cur == idx { inner.slice(start, inner.length()).trim() } else { "" }
 }
 
+///| Resolve the static type of a root-anchored dot chain ending at `end_idx`
+///| (e.g. `x`, `a.b.c`, `@pkg.v.field`), walking all the way back to the true chain head
+///| and returning `""` whenever the head is preceded by `.`, `::`, `)`, `]`, or `}` (e.g. `f().inner.items`).
+fn resolve_dot_chain_static_type(ctx : StageAContext, tokens : Array[Token], end_idx : Int) -> String {
+  if end_idx < 0 || tokens[end_idx].kind != TokenKind::Ident {
+    return ""
+  }
+  let rev_segs : Array[String] = []
+  let mut head_i = end_idx
+  while head_i >= 2 && tokens[head_i - 1].kind == TokenKind::Dot && tokens[head_i - 2].kind == TokenKind::Ident {
+    rev_segs.push(tokens[head_i].raw)
+    head_i = head_i - 2
+  }
+  let mut cur_ty = ""
+  if head_i >= 2 && tokens[head_i - 1].kind == TokenKind::Dot && tokens[head_i - 2].kind == TokenKind::PkgRef {
+    let raw_pkg = tokens[head_i - 2].raw.slice(1, tokens[head_i - 2].raw.length())
+    let mapped_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
+      Some(p) => p
+      None => raw_pkg
+    }
+    let vname = tokens[head_i].raw
+    cur_ty = match ctx.symtab.val_types.get(mapped_pkg + "::" + vname) {
+      Some(t) => t
+      None => match ctx.symtab.val_types.get(raw_pkg + "::" + vname) {
+        Some(t) => t
+        None => ""
+      }
+    }
+  } else if head_i >= 1 && (tokens[head_i - 1].kind == TokenKind::Dot ||
+    tokens[head_i - 1].kind == TokenKind::ColonColon ||
+    (!tokens[head_i].newline_before && (tokens[head_i - 1].kind == TokenKind::RParen ||
+      tokens[head_i - 1].kind == TokenKind::RBracket ||
+      tokens[head_i - 1].kind == TokenKind::RBrace))) {
+    return ""
+  } else {
+    cur_ty = lookup_ident_static_type(ctx, tokens[head_i].raw)
+  }
+  if cur_ty.length() == 0 {
+    return ""
+  }
+  let mut ri = rev_segs.length() - 1
+  while ri >= 0 {
+    let sbase = strip_type_args_sym(cur_ty)
+    match ctx.symtab.struct_field_types.get(sbase) {
+      Some(fmap) =>
+      match fmap.get(rev_segs[ri]) {
+        Some(fty) => cur_ty = fty
+        None => return ""
+      }
+      None => return ""
+    }
+    ri = ri - 1
+  }
+  cur_ty
+}
+
+///| Extract the true root identifier of a dot chain ending at `end_idx`, or `""` if not root-anchored.
+fn extract_dot_chain_root_ident(tokens : Array[Token], end_idx : Int) -> String {
+  if end_idx < 0 || tokens[end_idx].kind != TokenKind::Ident {
+    return ""
+  }
+  let mut head_i = end_idx
+  while head_i >= 2 && tokens[head_i - 1].kind == TokenKind::Dot && tokens[head_i - 2].kind == TokenKind::Ident {
+    head_i = head_i - 2
+  }
+  if head_i >= 1 && (tokens[head_i - 1].kind == TokenKind::Dot ||
+    tokens[head_i - 1].kind == TokenKind::ColonColon ||
+    (!tokens[head_i].newline_before && (tokens[head_i - 1].kind == TokenKind::RParen ||
+      tokens[head_i - 1].kind == TokenKind::RBracket ||
+      tokens[head_i - 1].kind == TokenKind::RBrace))) {
+    return ""
+  }
+  tokens[head_i].raw
+}
+
 fn try_resolve_static_val_field(ctx : StageAContext, tokens : Array[Token], dot_i : Int) -> Option[String] {
   if dot_i <= 0 {
     return None
@@ -1549,7 +1642,7 @@ fn try_resolve_static_val_field(ctx : StageAContext, tokens : Array[Token], dot_
     }
     return None
   }
-  // Case 0b: `a.b[k].val` or `a[k].val`
+  // Case 0b: `<dot_chain>[k].val` (root-anchored dot chain before `[k]`)
   if dot_i >= 3 && tokens[dot_i - 1].kind == TokenKind::RBracket {
     let mut ob = dot_i - 2
     let mut d = 1
@@ -1560,18 +1653,7 @@ fn try_resolve_static_val_field(ctx : StageAContext, tokens : Array[Token], dot_
       ob = ob - 1
     }
     if ob >= 1 && tokens[ob].kind == TokenKind::LBracket {
-      let mut cty = ""
-      if ob >= 3 && tokens[ob - 3].kind == TokenKind::Ident && tokens[ob - 2].kind == TokenKind::Dot && tokens[ob - 1].kind == TokenKind::Ident {
-        let rty = lookup_ident_static_type(ctx, tokens[ob - 3].raw)
-        if rty.length() > 0 {
-          match ctx.symtab.struct_field_types.get(strip_type_args_sym(rty)) {
-            Some(fm) => match fm.get(tokens[ob - 1].raw) { Some(ft) => cty = ft, None => () }
-            None => ()
-          }
-        }
-      } else if tokens[ob - 1].kind == TokenKind::Ident {
-        cty = lookup_ident_static_type(ctx, tokens[ob - 1].raw)
-      }
+      let cty = resolve_dot_chain_static_type(ctx, tokens, ob - 1)
       if cty.length() > 0 {
         let vty = extract_container_value_type(cty)
         return try_resolve_static_val_field_from_ty(ctx, vty)
@@ -1579,46 +1661,9 @@ fn try_resolve_static_val_field(ctx : StageAContext, tokens : Array[Token], dot_
     }
     return None
   }
-  // Case 1: `@pkg.val_name.val`
-  if dot_i >= 3 && tokens[dot_i - 3].kind == TokenKind::PkgRef &&
-  tokens[dot_i - 2].kind == TokenKind::Dot && tokens[dot_i - 1].kind == TokenKind::Ident {
-    let raw_pkg = tokens[dot_i - 3].raw.slice(1, tokens[dot_i - 3].raw.length())
-    let mapped_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
-      Some(p) => p
-      None => raw_pkg
-    }
-    let vname = tokens[dot_i - 1].raw
-    let vty = match ctx.symtab.val_types.get(mapped_pkg + "::" + vname) {
-      Some(t) => t
-      None => match ctx.symtab.val_types.get(raw_pkg + "::" + vname) {
-        Some(t) => t
-        None => ""
-      }
-    }
-    return try_resolve_static_val_field_from_ty(ctx, vty)
-  }
-  // Case 2: `recv.field.val`
-  if dot_i >= 3 && tokens[dot_i - 3].kind == TokenKind::Ident &&
-  tokens[dot_i - 2].kind == TokenKind::Dot && tokens[dot_i - 1].kind == TokenKind::Ident &&
-  !(dot_i >= 4 && tokens[dot_i - 4].kind == TokenKind::Dot) {
-    let rty = lookup_ident_static_type(ctx, tokens[dot_i - 3].raw)
-    if rty.length() > 0 {
-      let sbase = strip_type_args_sym(rty)
-      match ctx.symtab.struct_field_types.get(sbase) {
-        Some(fmap) =>
-        match fmap.get(tokens[dot_i - 1].raw) {
-          Some(fty) => return try_resolve_static_val_field_from_ty(ctx, fty)
-          None => ()
-        }
-        None => ()
-      }
-    }
-    return None
-  }
-  // Case 3: `x.val`
-  if tokens[dot_i - 1].kind == TokenKind::Ident &&
-  !(dot_i >= 2 && (tokens[dot_i - 2].kind == TokenKind::Dot || tokens[dot_i - 2].kind == TokenKind::ColonColon)) {
-    let rty = lookup_ident_static_type(ctx, tokens[dot_i - 1].raw)
+  // Case 1/2/3: unified root-anchored dot chain (`@pkg.v.val`, `a.b.c.val`, `x.val`)
+  let rty = resolve_dot_chain_static_type(ctx, tokens, dot_i - 1)
+  if rty.length() > 0 {
     return try_resolve_static_val_field_from_ty(ctx, rty)
   }
   None
@@ -1638,7 +1683,8 @@ fn should_defer_val_assign_to_a5(
     return false
   }
   let is_simple_ident_recv = dot_i >= 1 && tokens[dot_i - 1].kind == TokenKind::Ident &&
-  !(dot_i >= 2 && (tokens[dot_i - 2].kind == TokenKind::Dot || tokens[dot_i - 2].kind == TokenKind::ColonColon))
+  !(dot_i >= 2 && (tokens[dot_i - 2].kind == TokenKind::Dot || tokens[dot_i - 2].kind == TokenKind::ColonColon ||
+    (!tokens[dot_i - 1].newline_before && (tokens[dot_i - 2].kind == TokenKind::RParen || tokens[dot_i - 2].kind == TokenKind::RBracket || tokens[dot_i - 2].kind == TokenKind::RBrace))))
   let mut root_raw = ""
   if dot_i >= 5 && tokens[dot_i - 1].kind == TokenKind::RParen &&
   tokens[dot_i - 2].kind == TokenKind::IntLit && tokens[dot_i - 3].kind == TokenKind::Dot &&
@@ -1653,16 +1699,11 @@ fn should_defer_val_assign_to_a5(
       if d == 0 { break }
       ob = ob - 1
     }
-    if ob >= 3 && tokens[ob - 3].kind == TokenKind::Ident && tokens[ob - 2].kind == TokenKind::Dot && tokens[ob - 1].kind == TokenKind::Ident {
-      root_raw = tokens[ob - 3].raw
-    } else if ob >= 1 && tokens[ob - 1].kind == TokenKind::Ident {
-      root_raw = tokens[ob - 1].raw
+    if ob >= 1 && tokens[ob].kind == TokenKind::LBracket {
+      root_raw = extract_dot_chain_root_ident(tokens, ob - 1)
     }
-  } else if dot_i >= 3 && tokens[dot_i - 3].kind == TokenKind::Ident &&
-  tokens[dot_i - 2].kind == TokenKind::Dot && tokens[dot_i - 1].kind == TokenKind::Ident {
-    root_raw = tokens[dot_i - 3].raw
-  } else if is_simple_ident_recv {
-    root_raw = tokens[dot_i - 1].raw
+  } else {
+    root_raw = extract_dot_chain_root_ident(tokens, dot_i - 1)
   }
   let mut root_is_known_immut = false
   if root_raw.length() > 0 {
@@ -2870,18 +2911,24 @@ fn lower_stmts_range(
         let param_set : Map[String, Bool] = Map()
         for pn in p_names { param_set[pn] = true }
         if !is_self_rec {
-          let (p_str, p_pre, _) = lower_param_list(ctx, tokens, g.open_p, g.close_p, file, false)
+          let (p_str, p_pre, _, p_renames) = lower_param_list_scoped(ctx, tokens, g.open_p, g.close_p, file, false, true)
+          let raw_p_names = extract_raw_param_names(tokens, g.open_p, g.close_p)
           let ret_str = if g.ret_start >= 0 && g.ret_end > g.ret_start {
             " -> " + lower_type_tokens_checked(ctx, tokens, g.ret_start, g.ret_end, file)
           } else {
             ""
           }
-          // Push own params as non-boxed ScopeVars so shadowed outer boxed `mut` vars are NOT rewritten to `.v`!
+          // Push own params as non-boxed ScopeVars + scoped ident_renames so shadowed outer vars/keywords stay hygienic!
           let saved_sc = ctx.scope_vars.length()
+          let saved_rn = ctx.ident_renames.length()
+          if p_renames.length() > 0 {
+            ctx.ident_renames.push(p_renames)
+          }
           let mut pi = 0
-          while pi < p_names.length() {
+          while pi < raw_p_names.length() {
+            let eff_pn = resolve_ident_in_scope(ctx, raw_p_names[pi])
             ctx.scope_vars.push(ScopeVar::{
-              name: p_names[pi],
+              name: eff_pn,
               ty: if pi < p_tys.length() { p_tys[pi] } else { "" },
               is_mut: false,
               is_boxed: false,
@@ -2890,6 +2937,7 @@ fn lower_stmts_range(
           }
           let body = lower_block_range(ctx, tokens, g.lb, g.rb, file, p_pre)
           restore_scope_vars(ctx, saved_sc)
+          restore_ident_renames(ctx, saved_rn)
           sb.write_string(tokens[g.start_tok].leading_trivia)
           sb.write_string("let " + g.name + " = fn(" + p_str + ")" + ret_str + " " + body)
           // Register this local fn in scope for subsequent statements/local fns (declaration order!)
@@ -2956,17 +3004,25 @@ fn lower_stmts_range(
           lifted_name: lname,
           env_args: env_args,
         }
-        let (p_str, p_pre, _) = lower_param_list(ctx, tokens, g.open_p, g.close_p, file, false)
+        let (p_str, p_pre, _, p_renames) = lower_param_list_scoped(ctx, tokens, g.open_p, g.close_p, file, false, true)
+        let raw_p_names = extract_raw_param_names(tokens, g.open_p, g.close_p)
         let ret_str = if g.ret_start >= 0 && g.ret_end > g.ret_start {
           " -> " + lower_type_tokens_checked(ctx, tokens, g.ret_start, g.ret_end, file)
         } else {
           " -> Unit"
         }
         let saved_sc = ctx.scope_vars.length()
+        let saved_rn = ctx.ident_renames.length()
+        if p_renames.length() > 0 {
+          ctx.ident_renames.push(p_renames)
+        }
+        let eff_p_names : Array[String] = []
         let mut pi = 0
-        while pi < p_names.length() {
+        while pi < raw_p_names.length() {
+          let eff_pn = resolve_ident_in_scope(ctx, raw_p_names[pi])
+          eff_p_names.push(eff_pn)
           ctx.scope_vars.push(ScopeVar::{
-            name: p_names[pi],
+            name: eff_pn,
             ty: if pi < p_tys.length() { p_tys[pi] } else { "" },
             is_mut: false,
             is_boxed: false,
@@ -2975,6 +3031,7 @@ fn lower_stmts_range(
         }
         let body = lower_block_range(ctx, tokens, g.lb, g.rb, file, p_pre)
         restore_scope_vars(ctx, saved_sc)
+        restore_ident_renames(ctx, saved_rn)
         let full_params = if env_params.length() > 0 && p_str.length() > 0 {
           join_comma(env_params) + ", " + p_str
         } else if env_params.length() > 0 {
@@ -2989,7 +3046,7 @@ fn lower_stmts_range(
         if escapes {
           let call_args_all : Array[String] = []
           for ea in env_args { call_args_all.push(ea) }
-          for pn in p_names { call_args_all.push(pn) }
+          for pn in eff_p_names { call_args_all.push(pn) }
           sb.write_string("let " + g.name + " = fn(" + p_str + ")" + ret_str + " { " + lname + "(" + join_comma(call_args_all) + ") }")
         } else {
           sb.write_string("// lifted recursive local fn: " + lname)
@@ -4864,8 +4921,9 @@ fn lower_one_token_or_form(
   if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "fn" && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
     let open_p = i + 1
     let close_p = find_matching_delim(tokens, open_p)
-    let (p_str, p_pre, _) = lower_param_list(ctx, tokens, open_p, close_p, file, false)
-    let (p_names, p_tys, _) = extract_param_info(ctx, tokens, open_p, close_p, file)
+    let (p_str, p_pre, _, p_renames) = lower_param_list_scoped(ctx, tokens, open_p, close_p, file, false, true)
+    let raw_p_names = extract_raw_param_names(tokens, open_p, close_p)
+    let (_, p_tys, _) = extract_param_info(ctx, tokens, open_p, close_p, file)
     let mut cur = close_p + 1
     let mut ret_str = ""
     if cur < end && tokens[cur].kind == TokenKind::Arrow {
@@ -4886,11 +4944,16 @@ fn lower_one_token_or_form(
     if cur < end && tokens[cur].kind == TokenKind::LBrace {
       let close_b = find_matching_delim(tokens, cur)
       let saved_fn_sc = ctx.scope_vars.length()
+      let saved_fn_rn = ctx.ident_renames.length()
+      if p_renames.length() > 0 {
+        ctx.ident_renames.push(p_renames)
+      }
       let mut pi = 0
-      while pi < p_names.length() {
-        if p_names[pi] != "_" {
+      while pi < raw_p_names.length() {
+        if raw_p_names[pi] != "_" {
+          let eff_pn = resolve_ident_in_scope(ctx, raw_p_names[pi])
           let pty = if pi < p_tys.length() { p_tys[pi] } else { "" }
-          ctx.scope_vars.push(ScopeVar::{ name: p_names[pi], ty: pty, is_mut: false, is_boxed: false })
+          ctx.scope_vars.push(ScopeVar::{ name: eff_pn, ty: pty, is_mut: false, is_boxed: false })
         }
         pi = pi + 1
       }
@@ -4898,6 +4961,7 @@ fn lower_one_token_or_form(
       let body = lower_block_range(ctx, tokens, cur, close_b, file, p_pre)
       ctx.in_closure_depth = ctx.in_closure_depth - 1
       restore_scope_vars(ctx, saved_fn_sc)
+      restore_ident_renames(ctx, saved_fn_rn)
       return (trivia + "fn(" + p_str + ")" + ret_str + " " + body, close_b + 1)
     }
   }
@@ -4937,14 +5001,20 @@ fn lower_one_token_or_form(
   if !in_pattern && t.kind == TokenKind::LParen {
     let close_p = is_arrow_fn_at(tokens, i, end)
     if close_p >= 0 {
-      let (p_str, _, _) = lower_param_list(ctx, tokens, i, close_p, file, false)
-      let (p_names, p_tys, _) = extract_param_info(ctx, tokens, i, close_p, file)
+      let (p_str, _, _, p_renames) = lower_param_list_scoped(ctx, tokens, i, close_p, file, false, true)
+      let raw_p_names = extract_raw_param_names(tokens, i, close_p)
+      let (_, p_tys, _) = extract_param_info(ctx, tokens, i, close_p, file)
       let saved_arr_sc = ctx.scope_vars.length()
+      let saved_arr_rn = ctx.ident_renames.length()
+      if p_renames.length() > 0 {
+        ctx.ident_renames.push(p_renames)
+      }
       let mut pi = 0
-      while pi < p_names.length() {
-        if p_names[pi] != "_" {
+      while pi < raw_p_names.length() {
+        if raw_p_names[pi] != "_" {
+          let eff_pn = resolve_ident_in_scope(ctx, raw_p_names[pi])
           let pty = if pi < p_tys.length() { p_tys[pi] } else { "" }
-          ctx.scope_vars.push(ScopeVar::{ name: p_names[pi], ty: pty, is_mut: false, is_boxed: false })
+          ctx.scope_vars.push(ScopeVar::{ name: eff_pn, ty: pty, is_mut: false, is_boxed: false })
         }
         pi = pi + 1
       }
@@ -4955,12 +5025,14 @@ fn lower_one_token_or_form(
         let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
         ctx.in_closure_depth = ctx.in_closure_depth - 1
         restore_scope_vars(ctx, saved_arr_sc)
+        restore_ident_renames(ctx, saved_arr_rn)
         return (trivia + "fn(" + p_str + ") " + body, body_close + 1)
       }
       let body_end = find_expr_end(tokens, body_start, end)
       let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
       ctx.in_closure_depth = ctx.in_closure_depth - 1
       restore_scope_vars(ctx, saved_arr_sc)
+      restore_ident_renames(ctx, saved_arr_rn)
       return (trivia + "fn(" + p_str + ") { " + body_expr + " }", body_end)
     }
     // Check type ascription `(expr : Type)` (single top-level `:`, no top-level `,`, RHS starts with type token)
@@ -5045,8 +5117,13 @@ fn lower_one_token_or_form(
   if !in_pattern && (t.kind == TokenKind::Ident || t.kind == TokenKind::Underscore) &&
   i + 1 < end && tokens[i + 1].kind == TokenKind::FatArrow &&
   !(i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
-    let pname = if t.kind == TokenKind::Underscore { "_" } else { rename_keyword_ident(t.raw) }
     let saved_arr_sc = ctx.scope_vars.length()
+    let saved_arr_rn = ctx.ident_renames.length()
+    let arr_rn = if t.kind == TokenKind::Underscore { Map() } else { compute_scoped_binder_renames(ctx, [t.raw]) }
+    if arr_rn.length() > 0 {
+      ctx.ident_renames.push(arr_rn)
+    }
+    let pname = if t.kind == TokenKind::Underscore { "_" } else { resolve_ident_in_scope(ctx, t.raw) }
     if pname != "_" {
       ctx.scope_vars.push(ScopeVar::{ name: pname, ty: "", is_mut: false, is_boxed: false })
     }
@@ -5057,12 +5134,14 @@ fn lower_one_token_or_form(
       let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
       ctx.in_closure_depth = ctx.in_closure_depth - 1
       restore_scope_vars(ctx, saved_arr_sc)
+      restore_ident_renames(ctx, saved_arr_rn)
       return (trivia + "fn(" + pname + ") " + body, body_close + 1)
     }
     let body_end = find_expr_end(tokens, body_start, end)
     let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
     ctx.in_closure_depth = ctx.in_closure_depth - 1
     restore_scope_vars(ctx, saved_arr_sc)
+    restore_ident_renames(ctx, saved_arr_rn)
     return (trivia + "fn(" + pname + ") { " + body_expr + " }", body_end)
   }
 
@@ -6259,11 +6338,12 @@ fn lower_one_token_or_form(
       }
     }
 
-    // §5: Fail-closed gate on raising callbacks passed to `.retain(cb)` / `.filter_map(cb)`
+    // §5 & Astra P0-1: Fail-closed gates on raising callbacks AND receiver-mutating callbacks passed to `.retain(cb)` / `.filter_map(cb)`
     if !in_pattern && prev_dot && (t.raw == "retain" || t.raw == "filter_map") &&
     next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before {
       let close_p = find_matching_delim(tokens, next_i)
       check_non_raising_callback(ctx, tokens, next_i + 1, close_p, t.raw, file, t.line, t.col)
+      check_no_receiver_mut_callback(ctx, tokens, i - 1, next_i + 1, close_p, t.raw, file, t.line, t.col)
     }
 
     // Check method call `recv.method(...)` with expected-type guidance from `Type::method` or unique method signature

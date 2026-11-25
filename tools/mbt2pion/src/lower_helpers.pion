@@ -1044,6 +1044,377 @@ fn check_non_raising_callback(
   }
 }
 
+fn is_array_mutating_method(m : String) -> Bool {
+  m == "pop" || m == "push" || m == "clear" || m == "truncate" || m == "resize" ||
+  m == "drain" || m == "remove" || m == "insert" || m == "append" || m == "retain" ||
+  m == "set" || m == "unsafe_set" || m == "swap" || m == "sort" || m == "sort_by" ||
+  m == "sort_by_key" || m == "rev_in_place" || m == "map_in_place" || m == "push_iter" ||
+  m == "shrink_to_fit" || m == "dedup" || m == "blit_to"
+}
+
+///| Return true iff token slice `[s, e)` mentions any identifier in `alias_set`
+///| (requiring full `field_chain` match when `field_chain.length() > 1` and matching `field_chain[0]`).
+fn tokens_mention_alias_set(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  alias_set : Map[String, Bool],
+  field_chain : Array[String],
+) -> Bool {
+  let mut k = s
+  while k < e {
+    let tk = tokens[k]
+    let prev_qual = k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)
+    if tk.kind == TokenKind::Ident && !prev_qual && alias_set.contains(tk.raw) {
+      if field_chain.length() > 1 && tk.raw == field_chain[0] {
+        let mut p = k + 1
+        let mut fi = 1
+        let mut ok = true
+        while fi < field_chain.length() {
+          if p + 1 < e && tokens[p].kind == TokenKind::Dot && tokens[p + 1].raw == field_chain[fi] {
+            p = p + 2
+            fi = fi + 1
+          } else {
+            ok = false
+            break
+          }
+        }
+        if ok { return true }
+      } else {
+        return true
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Check whether a top-level function `fn_name` transitively references global `recv_root` via `ctx.fn_bodies`.
+fn top_fn_reaches_global(
+  ctx : StageAContext,
+  fn_name : String,
+  recv_root : String,
+  seen : Map[String, Bool],
+) -> Bool {
+  if seen.contains(fn_name) {
+    return false
+  }
+  seen[fn_name] = true
+  for fb in ctx.fn_bodies {
+    if fb.name == fn_name {
+      for r in fb.referenced_idents {
+        if r == recv_root {
+          return true
+        }
+      }
+      for cf in fb.called_fns {
+        if top_fn_reaches_global(ctx, cf, recv_root, seen) {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+///| Scan `[s, e)` for any mutation or aliasing escape of a tracked array variable/path in `alias_set`
+///| (or calls into local functions/closures capturing `alias_set`, or top-level fns touching global `recv_root`).
+fn tokens_may_mutate_array_aliases(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  alias_set : Map[String, Bool],
+  captured_fns : Map[String, Bool],
+  field_chain : Array[String],
+  local_fn_bodies : Map[String, (Int, Int)],
+  visited_fns : Map[String, Bool],
+  recv_is_global : Bool,
+  recv_root : String,
+) -> Bool {
+  let mut k = s
+  while k < e {
+    let tk = tokens[k]
+    let prev_qual = k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)
+    if tk.kind == TokenKind::Ident && !prev_qual {
+      // 0. Calling a local closure/fn that transitively captured any alias -> fail-closed!
+      if k + 1 < e && tokens[k + 1].kind == TokenKind::LParen && captured_fns.contains(tk.raw) {
+        return true
+      }
+      // 1. Check direct/aliased variable match (including field paths like `box.arr.pop()` or `self.items.pop()`)
+      if alias_set.contains(tk.raw) {
+        let mut p = k + 1
+        let mut path_matched = true
+        if field_chain.length() > 1 && tk.raw == field_chain[0] {
+          let mut fi = 1
+          while fi < field_chain.length() {
+            if p + 1 < e && tokens[p].kind == TokenKind::Dot && tokens[p + 1].raw == field_chain[fi] {
+              p = p + 2
+              fi = fi + 1
+            } else {
+              path_matched = false
+              break
+            }
+          }
+        } else {
+          // For derived aliases (e.g. `box` from `let box = Box::{ arr: a }`), walk optional `.field` chain before mutating method/index!
+          while p + 2 < e && tokens[p].kind == TokenKind::Dot && tokens[p + 1].kind == TokenKind::Ident &&
+          tokens[p + 2].kind != TokenKind::LParen {
+            p = p + 2
+          }
+        }
+        if path_matched {
+          if p + 2 < e && tokens[p].kind == TokenKind::Dot &&
+          tokens[p + 1].kind == TokenKind::Ident && tokens[p + 2].kind == TokenKind::LParen &&
+          is_array_mutating_method(tokens[p + 1].raw) {
+            return true
+          }
+          if p < e && tokens[p].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, p)
+            if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+              return true
+            }
+          }
+          if p < e && (tokens[p].kind == TokenKind::Eq || tokens[p].kind == TokenKind::AssignOp) {
+            return true
+          }
+          // Bare alias passed as call argument `foo(..., a, ...)` / `foo(box)` (excluding `UpperIdent` pattern/ctor like `Some(m)`)
+          if (field_chain.length() <= 1 || tk.raw != field_chain[0]) &&
+          !(p < e && (tokens[p].kind == TokenKind::Dot || tokens[p].kind == TokenKind::LBracket)) {
+            if k > s && (tokens[k - 1].kind == TokenKind::LParen || tokens[k - 1].kind == TokenKind::Comma || tokens[k - 1].kind == TokenKind::Eq) {
+              let is_ctor_arg = tokens[k - 1].kind == TokenKind::LParen && k >= s + 2 && tokens[k - 2].kind == TokenKind::UpperIdent
+              if !is_ctor_arg && p < e && (tokens[p].kind == TokenKind::RParen || tokens[p].kind == TokenKind::Comma || tokens[p].kind == TokenKind::Tilde) {
+                return true
+              }
+            }
+          }
+        }
+      }
+      // 2. Check call to a local fn/closure or top-level fn reaching global receiver
+      if k + 1 < e && tokens[k + 1].kind == TokenKind::LParen {
+        match local_fn_bodies.get(tk.raw) {
+          Some((bs, be)) =>
+          if !visited_fns.contains(tk.raw) {
+            visited_fns[tk.raw] = true
+            if tokens_may_mutate_array_aliases(ctx, tokens, bs, be, alias_set, captured_fns, field_chain, local_fn_bodies, visited_fns, recv_is_global, recv_root) {
+              return true
+            }
+          }
+          None =>
+          if recv_is_global {
+            let seen_g : Map[String, Bool] = Map()
+            if top_fn_reaches_global(ctx, tk.raw, recv_root, seen_g) {
+              return true
+            }
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Astra P0-1: Fail-closed gate rejecting `.retain(cb)` / `.filter_map(cb)` callbacks that may
+///| mutate the receiver array (via transitive local aliases, captured closures/helper fns, escaping calls,
+///| or top-level helpers referencing a global receiver).
+fn check_no_receiver_mut_callback(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  dot_i : Int,
+  arg_s : Int,
+  arg_e : Int,
+  method_name : String,
+  file : String,
+  line : Int,
+  col : Int,
+) -> Unit {
+  if dot_i <= 0 || arg_s >= arg_e {
+    return
+  }
+  let rev_segs : Array[String] = []
+  let mut head_i = dot_i - 1
+  if tokens[head_i].kind != TokenKind::Ident {
+    return
+  }
+  rev_segs.push(tokens[head_i].raw)
+  while head_i >= 2 && tokens[head_i - 1].kind == TokenKind::Dot && tokens[head_i - 2].kind == TokenKind::Ident {
+    head_i = head_i - 2
+    rev_segs.push(tokens[head_i].raw)
+  }
+  if head_i >= 1 && (tokens[head_i - 1].kind == TokenKind::Dot || tokens[head_i - 1].kind == TokenKind::ColonColon ||
+    (!tokens[head_i].newline_before && (tokens[head_i - 1].kind == TokenKind::RParen || tokens[head_i - 1].kind == TokenKind::RBracket || tokens[head_i - 1].kind == TokenKind::RBrace))) {
+    return
+  }
+  let field_chain : Array[String] = []
+  let mut ri = rev_segs.length() - 1
+  while ri >= 0 {
+    field_chain.push(rev_segs[ri])
+    ri = ri - 1
+  }
+  let recv_root = field_chain[0]
+  let recv_is_global = ctx.symtab.val_types.contains(recv_root) && !(lookup_scope_var(ctx, recv_root) is Some(_))
+  // Find enclosing top-level function/test body start by scanning backward for outermost unmatched `{`
+  let mut fn_start = 0
+  let mut scan = dot_i
+  let mut depth = 0
+  while scan >= 0 {
+    let sk = tokens[scan].kind
+    if sk == TokenKind::RBrace {
+      depth = depth + 1
+    } else if sk == TokenKind::LBrace {
+      if depth == 0 {
+        fn_start = scan
+        let mut check_i = scan - 1
+        let mut cd = 0
+        let mut found_outer = false
+        while check_i >= 0 {
+          let ck = tokens[check_i].kind
+          if ck == TokenKind::RBrace { cd = cd + 1 }
+          else if ck == TokenKind::LBrace {
+            if cd == 0 {
+              found_outer = true
+              break
+            }
+            cd = cd - 1
+          }
+          check_i = check_i - 1
+        }
+        if !found_outer {
+          break
+        }
+      } else {
+        depth = depth - 1
+      }
+    }
+    scan = scan - 1
+  }
+  // Collect all lexically in-scope `let` bindings & local `fn` declarations in `[fn_start, dot_i)`
+  let let_bindings : Array[(String, Int, Int, Bool)] = []
+  let local_fn_bodies : Map[String, (Int, Int)] = Map()
+  let mut si = fn_start + 1
+  while si < dot_i {
+    let st = tokens[si]
+    // Skip closed sibling blocks `{ ... }` that ended before `dot_i` (not in scope at `dot_i`!)
+    if st.kind == TokenKind::LBrace {
+      let cb = find_matching_delim(tokens, si)
+      if cb < dot_i {
+        si = cb + 1
+        continue
+      }
+    }
+    if st.kind == TokenKind::Keyword && st.raw == "let" {
+      let mut ni = si + 1
+      if ni < dot_i && tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" {
+        ni = ni + 1
+      }
+      if ni + 2 < dot_i && tokens[ni].kind == TokenKind::Ident {
+        let lhs_name = tokens[ni].raw
+        let mut eq_i = ni + 1
+        if eq_i < dot_i && tokens[eq_i].kind == TokenKind::Colon {
+          let mut td = 0
+          while eq_i < dot_i {
+            let tk = tokens[eq_i].kind
+            if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+            else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { if td > 0 { td = td - 1 } }
+            else if td == 0 && tk == TokenKind::Eq { break }
+            eq_i = eq_i + 1
+          }
+        }
+        if eq_i < dot_i && tokens[eq_i].kind == TokenKind::Eq && eq_i + 1 < dot_i {
+          let rhs_s = eq_i + 1
+          let rhs_e = find_expr_end(tokens, rhs_s, dot_i)
+          let is_clo = (tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") ||
+          (tokens[rhs_s].kind == TokenKind::LParen && is_arrow_fn_at(tokens, rhs_s, rhs_e) >= 0) ||
+          (rhs_s + 1 < rhs_e && tokens[rhs_s + 1].kind == TokenKind::FatArrow)
+          let_bindings.push((lhs_name, rhs_s, rhs_e, is_clo))
+          if is_clo {
+            local_fn_bodies[lhs_name] = (rhs_s, rhs_e)
+          }
+        }
+      }
+    } else if st.kind == TokenKind::Keyword && st.raw == "fn" && si + 2 < dot_i &&
+    tokens[si + 1].kind == TokenKind::Ident && tokens[si + 2].kind == TokenKind::LParen {
+      let fn_name = tokens[si + 1].raw
+      let cp = find_matching_delim(tokens, si + 2)
+      let mut lb = cp + 1
+      while lb < dot_i && tokens[lb].kind != TokenKind::LBrace {
+        lb = lb + 1
+      }
+      if lb < dot_i && tokens[lb].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(tokens, lb)
+        local_fn_bodies[fn_name] = (lb, rb + 1)
+      }
+    }
+    si = si + 1
+  }
+  // Fixpoint transitive alias & capture closure:
+  // Any `let y = <expr mentioning aliases>` or `fn helper(...) { ... aliases ... }` joins `alias_set`!
+  let alias_set : Map[String, Bool] = Map()
+  alias_set[recv_root] = true
+  let captured_fns : Map[String, Bool] = Map()
+  let mut changed = true
+  while changed {
+    changed = false
+    for lb in let_bindings {
+      let (lhs_name, rhs_s, rhs_e, is_clo) = lb
+      if !alias_set.contains(lhs_name) && tokens_mention_alias_set(tokens, rhs_s, rhs_e, alias_set, field_chain) {
+        alias_set[lhs_name] = true
+        if is_clo {
+          captured_fns[lhs_name] = true
+        }
+        changed = true
+      }
+    }
+    for fn_name in local_fn_bodies.keys() {
+      if !captured_fns.contains(fn_name) {
+        match local_fn_bodies.get(fn_name) {
+          Some((bs, be)) =>
+          if tokens_mention_alias_set(tokens, bs, be, alias_set, field_chain) {
+            alias_set[fn_name] = true
+            captured_fns[fn_name] = true
+            changed = true
+          }
+          None => ()
+        }
+      }
+    }
+  }
+
+  let visited_fns : Map[String, Bool] = Map()
+  let mut may_mutate = false
+  if arg_e == arg_s + 1 && tokens[arg_s].kind == TokenKind::Ident {
+    let cb_name = tokens[arg_s].raw
+    if captured_fns.contains(cb_name) {
+      match local_fn_bodies.get(cb_name) {
+        Some((bs, be)) => {
+          visited_fns[cb_name] = true
+          may_mutate = tokens_may_mutate_array_aliases(ctx, tokens, bs, be, alias_set, captured_fns, field_chain, local_fn_bodies, visited_fns, recv_is_global, recv_root)
+        }
+        None => may_mutate = true
+      }
+    } else if recv_is_global {
+      let seen_g : Map[String, Bool] = Map()
+      if top_fn_reaches_global(ctx, cb_name, recv_root, seen_g) {
+        may_mutate = true
+      } else if lookup_scope_var(ctx, cb_name) is Some(_) {
+        may_mutate = true
+      }
+    }
+  } else {
+    may_mutate = tokens_may_mutate_array_aliases(ctx, tokens, arg_s, arg_e, alias_set, captured_fns, field_chain, local_fn_bodies, visited_fns, recv_is_global, recv_root)
+  }
+  if may_mutate {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      line,
+      col,
+      "callback mutating receiver array `" + recv_root + "` inside `." + method_name + "(...)` is not supported (fail-closed)",
+    ))
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 5. Recursive Nested Tuple-Struct Destructuring (`let W(V(p, q), name) = w`)
 // ---------------------------------------------------------------------------
