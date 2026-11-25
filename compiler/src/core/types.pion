@@ -458,6 +458,8 @@ pub struct Env {
   mut verify_fn_name : String
   /// Names of the enclosing function's `mut` parameters.
   mut_params : Map[String, Bool]
+  /// Outer moved bindings shadowed by each lexical scope (1:1 with `scopes`).
+  moved_shadow_stack : Array[Map[String, Span]]
 }
 
 ///|
@@ -526,6 +528,7 @@ pub struct TypeChecker {
   scalar_const_exprs : Map[String, Expr]
   const_init_order : Array[String]
   import_aliases : Map[String, String]
+  file_import_aliases : Map[String, Map[String, String]]
   dep_map : Map[String, String]
   canon_display_keys : Array[String]
   canon_display_vals : Array[String]
@@ -639,6 +642,7 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     in_verify: false,
     verify_fn_name: "",
     mut_params: Map([]),
+    moved_shadow_stack: [Map([])],
   }
 }
 
@@ -704,12 +708,54 @@ fn env_for_default_arg_callee(
 ///|
 fn env_push(env : Env) -> Unit {
   env.scopes.push(Map([]))
+  env.moved_shadow_stack.push(Map([]))
 }
 
 ///|
 fn env_pop(env : Env) -> Unit {
   if env.scopes.length() > 1 {
-    let _ = env.scopes.pop()
+    match env.scopes.pop() {
+      Some(popped_scope) => {
+        let ks = popped_scope.keys()
+        let mut i = 0
+        while i < ks.length() {
+          env.moved.remove(ks[i])
+          i = i + 1
+        }
+      }
+      None => ()
+    }
+    match env.moved_shadow_stack.pop() {
+      Some(popped_shadows) => {
+        let sks = popped_shadows.keys()
+        let mut i = 0
+        while i < sks.length() {
+          let k = sks[i]
+          match popped_shadows.get(k) {
+            Some(sp) => env.moved.set(k, sp)
+            None => ()
+          }
+          i = i + 1
+        }
+      }
+      None => ()
+    }
+  }
+}
+
+///|
+fn env_record_define_moved_shadow(env : Env, name : String, already_in_top : Bool) -> Unit {
+  if env.moved.contains(name) {
+    if !already_in_top && env.moved_shadow_stack.length() > 0 {
+      let top_sh = env.moved_shadow_stack[env.moved_shadow_stack.length() - 1]
+      if !top_sh.contains(name) {
+        match env.moved.get(name) {
+          Some(sp) => top_sh.set(name, sp)
+          None => ()
+        }
+      }
+    }
+    env.moved.remove(name)
   }
 }
 
@@ -727,6 +773,7 @@ fn env_define_line(
   decl_line : Int,
 ) -> Unit {
   let top = env.scopes[env.scopes.length() - 1]
+  let already_in_top = top.contains(name)
   top.set(name, VarBinding::{
     name: name,
     ty: ty,
@@ -742,6 +789,7 @@ fn env_define_line(
     TWorld => env.has_world = true
     _ => ()
   }
+  env_record_define_moved_shadow(env, name, already_in_top)
 }
 
 ///|
@@ -778,6 +826,7 @@ fn env_define_let(
   init_end_col : Int,
 ) -> Unit {
   let top = env.scopes[env.scopes.length() - 1]
+  let already_in_top = top.contains(name)
   top.set(name, VarBinding::{
     name: name,
     ty: ty,
@@ -793,9 +842,7 @@ fn env_define_let(
     TWorld => env.has_world = true
     _ => ()
   }
-  if env.moved.contains(name) {
-    env.moved.remove(name)
-  }
+  env_record_define_moved_shadow(env, name, already_in_top)
 }
 
 ///|
@@ -1010,7 +1057,7 @@ fn str_arr_clone(arr : Array[String]) -> Array[String] {
 fn qualify_pat_bindings(pat : Pattern, bound : Array[String]) -> Unit {
   match pat {
     PIdent(n, _) => bound.push(n)
-    PVariant(_, _, subs, _) | PTuple(subs, _) => {
+    PVariant(_, _, subs, _, _) | PTuple(subs, _) => {
       let mut i = 0
       while i < subs.length() {
         qualify_pat_bindings(subs[i], bound)
@@ -1234,12 +1281,24 @@ fn qualify_imported_type_expr_opt(
 ///|
 fn qualify_imported_pat(ipkg : ImportedPkg, pat : Pattern) -> Pattern {
   match pat {
-    PVariant(enum_name, vname, subs, sp) => {
+    PVariant(enum_name, vname, subs, explicit_ctor, sp) => {
       let qsubs : Array[Pattern] = []
       let mut i = 0
       while i < subs.length() {
         qsubs.push(qualify_imported_pat(ipkg, subs[i]))
         i = i + 1
+      }
+      if !explicit_ctor && subs.length() == 0 {
+        match ipkg.tc.resolved_method_calls.get("pat_const:" + span_key(sp)) {
+          Some(ckey) =>
+            if has_qual_sep(ckey) {
+              let qp = split_qual_name(ckey)
+              return PVariant("@canon:" + qp.prefix, qp.name, qsubs, false, sp)
+            } else {
+              return PVariant("@canon:" + ipkg.name, ckey, qsubs, false, sp)
+            }
+          None => ()
+        }
       }
       let qenum = if enum_name != "" {
         if starts_with_str(enum_name, "@canon:") {
@@ -1258,7 +1317,7 @@ fn qualify_imported_pat(ipkg : ImportedPkg, pat : Pattern) -> Pattern {
       } else {
         ""
       }
-      PVariant(qenum, vname, qsubs, sp)
+      PVariant(qenum, vname, qsubs, explicit_ctor, sp)
     }
     PTuple(subs, sp) => {
       let qsubs : Array[Pattern] = []
@@ -1344,12 +1403,19 @@ fn qualify_imported_expr(
     }
     EUnary(op, inner, sp) => EUnary(op, qualify_imported_expr(ipkg, inner, bound, tparams), sp)
     EBinary(op, l, r, sp) =>
-      EBinary(
-        op,
-        qualify_imported_expr(ipkg, l, bound, tparams),
-        qualify_imported_expr(ipkg, r, bound, tparams),
-        sp,
-      )
+      if op == "&&" {
+        let rb = str_arr_clone(bound)
+        let ql = qualify_imported_cond(ipkg, l, rb, tparams)
+        let qr = qualify_imported_expr(ipkg, r, rb, tparams)
+        EBinary(op, ql, qr, sp)
+      } else {
+        EBinary(
+          op,
+          qualify_imported_expr(ipkg, l, bound, tparams),
+          qualify_imported_expr(ipkg, r, bound, tparams),
+          sp,
+        )
+      }
     ECall(callee, args, sp) => {
       let qc = match callee {
         EPath(qual, mem, psp) => qualify_imported_path(ipkg, qual, mem, psp, true)
@@ -1458,7 +1524,7 @@ fn qualify_imported_expr(
         let ab = str_arr_clone(bound)
         qualify_pat_bindings(a.pat, ab)
         let qg = match a.guard_expr {
-          Some(ge) => Some(qualify_imported_expr(ipkg, ge, ab, tparams))
+          Some(ge) => Some(qualify_imported_cond(ipkg, ge, ab, tparams))
           None => None
         }
         qarms.push(MatchArm::{
@@ -2559,6 +2625,188 @@ fn add_arity_edit(
 }
 
 ///|
+fn tc_visible_alias_for_pkg(
+  tc : TypeChecker,
+  canon_pkg : String,
+  file : String,
+) -> Option[String] {
+  if canon_pkg == "" || canon_pkg == tc.pkg_name {
+    return Some("")
+  }
+  let base = tc_strip_canon_hash(canon_pkg)
+  match tc.file_import_aliases.get(file) {
+    Some(f_al) => {
+      let keys = f_al.keys()
+      let mut best = ""
+      let mut i = 0
+      while i < keys.length() {
+        let al = keys[i]
+        match f_al.get(al) {
+          Some(t) =>
+            if t == canon_pkg {
+              if al == base {
+                best = base
+              } else if best != base && (best == "" || al < best) {
+                best = al
+              }
+            }
+          None => ()
+        }
+        i = i + 1
+      }
+      if best != "" {
+        Some(best)
+      } else {
+        None
+      }
+    }
+    None => None
+  }
+}
+
+///|
+fn tc_render_qual_name_for_file(
+  tc : TypeChecker,
+  name : String,
+  file : String,
+) -> Option[String] {
+  if !has_qual_sep(name) {
+    return Some(name)
+  }
+  let qp = split_qual_name(name)
+  match tc_visible_alias_for_pkg(tc, qp.prefix, file) {
+    Some(al) =>
+      if al == "" {
+        Some(qp.name)
+      } else {
+        Some(al + "::" + qp.name)
+      }
+    None => None
+  }
+}
+
+///|
+fn tc_render_ty_for_file(
+  tc : TypeChecker,
+  t : Ty,
+  file : String,
+) -> Option[String] {
+  match t {
+    TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TInt8 | TChar | TString | TStrView | TBytes | TBytesView | TStringBuilder | TUnit | TNever | TWorld | TScope | TAtomicInt | TPtr | TError =>
+      Some(ty_to_string(t))
+    TParam(n) => Some(n)
+    TArray(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("Array[" + es + "]")
+        None => None
+      }
+    TFixedArray(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("FixedArray[" + es + "]")
+        None => None
+      }
+    TImmArray(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("ImmArray[" + es + "]")
+        None => None
+      }
+    TMap(k, v) =>
+      match (tc_render_ty_for_file(tc, k, file), tc_render_ty_for_file(tc, v, file)) {
+        (Some(ks), Some(vs)) => Some("Map[" + ks + ", " + vs + "]")
+        _ => None
+      }
+    TOption(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("Option[" + es + "]")
+        None => None
+      }
+    TResult(ok, err) =>
+      match (tc_render_ty_for_file(tc, ok, file), tc_render_ty_for_file(tc, err, file)) {
+        (Some(os), Some(es)) => Some("Result[" + os + ", " + es + "]")
+        _ => None
+      }
+    TChannel(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("Channel[" + es + "]")
+        None => None
+      }
+    TMutex(e) =>
+      match tc_render_ty_for_file(tc, e, file) {
+        Some(es) => Some("Mutex[" + es + "]")
+        None => None
+      }
+    TDynTrait(name) =>
+      match tc_render_qual_name_for_file(tc, name, file) {
+        Some(rn) => Some("dyn " + rn)
+        None => None
+      }
+    TStruct(name, args) | TEnum(name, args) =>
+      match tc_render_qual_name_for_file(tc, name, file) {
+        Some(rn) =>
+          if args.length() == 0 {
+            Some(rn)
+          } else {
+            let sb = StringBuilder()
+            sb.write_string(rn)
+            sb.write_string("[")
+            let mut i = 0
+            while i < args.length() {
+              if i > 0 {
+                sb.write_string(", ")
+              }
+              match tc_render_ty_for_file(tc, args[i], file) {
+                Some(as_s) => sb.write_string(as_s)
+                None => return None
+              }
+              i = i + 1
+            }
+            sb.write_string("]")
+            Some(sb.to_string())
+          }
+        None => None
+      }
+    TTuple(elems) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      let mut i = 0
+      while i < elems.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        match tc_render_ty_for_file(tc, elems[i], file) {
+          Some(es) => sb.write_string(es)
+          None => return None
+        }
+        i = i + 1
+      }
+      sb.write_string(")")
+      Some(sb.to_string())
+    }
+    TFn(params, ret) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      let mut i = 0
+      while i < params.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        match tc_render_ty_for_file(tc, params[i], file) {
+          Some(ps) => sb.write_string(ps)
+          None => return None
+        }
+        i = i + 1
+      }
+      sb.write_string(") -> ")
+      match tc_render_ty_for_file(tc, ret, file) {
+        Some(rs) => sb.write_string(rs)
+        None => return None
+      }
+      Some(sb.to_string())
+    }
+  }
+}
+
+///|
 fn add_missing_impl_edit(
   tc : TypeChecker,
   trait_name : String,
@@ -2589,13 +2837,63 @@ fn add_missing_impl_edit(
   if insert_span.line == 0 {
     return
   }
+  let rendered_trait = match tc_render_qual_name_for_file(tc, trait_name, insert_span.file) {
+    Some(rn) => rn
+    None => {
+      if has_qual_sep(trait_name) && tc.diagnostics.length() > 0 {
+        let tpkg = split_qual_name(trait_name).prefix
+        let base = tc_strip_canon_hash(tpkg)
+        let mut dep_key = ""
+        let dep_keys = tc.dep_map.keys()
+        let mut di = 0
+        while di < dep_keys.length() {
+          let al = dep_keys[di]
+          match tc.dep_map.get(al) {
+            Some(t) =>
+              if t == tpkg {
+                if al == base {
+                  dep_key = base
+                } else if dep_key != base && (dep_key == "" || al < dep_key) {
+                  dep_key = al
+                }
+              }
+            None => ()
+          }
+          di = di + 1
+        }
+        let import_hint = if dep_key != "" {
+          " (add `import \"" + dep_key + "\"` in `" + insert_span.file + "` first)"
+        } else {
+          " (add `" + base + "` to pion.toml dependencies and import it in `" + insert_span.file + "` first)"
+        }
+        let last_i = tc.diagnostics.length() - 1
+        let d = tc.diagnostics[last_i]
+        tc.diagnostics[last_i] = Diagnostic::{
+          file: d.file,
+          line: d.line,
+          col: d.col,
+          code: d.code,
+          message: d.message,
+          expected: d.expected,
+          found: d.found,
+          fixit: d.fixit + import_hint,
+          edits: d.edits,
+        }
+      }
+      return
+    }
+  }
+  let rendered_target = match tc_render_ty_for_file(tc, concrete_ty, insert_span.file) {
+    Some(rt) => rt
+    None => return
+  }
   let self_subst : Map[String, Ty] = Map([])
   self_subst.set("Self", concrete_ty)
   let sb = StringBuilder()
   sb.write_string("\n\nimpl ")
-  sb.write_string(trait_name)
+  sb.write_string(rendered_trait)
   sb.write_string(" for ")
-  sb.write_string(ty_to_string(concrete_ty))
+  sb.write_string(rendered_target)
   sb.write_string(" {\n")
   let mut mi = 0
   while mi < tinfo.methods.length() {
@@ -2614,13 +2912,22 @@ fn add_missing_impl_edit(
       } else {
         "arg" + pi.to_string()
       }
+      if pi < decl_m.params.length() && decl_m.params[pi].is_mut {
+        sb.write_string("mut ")
+      }
       sb.write_string(pname)
       sb.write_string(" : ")
-      sb.write_string(ty_to_string(subst_ty(tm.param_tys[pi], self_subst)))
+      match tc_render_ty_for_file(tc, subst_ty(tm.param_tys[pi], self_subst), insert_span.file) {
+        Some(pts) => sb.write_string(pts)
+        None => return
+      }
       pi = pi + 1
     }
     sb.write_string(") -> ")
-    sb.write_string(ty_to_string(subst_ty(tm.ret_ty, self_subst)))
+    match tc_render_ty_for_file(tc, subst_ty(tm.ret_ty, self_subst), insert_span.file) {
+      Some(rts) => sb.write_string(rts)
+      None => return
+    }
     sb.write_string(" {\n    panic(\"todo\")\n  }\n")
     mi = mi + 1
   }
@@ -4897,7 +5204,7 @@ fn collect_pat_bindings(pat : Pattern, bound : Map[String, Bool]) -> Unit {
   match pat {
     PWild(_) | PBool(_, _) | PInt(_, _) | PString(_, _) | PChar(_, _) => ()
     PIdent(n, _) => bound.set(n, true)
-    PVariant(_, _, sub, _) => {
+    PVariant(_, _, sub, _, _) => {
       let mut i = 0
       while i < sub.length() {
         collect_pat_bindings(sub[i], bound)
@@ -5012,10 +5319,15 @@ fn collect_expr_captures(
         _ => collect_expr_captures(inner, locals, out)
       }
     EUnary(_, inner, _) => collect_expr_captures(inner, locals, out)
-    EBinary(_, l, r, _) => {
-      collect_expr_captures(l, locals, out)
-      collect_expr_captures(r, locals, out)
-    }
+    EBinary(op, l, r, _) =>
+      if op == "&&" && expr_has_is(l) {
+        let and_locals = locals.copy()
+        collect_cond_captures_with_is(l, and_locals, out)
+        collect_expr_captures(r, and_locals, out)
+      } else {
+        collect_expr_captures(l, locals, out)
+        collect_expr_captures(r, locals, out)
+      }
     ECall(callee, args, _) => {
       collect_expr_captures(callee, locals, out)
       let mut i = 0
@@ -5075,7 +5387,7 @@ fn collect_expr_captures(
         let arm_locals = locals.copy()
         collect_pat_bindings(arms[i].pat, arm_locals)
         match arms[i].guard_expr {
-          Some(ge) => collect_expr_captures(ge, arm_locals, out)
+          Some(ge) => collect_cond_captures_with_is(ge, arm_locals, out)
           None => ()
         }
         collect_expr_captures(arms[i].body, arm_locals, out)
@@ -5278,16 +5590,17 @@ fn pat_matrix_specialize(
       }
     } else if kind == 2 {
       match cell {
-        PVariant(pat_enum, vn, sub, _) => {
-          let pat_ok = if pat_enum == "" || want_enum == "" {
-            true
-          } else {
-            canon_pat_enum_name(tc, pat_enum, tc.in_default_arg_expansion) == want_enum
+        PVariant(pat_enum, vn, sub, _, sp2) =>
+          if !tc.resolved_method_calls.contains("pat_const:" + span_key(sp2)) {
+            let pat_ok = if pat_enum == "" || want_enum == "" {
+              true
+            } else {
+              canon_pat_enum_name(tc, pat_enum, tc.in_default_arg_expansion) == want_enum
+            }
+            if pat_ok && vn == ctor_name && sub.length() == arity {
+              out.push(pat_matrix_splice_row(row, c, sub))
+            }
           }
-          if pat_ok && vn == ctor_name && sub.length() == arity {
-            out.push(pat_matrix_splice_row(row, c, sub))
-          }
-        }
         _ =>
           if pat_is_irrefutable(cell) {
             out.push(pat_matrix_splice_row(row, c, pat_wilds(arity)))
@@ -5510,7 +5823,7 @@ fn check_match_exhaustiveness(
       i = 0
       while i < unguarded.length() {
         match unguarded[i] {
-          PVariant(_, vname, sub, _) =>
+          PVariant(_, vname, sub, _, _) =>
             if vname == "None" && sub.length() == 0 {
               has_none = true
             } else if vname == "Some" && sub.length() == 1 {
@@ -5547,7 +5860,7 @@ fn check_match_exhaustiveness(
       i = 0
       while i < unguarded.length() {
         match unguarded[i] {
-          PVariant(_, vname, sub, _) =>
+          PVariant(_, vname, sub, _, _) =>
             if vname == "Ok" && sub.length() == 1 {
               ok_subs.push(sub[0])
             } else if vname == "Err" && sub.length() == 1 {
@@ -5594,8 +5907,10 @@ fn check_match_exhaustiveness(
               i = 0
               while i < unguarded.length() {
                 match unguarded[i] {
-                  PVariant(_, vn, sub, _) =>
-                    if vn == v.name && sub.length() == 0 {
+                  PVariant(_, vn, sub, _, sp2) =>
+                    if !tc.resolved_method_calls.contains("pat_const:" + span_key(sp2)) &&
+                      vn == v.name &&
+                      sub.length() == 0 {
                       hit = true
                       break
                     }
@@ -5609,8 +5924,10 @@ fn check_match_exhaustiveness(
               i = 0
               while i < unguarded.length() {
                 match unguarded[i] {
-                  PVariant(_, vn, sub, _) =>
-                    if vn == v.name && sub.length() == 1 {
+                  PVariant(_, vn, sub, _, sp2) =>
+                    if !tc.resolved_method_calls.contains("pat_const:" + span_key(sp2)) &&
+                      vn == v.name &&
+                      sub.length() == 1 {
                       subs.push(sub[0])
                     }
                   _ => ()
@@ -5629,8 +5946,10 @@ fn check_match_exhaustiveness(
               i = 0
               while i < unguarded.length() {
                 match unguarded[i] {
-                  PVariant(_, vn, sub, sp2) =>
-                    if vn == v.name && sub.length() == nf {
+                  PVariant(_, vn, sub, _, sp2) =>
+                    if !tc.resolved_method_calls.contains("pat_const:" + span_key(sp2)) &&
+                      vn == v.name &&
+                      sub.length() == nf {
                       subs.push(PTuple(sub, sp2))
                     }
                   _ => ()
@@ -5837,7 +6156,9 @@ fn bind_pattern(
             "use a pattern matching `" + ty_to_string(scrut_ty) + "`",
           )
       }
-    PVariant(pat_enum, vname, sub, sp) => {
+    PVariant(pat_enum, vname, sub, explicit_ctor, sp) => {
+      let const_pat_fix = "uppercase identifiers in patterns match variants or constants; use a lowercase name to bind a variable"
+      let pat_disp = if pat_enum != "" { pat_enum + "::" + vname } else { vname }
       if pat_enum != "" && !env.in_default_arg {
         if has_qual_sep(pat_enum) {
           let qp_p = split_qual_name(pat_enum)
@@ -5975,6 +6296,81 @@ fn bind_pattern(
           }
         }
         TEnum(ename, args) => {
+          let einfo_opt = lookup_enum_info_for_match(tc, ename)
+          let mut hit_variant = false
+          if canon_pat_enum == "" || canon_pat_enum == ename {
+            match einfo_opt {
+              Some(einfo) => {
+                let subst = make_subst(einfo.decl.type_params, args)
+                let mut vi = 0
+                while vi < einfo.variants.length() {
+                  let v = einfo.variants[vi]
+                  if v.name == vname {
+                    hit_variant = true
+                    if sub.length() != v.field_tys.length() {
+                      tc_err(
+                        tc,
+                        sp,
+                        "E_TYPE_MISMATCH",
+                        "variant `" +
+                        vname +
+                        "` expects " +
+                        v.field_tys.length().to_string() +
+                        " pattern argument(s), found " +
+                        sub.length().to_string(),
+                        v.field_tys.length().to_string() + " pattern arguments",
+                        sub.length().to_string() + " pattern arguments",
+                        "match the pattern count to variant `" + vname + "`",
+                      )
+                    }
+                    let mut fi = 0
+                    while fi < sub.length() && fi < v.field_tys.length() {
+                      let fty = subst_ty(v.field_tys[fi], subst)
+                      bind_pattern(tc, env, sub[fi], fty)
+                      fi = fi + 1
+                    }
+                    break
+                  }
+                  vi = vi + 1
+                }
+              }
+              None => ()
+            }
+          }
+          if hit_variant {
+            return
+          }
+          if !explicit_ctor && sub.length() == 0 {
+            match resolve_const_pat(tc, env, pat_enum, vname, sp) {
+              Some((cty, canon_key)) => {
+                if !ty_is_const_pat_allowed(tc, cty) {
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "constant `" + pat_disp + "` of type `" + ty_to_string(cty) + "` cannot be used as a pattern",
+                    ty_to_string(scrut_ty),
+                    ty_to_string(cty),
+                    const_pat_fix,
+                  )
+                } else if !ty_compat(cty, scrut_ty) {
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "constant pattern `" + pat_disp + "` has type `" + ty_to_string(cty) + "`, expected `" + ty_to_string(scrut_ty) + "`",
+                    ty_to_string(scrut_ty),
+                    ty_to_string(cty),
+                    const_pat_fix,
+                  )
+                } else {
+                  tc.resolved_method_calls.set("pat_const:" + span_key(sp), canon_key)
+                }
+                return
+              }
+              None => ()
+            }
+          }
           if canon_pat_enum != "" && canon_pat_enum != ename {
             tc_err(
               tc,
@@ -5987,60 +6383,170 @@ fn bind_pattern(
             )
             return
           }
-          let einfo_opt = lookup_enum_info_for_match(tc, ename)
           match einfo_opt {
+            Some(_) =>
+              tc_err(
+                tc,
+                sp,
+                "E_UNKNOWN_VARIANT",
+                "enum `" + ename + "` has no variant `" + vname + "`",
+                "valid variant of `" + ename + "`",
+                vname,
+                "check the variant name on enum `" + ename + "`",
+              )
             None => ()
-            Some(einfo) => {
-              let subst = make_subst(einfo.decl.type_params, args)
-              let mut found = false
-              let mut vi = 0
-              while vi < einfo.variants.length() {
-                let v = einfo.variants[vi]
-                if v.name == vname {
-                  found = true
-                  if sub.length() != v.field_tys.length() {
-                    tc_err(
-                      tc,
-                      sp,
-                      "E_TYPE_MISMATCH",
-                      "variant `" +
-                      vname +
-                      "` expects " +
-                      v.field_tys.length().to_string() +
-                      " pattern argument(s), found " +
-                      sub.length().to_string(),
-                      v.field_tys.length().to_string() + " pattern arguments",
-                      sub.length().to_string() + " pattern arguments",
-                      "match the pattern count to variant `" + vname + "`",
-                    )
-                  }
-                  let mut fi = 0
-                  while fi < sub.length() && fi < v.field_tys.length() {
-                    let fty = subst_ty(v.field_tys[fi], subst)
-                    bind_pattern(tc, env, sub[fi], fty)
-                    fi = fi + 1
-                  }
-                  break
+          }
+        }
+        TError | TNever => ()
+        TParam(_) =>
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "pattern `" + pat_disp + "` cannot match generic type parameter `" + ty_to_string(scrut_ty) + "`",
+            "concrete pattern type",
+            ty_to_string(scrut_ty),
+            const_pat_fix,
+          )
+        _ =>
+          if !explicit_ctor && sub.length() == 0 {
+            match resolve_const_pat(tc, env, pat_enum, vname, sp) {
+              Some((cty, canon_key)) =>
+                if !ty_is_const_pat_allowed(tc, cty) {
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "constant `" + pat_disp + "` of type `" + ty_to_string(cty) + "` cannot be used as a pattern",
+                    "supported constant pattern type",
+                    ty_to_string(cty),
+                    const_pat_fix,
+                  )
+                } else if !ty_compat(cty, scrut_ty) {
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "constant pattern `" + pat_disp + "` has type `" + ty_to_string(cty) + "`, expected `" + ty_to_string(scrut_ty) + "`",
+                    ty_to_string(scrut_ty),
+                    ty_to_string(cty),
+                    const_pat_fix,
+                  )
+                } else {
+                  tc.resolved_method_calls.set("pat_const:" + span_key(sp), canon_key)
                 }
-                vi = vi + 1
-              }
-              if !found {
+              None =>
                 tc_err(
                   tc,
                   sp,
-                  "E_UNKNOWN_VARIANT",
-                  "enum `" + ename + "` has no variant `" + vname + "`",
-                  "valid variant of `" + ename + "`",
-                  vname,
-                  "check the variant name on enum `" + ename + "`",
+                  "E_TYPE_MISMATCH",
+                  "pattern `" + pat_disp + "` cannot match `" + ty_to_string(scrut_ty) + "`",
+                  ty_to_string(scrut_ty),
+                  pat_disp,
+                  const_pat_fix,
                 )
-              }
             }
+          } else {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "variant pattern `" + pat_disp + "` cannot match `" + ty_to_string(scrut_ty) + "`",
+              ty_to_string(scrut_ty),
+              pat_disp,
+              const_pat_fix,
+            )
           }
-        }
-        _ => ()
       }
     }
+  }
+}
+
+///|
+///|
+fn ty_is_const_pat_allowed(tc : TypeChecker, ty : Ty) -> Bool {
+  match ty {
+    TInt
+    | TInt64
+    | TUInt
+    | TUInt64
+    | TByte
+    | TInt8
+    | TChar
+    | TBool
+    | TString
+    | TStrView => true
+    TEnum(ename, _) =>
+      match lookup_enum_info_for_match(tc, ename) {
+        Some(einfo) => {
+          if einfo.variants.length() == 0 {
+            return false
+          }
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            if einfo.variants[vi].field_tys.length() > 0 {
+              return false
+            }
+            vi = vi + 1
+          }
+          true
+        }
+        None => false
+      }
+    _ => false
+  }
+}
+
+///|
+fn resolve_const_pat(
+  tc : TypeChecker,
+  env : Env,
+  pat_enum : String,
+  vname : String,
+  sp : Span,
+) -> Option[(Ty, String)] {
+  if pat_enum == "" {
+    match tc.consts.get(vname) {
+      Some(cty) => Some((cty, vname))
+      None => None
+    }
+  } else if starts_with_str(pat_enum, "@canon:") {
+    let owner_pkg = slice_str(pat_enum, 7, pat_enum.length())
+    if owner_pkg == tc.pkg_name {
+      match tc.consts.get(vname) {
+        Some(cty) => Some((cty, vname))
+        None => None
+      }
+    } else {
+      match lookup_imported_pkg_transitive(tc, owner_pkg) {
+        Some(ipkg) =>
+          match ipkg.tc.consts.get(vname) {
+            Some(cty) => Some((qualify_imported_ty(ipkg.name, cty), ipkg.name + "::" + vname))
+            None => None
+          }
+        None => None
+      }
+    }
+  } else if !has_qual_sep(pat_enum) {
+    match resolve_pkg_for_lookup(tc, pat_enum, env.in_default_arg) {
+      Some(ipkg) =>
+        match ipkg.tc.consts.get(vname) {
+          Some(cty) => {
+            let is_p = match ipkg.tc.const_pub.get(vname) {
+              Some(b) => b
+              None => false
+            }
+            if !is_p && !env.in_default_arg {
+              emit_private_err(tc, sp, "let", ipkg.name, vname)
+            }
+            Some((qualify_imported_ty(ipkg.name, cty), ipkg.name + "::" + vname))
+          }
+          None => None
+        }
+      None => None
+    }
+  } else {
+    None
   }
 }
 
@@ -6716,6 +7222,26 @@ fn collect_cond_is_locals(cond : Expr, locals : Map[String, Bool]) -> Unit {
     }
     _ => ()
   }
+}
+
+///|
+fn expr_has_is(e : Expr) -> Bool {
+  let work : Array[Expr] = [e]
+  while work.length() > 0 {
+    match work.pop() {
+      Some(cur) =>
+        match cur {
+          EIs(_, _, _) => return true
+          EBinary("&&", lhs, rhs, _) => {
+            work.push(rhs)
+            work.push(lhs)
+          }
+          _ => ()
+        }
+      None => break
+    }
+  }
+  false
 }
 
 ///|
@@ -7476,9 +8002,6 @@ fn check_stmt(
                 )
               } else if is_pending {
                 infer_refine_binding(tc, env, name, rty)
-              }
-              if env.moved.contains(name) {
-                env.moved.remove(name)
               }
             }
             None => {
@@ -8791,17 +9314,6 @@ fn mut_index_is_simple(e : Expr) -> Bool {
 fn check_mut_place(tc : TypeChecker, env : Env, e : Expr, check_index : Bool) -> Ty {
   let ty = match e {
     EIdent(name, sp) => {
-      if env.moved.contains(name) {
-        tc_err(
-          tc,
-          sp,
-          "E_USE_AFTER_MOVE",
-          "use of moved value `" + name + "`",
-          "live binding",
-          "moved variable `" + name + "`",
-          "do not use `" + name + "` after `move`, or pass a separate value",
-        )
-      }
       match env_lookup(env, name) {
         Some(b) => {
           if !b.is_mut {
@@ -10303,6 +10815,8 @@ fn make_default_arg_env(
         decl_line: pj.span.line,
         ty_span: span_new("", 0, 0),
         ty_end_col: 0,
+        init_span: span_new("", 0, 0),
+        init_end_col: 0,
       },
     )
     j = j + 1
@@ -10366,6 +10880,7 @@ fn make_default_arg_env(
     in_verify: env.in_verify,
     verify_fn_name: env.verify_fn_name,
     mut_params: Map([]),
+    moved_shadow_stack: [Map([])],
   }
 }
 
@@ -11072,6 +11587,1191 @@ fn tc_check_type_bounds(
 }
 
 ///|
+fn expr_is_unannotated_closure(e : Expr) -> Bool {
+  match e {
+    EClosure(params, _, _, _) => {
+      let mut i = 0
+      while i < params.length() {
+        match params[i].ty {
+          TyMissing(_) => return true
+          _ => ()
+        }
+        i = i + 1
+      }
+      false
+    }
+    ENamedArg(_, _, inner, _) => expr_is_unannotated_closure(inner)
+    _ => false
+  }
+}
+
+///|
+fn expr_is_unannotated_closure_arg(e : Expr, is_opt_wrap : Bool) -> Bool {
+  if is_opt_wrap {
+    match e {
+      ECall(_, some_args, _) =>
+        if some_args.length() == 1 {
+          return expr_is_unannotated_closure(some_args[0])
+        }
+      _ => ()
+    }
+  }
+  expr_is_unannotated_closure(e)
+}
+
+///|
+fn ty_has_tparam(t : Ty) -> Bool {
+  match t {
+    TParam(_) => true
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      ty_has_tparam(e)
+    TResult(o, e) | TMap(o, e) => ty_has_tparam(o) || ty_has_tparam(e)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ty_has_tparam(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        if ty_has_tparam(ps[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      ty_has_tparam(r)
+    }
+    _ => false
+  }
+}
+
+///|
+fn moved_clone(m : Map[String, Span]) -> Map[String, Span] {
+  let out : Map[String, Span] = Map([])
+  let ks = m.keys()
+  let mut i = 0
+  while i < ks.length() {
+    let k = ks[i]
+    match m.get(k) {
+      Some(sp) => out.set(k, sp)
+      None => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn moved_set_from(dst : Map[String, Span], src : Map[String, Span]) -> Unit {
+  let dks = dst.keys()
+  let mut i = 0
+  while i < dks.length() {
+    dst.remove(dks[i])
+    i = i + 1
+  }
+  let sks = src.keys()
+  i = 0
+  while i < sks.length() {
+    let k = sks[i]
+    match src.get(k) {
+      Some(sp) => dst.set(k, sp)
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn recheck_pat_bindings(p : Pattern, out : Array[String]) -> Unit {
+  match p {
+    PIdent(n, _) =>
+      if n != "_" && !str_arr_contains(out, n) {
+        out.push(n)
+      }
+    PVariant(_, _, subs, _, _) | PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        recheck_pat_bindings(subs[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn recheck_cond_is_bindings(e : Expr, out : Array[String]) -> Unit {
+  match e {
+    EIs(_, p, _) => recheck_pat_bindings(p, out)
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        recheck_cond_is_bindings(l, out)
+        recheck_cond_is_bindings(r, out)
+      }
+    _ => ()
+  }
+}
+
+///|
+fn moved_union_maps(a : Map[String, Span], b : Map[String, Span]) -> Map[String, Span] {
+  let out = moved_clone(a)
+  let bks = b.keys()
+  let mut i = 0
+  while i < bks.length() {
+    let k = bks[i]
+    if !out.contains(k) {
+      match b.get(k) {
+        Some(sp) => out.set(k, sp)
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn tc_define_move_bindings(env : Env, names : Array[String]) -> Unit {
+  let mut i = 0
+  while i < names.length() {
+    if names[i] != "_" {
+      env_define_line(env, names[i], TError, false, 0)
+    }
+    i = i + 1
+  }
+}
+
+///|
+struct MoveState {
+  env : Env
+  mut diverged : Bool
+  loop_cont_moved : Array[Map[String, Span]]
+  loop_had_cont : Array[Bool]
+  loop_break_moved : Array[Map[String, Span]]
+  loop_had_break : Array[Bool]
+  loop_scope_depth : Array[Int]
+  closure_moved_stack : Array[Map[String, Span]]
+  closure_scope_depth : Array[Int]
+  reported_spans : Map[String, Bool]
+}
+
+///|
+fn move_state_new() -> MoveState {
+  MoveState::{
+    env: env_new(TUnit, []),
+    diverged: false,
+    loop_cont_moved: [],
+    loop_had_cont: [],
+    loop_break_moved: [],
+    loop_had_break: [],
+    loop_scope_depth: [],
+    closure_moved_stack: [],
+    closure_scope_depth: [],
+    reported_spans: Map([]),
+  }
+}
+
+///|
+fn env_binding_depth(env : Env, name : String) -> Int {
+  let mut i = env.scopes.length() - 1
+  while i >= 0 {
+    if env.scopes[i].contains(name) {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+///|
+/// Non-mutating snapshot of `env.moved` as if popping lexical scopes from the
+/// top down to `target_len` (inclusive), removing inner definitions and
+/// restoring shadowed outer moved bindings.
+fn moved_snapshot_to_depth(env : Env, target_len : Int) -> Map[String, Span] {
+  let out = moved_clone(env.moved)
+  let mut idx = env.scopes.length() - 1
+  while idx >= target_len && idx >= 0 {
+    let sc = env.scopes[idx]
+    let ks = sc.keys()
+    let mut i = 0
+    while i < ks.length() {
+      out.remove(ks[i])
+      i = i + 1
+    }
+    if idx < env.moved_shadow_stack.length() {
+      let sh = env.moved_shadow_stack[idx]
+      let sks = sh.keys()
+      i = 0
+      while i < sks.length() {
+        let k = sks[i]
+        match sh.get(k) {
+          Some(sp) => out.set(k, sp)
+          None => ()
+        }
+        i = i + 1
+      }
+    }
+    idx = idx - 1
+  }
+  out
+}
+
+///|
+fn moved_outer_snapshot(env : Env) -> Map[String, Span] {
+  moved_snapshot_to_depth(env, env.scopes.length() - 1)
+}
+
+///|
+fn moved_has_new_key(before : Map[String, Span], after : Map[String, Span]) -> Bool {
+  let aks = after.keys()
+  let mut i = 0
+  while i < aks.length() {
+    if !before.contains(aks[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn ms_pat_is_irrefutable(p : Pattern) -> Bool {
+  match p {
+    PWild(_) | PIdent(_, _) => true
+    PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        if !ms_pat_is_irrefutable(subs[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn ms_err_moved(
+  tc : TypeChecker,
+  ms : MoveState,
+  sp : Span,
+  name : String,
+  msg : String,
+  hint : String,
+) -> Unit {
+  let key = span_key(sp)
+  if ms.reported_spans.contains(key) {
+    return
+  }
+  ms.reported_spans.set(key, true)
+  tc_err(
+    tc,
+    sp,
+    "E_USE_AFTER_MOVE",
+    msg,
+    "live binding",
+    "moved variable `" + name + "`",
+    hint,
+  )
+}
+
+///|
+fn ms_push_loop(ms : MoveState) -> Int {
+  ms.loop_cont_moved.push(Map([]))
+  ms.loop_had_cont.push(false)
+  ms.loop_break_moved.push(Map([]))
+  ms.loop_had_break.push(false)
+  ms.loop_scope_depth.push(ms.env.scopes.length())
+  ms.loop_cont_moved.length() - 1
+}
+
+///|
+fn ms_pop_loop(ms : MoveState) -> Unit {
+  let _ = ms.loop_cont_moved.pop()
+  let _ = ms.loop_had_cont.pop()
+  let _ = ms.loop_break_moved.pop()
+  let _ = ms.loop_had_break.pop()
+  let _ = ms.loop_scope_depth.pop()
+}
+
+///|
+fn ms_record_false(
+  false_out : Map[String, Span],
+  false_live : Array[Bool],
+  snap : Map[String, Span],
+) -> Unit {
+  if !false_live[0] {
+    moved_set_from(false_out, snap)
+    false_live[0] = true
+  } else {
+    moved_set_from(false_out, moved_union_maps(false_out, snap))
+  }
+}
+
+///|
+/// Evaluates a condition in the caller's already-pushed success scope so
+/// `is`-pattern bindings and moves across `&&` persist into the success branch
+/// while `false_out` accumulates every reachable short-circuit/failure outer moved state
+/// unwound to `false_depth`.
+fn tc_check_moves_in_cond(
+  tc : TypeChecker,
+  ms : MoveState,
+  cond : Expr,
+  false_depth : Int,
+  false_out : Map[String, Span],
+  false_live : Array[Bool],
+) -> Unit {
+  match cond {
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        tc_check_moves_in_cond(tc, ms, l, false_depth, false_out, false_live)
+        if !ms.diverged {
+          tc_check_moves_in_cond(tc, ms, r, false_depth, false_out, false_live)
+        }
+      } else if op == "||" {
+        let l_depth = ms.env.scopes.length()
+        let l_false : Map[String, Span] = Map([])
+        let l_fl : Array[Bool] = [false]
+        env_push(ms.env)
+        tc_check_moves_in_cond(tc, ms, l, l_depth, l_false, l_fl)
+        let l_true_div = ms.diverged
+        env_pop(ms.env)
+        let l_true = moved_clone(ms.env.moved)
+        let mut r_true_div = true
+        let mut r_true : Map[String, Span] = Map([])
+        if l_fl[0] {
+          moved_set_from(ms.env.moved, l_false)
+          ms.diverged = false
+          env_push(ms.env)
+          tc_check_moves_in_cond(tc, ms, r, false_depth, false_out, false_live)
+          r_true_div = ms.diverged
+          env_pop(ms.env)
+          r_true = moved_clone(ms.env.moved)
+        }
+        if l_true_div && r_true_div {
+          ms.diverged = true
+        } else if l_true_div {
+          moved_set_from(ms.env.moved, r_true)
+          ms.diverged = false
+        } else if r_true_div {
+          moved_set_from(ms.env.moved, l_true)
+          ms.diverged = false
+        } else {
+          moved_set_from(ms.env.moved, moved_union_maps(l_true, r_true))
+          ms.diverged = false
+        }
+      } else {
+        tc_check_moves_in_expr(tc, ms, cond)
+        if !ms.diverged {
+          ms_record_false(false_out, false_live, moved_snapshot_to_depth(ms.env, false_depth))
+        }
+      }
+    EUnary(uop, inner, _) =>
+      if uop == "!" {
+        let cur_depth = ms.env.scopes.length()
+        let sub_false : Map[String, Span] = Map([])
+        let sub_fl : Array[Bool] = [false]
+        env_push(ms.env)
+        tc_check_moves_in_cond(tc, ms, inner, cur_depth, sub_false, sub_fl)
+        let sub_true_div = ms.diverged
+        env_pop(ms.env)
+        if !sub_true_div {
+          ms_record_false(false_out, false_live, moved_snapshot_to_depth(ms.env, false_depth))
+        }
+        if sub_fl[0] {
+          moved_set_from(ms.env.moved, sub_false)
+          ms.diverged = false
+        } else {
+          ms.diverged = true
+        }
+      } else {
+        tc_check_moves_in_expr(tc, ms, cond)
+        if !ms.diverged {
+          ms_record_false(false_out, false_live, moved_snapshot_to_depth(ms.env, false_depth))
+        }
+      }
+    EIs(scrut, pat, _) => {
+      tc_check_moves_in_expr(tc, ms, scrut)
+      if !ms.diverged {
+        ms_record_false(false_out, false_live, moved_snapshot_to_depth(ms.env, false_depth))
+      }
+      let pbs : Array[String] = []
+      recheck_pat_bindings(pat, pbs)
+      tc_define_move_bindings(ms.env, pbs)
+    }
+    _ => {
+      tc_check_moves_in_expr(tc, ms, cond)
+      if !ms.diverged {
+        ms_record_false(false_out, false_live, moved_snapshot_to_depth(ms.env, false_depth))
+      }
+    }
+  }
+}
+
+///|
+/// Single unified post-typecheck source-order move checker for every function,
+/// method, extern body, constant, and test body in the compiler.
+fn tc_check_moves_in_stmts(
+  tc : TypeChecker,
+  ms : MoveState,
+  stmts : Array[Stmt],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    if ms.diverged {
+      break
+    }
+    match stmts[i] {
+      SLet(name, is_mut, _, init, _) => {
+        tc_check_moves_in_expr(tc, ms, init)
+        if name != "_" {
+          env_define_line(ms.env, name, TError, is_mut, 0)
+        }
+      }
+      SLetTuple(names, _, init, _) => {
+        tc_check_moves_in_expr(tc, ms, init)
+        tc_define_move_bindings(ms.env, names)
+      }
+      SAssign(lhs, rhs, _) =>
+        match lhs {
+          EIdent(x, _) => {
+            tc_check_moves_in_expr(tc, ms, rhs)
+            if !ms.diverged {
+              match env_lookup(ms.env, x) {
+                Some(_) => ms.env.moved.remove(x)
+                None => env_define_line(ms.env, x, TError, true, 0)
+              }
+            }
+          }
+          EIndex(arr, idx, _) => {
+            tc_check_moves_in_expr(tc, ms, arr)
+            if !ms.diverged {
+              tc_check_moves_in_expr(tc, ms, idx)
+            }
+            if !ms.diverged {
+              tc_check_moves_in_expr(tc, ms, rhs)
+            }
+          }
+          EField(obj, _, _) => {
+            tc_check_moves_in_expr(tc, ms, obj)
+            if !ms.diverged {
+              tc_check_moves_in_expr(tc, ms, rhs)
+            }
+          }
+          _ => {
+            tc_check_moves_in_expr(tc, ms, lhs)
+            if !ms.diverged {
+              tc_check_moves_in_expr(tc, ms, rhs)
+            }
+          }
+        }
+      SCompoundAssign(_, lhs, rhs, _) => {
+        tc_check_moves_in_expr(tc, ms, lhs)
+        if !ms.diverged {
+          tc_check_moves_in_expr(tc, ms, rhs)
+        }
+      }
+      SGuard(cond, els, _) => {
+        let cond_bs : Array[String] = []
+        recheck_cond_is_bindings(cond, cond_bs)
+        let outer_depth = ms.env.scopes.length()
+        let false_m : Map[String, Span] = Map([])
+        let false_live : Array[Bool] = [false]
+        env_push(ms.env)
+        tc_check_moves_in_cond(tc, ms, cond, outer_depth, false_m, false_live)
+        let cond_div = ms.diverged
+        let moved_in_cond : Map[String, Span] = Map([])
+        let mut bi = 0
+        while bi < cond_bs.length() {
+          let bn = cond_bs[bi]
+          match ms.env.moved.get(bn) {
+            Some(sp) => moved_in_cond.set(bn, sp)
+            None => ()
+          }
+          bi = bi + 1
+        }
+        env_pop(ms.env)
+        let after_true = moved_clone(ms.env.moved)
+        if false_live[0] {
+          moved_set_from(ms.env.moved, false_m)
+          ms.diverged = false
+          env_push(ms.env)
+          tc_check_moves_in_stmts(tc, ms, els)
+          env_pop(ms.env)
+        }
+        moved_set_from(ms.env.moved, after_true)
+        ms.diverged = cond_div
+        tc_define_move_bindings(ms.env, cond_bs)
+        let mks = moved_in_cond.keys()
+        let mut mi = 0
+        while mi < mks.length() {
+          let k = mks[mi]
+          match moved_in_cond.get(k) {
+            Some(sp) => ms.env.moved.set(k, sp)
+            None => ()
+          }
+          mi = mi + 1
+        }
+      }
+      SWhile(cond, body, _) => {
+        let is_inf_true = match cond {
+          EBool(true, _) => true
+          _ => false
+        }
+        let lidx = ms_push_loop(ms)
+        let m_entry = moved_clone(ms.env.moved)
+        let outer_depth = ms.env.scopes.length()
+        let false0 : Map[String, Span] = Map([])
+        let false0_live : Array[Bool] = [false]
+        env_push(ms.env)
+        tc_check_moves_in_cond(tc, ms, cond, outer_depth, false0, false0_live)
+        if !ms.diverged {
+          tc_check_moves_in_stmts(tc, ms, body)
+        }
+        let end0_div = ms.diverged
+        env_pop(ms.env)
+        let end0_m = moved_clone(ms.env.moved)
+        let had_cont0 = ms.loop_had_cont[lidx]
+        let has_back0 = !end0_div || had_cont0
+        let mut back0 : Map[String, Span] = Map([])
+        if !end0_div {
+          back0 = end0_m
+        }
+        if had_cont0 {
+          back0 = if !end0_div {
+            moved_union_maps(back0, ms.loop_cont_moved[lidx])
+          } else {
+            moved_clone(ms.loop_cont_moved[lidx])
+          }
+        }
+        let mut post_live = !is_inf_true && false0_live[0]
+        let mut post : Map[String, Span] = if post_live { false0 } else { Map([]) }
+        if has_back0 && moved_has_new_key(m_entry, back0) {
+          ms.loop_cont_moved[lidx] = Map([])
+          ms.loop_had_cont[lidx] = false
+          moved_set_from(ms.env.moved, moved_union_maps(m_entry, back0))
+          ms.diverged = false
+          let false1 : Map[String, Span] = Map([])
+          let false1_live : Array[Bool] = [false]
+          env_push(ms.env)
+          tc_check_moves_in_cond(tc, ms, cond, outer_depth, false1, false1_live)
+          if !ms.diverged {
+            tc_check_moves_in_stmts(tc, ms, body)
+          }
+          env_pop(ms.env)
+          if !is_inf_true && false1_live[0] {
+            if post_live {
+              post = moved_union_maps(post, false1)
+            } else {
+              post = false1
+              post_live = true
+            }
+          }
+        }
+        if ms.loop_had_break[lidx] {
+          if post_live {
+            post = moved_union_maps(post, ms.loop_break_moved[lidx])
+          } else {
+            post = ms.loop_break_moved[lidx]
+            post_live = true
+          }
+        }
+        ms_pop_loop(ms)
+        if post_live {
+          moved_set_from(ms.env.moved, post)
+          ms.diverged = false
+        } else {
+          ms.diverged = true
+        }
+      }
+      SFor(init, cond, step, body, _) => {
+        let is_inf_true = match cond {
+          EBool(true, _) => true
+          _ => false
+        }
+        env_push(ms.env)
+        tc_check_moves_in_stmts(tc, ms, [init])
+        if !ms.diverged {
+          let lidx = ms_push_loop(ms)
+          let m_entry = moved_clone(ms.env.moved)
+          let outer_depth = ms.env.scopes.length()
+          let false0 : Map[String, Span] = Map([])
+          let false0_live : Array[Bool] = [false]
+          env_push(ms.env)
+          tc_check_moves_in_cond(tc, ms, cond, outer_depth, false0, false0_live)
+          if !ms.diverged {
+            tc_check_moves_in_stmts(tc, ms, body)
+          }
+          let body_div0 = ms.diverged
+          env_pop(ms.env)
+          let had_cont0 = ms.loop_had_cont[lidx]
+          let mut has_back0 = false
+          let mut back0 : Map[String, Span] = Map([])
+          if !body_div0 || had_cont0 {
+            let step_in = if !body_div0 && had_cont0 {
+              moved_union_maps(ms.env.moved, ms.loop_cont_moved[lidx])
+            } else if !body_div0 {
+              moved_clone(ms.env.moved)
+            } else {
+              moved_clone(ms.loop_cont_moved[lidx])
+            }
+            moved_set_from(ms.env.moved, step_in)
+            ms.diverged = false
+            tc_check_moves_in_stmts(tc, ms, [step])
+            if !ms.diverged {
+              has_back0 = true
+              back0 = moved_clone(ms.env.moved)
+            }
+          }
+          let mut post_live = !is_inf_true && false0_live[0]
+          let mut post : Map[String, Span] = if post_live { false0 } else { Map([]) }
+          if has_back0 && moved_has_new_key(m_entry, back0) {
+            ms.loop_cont_moved[lidx] = Map([])
+            ms.loop_had_cont[lidx] = false
+            moved_set_from(ms.env.moved, moved_union_maps(m_entry, back0))
+            ms.diverged = false
+            let false1 : Map[String, Span] = Map([])
+            let false1_live : Array[Bool] = [false]
+            env_push(ms.env)
+            tc_check_moves_in_cond(tc, ms, cond, outer_depth, false1, false1_live)
+            if !ms.diverged {
+              tc_check_moves_in_stmts(tc, ms, body)
+            }
+            let body_div1 = ms.diverged
+            env_pop(ms.env)
+            let had_cont1 = ms.loop_had_cont[lidx]
+            if !body_div1 || had_cont1 {
+              let step_in1 = if !body_div1 && had_cont1 {
+                moved_union_maps(ms.env.moved, ms.loop_cont_moved[lidx])
+              } else if !body_div1 {
+                moved_clone(ms.env.moved)
+              } else {
+                moved_clone(ms.loop_cont_moved[lidx])
+              }
+              moved_set_from(ms.env.moved, step_in1)
+              ms.diverged = false
+              tc_check_moves_in_stmts(tc, ms, [step])
+            }
+            if !is_inf_true && false1_live[0] {
+              if post_live {
+                post = moved_union_maps(post, false1)
+              } else {
+                post = false1
+                post_live = true
+              }
+            }
+          }
+          if ms.loop_had_break[lidx] {
+            if post_live {
+              post = moved_union_maps(post, ms.loop_break_moved[lidx])
+            } else {
+              post = ms.loop_break_moved[lidx]
+              post_live = true
+            }
+          }
+          ms_pop_loop(ms)
+          if post_live {
+            moved_set_from(ms.env.moved, post)
+            ms.diverged = false
+          } else {
+            ms.diverged = true
+          }
+        }
+        env_pop(ms.env)
+      }
+      SForRange(v, lo, hi, _, body, _) => {
+        tc_check_moves_in_expr(tc, ms, lo)
+        if !ms.diverged {
+          tc_check_moves_in_expr(tc, ms, hi)
+        }
+        if !ms.diverged {
+          let lidx = ms_push_loop(ms)
+          let m_entry = moved_clone(ms.env.moved)
+          env_push(ms.env)
+          if v != "_" {
+            env_define_line(ms.env, v, TError, false, 0)
+          }
+          tc_check_moves_in_stmts(tc, ms, body)
+          let end0_div = ms.diverged
+          env_pop(ms.env)
+          let end0_m = moved_clone(ms.env.moved)
+          let had_cont0 = ms.loop_had_cont[lidx]
+          let has_back0 = !end0_div || had_cont0
+          let mut back0 : Map[String, Span] = Map([])
+          if !end0_div {
+            back0 = end0_m
+          }
+          if had_cont0 {
+            back0 = if !end0_div {
+              moved_union_maps(back0, ms.loop_cont_moved[lidx])
+            } else {
+              moved_clone(ms.loop_cont_moved[lidx])
+            }
+          }
+          let mut post = m_entry
+          if has_back0 {
+            post = moved_union_maps(post, back0)
+          }
+          if has_back0 && moved_has_new_key(m_entry, back0) {
+            ms.loop_cont_moved[lidx] = Map([])
+            ms.loop_had_cont[lidx] = false
+            moved_set_from(ms.env.moved, moved_union_maps(m_entry, back0))
+            ms.diverged = false
+            env_push(ms.env)
+            if v != "_" {
+              env_define_line(ms.env, v, TError, false, 0)
+            }
+            tc_check_moves_in_stmts(tc, ms, body)
+            let end1_div = ms.diverged
+            env_pop(ms.env)
+            if !end1_div {
+              post = moved_union_maps(post, ms.env.moved)
+            }
+            if ms.loop_had_cont[lidx] {
+              post = moved_union_maps(post, ms.loop_cont_moved[lidx])
+            }
+          }
+          if ms.loop_had_break[lidx] {
+            post = moved_union_maps(post, ms.loop_break_moved[lidx])
+          }
+          ms_pop_loop(ms)
+          moved_set_from(ms.env.moved, post)
+          ms.diverged = false
+        }
+      }
+      SForIn(v1, v2, iter, body, _) => {
+        tc_check_moves_in_expr(tc, ms, iter)
+        if !ms.diverged {
+          let lidx = ms_push_loop(ms)
+          let m_entry = moved_clone(ms.env.moved)
+          env_push(ms.env)
+          if v1 != "_" {
+            env_define_line(ms.env, v1, TError, false, 0)
+          }
+          if v2.length() > 0 && v2 != "_" {
+            env_define_line(ms.env, v2, TError, false, 0)
+          }
+          tc_check_moves_in_stmts(tc, ms, body)
+          let end0_div = ms.diverged
+          env_pop(ms.env)
+          let end0_m = moved_clone(ms.env.moved)
+          let had_cont0 = ms.loop_had_cont[lidx]
+          let has_back0 = !end0_div || had_cont0
+          let mut back0 : Map[String, Span] = Map([])
+          if !end0_div {
+            back0 = end0_m
+          }
+          if had_cont0 {
+            back0 = if !end0_div {
+              moved_union_maps(back0, ms.loop_cont_moved[lidx])
+            } else {
+              moved_clone(ms.loop_cont_moved[lidx])
+            }
+          }
+          let mut post = m_entry
+          if has_back0 {
+            post = moved_union_maps(post, back0)
+          }
+          if has_back0 && moved_has_new_key(m_entry, back0) {
+            ms.loop_cont_moved[lidx] = Map([])
+            ms.loop_had_cont[lidx] = false
+            moved_set_from(ms.env.moved, moved_union_maps(m_entry, back0))
+            ms.diverged = false
+            env_push(ms.env)
+            if v1 != "_" {
+              env_define_line(ms.env, v1, TError, false, 0)
+            }
+            if v2.length() > 0 && v2 != "_" {
+              env_define_line(ms.env, v2, TError, false, 0)
+            }
+            tc_check_moves_in_stmts(tc, ms, body)
+            let end1_div = ms.diverged
+            env_pop(ms.env)
+            if !end1_div {
+              post = moved_union_maps(post, ms.env.moved)
+            }
+            if ms.loop_had_cont[lidx] {
+              post = moved_union_maps(post, ms.loop_cont_moved[lidx])
+            }
+          }
+          if ms.loop_had_break[lidx] {
+            post = moved_union_maps(post, ms.loop_break_moved[lidx])
+          }
+          ms_pop_loop(ms)
+          moved_set_from(ms.env.moved, post)
+          ms.diverged = false
+        }
+      }
+      SReturn(opt_e, _) => {
+        match opt_e {
+          Some(e) => tc_check_moves_in_expr(tc, ms, e)
+          None => ()
+        }
+        ms.diverged = true
+      }
+      SBreak(_) => {
+        if ms.loop_break_moved.length() > 0 {
+          let idx = ms.loop_break_moved.length() - 1
+          let snap = moved_snapshot_to_depth(ms.env, ms.loop_scope_depth[idx])
+          if ms.loop_had_break[idx] {
+            ms.loop_break_moved[idx] = moved_union_maps(ms.loop_break_moved[idx], snap)
+          } else {
+            ms.loop_break_moved[idx] = snap
+            ms.loop_had_break[idx] = true
+          }
+        }
+        ms.diverged = true
+      }
+      SContinue(_) => {
+        if ms.loop_cont_moved.length() > 0 {
+          let idx = ms.loop_cont_moved.length() - 1
+          let snap = moved_snapshot_to_depth(ms.env, ms.loop_scope_depth[idx])
+          if ms.loop_had_cont[idx] {
+            ms.loop_cont_moved[idx] = moved_union_maps(ms.loop_cont_moved[idx], snap)
+          } else {
+            ms.loop_cont_moved[idx] = snap
+            ms.loop_had_cont[idx] = true
+          }
+        }
+        ms.diverged = true
+      }
+      SDebugAssert(cond, msg, _) => {
+        let pre_da = moved_clone(ms.env.moved)
+        tc_check_moves_in_expr(tc, ms, cond)
+        if !ms.diverged {
+          tc_check_moves_in_expr(tc, ms, msg)
+        }
+        if ms.diverged {
+          moved_set_from(ms.env.moved, pre_da)
+        } else {
+          moved_set_from(ms.env.moved, moved_union_maps(pre_da, ms.env.moved))
+        }
+        ms.diverged = false
+      }
+      SExpr(e, _) => tc_check_moves_in_expr(tc, ms, e)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn tc_check_moves_in_expr(
+  tc : TypeChecker,
+  ms : MoveState,
+  e : Expr,
+) -> Unit {
+  if ms.diverged {
+    return
+  }
+  match e {
+    EIdent(x, isp) =>
+      if ms.env.moved.contains(x) {
+        ms_err_moved(
+          tc,
+          ms,
+          isp,
+          x,
+          "use of moved value `" + x + "`",
+          "do not use `" + x + "` after `move`, or pass a separate value",
+        )
+      }
+    EMove(inner, _) =>
+      match inner {
+        EIdent(x, isp) =>
+          if ms.env.moved.contains(x) {
+            ms_err_moved(
+              tc,
+              ms,
+              isp,
+              x,
+              "value `" + x + "` was already moved",
+              "move `" + x + "` at most once",
+            )
+          } else {
+            match env_lookup(ms.env, x) {
+              Some(_) => {
+                ms.env.moved.set(x, isp)
+                let bdepth = env_binding_depth(ms.env, x)
+                if bdepth >= 0 {
+                  let mut ci = 0
+                  while ci < ms.closure_moved_stack.length() {
+                    if bdepth < ms.closure_scope_depth[ci] {
+                      ms.closure_moved_stack[ci].set(x, isp)
+                    }
+                    ci = ci + 1
+                  }
+                }
+              }
+              None => ()
+            }
+          }
+        _ => tc_check_moves_in_expr(tc, ms, inner)
+      }
+    ENamedArg(_, _, inner, _) | EMutArg(inner, _) | EUnary(_, inner, _) | EField(inner, _, _) | EAs(inner, _, _) | ETry(inner, _) =>
+      tc_check_moves_in_expr(tc, ms, inner)
+    EBinary(op, l, r, _) =>
+      if op == "&&" || op == "||" {
+        let outer_depth = ms.env.scopes.length()
+        let false_m : Map[String, Span] = Map([])
+        let false_live : Array[Bool] = [false]
+        env_push(ms.env)
+        tc_check_moves_in_cond(tc, ms, e, outer_depth, false_m, false_live)
+        let d_true = ms.diverged
+        env_pop(ms.env)
+        if d_true && !false_live[0] {
+          ms.diverged = true
+        } else if d_true {
+          moved_set_from(ms.env.moved, false_m)
+          ms.diverged = false
+        } else if !false_live[0] {
+          ms.diverged = false
+        } else {
+          moved_set_from(ms.env.moved, moved_union_maps(ms.env.moved, false_m))
+          ms.diverged = false
+        }
+      } else {
+        tc_check_moves_in_expr(tc, ms, l)
+        if !ms.diverged {
+          tc_check_moves_in_expr(tc, ms, r)
+        }
+      }
+    ECall(callee, args, csp) => {
+      let skip_callee = match callee {
+        EIdent(_, _) =>
+          tc.resolved_method_calls.contains("call_nonlocal:" + span_key(csp)) ||
+          tc.resolved_method_calls.contains("call_pkg:" + span_key(csp))
+        _ => false
+      }
+      if !skip_callee {
+        tc_check_moves_in_expr(tc, ms, callee)
+      }
+      let mut i = 0
+      while i < args.length() && !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, args[i])
+        i = i + 1
+      }
+      if tc.never_calls.contains(span_key(csp)) {
+        ms.diverged = true
+      }
+    }
+    EMethodCall(recv, _, args, msp) => {
+      tc_check_moves_in_expr(tc, ms, recv)
+      let mut i = 0
+      while i < args.length() && !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, args[i])
+        i = i + 1
+      }
+      if tc.never_calls.contains(span_key(msp)) {
+        ms.diverged = true
+      }
+    }
+    EIndex(arr, idx, _) => {
+      tc_check_moves_in_expr(tc, ms, arr)
+      if !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, idx)
+      }
+    }
+    EArrayLit(es, _) | ETuple(es, _) | EDotVariant(_, es, _) | EInterp(es, _) => {
+      let mut i = 0
+      while i < es.length() && !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, es[i])
+        i = i + 1
+      }
+    }
+    EStructLit(_, spread, fields, _) => {
+      match spread {
+        Some(se) => tc_check_moves_in_expr(tc, ms, se)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() && !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, fields[i].value)
+        i = i + 1
+      }
+    }
+    EBlock(ss, _) => {
+      env_push(ms.env)
+      tc_check_moves_in_stmts(tc, ms, ss)
+      env_pop(ms.env)
+    }
+    EIf(cond, then_ss, else_opt, _) => {
+      let outer_depth = ms.env.scopes.length()
+      let false_m : Map[String, Span] = Map([])
+      let false_live : Array[Bool] = [false]
+      env_push(ms.env)
+      tc_check_moves_in_cond(tc, ms, cond, outer_depth, false_m, false_live)
+      if !ms.diverged {
+        tc_check_moves_in_stmts(tc, ms, then_ss)
+      }
+      let d_then = ms.diverged
+      env_pop(ms.env)
+      let m_then = moved_clone(ms.env.moved)
+      let mut d_else = true
+      let mut m_else : Map[String, Span] = Map([])
+      if false_live[0] {
+        moved_set_from(ms.env.moved, false_m)
+        ms.diverged = false
+        match else_opt {
+          Some(ee) => tc_check_moves_in_expr(tc, ms, ee)
+          None => ()
+        }
+        d_else = ms.diverged
+        m_else = moved_clone(ms.env.moved)
+      }
+      if d_then && d_else {
+        ms.diverged = true
+      } else if d_then {
+        moved_set_from(ms.env.moved, m_else)
+        ms.diverged = false
+      } else if d_else {
+        moved_set_from(ms.env.moved, m_then)
+        ms.diverged = false
+      } else {
+        moved_set_from(ms.env.moved, moved_union_maps(m_then, m_else))
+        ms.diverged = false
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      tc_check_moves_in_expr(tc, ms, scrut)
+      if !ms.diverged && arms.length() > 0 {
+        let mut entry = moved_clone(ms.env.moved)
+        let mut entry_live = true
+        let mut any_arm_live = false
+        let mut merged : Map[String, Span] = Map([])
+        let mut ai = 0
+        while ai < arms.length() {
+          let arm = arms[ai]
+          if !entry_live {
+            ai = ai + 1
+            continue
+          }
+          moved_set_from(ms.env.moved, entry)
+          ms.diverged = false
+          let match_outer_depth = ms.env.scopes.length()
+          env_push(ms.env)
+          let pbs : Array[String] = []
+          recheck_pat_bindings(arm.pat, pbs)
+          tc_define_move_bindings(ms.env, pbs)
+          let irref = ms_pat_is_irrefutable(arm.pat)
+          match arm.guard_expr {
+            Some(ge) => {
+              let g_false : Map[String, Span] = Map([])
+              let g_false_live : Array[Bool] = [false]
+              tc_check_moves_in_cond(tc, ms, ge, match_outer_depth, g_false, g_false_live)
+              if irref {
+                if g_false_live[0] {
+                  entry = g_false
+                } else {
+                  entry_live = false
+                }
+              } else if g_false_live[0] {
+                entry = moved_union_maps(entry, g_false)
+              }
+            }
+            None =>
+              if irref {
+                entry_live = false
+              }
+          }
+          if !ms.diverged {
+            tc_check_moves_in_expr(tc, ms, arm.body)
+          }
+          let arm_div = ms.diverged
+          env_pop(ms.env)
+          if !arm_div {
+            if !any_arm_live {
+              merged = moved_clone(ms.env.moved)
+              any_arm_live = true
+            } else {
+              merged = moved_union_maps(merged, ms.env.moved)
+            }
+          }
+          ai = ai + 1
+        }
+        if any_arm_live {
+          moved_set_from(ms.env.moved, merged)
+          ms.diverged = false
+        } else {
+          ms.diverged = true
+        }
+      }
+    }
+    EIs(scrut, _, _) => tc_check_moves_in_expr(tc, ms, scrut)
+    EClosure(params, _, body, _) => {
+      let pre_cl_moved = moved_clone(ms.env.moved)
+      let saved_div = ms.diverged
+      ms.diverged = false
+      ms.closure_moved_stack.push(Map([]))
+      ms.closure_scope_depth.push(ms.env.scopes.length())
+      env_push(ms.env)
+      let mut pi = 0
+      while pi < params.length() {
+        if params[pi].name != "_" {
+          env_define_line(ms.env, params[pi].name, TError, params[pi].is_mut, 0)
+        }
+        pi = pi + 1
+      }
+      tc_check_moves_in_stmts(tc, ms, body)
+      env_pop(ms.env)
+      let cl_moves = match ms.closure_moved_stack.pop() {
+        Some(m) => m
+        None => Map([])
+      }
+      let _ = ms.closure_scope_depth.pop()
+      ms.diverged = saved_div
+      moved_set_from(
+        ms.env.moved,
+        moved_union_maps(pre_cl_moved, moved_union_maps(ms.env.moved, cl_moves)),
+      )
+    }
+    EScope(w, f, _) | ESpawn(w, f, _) => {
+      tc_check_moves_in_expr(tc, ms, w)
+      if !ms.diverged {
+        tc_check_moves_in_expr(tc, ms, f)
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn tc_check_moves_fn_decl(
+  tc : TypeChecker,
+  params : Array[Param],
+  body : Array[Stmt],
+) -> Unit {
+  let ms = move_state_new()
+  let mut pi = 0
+  while pi < params.length() {
+    match params[pi].default_expr {
+      Some(def) => {
+        let saved = moved_clone(ms.env.moved)
+        let saved_div = ms.diverged
+        ms.diverged = false
+        env_push(ms.env)
+        tc_check_moves_in_expr(tc, ms, def)
+        env_pop(ms.env)
+        moved_set_from(ms.env.moved, saved)
+        ms.diverged = saved_div
+      }
+      None => ()
+    }
+    if params[pi].name != "_" {
+      env_define_line(ms.env, params[pi].name, TError, params[pi].is_mut, params[pi].span.line)
+    }
+    pi = pi + 1
+  }
+  tc_check_moves_in_stmts(tc, ms, body)
+}
+
+///|
 fn check_fn_call(
   tc : TypeChecker,
   env : Env,
@@ -11124,15 +12824,88 @@ fn check_fn_call(
     add_arity_edit(tc, sp, args, finfo.param_tys)
   }
   let fnval_exp : Array[String] = []
-  let mut i = 0
-  while i < resolved_args.length() {
+  let mut fi_init = 0
+  while fi_init < resolved_args.length() {
     fnval_exp.push("")
-    if i < missing_flags.length() && missing_flags[i] {
-      i = i + 1
-      continue
+    fi_init = fi_init + 1
+  }
+  let defer_flags : Array[Bool] = []
+  let mut has_deferred = false
+  let mut di_init = 0
+  while di_init < resolved_args.length() {
+    let is_miss = di_init < missing_flags.length() && missing_flags[di_init]
+    let is_def = di_init < default_flags.length() && default_flags[di_init]
+    let is_opt_wrap = use_named && di_init < opt_wrapped_flags.length() && opt_wrapped_flags[di_init]
+    let p_has_tp = di_init < finfo.param_tys.length() &&
+      ty_has_tparam(subst_ty(finfo.param_tys[di_init], subst))
+    let dcl = !is_miss &&
+      !is_def &&
+      p_has_tp &&
+      expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap)
+    defer_flags.push(dcl)
+    if dcl {
+      has_deferred = true
     }
-    let is_def = i < default_flags.length() && default_flags[i]
-    let p_is_into = !is_def && param_is_into_at(finfo.decl.params, i)
+    di_init = di_init + 1
+  }
+  // O(N) source-order traversal: explicit args (`raw_i = 0, 1, ...`), then defaults (`raw_i < 0`).
+  let check_order : Array[Int] = []
+  if !use_named {
+    let mut si = 0
+    while si < resolved_args.length() {
+      if !(si < missing_flags.length() && missing_flags[si]) {
+        check_order.push(si)
+      }
+      si = si + 1
+    }
+  } else {
+    let raw_to_slot : Array[Int] = []
+    let mut rinit = 0
+    while rinit < args.length() {
+      raw_to_slot.push(-1)
+      rinit = rinit + 1
+    }
+    let def_slots : Array[Int] = []
+    let mut si = 0
+    while si < resolved_args.length() {
+      if !(si < missing_flags.length() && missing_flags[si]) {
+        let ridx = if si < raw_indices.length() { raw_indices[si] } else { -1 }
+        if ridx >= 0 && ridx < raw_to_slot.length() && raw_to_slot[ridx] < 0 {
+          raw_to_slot[ridx] = si
+        } else {
+          def_slots.push(si)
+        }
+      }
+      si = si + 1
+    }
+    let mut rk = 0
+    while rk < raw_to_slot.length() {
+      if raw_to_slot[rk] >= 0 {
+        check_order.push(raw_to_slot[rk])
+      }
+      rk = rk + 1
+    }
+    let mut dsi = 0
+    while dsi < def_slots.length() {
+      check_order.push(def_slots[dsi])
+      dsi = dsi + 1
+    }
+  }
+  let mut pass = 0
+  while pass < 2 {
+    if pass == 1 && !has_deferred {
+      break
+    }
+    let mut ci = 0
+    while ci < check_order.length() {
+      let i = check_order[ci]
+      let is_def = i < default_flags.length() && default_flags[i]
+      let defer_cl = defer_flags[i]
+      if (pass == 0 && defer_cl) || (pass == 1 && !defer_cl) {
+        ci = ci + 1
+        continue
+      }
+      let p_is_into = !is_def && param_is_into_at(finfo.decl.params, i)
     let raw_i = if use_named {
       if i < raw_indices.length() { raw_indices[i] } else { -1 }
     } else {
@@ -11251,7 +13024,9 @@ fn check_fn_call(
         }
       }
     }
-    i = i + 1
+    ci = ci + 1
+  }
+  pass = pass + 1
   }
   tc_recheck_fn_value_args(
     tc,
@@ -12881,7 +14656,11 @@ fn check_method_call(
       }
       if method_name == "with_lock" {
         if args.length() >= 1 {
-          let fty = check_expr(tc, env, args[0], None)
+          let exp_ret = match expected {
+            Some(t) => t
+            None => TError
+          }
+          let fty = check_expr(tc, env, args[0], Some(TFn([elem], exp_ret)))
           match fty {
             TFn(_, ret) => return ret
             _ => ()
@@ -12967,15 +14746,88 @@ fn check_method_call(
             }
           }
           let fnval_exp : Array[String] = []
-          let mut i = 0
-          while i < resolved_args.length() {
+          let mut fi_init = 0
+          while fi_init < resolved_args.length() {
             fnval_exp.push("")
-            if i < missing_flags.length() && missing_flags[i] {
-              i = i + 1
-              continue
+            fi_init = fi_init + 1
+          }
+          let defer_flags : Array[Bool] = []
+          let mut has_deferred = false
+          let mut di_init = 0
+          while di_init < resolved_args.length() {
+            let is_miss = di_init < missing_flags.length() && missing_flags[di_init]
+            let is_def = di_init < default_flags.length() && default_flags[di_init]
+            let is_opt_wrap = use_named && di_init < opt_wrapped_flags.length() && opt_wrapped_flags[di_init]
+            let p_idx_i = di_init + 1
+            let p_has_tp = p_idx_i < minfo.param_tys.length() &&
+              ty_has_tparam(subst_ty(minfo.param_tys[p_idx_i], subst))
+            let dcl = !is_miss &&
+              !is_def &&
+              p_has_tp &&
+              expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap)
+            defer_flags.push(dcl)
+            if dcl {
+              has_deferred = true
             }
+            di_init = di_init + 1
+          }
+          let check_order : Array[Int] = []
+          if !use_named {
+            let mut si = 0
+            while si < resolved_args.length() {
+              if !(si < missing_flags.length() && missing_flags[si]) {
+                check_order.push(si)
+              }
+              si = si + 1
+            }
+          } else {
+            let raw_to_slot : Array[Int] = []
+            let mut rinit = 0
+            while rinit < args.length() {
+              raw_to_slot.push(-1)
+              rinit = rinit + 1
+            }
+            let def_slots : Array[Int] = []
+            let mut si = 0
+            while si < resolved_args.length() {
+              if !(si < missing_flags.length() && missing_flags[si]) {
+                let ridx = if si < raw_indices.length() { raw_indices[si] } else { -1 }
+                if ridx >= 0 && ridx < raw_to_slot.length() && raw_to_slot[ridx] < 0 {
+                  raw_to_slot[ridx] = si
+                } else {
+                  def_slots.push(si)
+                }
+              }
+              si = si + 1
+            }
+            let mut rk = 0
+            while rk < raw_to_slot.length() {
+              if raw_to_slot[rk] >= 0 {
+                check_order.push(raw_to_slot[rk])
+              }
+              rk = rk + 1
+            }
+            let mut dsi = 0
+            while dsi < def_slots.length() {
+              check_order.push(def_slots[dsi])
+              dsi = dsi + 1
+            }
+          }
+          let mut pass = 0
+          while pass < 2 {
+          if pass == 1 && !has_deferred {
+            break
+          }
+          let mut ci = 0
+          while ci < check_order.length() {
+            let i = check_order[ci]
             let p_idx = i + 1
             let is_def = i < default_flags.length() && default_flags[i]
+            let defer_cl = defer_flags[i]
+            if (pass == 0 && defer_cl) || (pass == 1 && !defer_cl) {
+              ci = ci + 1
+              continue
+            }
             let p_is_into = !is_def && param_is_into_at(minfo.decl.params, p_idx)
             let raw_i = if use_named {
               if i < raw_indices.length() { raw_indices[i] } else { -1 }
@@ -13123,7 +14975,9 @@ fn check_method_call(
                 }
               }
             }
-            i = i + 1
+            ci = ci + 1
+          }
+          pass = pass + 1
           }
           tc_recheck_fn_value_args(
             tc,
@@ -13664,6 +15518,18 @@ fn check_binary_chain(
     if !has_val {
       match cur {
         EBinary(op, lhs, rhs, sp) => {
+          if op == "&&" && expr_has_is(lhs) {
+            env_push(env)
+            let lty = check_cond_with_bindings(tc, env, lhs)
+            let rty = check_expr(tc, env, rhs, Some(TBool))
+            env_pop(env)
+            cur_ty = check_binary_combine(tc, env, op, lty, rty, sp)
+            if env.in_verify || tc.record_analyze {
+              tc.expr_tys.set(span_key(sp), cur_ty)
+            }
+            has_val = true
+            continue
+          }
           let is_arith_or_bit = op != "&&" &&
             op != "||" &&
             op != "==" &&
@@ -13778,6 +15644,37 @@ fn check_binary_chain(
     }
   }
   cur_ty
+}
+
+///|
+fn check_builtin_no_named_args(
+  tc : TypeChecker,
+  env : Env,
+  args : Array[Expr],
+  callee_name : String,
+) -> Bool {
+  let mut had_named = false
+  let mut i = 0
+  while i < args.length() {
+    match args[i] {
+      ENamedArg(name, _, inner, nsp) => {
+        had_named = true
+        tc_err(
+          tc,
+          nsp,
+          "E_TYPE_MISMATCH",
+          "`" + callee_name + "` does not accept named argument `" + name + "`",
+          "positional argument",
+          "named argument `" + name + "`",
+          "pass positional arguments without labels",
+        )
+        let _ = check_expr(tc, env, inner, None)
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  had_named
 }
 
 ///|
@@ -13933,17 +15830,6 @@ fn check_expr_inner(
       check_expr(tc, env, inner, expected)
     }
     EIdent(name, sp) => {
-      if env.moved.contains(name) {
-        tc_err(
-          tc,
-          sp,
-          "E_USE_AFTER_MOVE",
-          "use of moved value `" + name + "`",
-          "live binding",
-          "moved variable `" + name + "`",
-          "do not use `" + name + "` after `move`, or pass a separate value",
-        )
-      }
       match env_lookup(env, name) {
         Some(b) => {
           if env.in_no_io {
@@ -14406,17 +16292,7 @@ fn check_expr_inner(
     EMove(inner, sp) =>
       match inner {
         EIdent(name, isp) => {
-          if env.moved.contains(name) {
-            tc_err(
-              tc,
-              isp,
-              "E_USE_AFTER_MOVE",
-              "value `" + name + "` was already moved",
-              "live binding",
-              "moved variable `" + name + "`",
-              "move `" + name + "` at most once",
-            )
-          }
+          let _ = sp
           let ty = match env_lookup(env, name) {
             Some(b) => b.ty
             None => {
@@ -14432,7 +16308,6 @@ fn check_expr_inner(
               TError
             }
           }
-          env.moved.set(name, sp)
           ty
         }
         _ => check_expr(tc, env, inner, expected)
@@ -15035,17 +16910,6 @@ fn check_expr_inner(
             Some(b) =>
               match b.ty {
                 TFn(ptys, rty) => {
-                  if env.moved.contains(name) {
-                    tc_err(
-                      tc,
-                      sp,
-                      "E_USE_AFTER_MOVE",
-                      "use of moved closure `" + name + "`",
-                      "live binding",
-                      "moved variable `" + name + "`",
-                      "do not call `" + name + "` after `move`",
-                    )
-                  }
                   if args.length() != ptys.length() {
                     tc_err(
                       tc,
@@ -15257,20 +17121,47 @@ fn check_expr_inner(
             return TFloat
           }
           if qual == "StringBuilder" && mem == "new" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "StringBuilder::new")
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`StringBuilder::new` expects 0 arguments, found " + args.length().to_string(),
+                "0 args",
+                args.length().to_string() + " args",
+                "call `StringBuilder::new()` with no arguments",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            }
             return TStringBuilder
           }
           if qual == "StringBuilder" && mem == "with_capacity" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "StringBuilder::with_capacity")
             if args.length() != 1 {
               tc_err(
                 tc,
                 sp,
-                "E_ARITY",
-                "`StringBuilder::with_capacity` expects 1 argument `cap : Int`",
+                "E_ARITY_MISMATCH",
+                "`StringBuilder::with_capacity` expects 1 argument `cap : Int`, found " + args.length().to_string(),
                 "1 argument",
                 args.length().to_string() + " arguments",
                 "pass an initial capacity `Int`",
               )
-            } else {
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if !had_named {
               let cty = check_expr(tc, env, args[0], Some(TInt))
               if !ty_compat(TInt, cty) {
                 tc_err(
@@ -15287,12 +17178,30 @@ fn check_expr_inner(
             return TStringBuilder
           }
           if qual == "Bytes" && mem == "new" {
-            if args.length() >= 1 {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Bytes::new")
+            if args.length() > 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`Bytes::new` expects 0 or 1 arguments, found " + args.length().to_string(),
+                "0 or 1 args",
+                args.length().to_string() + " args",
+                "call `Bytes::new()` or `Bytes::new(len)`",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if args.length() == 1 && !had_named {
               let lty = check_expr(tc, env, args[0], Some(TInt))
               if !ty_compat(TInt, lty) {
                 tc_err(
                   tc,
-                  sp,
+                  expr_span(args[0]),
                   "E_TYPE_MISMATCH",
                   "`Bytes::new` length must be `Int`",
                   "Int",
@@ -15304,23 +17213,50 @@ fn check_expr_inner(
             return TBytes
           }
           if qual == "Map" && mem == "new" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Map::new")
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`Map::new` expects 0 arguments, found " + args.length().to_string(),
+                "0 args",
+                args.length().to_string() + " args",
+                "call `Map::new()` with no arguments",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            }
             return match expected {
               Some(TMap(k, v)) => TMap(k, v)
               _ => TMap(TString, TError)
             }
           }
           if qual == "Map" && mem == "with_capacity" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Map::with_capacity")
             if args.length() != 1 {
               tc_err(
                 tc,
                 sp,
-                "E_TYPE_MISMATCH",
+                "E_ARITY_MISMATCH",
                 "`Map::with_capacity` expects 1 argument, found " + args.length().to_string(),
                 "1 arg",
                 args.length().to_string() + " args",
                 "pass an `Int` capacity: `Map::with_capacity(cap)`",
               )
-            } else {
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if !had_named {
               let cty = check_expr(tc, env, args[0], Some(TInt))
               if !ty_compat(TInt, cty) {
                 tc_err(
@@ -15340,23 +17276,50 @@ fn check_expr_inner(
             }
           }
           if qual == "Array" && mem == "new" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Array::new")
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`Array::new` expects 0 arguments, found " + args.length().to_string(),
+                "0 args",
+                args.length().to_string() + " args",
+                "call `Array::new()` with no arguments",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            }
             return match expected {
               Some(TArray(e)) => TArray(e)
               _ => TArray(TError)
             }
           }
           if qual == "Array" && mem == "with_capacity" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Array::with_capacity")
             if args.length() != 1 {
               tc_err(
                 tc,
                 sp,
-                "E_TYPE_MISMATCH",
+                "E_ARITY_MISMATCH",
                 "`Array::with_capacity` expects 1 argument, found " + args.length().to_string(),
                 "1 arg",
                 args.length().to_string() + " args",
                 "pass an `Int` capacity: `Array::with_capacity(cap)`",
               )
-            } else {
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if !had_named {
               let cty = check_expr(tc, env, args[0], Some(TInt))
               if !ty_compat(TInt, cty) {
                 tc_err(
@@ -15607,12 +17570,30 @@ fn check_expr_inner(
             return TImmArray(ety)
           }
           if qual == "Channel" && mem == "new" {
-            if args.length() >= 1 {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Channel::new")
+            if args.length() > 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`Channel::new` expects 0 or 1 arguments, found " + args.length().to_string(),
+                "0 or 1 args",
+                args.length().to_string() + " args",
+                "call `Channel::new()` or `Channel::new(cap)`",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if args.length() == 1 && !had_named {
               let cty = check_expr(tc, env, args[0], Some(TInt))
               if !ty_compat(TInt, cty) {
                 tc_err(
                   tc,
-                  sp,
+                  expr_span(args[0]),
                   "E_TYPE_MISMATCH",
                   "`Channel::new` capacity must be `Int`",
                   "Int",
@@ -15627,20 +17608,75 @@ fn check_expr_inner(
             }
           }
           if qual == "Mutex" && mem == "new" {
+            let had_named = check_builtin_no_named_args(tc, env, args, "Mutex::new")
             let exp_inner : Option[Ty] = match expected {
               Some(TMutex(e)) => Some(e)
               _ => None
             }
-            let vty = if args.length() >= 1 {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`Mutex::new` expects 1 argument, found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "call `Mutex::new(value)` with 1 argument",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+              return match exp_inner {
+                Some(e) => TMutex(e)
+                None => TMutex(TError)
+              }
+            }
+            let vty = if !had_named {
               check_expr(tc, env, args[0], exp_inner)
             } else {
-              TError
+              match exp_inner {
+                Some(e) => e
+                None => TError
+              }
             }
             return TMutex(vty)
           }
           if qual == "AtomicInt" && mem == "new" {
-            if args.length() >= 1 {
-              let _ = check_expr(tc, env, args[0], Some(TInt))
+            let had_named = check_builtin_no_named_args(tc, env, args, "AtomicInt::new")
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`AtomicInt::new` expects 1 argument, found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "call `AtomicInt::new(value)` with 1 `Int` argument",
+              )
+              if !had_named {
+                let mut ai = 0
+                while ai < args.length() {
+                  let _ = check_expr(tc, env, args[ai], None)
+                  ai = ai + 1
+                }
+              }
+            } else if !had_named {
+              let vty = check_expr(tc, env, args[0], Some(TInt))
+              if !ty_compat(TInt, vty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`AtomicInt::new` initial value must be `Int`",
+                  "Int",
+                  ty_to_string(vty),
+                  "pass an `Int` initial value",
+                )
+              }
             }
             return TAtomicInt
           }
@@ -16401,9 +18437,23 @@ fn check_expr_inner(
               }
             None => ()
           }
+          let seen_fields : Map[String, Bool] = Map([])
           let mut fi = 0
           while fi < fields.length() {
             let f = fields[fi]
+            if seen_fields.contains(f.name) {
+              tc_err(
+                tc,
+                f.span,
+                "E_TYPE_MISMATCH",
+                "duplicate field `" + f.name + "` in struct literal `" + resolved_name + "`",
+                "unique field",
+                f.name,
+                "remove the duplicate `" + f.name + "` initializer",
+              )
+            } else {
+              seen_fields.set(f.name, true)
+            }
             let mut found_idx = -1
             let mut j = 0
             while j < sinfo.field_names.length() {
@@ -16463,6 +18513,39 @@ fn check_expr_inner(
               }
             }
             fi = fi + 1
+          }
+          match spread_opt {
+            None => {
+              let missing : Array[String] = []
+              let missing_bt : Array[String] = []
+              let mut mj = 0
+              while mj < sinfo.field_names.length() {
+                let fn_m = sinfo.field_names[mj]
+                if !seen_fields.contains(fn_m) {
+                  missing.push(fn_m)
+                  missing_bt.push("`" + fn_m + "`")
+                }
+                mj = mj + 1
+              }
+              if missing.length() > 0 {
+                let miss_str = join_strs(missing_bt, ", ")
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "missing field" +
+                  (if missing.length() == 1 { " " } else { "s " }) +
+                  miss_str +
+                  " in struct literal `" +
+                  resolved_name +
+                  "`",
+                  "all fields of `" + resolved_name + "`",
+                  "missing " + join_strs(missing, ", "),
+                  "initialize " + miss_str + " in `" + resolved_name + "::{ ... }`",
+                )
+              }
+            }
+            Some(_) => ()
           }
           let targs : Array[Ty] = []
           let mut ti = 0
@@ -16549,7 +18632,6 @@ fn check_expr_inner(
     }
     EMatch(scrut, arms, sp) => {
       let scrut_ty = check_expr(tc, env, scrut, None)
-      check_match_exhaustiveness(tc, scrut_ty, arms, sp)
       let mut res_ty : Option[Ty] = expected
       let mut i = 0
       while i < arms.length() {
@@ -16557,7 +18639,7 @@ fn check_expr_inner(
         bind_pattern(tc, env, arms[i].pat, scrut_ty)
         match arms[i].guard_expr {
           Some(ge) => {
-            let gty = check_expr(tc, env, ge, Some(TBool))
+            let gty = check_cond_with_bindings(tc, env, ge)
             if !ty_compat(TBool, gty) {
               tc_err(
                 tc,
@@ -16617,6 +18699,7 @@ fn check_expr_inner(
         }
         i = i + 1
       }
+      check_match_exhaustiveness(tc, scrut_ty, arms, sp)
       match res_ty {
         Some(t) => t
         None => TUnit
@@ -16628,20 +18711,36 @@ fn check_expr_inner(
         _ => []
       }
       let ptys : Array[Ty] = []
-      let mut i = 0
-      while i < params.length() {
-        let pty = match params[i].ty {
-          TyMissing(_) =>
-            if i < exp_ptys.length() {
-              exp_ptys[i]
-            } else {
-              TError
+          let mut i = 0
+          while i < params.length() {
+            let pty = match params[i].ty {
+              TyMissing(psp) => {
+                let inf = if i < exp_ptys.length() {
+                  exp_ptys[i]
+                } else {
+                  TError
+                }
+                match inf {
+                  TError => {
+                    tc_err(
+                      tc,
+                      psp,
+                      "E_TYPE_MISMATCH",
+                      "cannot infer type for closure parameter `" + params[i].name + "`",
+                      "explicit parameter type annotation",
+                      "unannotated parameter",
+                      "add a type annotation, e.g. `" + params[i].name + " : Int`",
+                    )
+                    TError
+                  }
+                  _ => inf
+                }
+              }
+              _ => resolve_type_expr(tc, params[i].ty, env.type_params)
             }
-          _ => resolve_type_expr(tc, params[i].ty, env.type_params)
-        }
-        ptys.push(pty)
-        i = i + 1
-      }
+            ptys.push(pty)
+            i = i + 1
+          }
       let has_explicit_ret = match ret_te {
         TyMissing(_) => false
         _ => true
@@ -17200,6 +19299,7 @@ pub fn check_package_with_imports_mapped(
     scalar_const_exprs: Map([]),
     const_init_order: [],
     import_aliases: Map([]),
+    file_import_aliases: Map([]),
     dep_map: dep_map,
     canon_display_keys: [],
     canon_display_vals: [],
@@ -17294,7 +19394,18 @@ pub fn check_package_with_imports_mapped(
           }
       }
       match resolved_canon {
-        Some(canon) => tc.import_aliases.set(imp.alias_name, canon)
+        Some(canon) => {
+          tc.import_aliases.set(imp.alias_name, canon)
+          let f_al = match tc.file_import_aliases.get(f.path) {
+            Some(m) => m
+            None => {
+              let m : Map[String, String] = Map([])
+              tc.file_import_aliases.set(f.path, m)
+              m
+            }
+          }
+          f_al.set(imp.alias_name, canon)
+        }
         None =>
           tc_err(
             tc,
@@ -18161,6 +20272,7 @@ pub fn check_package_with_imports_mapped(
                 pi = pi + 1
               }
               let body_ty = check_stmts(tc, env, fd.body, Some(finfo.ret_ty))
+              tc_check_moves_fn_decl(tc, fd.params, fd.body)
               if fd.is_verify {
                 verify_check_fn(tc, fd, finfo, env.verify_fn_name, env.fn_key)
               }
@@ -18249,6 +20361,7 @@ pub fn check_package_with_imports_mapped(
                   pi = pi + 1
                 }
                 let body_ty = check_stmts(tc, env, ed.body, Some(einfo.ret_ty))
+                tc_check_moves_fn_decl(tc, ed.params, ed.body)
                 if !ty_compat(einfo.ret_ty, body_ty) {
                   tc_err(
                     tc,
@@ -18349,6 +20462,7 @@ pub fn check_package_with_imports_mapped(
                       pi = pi + 1
                     }
                     let body_ty = check_stmts(tc, env, md.body, Some(finfo.ret_ty))
+                    tc_check_moves_fn_decl(tc, md.params, md.body)
                     if md.is_verify {
                       verify_check_fn(tc, md, finfo, env.verify_fn_name, env.fn_key)
                     }
@@ -18403,6 +20517,8 @@ pub fn check_package_with_imports_mapped(
           }
           let env = env_new(TUnit, [])
           let vty = check_expr(tc, env, cd.value, Some(cty))
+          let cms = move_state_new()
+          tc_check_moves_in_expr(tc, cms, cd.value)
           if !ty_compat(cty, vty) {
             tc_err(
               tc,
@@ -18418,6 +20534,8 @@ pub fn check_package_with_imports_mapped(
         DTest(td) => {
           let env = env_new(TUnit, [])
           let _ = check_stmts_ex(tc, env, td.body, None, false)
+          let tms = move_state_new()
+          tc_check_moves_in_stmts(tc, tms, td.body)
         }
         _ => ()
       }

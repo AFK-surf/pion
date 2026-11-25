@@ -639,13 +639,59 @@ fn sig_collect_pat_binds(pat : Pattern, out : Array[String]) -> Unit {
       if name != "_" {
         out.push(name)
       }
-    PVariant(_, _, sub, _) | PTuple(sub, _) => {
+    PVariant(_, _, sub, _, _) | PTuple(sub, _) => {
       let mut i = 0
       while i < sub.length() {
         sig_collect_pat_binds(sub[i], out)
         i = i + 1
       }
     }
+    _ => ()
+  }
+}
+
+///|
+fn sig_collect_pat_const_deps(
+  pat : Pattern,
+  idents : Map[String, Bool],
+  ident_list : Array[String],
+  calls : Map[String, Bool],
+  call_list : Array[String],
+  ctx : SigDepCtx,
+) -> Unit {
+  match pat {
+    PTuple(sub, _) => {
+      let mut i = 0
+      while i < sub.length() {
+        sig_collect_pat_const_deps(sub[i], idents, ident_list, calls, call_list, ctx)
+        i = i + 1
+      }
+    }
+    PVariant(pat_enum, vname, sub, explicit_ctor, sp) =>
+      if sub.length() > 0 {
+        let mut i = 0
+        while i < sub.length() {
+          sig_collect_pat_const_deps(sub[i], idents, ident_list, calls, call_list, ctx)
+          i = i + 1
+        }
+      } else if !explicit_ctor {
+        if ctx.has_tc {
+          match ctx.resolved_methods.get("pat_const:" + span_key(sp)) {
+            Some(ckey) =>
+              if !has_qual_sep(ckey) && !idents.contains(ckey) {
+                idents.set(ckey, true)
+                ident_list.push(ckey)
+              }
+            None => ()
+          }
+        } else if pat_enum == "" {
+          let desc = "pat?:" + vname + "@0"
+          if !calls.contains(desc) {
+            calls.set(desc, true)
+            call_list.push(desc)
+          }
+        }
+      }
     _ => ()
   }
 }
@@ -4367,8 +4413,13 @@ fn sig_collect_expr_deps(
       | EMove(inner, _)
       | EAs(inner, _, _)
       | ETry(inner, _)
-      | ENamedArg(_, _, inner, _)
-      | EIs(inner, _, _) => {
+      | ENamedArg(_, _, inner, _) => {
+        w_kind.push(0)
+        w_expr.push(inner)
+        w_binds.push([])
+      }
+      EIs(inner, pat, _) => {
+        sig_collect_pat_const_deps(pat, idents, ident_list, calls, call_list, ctx)
         w_kind.push(0)
         w_expr.push(inner)
         w_binds.push([])
@@ -5030,12 +5081,15 @@ fn sig_collect_expr_deps(
         let scrut_eval = sig_eval_local_let_rhs(scrut, bound, ctx)
         let mut ai = 0
         while ai < arms.length() {
+          sig_collect_pat_const_deps(arms[ai].pat, idents, ident_list, calls, call_list, ctx)
           let pbinds : Array[String] = []
           sig_bind_pat_from_expr(arms[ai].pat, scrut, scrut_eval, bound, ctx, pbinds)
           ctx.cond_depth = ctx.cond_depth + 1
           match arms[ai].guard_expr {
-            Some(ge) =>
+            Some(ge) => {
               sig_collect_expr_deps(ge, bound, idents, ident_list, calls, call_list, ctx)
+              sig_bind_cond_pat_from_expr(ge, bound, ctx, pbinds)
+            }
             None => ()
           }
           sig_collect_expr_deps(arms[ai].body, bound, idents, ident_list, calls, call_list, ctx)
@@ -5356,7 +5410,7 @@ fn sig_collect_pat_bindings(
         out_names.push(name)
         out_evals.push(scrut_eval)
       }
-    PVariant(_, vname, subs, _) => {
+    PVariant(_, vname, subs, _, _) => {
       let mut matched_args : Option[Array[Expr]] = None
       match unwrapped {
         ECall(callee, cargs, sp) =>
@@ -5784,11 +5838,14 @@ fn sig_collect_and_eval_tuple_rhs(
       ctx.cond_depth = ctx.cond_depth + 1
       let mut ai = 0
       while ai < arms.length() {
+        sig_collect_pat_const_deps(arms[ai].pat, idents, ident_list, calls, call_list, ctx)
         let pbinds : Array[String] = []
         sig_bind_pat_from_expr(arms[ai].pat, scrut, scrut_eval, bound, ctx, pbinds)
         match arms[ai].guard_expr {
-          Some(ge) =>
+          Some(ge) => {
             sig_collect_expr_deps(ge, bound, idents, ident_list, calls, call_list, ctx)
+            sig_bind_cond_pat_from_expr(ge, bound, ctx, pbinds)
+          }
           None => ()
         }
         let r_arm = sig_collect_and_eval_tuple_rhs(
@@ -6882,6 +6939,8 @@ pub struct XpkgPubSyms {
   pub_methods : Map[String, Bool]
   priv_methods : Map[String, Bool]
   scalar_consts : Map[String, Bool]
+  pub_consts : Map[String, Bool]
+  priv_nonscalar_consts : Map[String, Bool]
   inline_priv_fns : Map[String, Bool]
   has_pub_opt_res : Bool
 }
@@ -6902,6 +6961,8 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
   let pub_methods : Map[String, Bool] = Map([])
   let priv_methods : Map[String, Bool] = Map([])
   let scalar_consts : Map[String, Bool] = Map([])
+  let pub_consts : Map[String, Bool] = Map([])
+  let priv_nonscalar_consts : Map[String, Bool] = Map([])
   let inline_priv_fns : Map[String, Bool] = Map([])
   let mut has_pub_opt_res = false
   let mut fi = 0
@@ -6952,8 +7013,12 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
           }
         }
         DConst(cd) =>
-          if !cd.is_pub && xpkg_is_const_scalar_expr(cd.value) {
+          if cd.is_pub {
+            pub_consts.set(cd.name, true)
+          } else if xpkg_is_const_scalar_expr(cd.value) {
             scalar_consts.set(cd.name, true)
+          } else {
+            priv_nonscalar_consts.set(cd.name, true)
           }
         _ => ()
       }
@@ -6970,6 +7035,8 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
     pub_methods: pub_methods,
     priv_methods: priv_methods,
     scalar_consts: scalar_consts,
+    pub_consts: pub_consts,
+    priv_nonscalar_consts: priv_nonscalar_consts,
     inline_priv_fns: inline_priv_fns,
     has_pub_opt_res: has_pub_opt_res,
   }
@@ -7226,6 +7293,37 @@ fn xpkg_sym_is_scalar_const(view : XpkgSymView, name : String) -> Bool {
 }
 
 ///|
+fn xpkg_sym_is_pub_const(view : XpkgSymView, name : String) -> Bool {
+  match view.pkg_syms {
+    Some(s) => s.pub_consts.contains(name)
+    None =>
+      match view.tc {
+        Some(tc) =>
+          match tc.const_pub.get(name) {
+            Some(true) => true
+            _ => false
+          }
+        None => false
+      }
+  }
+}
+
+///|
+fn xpkg_sym_is_priv_nonscalar_const(view : XpkgSymView, name : String) -> Bool {
+  match view.pkg_syms {
+    Some(s) => s.priv_nonscalar_consts.contains(name)
+    None =>
+      match view.tc {
+        Some(tc) =>
+          tc.consts.contains(name) &&
+          !xpkg_sym_is_pub_const(view, name) &&
+          !tc.scalar_const_exprs.contains(name)
+        None => false
+      }
+  }
+}
+
+///|
 fn xpkg_sym_is_inline_priv_fn(view : XpkgSymView, name : String) -> Bool {
   match view.pkg_syms {
     Some(s) => s.inline_priv_fns.contains(name)
@@ -7265,7 +7363,13 @@ fn xpkg_pat_link_safe(
       }
       true
     }
-    PVariant(en, vn, subs, _) => {
+    PVariant(en, vn, subs, explicit_ctor, _) => {
+      if en == "" &&
+        !explicit_ctor &&
+        subs.length() == 0 &&
+        xpkg_sym_is_priv_nonscalar_const(view, vn) {
+        return false
+      }
       let en_ok = en == "Option" ||
         en == "Result" ||
         (en == "" &&
@@ -7273,7 +7377,8 @@ fn xpkg_pat_link_safe(
         vn == "None" ||
         vn == "Ok" ||
         vn == "Err" ||
-        xpkg_sym_is_pub_variant(view, vn))) ||
+        xpkg_sym_is_pub_variant(view, vn) ||
+        (!explicit_ctor && subs.length() == 0 && (xpkg_sym_is_scalar_const(view, vn) || xpkg_sym_is_pub_const(view, vn))))) ||
         (en != "" && xpkg_sym_is_pub_qual_variant(view, en, vn))
       if !en_ok {
         return false
@@ -7722,7 +7827,7 @@ fn stub_write_pat(sb : StringBuilder, pat : Pattern) -> Unit {
       }
       sb.write_string(")")
     }
-    PVariant(en, vn, subs, _) => {
+    PVariant(en, vn, subs, explicit_ctor, _) => {
       if en != "" {
         sb.write_string(en)
         sb.write_string("::")
@@ -7739,6 +7844,8 @@ fn stub_write_pat(sb : StringBuilder, pat : Pattern) -> Unit {
           i = i + 1
         }
         sb.write_string(")")
+      } else if explicit_ctor {
+        sb.write_string("()")
       }
     }
   }
@@ -12035,6 +12142,12 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
             fn_ambig[fni] = true
             changed = true
           }
+        } else if starts_with_str(cname, "pat?:") {
+          let pn = slice_str(cname, 5, cname.length())
+          if const_idx.contains(pn) && !fn_ambig[fni] {
+            fn_ambig[fni] = true
+            changed = true
+          }
         } else if starts_with_str(cname, "mth?:") {
           if !fn_ambig[fni] {
             fn_ambig[fni] = true
@@ -12308,6 +12421,12 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
               const_idx,
             ) &&
             !fdef_ambig[dfi] {
+            fdef_ambig[dfi] = true
+            changed = true
+          }
+        } else if starts_with_str(cname, "pat?:") {
+          let pn = slice_str(cname, 5, cname.length())
+          if const_idx.contains(pn) && !fdef_ambig[dfi] {
             fdef_ambig[dfi] = true
             changed = true
           }
@@ -12612,6 +12731,11 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
           fn_key_idx,
           const_idx,
         ) {
+          has_ambiguous_method = true
+        }
+      } else if starts_with_str(cname, "pat?:") {
+        let pn = slice_str(cname, 5, cname.length())
+        if const_idx.contains(pn) {
           has_ambiguous_method = true
         }
       } else if starts_with_str(cname, "mth?:") {

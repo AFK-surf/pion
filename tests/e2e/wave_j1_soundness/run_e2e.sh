@@ -5818,7 +5818,8 @@ test "$("$TMP_DIR/r35_alias_b")" = "16"
 PION_CACHE_DIR="$TMP_DIR/cas_r35_alias_rel" "$PIONC" build --release -o "$TMP_DIR/r35_alias_rel_b" "$TMP_DIR/r35/app_alias_ok"
 test "$("$TMP_DIR/r35_alias_rel_b")" = "16"
 
-# 36d: value-position `(Some(false) is Some(k)) && k` qualifies RHS `k` as `dep::k` (true), ignoring `app`'s `let k = false`
+# 36d: Wave L1-A A2 unified `&&` is-scoping: `(Some(false) is Some(k)) && k` binds `k = false` in RHS (0),
+# never leaking `dep::k` (true) or `app::k`.
 cat > "$TMP_DIR/r35/app_val_and/pion.toml" <<'EOF'
 [package]
 name = "app_val_and"
@@ -5828,7 +5829,7 @@ dep = { path = "../dep" }
 EOF
 cat > "$TMP_DIR/r35/app_val_and/src/main.pion" <<'EOF'
 import "dep"
-let k : Bool = false
+let k : Bool = true
 pub fn main(world : World) -> Unit {
   let _ = k
   let r = if dep::val_and() { 1 } else { 0 }
@@ -5836,9 +5837,9 @@ pub fn main(world : World) -> Unit {
 }
 EOF
 PION_CACHE_DIR="$TMP_DIR/cas_r35_val_and" "$PIONC" build -o "$TMP_DIR/r35_val_and_b" "$TMP_DIR/r35/app_val_and"
-test "$("$TMP_DIR/r35_val_and_b")" = "1"
+test "$("$TMP_DIR/r35_val_and_b")" = "0"
 
-echo "  R35 runtime (priv-enum val/call E_PRIVATE_SYMBOL, 3-pkg isolation E_PRIVATE_SYMBOL, alias-hijack==16 debug+--release, val-and==1) (OK)"
+echo "  R35 runtime (priv-enum val/call E_PRIVATE_SYMBOL, 3-pkg isolation E_PRIVATE_SYMBOL, alias-hijack==16 debug+--release, val-and==0) (OK)"
 
 echo "=== Wave J1 E2E [37/37]: R36 canonical Ty lookup vs alias, missing struct in aliased pkg, PVariant resolved visibility & FnInfo.is_imported ==="
 mkdir -p \
@@ -7790,7 +7791,7 @@ test "$("$TMP_DIR/r53_cal_h")" = "9"
 # 52c: Astra #2 — unannotated closure param `fn(READ) { READ() }` cycle + 2-file cold/hot CAS (7 -> 9)
 cat > "$TMP_DIR/r53_ucl_cyc/main.pion" <<'EOF'
 fn READ() -> Int { A }
-fn go() -> Int { let c = fn(READ) { let _ = READ; READ() }; c(0) }
+fn go() -> Int { let c : (() -> Int) -> Int = fn(READ) { let _ = READ; READ() }; c(READ) }
 let A : Int = go()
 pub fn main() -> Int { A }
 EOF
@@ -7803,7 +7804,7 @@ EOF
 cat > "$TMP_DIR/r53_ucl_cas/b.pion" <<'EOF'
 fn READ() -> Int { B }
 fn make_b() -> Int { 7 }
-fn go() -> Int { let c = fn(READ) { let _ = READ; READ() }; c(0) }
+fn go() -> Int { let c : (() -> Int) -> Int = fn(READ) { let _ = READ; READ() }; c(READ) }
 let B : Int = make_b()
 EOF
 PION_CACHE_DIR="$TMP_DIR/cas_r53_ucl" "$PIONC" build -o "$TMP_DIR/r53_ucl_c" "$TMP_DIR/r53_ucl_cas/a.pion" "$TMP_DIR/r53_ucl_cas/b.pion"
