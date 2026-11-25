@@ -598,7 +598,7 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
   let cache_dir = drv_resolve_cache_dir(world)
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let obj_path = cache_dir + "/obj/pion_rt_msvc_" + key + ".o"
-  if fs_exists(world, obj_path) {
+  if drv_is_nonempty_regular_file(world, obj_path) {
     return Some(obj_path)
   }
   let stamp = drv_tmp_tag(world, obj_path)
@@ -619,7 +619,9 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
     let _ = fs_remove(world, obj_tmp)
     return None
   }
-  let _ = fs_rename(world, obj_tmp, obj_path)
+  if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+    return None
+  }
   let sz = fs_size(world, obj_path)
   drv_cas_record_and_evict(
     world,
@@ -672,7 +674,7 @@ fn drv_ensure_cross_rt_lib(
   let cache_dir = drv_resolve_cache_dir(world)
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let ar_path = cache_dir + "/obj/pion_rt_" + qbe_target + "_" + key + ".a"
-  if fs_exists(world, ar_path) {
+  if drv_is_nonempty_regular_file(world, ar_path) {
     return Some(ar_path)
   }
   let stamp = drv_tmp_tag(world, ar_path)
@@ -708,7 +710,9 @@ fn drv_ensure_cross_rt_lib(
     Ok(_) => ()
   }
   let _ = fs_remove(world, obj_tmp)
-  let _ = fs_rename(world, ar_tmp, ar_path)
+  if !drv_publish_tmp(world, ar_tmp, ar_path, true) {
+    return None
+  }
   let sz = fs_size(world, ar_path)
   drv_cas_record_and_evict(
     world,
@@ -4218,7 +4222,7 @@ fn drv_compile_pkg_c_sources(
       headers_fp,
     )
     let obj_path = cache_dir + "/obj/cstub_" + key + ".o"
-    if fs_exists(world, obj_path) {
+    if drv_is_nonempty_regular_file(world, obj_path) {
       if trace_cas {
         io_eprintln(
           world,
@@ -4262,7 +4266,9 @@ fn drv_compile_pkg_c_sources(
           ")",
         )
       }
-      let _ = fs_rename(world, obj_tmp, obj_path)
+      if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+        return Err("failed to publish CAS object: " + obj_path)
+      }
       let sz = fs_size(world, obj_path)
       out_new_keys.push("cstub_" + key)
       out_new_sizes.push(if sz > 0L { sz } else { 0L })
@@ -4451,7 +4457,7 @@ fn drv_compile_pkg_rc_sources(
       res_fp,
     )
     let res_path = cache_dir + "/obj/rc_" + key + ".res"
-    if fs_exists(world, res_path) {
+    if drv_is_nonempty_regular_file(world, res_path) {
       if trace_cas {
         io_eprintln(
           world,
@@ -4485,7 +4491,9 @@ fn drv_compile_pkg_rc_sources(
           ")",
         )
       }
-      let _ = fs_rename(world, res_tmp, res_path)
+      if !drv_publish_tmp(world, res_tmp, res_path, true) {
+        return Err("failed to publish CAS resource: " + res_path)
+      }
       let sz = fs_size(world, res_path)
       out_new_keys.push("rc_" + key)
       out_new_sizes.push(if sz > 0L { sz } else { 0L })
@@ -4873,7 +4881,9 @@ fn drv_compile_ssa_to_obj(
         "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
       )
     }
-    let _ = fs_rename(world, obj_tmp, obj_path)
+    if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+      return Err("failed to publish CAS object: " + obj_path)
+    }
     Ok(())
   } else {
     let asm_path = obj_path + ".s." + stamp
@@ -4899,7 +4909,9 @@ fn drv_compile_ssa_to_obj(
       let _ = fs_remove(world, obj_tmp)
       return Err("as failed with exit code " + rc_as.to_string())
     }
-    let _ = fs_rename(world, obj_tmp, obj_path)
+    if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+      return Err("failed to publish CAS object: " + obj_path)
+    }
     Ok(())
   }
 }
@@ -5663,20 +5675,18 @@ fn drv_compile_missed(
       }
       let rc_qbe = proc_exec(world, argv)
       if rc_qbe != 0 {
-        let mut j = 0
-        while j < tmps.length() {
-          let _ = fs_remove(world, tmps[j])
-          j = j + 1
-        }
+        drv_remove_files(world, tmps, 0)
         return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
       }
-      let mut j = 0
-      while j < tmps.length() {
-        let _ = fs_rename(world, tmps[j], objs[j])
-        j = j + 1
+      let pub_err = drv_publish_unit_objs(world, tmps, objs)
+      if pub_err != "" {
+        return Err(pub_err)
       }
     } else {
       let err_ch : Channel[String] = Channel::new(nw + 1)
+      // Every batch's temporaries; the main thread publishes them below.
+      let all_tmps : Array[String] = []
+      let all_objs : Array[String] = []
       let qmv = qbe_macos_ver
       let qb = qbe_bin
       let qt = qbe_target
@@ -5695,49 +5705,42 @@ fn drv_compile_missed(
             spec_sb.write_char('\n')
             spec_sb.write_string(u_tmp)
             spec_sb.write_char('\n')
-            spec_sb.write_string(u_obj)
-            spec_sb.write_char('\n')
+            all_tmps.push(u_tmp)
+            all_objs.push(u_obj)
             mi = mi + 1
           }
           let spec = spec_sb.to_string()
           spawn(s, fn() -> Unit {
             let lines = drv_split_lines(spec)
             let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
-            let tmps : Array[String] = []
-            let objs : Array[String] = []
             let mut li = 0
-            while li + 2 < lines.length() {
+            while li + 1 < lines.length() {
               argv.push(lines[li])
               argv.push(lines[li + 1])
-              tmps.push(lines[li + 1])
-              objs.push(lines[li + 2])
-              li = li + 3
+              li = li + 2
             }
             let rc_qbe = proc_exec(argv)
             if rc_qbe != 0 {
-              let mut j = 0
-              while j < tmps.length() {
-                let _ = fs_remove(tmps[j])
-                j = j + 1
-              }
               let _ = err_ch.send(
                 "qbe --obj-batch failed with exit code " + rc_qbe.to_string(),
               )
-            } else {
-              let mut j = 0
-              while j < tmps.length() {
-                let _ = fs_rename(tmps[j], objs[j])
-                j = j + 1
-              }
             }
           })
           wi = wi + 1
         }
       })
+      // Every worker has exited: publish only when every batch succeeded.
       err_ch.close()
       match err_ch.recv() {
-        Some(err_msg) => return Err(err_msg)
+        Some(err_msg) => {
+          drv_remove_files(world, all_tmps, 0)
+          return Err(err_msg)
+        }
         None => ()
+      }
+      let pub_err = drv_publish_unit_objs(world, all_tmps, all_objs)
+      if pub_err != "" {
+        return Err(pub_err)
       }
     }
   } else if n_miss > 1 {
@@ -5755,6 +5758,8 @@ fn drv_compile_missed(
       }
       let err_ch : Channel[String] = Channel::new(batch + 1)
       let stamp_base = drv_tmp_tag(world, "qbe_miss_asm_" + base.to_string())
+      let batch_tmps : Array[String] = []
+      let batch_objs : Array[String] = []
       scope(world, fn(s : Scope) -> Unit {
         let mut off = 0
         while off < batch {
@@ -5763,6 +5768,8 @@ fn drv_compile_missed(
           let u_obj = miss_obj_paths[mi]
           let u_asm = u_obj + ".s." + stamp_base + "_" + mi.to_string()
           let u_tmp = u_obj + ".tmp." + stamp_base + "_" + mi.to_string()
+          batch_tmps.push(u_tmp)
+          batch_objs.push(u_obj)
           let qb = qbe_bin
           let qa = qbe_arch
           spawn(s, fn() -> Unit {
@@ -5809,8 +5816,6 @@ fn drv_compile_missed(
                 let _ = err_ch.send(
                   "as failed with exit code " + rc_as.to_string() + " on " + u_asm,
                 )
-              } else {
-                let _ = fs_rename(u_tmp, u_obj)
               }
             }
           })
@@ -5819,8 +5824,15 @@ fn drv_compile_missed(
       })
       err_ch.close()
       match err_ch.recv() {
-        Some(err_msg) => return Err(err_msg)
+        Some(err_msg) => {
+          drv_remove_files(world, batch_tmps, 0)
+          return Err(err_msg)
+        }
         None => ()
+      }
+      let pub_err = drv_publish_unit_objs(world, batch_tmps, batch_objs)
+      if pub_err != "" {
+        return Err(pub_err)
       }
       base = base + batch
     }
@@ -6034,7 +6046,9 @@ fn drv_build_nodes_objects_entry(
     let stub_path = cache_dir + "/sig/" + key + ".pionstub"
 
     let mut cas_hit = false
-    if fs_exists(world, obj_path) && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
+    if drv_is_nonempty_regular_file(world, obj_path) &&
+      fs_exists(world, sig_path) &&
+      fs_exists(world, stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
           sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
@@ -7534,7 +7548,7 @@ fn drv_build_targets(
     emit_cdylib_path == ""
   let ssa_only = only_text_emit && emit_asm_path == ""
   let mut has_main = true
-  let cache_hit = fs_exists(world, obj_path) &&
+  let cache_hit = drv_is_nonempty_regular_file(world, obj_path) &&
     fs_exists(world, ssa_path) &&
     fs_exists(world, sig_path)
 
@@ -7682,7 +7696,9 @@ fn drv_build_targets(
           "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
         )
       }
-      let _ = fs_rename(world, obj_tmp, obj_path)
+      if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+        return Err("failed to publish CAS object: " + obj_path)
+      }
     } else {
       let asm_path = cache_dir + "/obj/" + key + ".s." + stamp
       let rc_qbe = proc_exec(
@@ -7723,7 +7739,9 @@ fn drv_build_targets(
         let _ = fs_remove(world, obj_tmp)
         return Err("as failed with exit code " + rc_as.to_string())
       }
-      let _ = fs_rename(world, obj_tmp, obj_path)
+      if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
+        return Err("failed to publish CAS object: " + obj_path)
+      }
     }
 
     let sz_sig = fs_size(world, sig_path)
@@ -8058,7 +8076,7 @@ fn drv_exec_test_jobs(
         io_eprintln(world, "[cas] test=" + job.label + " HIT bin=" + drv_prefix16(bkey))
       }
     } else {
-      let need_qbe = !fs_exists(world, obj_path)
+      let need_qbe = !drv_is_nonempty_regular_file(world, obj_path)
       let ssa_path = tb_dir + "/" + okey + ".ssa." + drv_tmp_tag(world, okey + "_" + j.to_string())
       if need_qbe {
         if !drv_write_cas_text_atomic(world, ssa_path, job.ssa) {
@@ -8516,7 +8534,9 @@ fn drv_build_needed_objects(
     let sig_path = cache_dir + "/sig/" + key + ".pionsig"
     let stub_path = cache_dir + "/sig/" + key + ".pionstub"
     let mut cas_hit = false
-    if fs_exists(world, obj_path) && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
+    if drv_is_nonempty_regular_file(world, obj_path) &&
+      fs_exists(world, sig_path) &&
+      fs_exists(world, stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
           sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
