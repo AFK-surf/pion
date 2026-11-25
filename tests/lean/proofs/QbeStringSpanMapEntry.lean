@@ -16,10 +16,13 @@ and Channel[String].send changes (`compiler/src/core/qbe.pion`
      may trap (returning the state at the first failure), validating every span
      in source order and copying once at the end produces the same final state,
      the same first error and the same bytes as concatenating eagerly.
-     `runSteps_quiet` / `defer_cap_quiet`: moving a nested concatenation's
-     length check past later steps is equivalent when those steps are quiet
-     (state unchanged, no failure), the condition `qbe_concat_quiet` enforces;
-     `defer_cap_effect_counterexample`: otherwise it is not.
+     The compiler keeps the ordinary grouping of a `+` tree (the operands of
+     the `pion_str_concat_n` chain, or `[lhs, rhs]` of one `pion_str_concat`),
+     so each span copy replaces exactly one call that already checked the
+     total length once, after all its operands. `defer_cap_effect_counterexample`
+     shows why regrouping is not allowed in general: moving a nested
+     concatenation's length check past an observable step changes behaviour;
+     `runSteps_quiet` / `defer_cap_quiet` characterize the steps it may move past.
   4. `entry_update`: one probe that updates the found slot or inserts a fresh
      key equals `set k (f (lookup k m)) m`; `entry_hit_keeps_keys`: a hit
      keeps every stored key and its identity.
@@ -107,12 +110,12 @@ theorem fusion (steps : List (Step σ ε)) (st : σ) (ss : List Span) :
     · simp [deferred, eager, h]
     · simp [deferred, eager, h, ih, copySpans_append, copySpans]
 
-/-! Length checks of nested concatenations. Each `+` checks its own aggregate
-length (`capOk`) and fails with the same error `capErr`. Flattening a nested `+`
-into the enclosing span copy moves its check after the operands evaluated later.
-That is unobservable exactly when those later steps are quiet: they leave the
-state unchanged and cannot fail (`qbe_concat_quiet`: literals, locals and `+` of
-those). Otherwise the compiler keeps the nested concatenation. -/
+/-! Length checks of nested concatenations. Each concatenation checks its own
+aggregate length (`capOk`) and fails with the same error `capErr`. Moving a
+nested concatenation's check after operands evaluated later is unobservable when
+those later steps are quiet (state unchanged, no failure) and observable
+otherwise. The compiler therefore never regroups: a span copy covers exactly the
+operands of the concatenation call it replaces (`qbe_string_add_parts`). -/
 
 /-- Run steps left to right, stopping at the first failure. -/
 def runSteps : List (Step σ ε) → σ → σ × Except ε (List Span)

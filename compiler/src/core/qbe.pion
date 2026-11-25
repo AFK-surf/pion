@@ -39759,72 +39759,28 @@ fn qbe_checked_str_bounds(g : QbeGen, expr : Expr, borrow : Bool) -> (String, St
   }
 }
 
-///| An operand whose evaluation can neither fail with a different panic nor
-/// have an observable effect: literals, locals and `+` of those. Deferring an
-/// inner concatenation's length check past such operands is unobservable (a
-/// later `+` can only fail with the same length panic).
-fn qbe_concat_quiet(e : Expr) -> Bool {
-  match e {
-    EString(_, _) | EIdent(_, _) | EInt(_, _) | EInt64(_, _) | EBool(_, _) | EChar(_, _) => true
-    EBinary("+", l, r, _) => qbe_concat_quiet(l) && qbe_concat_quiet(r)
-    _ => false
-  }
-}
-
-///|
-fn qbe_concat_all_quiet(parts : Array[Expr]) -> Bool {
-  for p in parts {
-    if !qbe_concat_quiet(p) { return false }
-  }
-  true
-}
-
-///| Expand a nested `+` operand only when every operand evaluated after it is
-/// quiet, so its length check is not moved past an observable step.
-fn qbe_concat_expand(e : Expr, tail_quiet : Bool) -> Array[Expr] {
-  match e {
-    EBinary("+", l, r, _) =>
-      if tail_quiet {
-        let right = qbe_concat_expand(r, true)
-        let left = qbe_concat_expand(l, qbe_concat_all_quiet(right))
-        for x in right { left.push(x) }
-        return left
-      }
-    _ => ()
-  }
-  [e]
-}
-
-///| Operands of a string `+` chain in evaluation order. The outermost
-/// left spine is flattened as the ordinary `pion_str_concat_n` chain does;
-/// right-nested `+` operands keep their own concatenation (and its length
-/// check) unless everything after them is quiet.
+///| Operands of a string `+` in the same grouping as the ordinary lowering:
+/// when `lhs` is itself a `+`, every leaf of the tree in evaluation order (the
+/// `pion_str_concat_n` chain); otherwise just `[lhs, rhs]` (one
+/// `pion_str_concat`, a nested `rhs` keeping its own concatenation). A span copy
+/// over these parts evaluates the same operands in the same order and checks
+/// the total length once at the end, exactly like the call it replaces.
 fn qbe_string_add_parts(lhs : Expr, rhs : Expr) -> Array[Expr] {
-  let spine : Array[Expr] = [rhs]
-  let mut cur = lhs
-  while true {
-    match cur {
-      EBinary("+", l, r, _) => {
-        spine.push(r)
-        cur = l
-      }
-      _ => break
-    }
-  }
-  spine.push(cur)
-  // spine holds the operands right-to-left; expand them from the right.
-  let rev : Array[Array[Expr]] = []
-  let mut tail_quiet = true
-  for e in spine {
-    let sub = qbe_concat_expand(e, tail_quiet)
-    tail_quiet = tail_quiet && qbe_concat_all_quiet(sub)
-    rev.push(sub)
+  match lhs {
+    EBinary("+", _, _, _) => ()
+    _ => return [lhs, rhs]
   }
   let parts : Array[Expr] = []
-  let mut i = rev.length() - 1
-  while i >= 0 {
-    for x in rev[i] { parts.push(x) }
-    i = i - 1
+  let stack : Array[Expr] = [rhs, lhs]
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(EBinary("+", l, r, _)) => {
+        stack.push(r)
+        stack.push(l)
+      }
+      Some(part) => parts.push(part)
+      None => break
+    }
   }
   parts
 }
@@ -40885,47 +40841,18 @@ fn qbe_emit_binary_chain(
                 }
               }
             }
-            let check_slices = !g.target_wasm && (qbe_is_str_slice(g, lhs) || qbe_is_str_slice(g, rhs) ||
-              match rhs { EBinary("+", _, _, _) => true
-                _ => false })
-            if !g.target_wasm && (is_add_chain || check_slices) {
-              // Span copy only when a slice operand is present; its grouping
-              // never moves a nested length check past an observable step.
-              let span_parts = qbe_string_add_parts(lhs, rhs)
-              let mut use_spans = false
-              for part in span_parts {
-                if qbe_is_str_slice(g, part) {
-                  use_spans = true
-                  break
-                }
-              }
-              if use_spans {
-                qbe_scope_push(g)
-                let v = qbe_emit_span_concat(g, span_parts, Map([]), !root_has_assign)
-                qbe_scope_pop(g)
-                cur_arg = QbeArgVal::{ qv: v, borrowed: false }
-                has_val = true
-                continue
-              }
+            // A plain binary `slice + x` / `x + slice`: one span copy of [lhs, rhs]
+            // in place of `pion_str_concat` (a nested `+` operand keeps its own).
+            if !is_add_chain && !g.target_wasm && (qbe_is_str_slice(g, lhs) || qbe_is_str_slice(g, rhs)) {
+              qbe_scope_push(g)
+              let v = qbe_emit_span_concat(g, [lhs, rhs], Map([]), !root_has_assign)
+              qbe_scope_pop(g)
+              cur_arg = QbeArgVal::{ qv: v, borrowed: false }
+              has_val = true
+              continue
             }
-            // Chains without slices keep the ordinary full flattening into
-            // `pion_str_concat_n` (left and right nesting, outermost `+` only).
             if is_add_chain {
-              let parts : Array[Expr] = []
-              let stack : Array[Expr] = [rhs, lhs]
-              while stack.length() > 0 {
-                match stack.pop() {
-                  Some(scur) =>
-                    match scur {
-                      EBinary("+", cl, cr, _) => {
-                        stack.push(cr)
-                        stack.push(cl)
-                      }
-                      _ => parts.push(scur)
-                    }
-                  None => break
-                }
-              }
+              let parts = qbe_string_add_parts(lhs, rhs)
               if parts.length() >= 3 {
                 let mut is_str_chain = match cur_exp {
                   Some(TString) => true
@@ -40965,6 +40892,25 @@ fn qbe_emit_binary_chain(
                   }
                 }
                 if is_str_chain {
+                  // Same parts, same order: a span copy replaces pion_str_concat_n
+                  // when a slice operand is present (its length check stays last).
+                  if !g.target_wasm {
+                    let mut use_spans = false
+                    for part in parts {
+                      if qbe_is_str_slice(g, part) {
+                        use_spans = true
+                        break
+                      }
+                    }
+                    if use_spans {
+                      qbe_scope_push(g)
+                      let v = qbe_emit_span_concat(g, parts, Map([]), !root_has_assign)
+                      qbe_scope_pop(g)
+                      cur_arg = QbeArgVal::{ qv: v, borrowed: false }
+                      has_val = true
+                      continue
+                    }
+                  }
                   let can_borrow = !qbe_args_have_assign(parts)
                   let mut can_borrow_af = can_borrow
                   if can_borrow_af {
