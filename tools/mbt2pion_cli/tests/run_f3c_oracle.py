@@ -17,6 +17,14 @@ COMPAT_DIR = os.path.join(REPO_ROOT, "tools", "mbt_compat")
 CLI_DIR = os.path.join(REPO_ROOT, "tools", "mbt2pion_cli")
 
 F3C_MBT = r'''
+priv struct CBox {
+  n : Int
+}
+
+fn CBox::ok(self : CBox) -> Bool {
+  self.n > 0
+}
+
 pub fn run_f3c_1() -> String {
   let m : Map[Int, Int] = { 1: 10, 2: 20, 3: 30 }
   let mut s1 = 0
@@ -70,7 +78,13 @@ pub fn run_f3c_1() -> String {
     Some(t) => while { s7 < t } { s7 = s7 + 1 }
     None => ()
   }
-  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string() + "," + s6.to_string() + "," + s7.to_string()
+  let mut s8 = 3
+  match Some(1) {
+    Some(_) => while { CBox::{ n: s8 } }
+      .ok() { s8 = s8 - 1 }
+    None => ()
+  }
+  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string() + "," + s6.to_string() + "," + s7.to_string() + "," + s8.to_string()
 }
 
 pub fn run_f3c_2() -> String {
@@ -229,7 +243,7 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", pl])
 
         expected = (
-            "F3c-1:30,15,50,68,13,46,4\n"
+            "F3c-1:30,15,50,68,13,46,4,0\n"
             "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|4-7-10|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
             "F3c-3:-1,-1,300,53,300,7,1,0,0"
         )

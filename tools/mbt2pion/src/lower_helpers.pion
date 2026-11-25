@@ -1054,6 +1054,23 @@ fn is_array_mutating_method(m : String) -> Bool {
   m == "shrink_to_fit" || m == "dedup" || m == "blit_to"
 }
 
+fn is_recv_arr_copy_expr(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  recv_root : String,
+  fresh_disjoint : Map[String, Bool],
+) -> Bool {
+  recv_root != "__MBT2PION_UNKNOWN_RECV__" &&
+  e == s + 5 &&
+  tokens[s].kind == TokenKind::Ident &&
+  (tokens[s].raw == recv_root || fresh_disjoint.contains(tokens[s].raw)) &&
+  tokens[s + 1].kind == TokenKind::Dot &&
+  tokens[s + 2].raw == "copy" &&
+  tokens[s + 3].kind == TokenKind::LParen &&
+  tokens[s + 4].kind == TokenKind::RParen
+}
+
 ///| Return true iff `[s, e)` is a proven-fresh allocation expression (independent container object).
 fn is_fresh_container_alloc(tokens : Array[Token], s : Int, e : Int) -> Bool {
   if s >= e {
@@ -1061,11 +1078,6 @@ fn is_fresh_container_alloc(tokens : Array[Token], s : Int, e : Int) -> Bool {
   }
   // `[...]` array literal
   if tokens[s].kind == TokenKind::LBracket && find_matching_delim(tokens, s) == e - 1 {
-    return true
-  }
-  // `<expr>.copy()`
-  if e >= s + 4 && tokens[e - 4].kind == TokenKind::Dot && tokens[e - 3].raw == "copy" &&
-  tokens[e - 2].kind == TokenKind::LParen && tokens[e - 1].kind == TokenKind::RParen {
     return true
   }
   // `mbt_compat::arr_copy(...)` / `array_slice_clamp(...)` / `arr_concat(...)` / `arr_filter(...)` / `arr_filter_map(...)` / `arr_map(...)` / `OrderedMap::new()` / `ordered_set_new()`
@@ -1265,6 +1277,9 @@ fn stage_b_scope_may_mutate(
   let mut k = s
   while k < e {
     let tk = tokens[k]
+    if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline {
+      return true
+    }
     // 0. Child block `{ ... }` — isolate inner `let` bindings, propagate revocations of existing `inner_fresh` keys
     if tk.kind == TokenKind::LBrace {
       let rb = find_matching_delim(tokens, k)
@@ -1736,7 +1751,8 @@ fn stage_b_check_array_retain_mutation_with_root(
         if eq_i < fn_rb && tokens[eq_i].kind == TokenKind::Eq && eq_i + 1 < fn_rb {
           let rhs_s = eq_i + 1
           let rhs_e = find_expr_end(tokens, rhs_s, fn_rb)
-          if is_fresh_container_alloc(tokens, rhs_s, rhs_e) && lhs_name != recv_root && recv_root != "__MBT2PION_UNKNOWN_RECV__" {
+          if (is_fresh_container_alloc(tokens, rhs_s, rhs_e) || is_recv_arr_copy_expr(tokens, rhs_s, rhs_e, recv_root, fresh_disjoint)) &&
+          lhs_name != recv_root && recv_root != "__MBT2PION_UNKNOWN_RECV__" {
             fresh_disjoint[lhs_name] = true
           }
           if tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn" &&
@@ -1791,7 +1807,7 @@ fn stage_b_check_array_retain_mutation_with_root(
         if eq_i < fn_rb && tokens[eq_i].kind == TokenKind::Eq && eq_i + 1 < fn_rb {
           let rhs_s = eq_i + 1
           let rhs_e = find_expr_end(tokens, rhs_s, fn_rb)
-          if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) {
+          if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) && !is_recv_arr_copy_expr(tokens, rhs_s, rhs_e, recv_root, fresh_disjoint) {
             fresh_disjoint.remove(lhs_name)
             if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
               revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, fresh_disjoint)
@@ -1805,7 +1821,7 @@ fn stage_b_check_array_retain_mutation_with_root(
       let rhs_s = si + 2
       let rhs_e = find_expr_end(tokens, rhs_s, fn_rb)
       local_fn_bodies.remove(st.raw)
-      if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) {
+      if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) && !is_recv_arr_copy_expr(tokens, rhs_s, rhs_e, recv_root, fresh_disjoint) {
         fresh_disjoint.remove(st.raw)
         if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
           revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, fresh_disjoint)
@@ -3401,7 +3417,8 @@ fn iter_arg_tokens_are_pure(tokens : Array[Token], start : Int, end : Int) -> Bo
   while k < end {
     let tk = tokens[k].kind
     if tk == TokenKind::LBrace || tk == TokenKind::Eq || tk == TokenKind::AssignOp ||
-    tk == TokenKind::PipeGt || tk == TokenKind::LBracket {
+    tk == TokenKind::PipeGt || tk == TokenKind::LBracket ||
+    tk == TokenKind::InterpString || tk == TokenKind::InterpMultiline {
       return false
     }
     if tk == TokenKind::LParen && k > start {
@@ -3670,6 +3687,9 @@ fn stage_b_check_array_iter_mutation_cached(
     let mut si = fn_lb + 1
     while si < fn_rb {
       let st = tokens[si]
+      if st.kind == TokenKind::InterpString || st.kind == TokenKind::InterpMultiline {
+        xs_ok = false
+      }
       // Check fresh local declaration: `let [mut] <xs> [: T] = [...] | Array::new(...) | Array::make(...)`
       if st.kind == TokenKind::Keyword && st.raw == "let" {
         let mut ni = si + 1
@@ -3686,10 +3706,12 @@ fn stage_b_check_array_iter_mutation_cached(
             }
           }
           if eq_i + 1 < fn_rb && tokens[eq_i].kind == TokenKind::Eq {
+            let rhs_e = find_expr_end(tokens, eq_i + 1, fn_rb)
             let rhs = tokens[eq_i + 1]
-            let fresh_rhs = rhs.kind == TokenKind::LBracket ||
-            (rhs.raw == "Array" && eq_i + 3 < fn_rb && tokens[eq_i + 2].kind == TokenKind::ColonColon &&
-              (tokens[eq_i + 3].raw == "new" || tokens[eq_i + 3].raw == "make" || tokens[eq_i + 3].raw == "from_iter"))
+            let fresh_rhs = (rhs.kind == TokenKind::LBracket && find_matching_delim(tokens, eq_i + 1) == rhs_e - 1) ||
+            (rhs.raw == "Array" && eq_i + 4 < rhs_e && tokens[eq_i + 2].kind == TokenKind::ColonColon &&
+              (tokens[eq_i + 3].raw == "new" || tokens[eq_i + 3].raw == "make" || tokens[eq_i + 3].raw == "from_iter") &&
+              tokens[eq_i + 4].kind == TokenKind::LParen && find_matching_delim(tokens, eq_i + 4) == rhs_e - 1)
             if fresh_rhs && xs_decl_idx < 0 && ni < dot_i {
               xs_is_fresh_local = true
               xs_decl_idx = ni
@@ -3706,14 +3728,21 @@ fn stage_b_check_array_iter_mutation_cached(
       !(si > fn_lb && (tokens[si - 1].kind == TokenKind::Dot || tokens[si - 1].kind == TokenKind::ColonColon)) {
         if si != xs_decl_idx && si != dot_i - 1 {
           let is_dot_call = si + 3 < fn_rb && tokens[si + 1].kind == TokenKind::Dot && tokens[si + 3].kind == TokenKind::LParen
-          let is_allowed_method = is_dot_call && (
+          let mut is_allowed_method = false
+          if is_dot_call && (
             tokens[si + 2].raw == "push" || tokens[si + 2].raw == "length" ||
             tokens[si + 2].raw == "is_empty" || tokens[si + 2].raw == "copy"
-          )
+          ) {
+            let mrp = find_matching_delim(tokens, si + 3)
+            if iter_arg_tokens_are_pure(tokens, si + 4, mrp) {
+              is_allowed_method = true
+            }
+          }
           let mut is_read_index = false
           if si + 1 < fn_rb && tokens[si + 1].kind == TokenKind::LBracket {
             let cbr = find_matching_delim(tokens, si + 1)
-            if cbr + 1 >= fn_rb || (tokens[cbr + 1].kind != TokenKind::Eq && tokens[cbr + 1].kind != TokenKind::AssignOp) {
+            if iter_arg_tokens_are_pure(tokens, si + 2, cbr) &&
+            (cbr + 1 >= fn_rb || (tokens[cbr + 1].kind != TokenKind::Eq && tokens[cbr + 1].kind != TokenKind::AssignOp)) {
               is_read_index = true
             }
           }
