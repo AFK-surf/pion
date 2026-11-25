@@ -53,12 +53,14 @@ pub fn run_f2_2() -> String {
   let f : Float = hue_calc((0.25 : Float), (0.75 : Float), (3.5 : Float))
   let d0 : Double = (0 : Double) + (0x10 : Double)
   let big_hex : Double = (0x80000000 : Double)
+  let u64_hi : Bool = (0x8000000000000000 : Double) > 0.0
+  let neg_z : Bool = 1.0 / (-0x0 : Double) < 0.0
   let i64 : Int64 = (42 : Int64)
   let x : Double = 3.5
   let xd : Double = (x : Double) * 2.0
   let opt : Int? = (None : Int?)
   let o = match opt { Some(v) => v; None => 9 }
-  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + big_hex.to_int64().to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
+  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + big_hex.to_int64().to_string() + "," + u64_hi.to_string() + "," + neg_z.to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
 }
 
 fn lookup_kind(k : Int) -> Int? {
@@ -77,8 +79,11 @@ pub fn run_f2_3() -> String {
         lookup_kind(y) is Some(kind) => x + kind
       (Some(x), _) if probe(2, x > 10) => x * 2
       (Some(x), None) if {
-        let y = x + 1
-        y > 5
+        let s =
+          #|one}
+          #|two//
+        let y = x + s.length()
+        y > 15
       } => x + 100
       (Some(x), None) | (None, Some(x)) if x < 0 => -x
       _ => -99
@@ -135,6 +140,16 @@ pub fn run_all() -> String {
 }
 '''
 
+SHADOW_MBT = r'''
+fn Int::min(self : Int, y : Int) -> Int {
+  self + y
+}
+
+pub fn run_local_int_min() -> Int {
+  Int::min(2, 3)
+}
+'''
+
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
     if p.returncode != 0:
@@ -151,31 +166,39 @@ def main():
         bin_path = os.path.join(work, "mbt2pion")
         run_cmd([args.pionc, "build", CLI_DIR, "-o", bin_path])
         md = os.path.join(work, "moon_proj")
-        for sub in ("lib", "cmd"):
+        for sub in ("lib", "shadow", "cmd"):
             os.makedirs(os.path.join(md, sub))
         for rel, txt in [
             ("moon.mod", 'name = "f2/oracle"\n'),
             ("lib/moon.pkg", "\n"),
             ("lib/f2.mbt", F2_MBT),
-            ("cmd/moon.pkg", 'import { "f2/oracle/lib" }\npkgtype(kind: "executable")\n'),
-            ("cmd/main.mbt", 'fn main { println(@lib.run_all()) }\n'),
+            ("shadow/moon.pkg", "\n"),
+            ("shadow/shadow.mbt", SHADOW_MBT),
+            ("cmd/moon.pkg", 'import { "f2/oracle/lib", "f2/oracle/shadow" }\npkgtype(kind: "executable")\n'),
+            ("cmd/main.mbt", 'fn main { println(@lib.run_all() + "\\nF2-5:" + @shadow.run_local_int_min().to_string()) }\n'),
         ]:
             open(os.path.join(md, rel), "w").write(txt)
         moon_out = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=md)
 
+        ps = os.path.join(work, "p_shadow")
+        os.makedirs(os.path.join(ps, "src"))
+        run_cmd([bin_path, "--src", os.path.join(md, "shadow"), "--out", os.path.join(ps, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        open(os.path.join(ps, "pion.toml"), "w").write(f'[package]\nname = "shadow"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+
         pl = os.path.join(work, "p_lib")
         os.makedirs(os.path.join(pl, "src"))
         run_cmd([bin_path, "--src", os.path.join(md, "lib"), "--out", os.path.join(pl, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
-        open(os.path.join(pl, "pion.toml"), "w").write(f'[package]\nname = "f2lib"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
-        open(os.path.join(pl, "src", "main.pion"), "w").write('pub fn main(w : World) -> Int { io_println(w, run_all()); 0 }\n')
+        open(os.path.join(pl, "pion.toml"), "w").write(f'[package]\nname = "f2lib"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nshadow = {{ path = "{ps}" }}\n')
+        open(os.path.join(pl, "src", "main.pion"), "w").write('import "shadow"\npub fn main(w : World) -> Int { io_println(w, run_all() + "\\nF2-5:" + shadow::run_local_int_min().to_string()); 0 }\n')
         pion_native = run_cmd([args.pionc, "run", pl])
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", pl])
 
         expected = (
             "F2-1:has_loc|has_loc|has_loc,has_loc,pos_opt|def_loc\n"
-            "F2-2:50,16,2147483648,42,7,9\n"
+            "F2-2:50,16,2147483648,true,true,42,7,9\n"
             "F2-3:43,30,5,7,106,-99|1-1-2-2-2\n"
-            "F2-4:3,2,-4|5,9,-1|+1,+1,+0,-0,+2|+1,+1,+0,-0,+5|11,22"
+            "F2-4:3,2,-4|5,9,-1|+1,+1,+0,-0,+2|+1,+1,+0,-0,+5|11,22\n"
+            "F2-5:5"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
