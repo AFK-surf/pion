@@ -157,6 +157,16 @@ def main : IO Unit := do
   report "map_str" diff_cases.c_map_str
   report "map_int" diff_cases.c_map_int
   report "double_bits" diff_cases.c_double_bits
+  report "match_unit_enum" diff_cases.c_match_unit_enum
+  report "match_guarded_enum" diff_cases.c_match_guarded_enum
+  report "match_single_ctor_guard" diff_cases.c_match_single_ctor_guard
+  report "match_const_pat" diff_cases.c_match_const_pat
+  report "match_wild_tail" diff_cases.c_match_wild_tail
+  report "match_is_single_ctor" diff_cases.c_match_is_single_ctor
+  report "match_peeled_dead_arm" diff_cases.c_match_peeled_dead_arm
+  report "match_exhaustive_wild" diff_cases.c_match_exhaustive_wild
+  report "match_dup_arm" diff_cases.c_match_dup_arm
+  report "match_nested_dup" diff_cases.c_match_nested_dup
 
 end PionDiff
 
