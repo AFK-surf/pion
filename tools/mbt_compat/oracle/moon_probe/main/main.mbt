@@ -832,6 +832,15 @@ fn case_wave_m2b_parse() -> Unit {
   let cv3 = "abc".clamped_view(start=2, end=1).to_string()
   trace("str_views", "\{sv1}|\{sv2}|\{cv1}|\{cv2}|\{cv3}")
   check("m2b.str_views", sv1 == "bc" && sv2 == "b" && cv1 == "bc" && cv2 == "abc" && cv3 == "")
+
+  // P1-6: xxHash32 Hasher exact bit-for-bit match
+  let h7 = Hash::hash(7)
+  let h42 = Hash::hash(42)
+  let hstr = Hash::hash("hello")
+  let hpi = Hash::hash(3.14)
+  let hz_eq = Hash::hash(-0.0) == Hash::hash(0.0)
+  trace("xxhash32", "\{h7},\{h42},\{hstr},\{hpi},\{hz_eq}")
+  check("m2b.xxhash32", h7 == -427046664 && h42 == 1161967057 && hstr == -655549713 && hpi == -428265677 && hz_eq)
 }
 
 ///|

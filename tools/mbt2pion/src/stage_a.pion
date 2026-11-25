@@ -243,7 +243,10 @@ pub fn lower_type_tokens(
       piece = qname
     } else if t.kind == TokenKind::UpperIdent {
       let mut name = t.raw
-      if name == "SourceLoc" {
+      if symtab.active_generics.contains(name) {
+        // P1 (P0-4): Active generic type param (e.g. `fn[Json] id(x : Json) -> Json`) MUST stay untouched!
+        name = t.raw
+      } else if name == "SourceLoc" {
         name = "String"
       } else if name == "StringView" {
         name = "String"
@@ -4086,7 +4089,12 @@ fn lower_one_token_or_form(
       let close_b = find_matching_delim(tokens, brace_i)
       let scrut_ty = infer_simple_expr_type(ctx, tokens, i + 1, brace_i)
       let scrut = lower_expr_range(ctx, tokens, i + 1, brace_i, file, false)
+      // P0-2: Push sentinel so outer match's array element cache NEVER leaks into a nested `match`!
+      ctx.match_arr_cache_ctor.push("__BLOCKED__")
+      ctx.match_arr_cache_elems.push([])
       let arms = lower_match_arms_with_ty(ctx, tokens, brace_i + 1, close_b, file, scrut_ty)
+      let _ = ctx.match_arr_cache_ctor.pop()
+      let _ = ctx.match_arr_cache_elems.pop()
       return (trivia + "match" + scrut + tokens[brace_i].leading_trivia + "{" + arms + tokens[close_b].leading_trivia + "}", close_b + 1)
     }
   }
@@ -5587,6 +5595,9 @@ fn lower_match_arms_with_ty(
     let pat_end = if if_idx >= 0 { if_idx } else { fa }
     let saved_arm_sc = ctx.scope_vars.length()
     push_scope_binders(ctx, collect_pattern_binders(tokens, i, pat_end))
+    // P0-2: Block outer match's array element cache while lowering arm guard & body so nested matches never read outer cache!
+    ctx.match_arr_cache_ctor.push("__BLOCKED__")
+    ctx.match_arr_cache_elems.push([])
     let guard_str = if if_idx >= 0 {
       lower_expr_range(ctx, tokens, if_idx + 1, fa, file, false).trim()
     } else {
@@ -5612,6 +5623,8 @@ fn lower_match_arms_with_ty(
       body_raw = lower_expr_range(ctx, tokens, body_start, body_end, file, false)
       next_i = body_end
     }
+    let _ = ctx.match_arr_cache_ctor.pop()
+    let _ = ctx.match_arr_cache_elems.pop()
     restore_scope_vars(ctx, saved_arm_sc)
     let mut trail_sep = ""
     if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
@@ -8201,13 +8214,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 ))
               } else {
                 ctx.symtab.hashable_types[tname] = true
-                let hash_body = if kind_kw == "struct" {
-                  gen_struct_hash_body("self", field_types)
+                let hc_body = if kind_kw == "struct" {
+                  gen_struct_hash_combine_body("self", "hasher", field_types)
                 } else {
-                  gen_enum_hash_body("self", enum_variants)
+                  gen_enum_hash_combine_body("self", "hasher", enum_variants)
                 }
-                recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  " + hash_body + "\n}\n")
-                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash(self : " + tname + ") -> Int {\n    self.hash()\n  }\n}\n")
+                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
+                recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
               }
             }
             // Declarative recipe trait-impl synthesis for BOTH `struct` and `enum` (zero hardcoded project symbols!)
@@ -8425,9 +8438,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 ))
               } else {
                 ctx.symtab.hashable_types[tname] = true
-                let hash_body = gen_struct_hash_body("self", field_types)
-                recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  " + hash_body + "\n}\n")
-                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash(self : " + tname + ") -> Int {\n    self.hash()\n  }\n}\n")
+                let hc_body = gen_struct_hash_combine_body("self", "hasher", field_types)
+                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
+                recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
               }
             }
             for tr in ctx.recipes.trait_recipes {
@@ -8668,6 +8681,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             if !prev_c {
               fn_generic_names.push(tokens[gi].raw)
               ctx.active_generics[tokens[gi].raw] = true
+              ctx.symtab.active_generics[tokens[gi].raw] = true
             }
           }
           gi = gi + 1
@@ -8800,6 +8814,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           ctx.cur_fn_ret_ty = saved_ret_ty
           for gn in fn_generic_names {
             ctx.active_generics.remove(gn)
+            ctx.symtab.active_generics.remove(gn)
           }
           let decl_code = vis + extern_prefix + "fn " + fn_name + "(" + p_str + ")" + ret_str + " " + body
           let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)
@@ -9285,6 +9300,66 @@ fn gen_hash_expr(v : String, ty : String, depth : Int) -> String {
   }
   // Recursive trait `hash` call for nested key types
   v + ".hash()"
+}
+
+fn gen_hash_combine_stmt(v : String, ty : String, hasher : String) -> String {
+  let t = ty.trim()
+  if t.starts_with("Option[") && t.ends_with("]") {
+    let inner = t.slice(7, t.length() - 1).trim()
+    return "match " + v + " { Option::None => " + hasher + ".combine_int(0), Option::Some(__hv) => { " + hasher + ".combine_int(1); " + gen_hash_combine_stmt("__hv", inner, hasher) + " } }"
+  }
+  if t.starts_with("Array[") && t.ends_with("]") {
+    let inner = t.slice(6, t.length() - 1).trim()
+    return "for __he in " + v + " { " + gen_hash_combine_stmt("__he", inner, hasher) + " }"
+  }
+  v + ".hash_combine(" + hasher + ")"
+}
+
+fn gen_struct_hash_combine_body(self_var : String, hasher : String, field_types : Array[(String, String)]) -> String {
+  if field_types.length() == 0 {
+    return "let _ = " + hasher
+  }
+  let sb = StringBuilder()
+  let mut k = 0
+  while k < field_types.length() {
+    let ft = field_types[k]
+    if k > 0 { sb.write_string("\n    ") }
+    sb.write_string(gen_hash_combine_stmt(self_var + "." + ft.0, ft.1, hasher))
+    k = k + 1
+  }
+  sb.to_string()
+}
+
+fn gen_enum_hash_combine_body(self_var : String, hasher : String, variants : Array[(String, Array[String])]) -> String {
+  if variants.length() == 0 {
+    return "let _ = " + hasher
+  }
+  let sb = StringBuilder()
+  sb.write_string("match " + self_var + " {\n")
+  let mut tag = 0
+  for v in variants {
+    let vname = v.0
+    let args = v.1
+    if args.length() == 0 {
+      sb.write_string("      ." + vname + " => " + hasher + ".combine_int(" + tag.to_string() + ")\n")
+    } else {
+      let pat_vars : Array[String] = []
+      let body_sb = StringBuilder()
+      body_sb.write_string("{ " + hasher + ".combine_int(" + tag.to_string() + "); ")
+      let mut k = 0
+      while k < args.length() {
+        let vn = "__v" + k.to_string()
+        pat_vars.push(vn)
+        body_sb.write_string(gen_hash_combine_stmt(vn, args[k], hasher) + "; ")
+        k = k + 1
+      }
+      body_sb.write_string("}")
+      sb.write_string("      ." + vname + "(" + join_comma(pat_vars) + ") => " + body_sb.to_string() + "\n")
+    }
+    tag = tag + 1
+  }
+  sb.write_string("    }")
+  sb.to_string()
 }
 
 fn gen_struct_hash_body(self_var : String, field_types : Array[(String, String)]) -> String {
