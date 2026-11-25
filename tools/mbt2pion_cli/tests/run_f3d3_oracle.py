@@ -56,10 +56,23 @@ pub(all) struct DepValFields {
   val_ : Int
 }
 
+pub(all) struct DepKwFields {
+  scope : Int
+  scope_ : Int
+}
+
 pub(all) struct DepOpRow {
   mut a : Int
   b : Int
   c : Int
+}
+
+pub(all) struct T {
+  v : Int
+}
+
+pub fn make_t(v : Int) -> T {
+  T::{ v: v }
 }
 
 #callsite(autofill(loc))
@@ -363,6 +376,13 @@ priv struct GenRow[T] {
   c : Int
 }
 
+priv struct QualGenRow[T] {
+  mut a : Int
+  b : @f3d3dep.T
+  d : T
+  c : Int
+}
+
 priv struct Ping {
   f : () -> Unit
 }
@@ -409,6 +429,9 @@ pub fn run_f3d3_7() -> String {
   let g3t = GenRow::{ ..g3, c: { g3.a = 6; 7 }, b: [0.1] }
   let cr0 : CompRow = { a: 1, b: [0.5], o: None, p: (0.5, 0), c: 3 }
   let cr1 = CompRow::{ ..cr0, c: { cr0.a = 5; 7 }, b: [0.1], o: Some(0.2), p: (0.3, 1) }
+  // Generic struct with qualified `@f3d3dep.T` field (must NOT rewrite `f3d3dep::T` to `f3d3dep::Int`)
+  let qg0 : QualGenRow[Int] = { a: 1, b: @f3d3dep.make_t(2), d: 3, c: 4 }
+  let qg1 = QualGenRow::{ ..qg0, c: { qg0.a = 9; 7 }, b: @f3d3dep.make_t(5) }
 
   // P1-2: shadowed `panic(...)` must NOT be treated as diverging (else must NOT run)
   let panic = fn(_s : String) -> Unit { () }
@@ -448,12 +471,25 @@ pub fn run_f3d3_7() -> String {
   let j2 = Json::array(jfs.map(fn(f) {
     { "x": Json::number(f.x) }
   }))
+  // Chained `.map(...).map(...)`, `Json::number(m.get("n").unwrap_or(0).to_double())`, and `.filter_map(...)`
+  let jxs : Array[Int] = [0, 2]
+  let j3_arr : Array[Json] = jxs.map(fn(x) { { "n": x } }).map(fn(m) {
+    Json::number(m.get("n").unwrap_or(0).to_double())
+  })
+  let j4_arr : Array[Json] = jxs.map(fn(x) {
+    let m : Map[String, Int] = { "n": x }
+    Json::number(m.get("n").unwrap_or(0).to_double())
+  })
+  let j5_arr : Array[Json] = jxs.filter_map(fn(x) {
+    if x == 0 { None } else { Some({ "x": Json::number(1.5) }) }
+  })
 
   t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
-  op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "," + g3t.a.to_string() + "," + cr1.a.to_string() + "|" +
+  op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "," + g3t.a.to_string() + "," + cr1.a.to_string() + "," + qg1.a.to_string() + "," + qg1.b.v.to_string() + "|" +
   n_p.to_string() + "|" +
   vb_pkg.to_string() + "," + vb2.to_string() + "|" +
-  vf_r.to_string() + "|" + gs_r + "|" + j1.stringify() + "|" + j2.stringify()
+  vf_r.to_string() + "|" + gs_r + "|" + j1.stringify() + "|" + j2.stringify() + "|" +
+  Json::array(j3_arr).stringify() + "|" + Json::array(j4_arr).stringify() + "|" + Json::array(j5_arr).stringify()
 }
 
 pub fn run_all() -> String {
@@ -581,8 +617,8 @@ pub fn f(s : @f3d3dep.StrBoxed) -> Int {
 '''
 
 NEG_FOREIGN_VAL_PAT_MBT = r'''
-pub fn f(v : @f3d3dep.DepValFields?) -> Int {
-  if v is Some({ val: a, val_: b }) && true {
+pub fn f(v : @f3d3dep.DepKwFields?) -> Int {
+  if v is Some({ scope: a, scope_: b }) && true {
     a * 10 + b
   } else {
     0
@@ -678,7 +714,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            'F3d3-7:9,9,88,7,9,9,8,6,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]'
+            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]'
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"

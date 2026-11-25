@@ -36,7 +36,6 @@ import PionProofs.QbeFrontendColdSpeedOpts
 import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
-import PionProofs.QbeDoubleSimdSlp
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -829,15 +828,3 @@ import PionProofs.QbeDoubleSimdSlp
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.run_prefix
-#print axioms PionQbeDoubleSimdSlp.ordered
-#print axioms PionQbeDoubleSimdSlp.earlyRead
-#print axioms PionQbeDoubleSimdSlp.frame
-#print axioms PionQbeDoubleSimdSlp.preserves
-#print axioms PionQbeDoubleSimdSlp.disjoint
-#print axioms PionQbeDoubleSimdSlp.allocate
-#print axioms PionQbeDoubleSimdSlp.separate
-#print axioms PionQbeDoubleSimdSlp.lowOnly
-#print axioms PionQbeDoubleSimdSlp.callReload
-#print axioms PionQbeDoubleSimdSlp.leafFrameAligned
-#print axioms PionQbeDoubleSimdSlp.maskedVector
-#print axioms PionQbeDoubleSimdSlp.trapScalar

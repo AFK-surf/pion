@@ -5890,12 +5890,14 @@ fn wasm_is_sym_char(c : Int) -> Bool {
 }
 
 ///|
-/// Alpha-rename all file-local (non-exported) QBE `data` and `function` symbols in a package SSA
-/// unit so multi-package `--target wasm32` builds never collide on `pion_clo_*`, `pion_str_*`, etc.
-pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
+fn wasm_scan_ssa_defs(
+  ssa : String,
+  locals : Array[String],
+  local_is_fn : Array[Bool],
+  exports : Map[String, Bool],
+  all_defs : Map[String, Bool],
+) -> Unit {
   let n = ssa.length()
-  let local_syms : Map[String, Bool] = Map([])
-  let mut count = 0
   let mut pos = 0
   while pos < n {
     let mut eol = pos
@@ -5907,36 +5909,109 @@ pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
     let la = wasm_skip_ws_range(ssa, pos, cend)
     let lb = wasm_rtrim_ws_range(ssa, la, cend)
     if lb > la {
-      if wasm_starts_with_at(ssa, la, lb, "data ") {
-        let eq = wasm_find_char_range(ssa, 61, la, lb)
-        if eq > la {
-          let dl = wasm_find_char_range(ssa, 36, la, eq)
+      let mut is_exp = false
+      let mut da = la
+      if wasm_starts_with_at(ssa, la, lb, "export ") {
+        is_exp = true
+        da = wasm_skip_ws_range(ssa, la + 7, lb)
+      }
+      if wasm_starts_with_at(ssa, da, lb, "data ") {
+        let eq = wasm_find_char_range(ssa, 61, da, lb)
+        if eq > da {
+          let dl = wasm_find_char_range(ssa, 36, da, eq)
           if dl >= 0 {
             let nb = wasm_rtrim_ws_range(ssa, dl + 1, eq)
             if nb > dl + 1 {
-              local_syms.set(slice_str(ssa, dl + 1, nb), true)
-              count = count + 1
+              let sym = slice_str(ssa, dl + 1, nb)
+              all_defs.set(sym, true)
+              if is_exp {
+                exports.set(sym, true)
+              } else {
+                locals.push(sym)
+                local_is_fn.push(false)
+              }
             }
           }
         }
-      } else if wasm_starts_with_at(ssa, la, lb, "function ") {
-        let dl = wasm_find_char_range(ssa, 36, la + 9, lb)
+      } else if wasm_starts_with_at(ssa, da, lb, "function ") {
+        let dl = wasm_find_char_range(ssa, 36, da + 9, lb)
         let lp = if dl >= 0 { wasm_find_char_range(ssa, 40, dl + 1, lb) } else { -1 }
         if dl >= 0 && lp > dl + 1 {
           let nb = wasm_rtrim_ws_range(ssa, dl + 1, lp)
           if nb > dl + 1 {
-            local_syms.set(slice_str(ssa, dl + 1, nb), true)
-            count = count + 1
+            let sym = slice_str(ssa, dl + 1, nb)
+            all_defs.set(sym, true)
+            if is_exp {
+              exports.set(sym, true)
+            } else {
+              locals.push(sym)
+              local_is_fn.push(true)
+            }
           }
         }
       }
     }
     pos = next_pos
   }
-  if count == 0 {
-    return ssa
-  }
+}
 
+///|
+fn wasm_scan_ssa_all_syms(
+  ssa : String,
+  all_syms : Map[String, Bool],
+  local_set : Map[String, Bool],
+  non_local_syms : Map[String, Bool],
+  collect_non_local : Bool,
+) -> Unit {
+  let n = ssa.length()
+  let mut i = 0
+  let mut in_str = false
+  let mut esc = false
+  let mut in_comment = false
+  while i < n {
+    let c = str_code_at(ssa, i)
+    if in_comment {
+      if c == 10 {
+        in_comment = false
+      }
+      i = i + 1
+    } else if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+      i = i + 1
+    } else if c == 34 {
+      in_str = true
+      i = i + 1
+    } else if c == 35 {
+      in_comment = true
+      i = i + 1
+    } else if c == 36 {
+      let mut j = i + 1
+      while j < n && wasm_is_sym_char(str_code_at(ssa, j)) {
+        j = j + 1
+      }
+      if j > i + 1 {
+        let sym = slice_str(ssa, i + 1, j)
+        all_syms.set(sym, true)
+        if collect_non_local && !local_set.contains(sym) {
+          non_local_syms.set(sym, true)
+        }
+      }
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+}
+
+///|
+fn wasm_rename_ssa_syms(ssa : String, renames : Map[String, String]) -> String {
+  let n = ssa.length()
   let sb = StringBuilder()
   let mut i = 0
   let mut seg_start = 0
@@ -5972,14 +6047,13 @@ pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
       }
       if j > i + 1 {
         let sym = slice_str(ssa, i + 1, j)
-        match local_syms.get(sym) {
-          Some(_) => {
+        match renames.get(sym) {
+          Some(renamed) => {
             if i > seg_start {
               sb.write_string(slice_str(ssa, seg_start, i))
             }
             sb.write_char('$')
-            sb.write_string(prefix)
-            sb.write_string(sym)
+            sb.write_string(renamed)
             seg_start = j
           }
           None => ()
@@ -5990,10 +6064,146 @@ pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
       i = i + 1
     }
   }
+  if seg_start == 0 {
+    return ssa
+  }
   if seg_start < n {
     sb.write_string(slice_str(ssa, seg_start, n))
   }
   sb.to_string()
+}
+
+///|
+/// Alpha-rename all file-local (non-exported) QBE `data` and `function` symbols in a package SSA
+/// unit so multi-package `--target wasm32` builds never collide on `pion_clo_*`, `pion_str_*`, etc.
+/// Preserves `pion_drop_{slots,struct,enum,clo}_` category prefixes and avoids all local, exported,
+/// and external symbol references (e.g. host imports or cross-unit callees) in the unit.
+pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
+  let locals : Array[String] = []
+  let local_is_fn : Array[Bool] = []
+  let occupied : Map[String, Bool] = Map([])
+  wasm_scan_ssa_defs(ssa, locals, local_is_fn, occupied, occupied)
+  if locals.length() == 0 {
+    return ssa
+  }
+  wasm_scan_ssa_all_syms(ssa, occupied, occupied, occupied, false)
+  let local_syms : Map[String, String] = Map([])
+  let mut li = 0
+  while li < locals.length() {
+    let sym = locals[li]
+    let base_renamed = if local_is_fn[li] {
+      if sym.starts_with("pion_drop_slots_") {
+        "pion_drop_slots_" + prefix + slice_str(sym, 16, sym.length())
+      } else if sym.starts_with("pion_drop_struct_") {
+        "pion_drop_struct_" + prefix + slice_str(sym, 17, sym.length())
+      } else if sym.starts_with("pion_drop_enum_") {
+        "pion_drop_enum_" + prefix + slice_str(sym, 15, sym.length())
+      } else if sym.starts_with("pion_drop_clo_") {
+        "pion_drop_clo_" + prefix + slice_str(sym, 14, sym.length())
+      } else {
+        prefix + sym
+      }
+    } else {
+      prefix + sym
+    }
+    let mut cand = base_renamed
+    if occupied.contains(cand) {
+      let mut k = 1
+      while occupied.contains(cand) {
+        cand = base_renamed + "_d" + k.to_string()
+        k = k + 1
+      }
+    }
+    occupied.set(cand, true)
+    local_syms.set(sym, cand)
+    li = li + 1
+  }
+  wasm_rename_ssa_syms(ssa, local_syms)
+}
+
+///|
+/// Cross-unit local symbol disambiguation: guarantees no non-exported `function` or `data`
+/// symbol in any unit collides with any exported symbol, external symbol reference (host import
+/// or cross-unit callee), or another unit's local symbol.
+/// Zero-copy when no collision occurs; preserves `pion_drop_*` prefixes by suffixing only.
+fn wasm_disambiguate_unit_locals(units : Array[String]) -> Array[String] {
+  let nu = units.length()
+  let unit_locals : Array[Array[String]] = []
+  let global_reserved : Map[String, Bool] = Map([])
+  let global_all_syms : Map[String, Bool] = Map([])
+  let mut ui = 0
+  while ui < nu {
+    let locs : Array[String] = []
+    let loc_is_fn : Array[Bool] = []
+    wasm_scan_ssa_defs(units[ui], locs, loc_is_fn, global_reserved, global_all_syms)
+    let local_set : Map[String, Bool] = Map([])
+    let mut lsi = 0
+    while lsi < locs.length() {
+      local_set.set(locs[lsi], true)
+      lsi = lsi + 1
+    }
+    wasm_scan_ssa_all_syms(units[ui], global_all_syms, local_set, global_reserved, true)
+    unit_locals.push(locs)
+    ui = ui + 1
+  }
+  let seen_locals : Map[String, Bool] = Map([])
+  let mut changed = false
+  let mut out : Array[String] = units
+  ui = 0
+  while ui < nu {
+    let locs = unit_locals[ui]
+    let mut has_collision = false
+    let mut li = 0
+    while li < locs.length() {
+      let sym = locs[li]
+      if global_reserved.contains(sym) || seen_locals.contains(sym) {
+        has_collision = true
+        break
+      }
+      li = li + 1
+    }
+    if !has_collision {
+      li = 0
+      while li < locs.length() {
+        seen_locals.set(locs[li], true)
+        li = li + 1
+      }
+    } else {
+      if !changed {
+        changed = true
+        out = []
+        let mut ci = 0
+        while ci < nu {
+          out.push(units[ci])
+          ci = ci + 1
+        }
+      }
+      let renames : Map[String, String] = Map([])
+      li = 0
+      while li < locs.length() {
+        let sym = locs[li]
+        if global_reserved.contains(sym) || seen_locals.contains(sym) {
+          let mut k = 1
+          let mut cand = sym + "__u" + ui.to_string() + "_" + k.to_string()
+          while global_reserved.contains(cand) ||
+            global_all_syms.contains(cand) ||
+            seen_locals.contains(cand) {
+            k = k + 1
+            cand = sym + "__u" + ui.to_string() + "_" + k.to_string()
+          }
+          global_all_syms.set(cand, true)
+          seen_locals.set(cand, true)
+          renames.set(sym, cand)
+        } else {
+          seen_locals.set(sym, true)
+        }
+        li = li + 1
+      }
+      out[ui] = wasm_rename_ssa_syms(units[ui], renames)
+    }
+    ui = ui + 1
+  }
+  out
 }
 
 ///|
@@ -6568,14 +6778,59 @@ fn wasm_emit_inline_rc_dec_leaf(
 }
 
 ///|
+/// Depth-bounded recursive descent into non-leaf left child `ev0` (local 3, unique-owner rc=1).
+/// Shares P73 `drop_depth` (`slab_ctl + 80`): when `d < 64`, increments depth, calls `self_idx`,
+/// and restores depth (zero JS crossing on shallow/balanced trees); when `d >= 64`, defers via
+/// `rc_dec_idx(ev0)` -> `rc_dec_slow_entry` -> JS defer stack (preventing Wasm stack overflow
+/// on deep left-leaning trees).
+fn wasm_emit_drop_s2_recurse_ev0(
+  body : Array[Int],
+  self_idx : Int,
+  rc_dec_idx : Int,
+  slot_local : Int,
+  tf_from_param : Bool,
+) -> Unit {
+  // d (local 10) = i32.load(slab_ctl + 80)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  body.push(0x22); wasm_push_u32(body, 10) // local.tee 10 (d)
+  body.push(0x41); wasm_push_s32(body, 64)
+  body.push(0x49) // i32.lt_u
+  body.push(0x04); body.push(0x40) // if d <u 64
+  // i32.store(slab_ctl + 80, d + 1)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 10)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x6A) // i32.add
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  // call self_idx(i32.wrap_i64(ev0), slot_local, expected_tf)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0xA7)
+  body.push(0x20); wasm_push_u32(body, slot_local)
+  if tf_from_param {
+    body.push(0x20); wasm_push_u32(body, 2)
+  } else {
+    body.push(0x20); wasm_push_u32(body, 6); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 12)
+  }
+  body.push(0x10); wasm_push_u32(body, self_idx)
+  // i32.store(slab_ctl + 80, d)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 10)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  body.push(0x05) // else (d >=u 64): defer via rc_dec_idx(ev0)
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x10); wasm_push_u32(body, rc_dec_idx)
+  body.push(0x0B) // end if
+}
+
+///|
 /// P56-A: Ultra-compact specialized 2-slot Slab tree destructor `pion_drop_s2(p: i32, slot: i32, expected_tf: i32) -> void`.
 /// Handles direct 2-slot nodes (0x80000003), leaf children (tdrop == 0L, e.g. None/String), AND inline
 /// unwrapping of boxed `Some(Node)` wrappers (0x80000002 -> recycle Some -> single-load `expected_tf` check
 /// -> recurse/tail-loop directly into Node with zero `slot` recomputation and zero `pion_rc_dec_slow` re-entry).
 fn wasm_build_drop_s2_body(self_idx : Int, rc_dec_idx : Int) -> Array[Int] {
   // Params: 0=p(i32), 1=slot(i32), 2=expected_tf(i32)
-  // Locals: 3 i64 (3=ev0, 4=ev1, 5=tdrop) + 4 i32 (6=base/thdr, 7=tflags, 8=tslot, 9=ttag)
-  let body : Array[Int] = [0x02, 0x03, 0x7E, 0x04, 0x7F]
+  // Locals: 3 i64 (3=ev0, 4=ev1, 5=tdrop) + 5 i32 (6=base/thdr, 7=tflags, 8=tslot, 9=ttag, 10=depth)
+  let body : Array[Int] = [0x02, 0x03, 0x7E, 0x05, 0x7F]
   body.push(0x03); body.push(0x40) // loop $s2 [depth 0]
   // ev0 (3) = i64.load(p + 0); ev1 (4) = i64.load(p + 8)
   body.push(0x20); wasm_push_u32(body, 0); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
@@ -6626,10 +6881,7 @@ fn wasm_build_drop_s2_body(self_idx : Int, rc_dec_idx : Int) -> Array[Int] {
   body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0xA7)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 2)
-  body.push(0x10); wasm_push_u32(body, self_idx)
+  wasm_emit_drop_s2_recurse_ev0(body, self_idx, rc_dec_idx, 1, true)
   body.push(0x0B) // end 5
   body.push(0x0C); wasm_push_u32(body, 2) // br $ev0_done (4 - 2 = 2)
   body.push(0x0B) // end 4
@@ -6685,10 +6937,7 @@ fn wasm_build_drop_s2_body(self_idx : Int, rc_dec_idx : Int) -> Array[Int] {
   body.push(0x20); wasm_push_u32(body, 6); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
   body.push(0x42); wasm_push_s64(body, 2147483651L); body.push(0x51); body.push(0x71)
   body.push(0x04); body.push(0x40) // [depth 9: homomorphic inner Node -> direct call reusing slot & expected_tf!]
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0xA7)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 2)
-  body.push(0x10); wasm_push_u32(body, self_idx)
+  wasm_emit_drop_s2_recurse_ev0(body, self_idx, rc_dec_idx, 1, true)
   body.push(0x0C); wasm_push_u32(body, 7) // br $ev0_done (9 - 2 = 7)
   body.push(0x0B) // end 9
   body.push(0x20); wasm_push_u32(body, 3); body.push(0x10); wasm_push_u32(body, rc_dec_idx)
@@ -6710,10 +6959,7 @@ fn wasm_build_drop_s2_body(self_idx : Int, rc_dec_idx : Int) -> Array[Int] {
   body.push(0x20); wasm_push_u32(body, 8); body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0xA7)
-  body.push(0x20); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 12)
-  body.push(0x10); wasm_push_u32(body, self_idx)
+  wasm_emit_drop_s2_recurse_ev0(body, self_idx, rc_dec_idx, 8, false)
   body.push(0x0B) // end 9
   body.push(0x0C); wasm_push_u32(body, 6) // br $ev0_done (8 - 2 = 6)
   body.push(0x0B) // end 8
@@ -12410,7 +12656,8 @@ pub fn emit_wasm_from_ssa_units_opts(
   emit_names : Bool,
   on_stage : (String) -> Unit,
 ) -> Bytes {
-  let p1 = wasm_parse_ssa_live_units(units, on_stage)
+  let safe_units = wasm_disambiguate_unit_locals(units)
+  let p1 = wasm_parse_ssa_live_units(safe_units, on_stage)
   wasm_verify_strict_jnz(p1.funcs)
   on_stage("parse_p3_live_funcs(funcs=" + p1.funcs.length().to_string() + ",datas=" + p1.datas.length().to_string() + ")")
   let parsed_dedup = wasm_dedup_module(p1)
@@ -12441,9 +12688,11 @@ pub fn emit_wasm_from_ssa_units_opts(
   dci = 0
   while dci < outlined_funcs.length() {
     let df = outlined_funcs[dci]
-    if !direct_called.contains(df.name) &&
+    if !df.exported &&
+      !direct_called.contains(df.name) &&
       (df.name.starts_with("pion_drop_slots_") ||
         df.name.starts_with("pion_drop_struct_") ||
+        df.name.starts_with("pion_drop_enum_") ||
         df.name.starts_with("pion_drop_clo_")) {
       let sm = wasm_try_extract_slot_drop_mask(df)
       if sm != 0L {
