@@ -2882,5 +2882,9 @@ print("[e2e] PASS: Wave M2-D1 E2E suite (ABI v1 compat, ABI v2 test/wbtest isola
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
+sh "$(dirname "$0")/run_e2_e2e.sh" "$PIONC"
+if command -v moon >/dev/null 2>&1 || [ -x "$HOME/.moon/bin/moon" ]; then
+  python3 "$(dirname "$0")/run_e2_oracle.py" --pionc "$PIONC"
+fi
 
 echo "[e2e] ALL E2E TESTS PASSED!"
