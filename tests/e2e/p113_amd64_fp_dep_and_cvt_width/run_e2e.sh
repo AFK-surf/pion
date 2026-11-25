@@ -351,13 +351,13 @@ PYEOF
     sed "s/^/p113 driver $OBJ: /" "$TMP_DIR/driver_$OBJ.out"
   done
   cmp "$TMP_DIR/driver_direct.out" "$TMP_DIR/driver_gas.out"
-  # grep exits 1 (no match) or 2 (unreadable): both fail here.
-  GROUPS_OK=$(grep -cE '^[a-z_]+ ([0-9]+)/\1$' "$TMP_DIR/driver_direct.out") || {
-    echo "FAIL: p113 driver results missing or unreadable" >&2
-    exit 1
-  }
-  if [ "$GROUPS_OK" -ne 7 ]; then
-    echo "FAIL: p113 driver: $GROUPS_OK of 7 groups passed" >&2
+  # Exact group names and check counts: a group that silently lost its
+  # cases (0/0) fails here.
+  printf '%s\n' 'double_copy_neg_div 876/876' 'float_copy_neg_div 588/588' 'mem_copy 24/24' \
+    'isolated_cvt 53/53' 'grouped_cvt 128/128' 'pressure_cvt 128/128' 'slot_cvt 104/104' > "$TMP_DIR/driver.want"
+  if ! cmp -s "$TMP_DIR/driver.want" "$TMP_DIR/driver_direct.out"; then
+    diff -u "$TMP_DIR/driver.want" "$TMP_DIR/driver_direct.out" || true
+    echo "FAIL: p113 driver groups or check counts differ" >&2
     exit 1
   fi
 else

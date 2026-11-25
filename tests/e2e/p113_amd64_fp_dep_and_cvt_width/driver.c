@@ -49,7 +49,7 @@ static int ok, total;
 
 static void group_end(const char *name) {
   printf("%s %d/%d\n", name, ok, total);
-  if (ok != total)
+  if (total == 0 || ok != total)
     fails++;
   ok = total = 0;
 }
