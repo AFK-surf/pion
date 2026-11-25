@@ -56,6 +56,12 @@ pub(all) struct DepValFields {
   val_ : Int
 }
 
+pub(all) struct DepOpRow {
+  mut a : Int
+  b : Int
+  c : Int
+}
+
 #callsite(autofill(loc))
 pub fn[T] dep_loc_fn(x : T, loc~ : SourceLoc) -> (T, String) {
   (x, loc.to_string())
@@ -343,6 +349,27 @@ priv struct RowFloat {
   c : Int
 }
 
+priv struct GenRow[T] {
+  mut a : Int
+  b : T
+  c : Int
+}
+
+priv struct Ping {
+  f : () -> Unit
+}
+
+impl Add for Ping with add(self, _other) {
+  (self.f)()
+  self
+}
+
+priv struct OpRow {
+  mut a : Int
+  b : Ping
+  c : Int
+}
+
 let val_ : Int = 9
 
 pub fn run_f3d3_7() -> String {
@@ -356,6 +383,15 @@ pub fn run_f3d3_7() -> String {
   // Out-of-order with Float literal field `b: 0.1` preserving `: Float` temp annotation
   let rf0 : RowFloat = { a: 1, b: 0.5, c: 3 }
   let rf1 = { ..rf0, c: { rf0.a = 7; 6 }, b: 0.1 }
+  // Overloaded `+` mutating `s.a` in local out-of-order struct update
+  let op0 : OpRow = { a: 1, b: { f: fn() { () } }, c: 3 }
+  let p : Ping = { f: fn() { op0.a = 9 } }
+  let op1 = OpRow::{ ..op0, c: 1, b: p + p }
+  // Generic struct `GenRow[Int]` and `GenRow[Array[Int]]` out-of-order update in non-generic fn
+  let g1 : GenRow[Int] = { a: 1, b: 2, c: 3 }
+  let g1t = GenRow::{ ..g1, c: { g1.a = 9; 7 }, b: 7 }
+  let g2 : GenRow[Array[Int]] = { a: 1, b: [2], c: 3 }
+  let g2t = GenRow::{ ..g2, c: { g2.a = 8; 7 }, b: [7] }
 
   // P1-2: shadowed `panic(...)` must NOT be treated as diverging (else must NOT run)
   let panic = fn(_s : String) -> Unit { () }
@@ -385,7 +421,8 @@ pub fn run_f3d3_7() -> String {
   }
   let gs_r = gs_fn(Some({ x: "__MBT_GUARD_LEAF_TUPLE__" }))
 
-  t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "|" +
+  t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
+  op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "|" +
   n_p.to_string() + "|" +
   vb_pkg.to_string() + "," + vb2.to_string() + "|" +
   vf_r.to_string() + "|" + gs_r
@@ -525,6 +562,13 @@ pub fn f(v : @f3d3dep.DepValFields?) -> Int {
 }
 '''
 
+NEG_FOREIGN_OP_SU_MBT = r'''
+pub fn f(s : @f3d3dep.DepOpRow, x : Int) -> Int {
+  let t = @f3d3dep.DepOpRow::{ ..s, c: 1, b: x + x }
+  t.a
+}
+'''
+
 
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
@@ -606,7 +650,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            "F3d3-7:9,9,88,7|1|19,12|19|hit"
+            "F3d3-7:9,9,88,7,9,9,8|1|19,12|19|hit"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -622,12 +666,13 @@ def main():
         assert_publish_blocked(bin_path, args.pionc, work, "pipe_as", NEG_PIPE_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_blocked(bin_path, args.pionc, work, "nested_as", NEG_NESTED_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
 
-        # Cross-package fail-closed gates (effectful/explicit/interp struct update & keyword-colliding foreign struct pattern)
+        # Cross-package fail-closed gates (effectful/explicit/interp/op struct update & keyword-colliding foreign struct pattern)
         for neg_name, neg_src in [
             ("foreign_su", NEG_FOREIGN_EFFECT_SU_MBT),
             ("foreign_explicit_su", NEG_FOREIGN_EXPLICIT_SU_MBT),
             ("foreign_interp_su", NEG_FOREIGN_INTERP_SU_MBT),
             ("foreign_val_pat", NEG_FOREIGN_VAL_PAT_MBT),
+            ("foreign_op_su", NEG_FOREIGN_OP_SU_MBT),
         ]:
             fs_sdir = os.path.join(work, f"neg_{neg_name}_src")
             fs_odir = os.path.join(work, f"neg_{neg_name}_out")
@@ -649,7 +694,7 @@ def main():
             )
             assert not os.listdir(fs_odir), f"blocked `{neg_name}` publish must leave --out empty"
 
-        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 7 positive + 12 negative cases)")
+        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 7 positive + 13 negative cases)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
