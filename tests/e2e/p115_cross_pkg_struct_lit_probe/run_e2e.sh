@@ -100,7 +100,7 @@ export PION_CACHE_DIR="$TMP_DIR/cas_neg"
 mkdir -p "$PION_CACHE_DIR"
 # neg <label> <statement> <name the diagnostic must mention>
 neg() {
-  printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{g.blur}")\n  %s\n  0\n}\n' \
+  printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let o = rootp::RootKind::origin()\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{o} \\{g.blur}")\n  %s\n  0\n}\n' \
     "$2" > "$PKGS/shadow/app2/src/main.pion"
   if "$PIONC" build -o "$TMP_DIR/neg" "$PKGS/shadow/app2" > "$TMP_DIR/neg.out" 2>&1; then
     echo "FAIL: p115 neg $1 compiled" >&2
@@ -114,13 +114,17 @@ neg() {
   echo "p115 neg $1 ok"
 }
 # Same source without the offending name must build, so `neg` fails for the name.
-printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{g.blur}")\n  0\n}\n' \
+printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let o = rootp::RootKind::origin()\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{o} \\{g.blur}")\n  0\n}\n' \
   > "$PKGS/shadow/app2/src/main.pion"
 "$PIONC" build -o "$TMP_DIR/neg" "$PKGS/shadow/app2"
-[ "$("$TMP_DIR/neg")" = "1 1" ] || { echo "FAIL: p115 neg control output" >&2; exit 1; }
+CTRL_OUT=$("$TMP_DIR/neg")
+[ "$CTRL_OUT" = "1 83 1" ] || { echo "FAIL: p115 neg control output" >&2; exit 1; }
 neg annotated-literal 'let x : paint::RootOnly = paint::RootOnly::{ n: 87 }' paint::RootOnly
 neg literal 'let x = paint::RootOnly::{ n: 87 }' paint::RootOnly
 neg type 'let x : paint::RootOnly = r' paint::RootOnly
 neg enum-type 'let x : paint::RootKind = rootp::RootKind::Root' paint::RootKind
 neg enum-path 'let x = paint::RootKind::Root' paint::RootKind
+neg static-call 'let x = paint::RootKind::origin()' paint::RootKind::origin
+neg static-value 'let f = paint::RootKind::origin
+  let x = f()' paint::RootKind::origin
 echo "[SUMMARY] p115_cross_pkg_struct_lit_probe: OK"
