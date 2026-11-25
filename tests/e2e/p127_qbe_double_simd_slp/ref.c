@@ -65,6 +65,29 @@ static void kick(Vec2 *p, Vec2 *v, double dt) {
   p->y = ny;
 }
 
+static int32_t mix(Vec2 *p, double dt, float a, float b, float c) {
+  float s = a * b + c;
+  float t = c * a + b * s;
+  p->x = p->x * dt + p->x;
+  p->y = p->y * dt + p->y;
+  float r = s * t + a - c;
+  int32_t u;
+  memcpy(&u, &r, 4);
+  return u;
+}
+
+static int32_t mix_nan(Vec2 *p, float a, float b, float c, double d0, double d1, double d2,
+                       double d3) {
+  float u = a * b;
+  p->x = d2 + d1;
+  p->y = d0 + d3;
+  float v = c * a;
+  float r = v * u;
+  int32_t w;
+  memcpy(&w, &r, 4);
+  return w;
+}
+
 static long long bits(double d) {
   int64_t b;
   memcpy(&b, &d, 8);
@@ -81,7 +104,14 @@ int main(void) {
       9218868437227405312LL, -4503599627370496LL, 9221120237041090561LL,
       -2251799813682500LL, 9218868437227408301LL,
   };
+  static const int32_t fbits[] = {
+      2143289345, 2143289347, 2143289348, -4194299, 1065353216, -1071644672, 2139095040,
+      2139098029,
+  };
   enum { N = sizeof dbits / sizeof dbits[0] };
+  float fs[8];
+  for (int i = 0; i < 8; i++)
+    memcpy(&fs[i], &fbits[i], 4);
   double ds[N];
   for (int i = 0; i < N; i++)
     memcpy(&ds[i], &dbits[i], 8);
@@ -125,6 +155,17 @@ int main(void) {
       kick(&ka, &ka, dt);
       printf(" kick_alias");
       show(&ka);
+      Vec2 m = {a, b};
+      int32_t mr = mix(&m, dt, fs[i % 8], fs[j % 8], fs[(i + j) % 8]);
+      float rf;
+      memcpy(&rf, &mr, 4);
+      printf(" mix %lld", bits((double)rf));
+      show(&m);
+      Vec2 mn = {a, b};
+      int32_t nr = mix_nan(&mn, fs[i % 8], fs[(i + j) % 8], fs[(i * 3 + j) % 8], a, b, c, d);
+      memcpy(&rf, &nr, 4);
+      printf(" mix_nan %lld", bits((double)rf));
+      show(&mn);
       printf("\n");
     }
   return 0;

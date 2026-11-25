@@ -8,7 +8,7 @@
       that a NaN in ref.c only requires a NaN (the winning payload of two NaN
       operands is target-defined; the V == S comparison pins it exactly).
   check.py asm FILE.s TARGET
-      drift / orbit / kick in the QBE text for amd64_sysv or arm64_apple carry
+      drift / orbit / kick / mix / mix_nan in the QBE text for amd64_sysv or arm64_apple carry
       the trap-mask entry test, the packed operations listed in WANT, a
       retained scalar arm, and (kick) a 16-byte aligned frame slot written
       with the whole packet before the foreign call and reloaded after it;
@@ -16,14 +16,14 @@
       another that may alias it, has no entry test and no packed code.
   check.py objcmp DIRECT.dis TEXT.dis
       objdump listings of the direct-object and assembled-text executables
-      have the same multiset of packed / MXCSR mnemonics in drift, orbit and
-      kick (amd64_sysv).
+      have the same multiset of packed / MXCSR / single-precision arithmetic
+      mnemonics in the five packed kernels (amd64_sysv).
 """
 import re
 import sys
 from collections import Counter
 
-FUNCS = ("drift", "orbit", "kick")
+FUNCS = ("drift", "orbit", "kick", "mix", "mix_nan")
 
 
 def fail(msg):
@@ -93,20 +93,25 @@ def bodies(path, names=FUNCS + ("shear",)):
 
 
 AMD64 = {
-    "all": [r"stmxcsr ", r"andl \$8064, ", r"cmpl \$8064, ", r"addsd ", r"mulsd "],
-    "drift": [r"movupd \(", r"movupd %xmm\d+, \(", r"pshufd \$68, ", r"mulpd ", r"addpd ",
+    "all": [r"stmxcsr ", r"andl \$8064, ", r"cmpl \$8064, ", r"addsd ", r"addpd "],
+    "drift": [r"mulsd ", r"movupd \(", r"movupd %xmm\d+, \(", r"pshufd \$68, ", r"mulpd ", r"addpd ",
               r"pshufd \$238, "],
-    "orbit": [r"movupd \(", r"movupd %xmm\d+, \(", r"pshufd \$68, ", r"mulpd ", r"subpd ",
+    "orbit": [r"mulsd ", r"movupd \(", r"movupd %xmm\d+, \(", r"pshufd \$68, ", r"mulpd ", r"subpd ",
               r"addpd ", r"pshufd \$238, "],
-    "kick": [r"mulpd ", r"addpd ", r"movupd %xmm\d+, \("],
+    "kick": [r"mulsd ", r"mulpd ", r"addpd ", r"movupd %xmm\d+, \("],
+    "mix": [r"mulsd ", r"mulpd ", r"addpd ", r"movupd %xmm\d+, \(", r"mulss ", r"addss ", r"subss "],
+    "mix_nan": [r"movupd %xmm\d+, \(", r"mulss "],
 }
 ARM64 = {
-    "all": [r"mrs\tx17, fpcr", r"mov\tw16, #0x9f00", r"tst\tw17, w16", r"fadd\td", r"fmul\td"],
-    "drift": [r"ldu?r\tq\d+, \[x\d+", r"stu?r\tq\d+, \[x\d+", r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ",
+    "all": [r"mrs\tx17, fpcr", r"mov\tw16, #0x9f00", r"tst\tw17, w16", r"fadd\td", r"fadd\tv\d+\.2d, "],
+    "drift": [r"fmul\td", r"ldu?r\tq\d+, \[x\d+", r"stu?r\tq\d+, \[x\d+", r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ",
               r"fadd\tv\d+\.2d, ", r"faddp\td\d+, v\d+\.2d"],
-    "orbit": [r"ldu?r\tq\d+, \[x\d+", r"stu?r\tq\d+, \[x\d+", r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ",
+    "orbit": [r"fmul\td", r"ldu?r\tq\d+, \[x\d+", r"stu?r\tq\d+, \[x\d+", r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ",
               r"fsub\tv\d+\.2d, ", r"fadd\tv\d+\.2d, ", r"faddp\td\d+, v\d+\.2d"],
-    "kick": [r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ", r"fadd\tv\d+\.2d, ", r"stu?r\tq\d+, \[x\d+"],
+    "kick": [r"fmul\td", r"dup\tv\d+\.2d, v\d+\.d\[0\]", r"fmul\tv\d+\.2d, ", r"fadd\tv\d+\.2d, ", r"stu?r\tq\d+, \[x\d+"],
+    "mix": [r"fmul\td", r"fmul\tv\d+\.2d, ", r"fadd\tv\d+\.2d, ", r"stu?r\tq\d+, \[x\d+", r"fmul\ts\d+, ",
+            r"fadd\ts\d+, ", r"fsub\ts\d+, "],
+    "mix_nan": [r"stu?r\tq\d+, \[x\d+", r"fmul\ts\d+, "],
 }
 
 
@@ -147,7 +152,7 @@ def check_asm(path, target):
                 found = True
     if not found:
         fail(f"{path} {target}: pion_fn_kick does not keep the packet in a 16-byte aligned slot across the call")
-    print(f"p127 {path.rsplit('/', 1)[-1]} {target}: drift / orbit / kick packed, "
+    print(f"p127 {path.rsplit('/', 1)[-1]} {target}: drift / orbit / kick / mix / mix_nan packed, "
           f"trap-mask entry test, scalar arm, packet spilled across the call; "
           f"shear (aliasing bases) scalar only")
 
@@ -165,7 +170,7 @@ def dis_counts(path):
         if cur and re.match(r"^[0-9a-f]+ <", l):
             cur = None
         if cur:
-            m = re.search(r"\b(movupd|addpd|subpd|mulpd|pshufd|unpcklpd|stmxcsr)\b", l)
+            m = re.search(r"\b(movupd|addpd|subpd|mulpd|pshufd|unpcklpd|stmxcsr|addss|subss|mulss)\b", l)
             if m:
                 out[cur][m.group(1)] += 1
     return out
@@ -174,7 +179,7 @@ def dis_counts(path):
 def check_objcmp(direct, text):
     a, b = dis_counts(direct), dis_counts(text)
     for f in FUNCS:
-        if not a[f]["addpd"] or not a[f]["mulpd"] or a[f]["stmxcsr"] != 1:
+        if not a[f]["addpd"] or a[f]["stmxcsr"] != 1:
             fail(f"{direct}: pion_fn_{f} lacks packed code in the direct object: {dict(a[f])}")
         if a[f] != b[f]:
             fail(f"pion_fn_{f}: direct object {dict(a[f])} != assembled text {dict(b[f])}")

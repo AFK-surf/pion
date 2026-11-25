@@ -1203,15 +1203,17 @@ emitins(Ins i, EF *e)
 	case Ovadd:
 	case Ovsub:
 	case Ovmul: {
+		int k = i.cls == Ks ? Ks : Kd;
 		if (req(i.to, i.arg[1]) && !req(i.to, i.arg[0])) {
-			emitcopy(TMP(XMM15), i.arg[1], Kd, e);
+			emitcopy(TMP(XMM15), i.arg[1], k, e);
 			i.arg[1] = TMP(XMM15);
 		}
-		emitcopy(i.to, i.arg[0], Kd, e);
+		emitcopy(i.to, i.arg[0], k, e);
 		int op = i.op == Oordadd || i.op == Ovadd   ? 0x58
 			 : i.op == Oordsub || i.op == Ovsub ? 0x5c
 							    : 0x59;
-		emit_modrm(i.cls == Kv2d ? 0x66 : 0xf2, 0, 0, 0x0f, op, hw_reg(i.to.val),
+		emit_modrm(i.cls == Kv2d ? 0x66 : i.cls == Ks ? 0xf3 : 0xf2, 0, 0, 0x0f, op,
+			   hw_reg(i.to.val),
 			   ref_to_rm(i.arg[1], 0, e), 0, 0);
 		break;
 	}

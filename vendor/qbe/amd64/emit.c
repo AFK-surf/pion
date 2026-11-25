@@ -505,17 +505,23 @@ emitins(Ins i, E *e)
 	case Ovsub:
 	case Ovmul:
 		if (req(i.to, i.arg[1]) && !req(i.to, i.arg[0])) {
-			emitcopy(TMP(XMM15), i.arg[1], Kd, e);
+			emitcopy(TMP(XMM15), i.arg[1], i.cls == Ks ? Ks : Kd, e);
 			i.arg[1] = TMP(XMM15);
 		}
-		emitcopy(i.to, i.arg[0], Kd, e);
-		emitf(i.op == Oordadd	? "addsd %D1, %D="
-		      : i.op == Oordsub ? "subsd %D1, %D="
-		      : i.op == Oordmul ? "mulsd %D1, %D="
-		      : i.op == Ovadd	? "addpd %D1, %D="
-		      : i.op == Ovsub	? "subpd %D1, %D="
-					: "mulpd %D1, %D=",
-		      &i, e);
+		emitcopy(i.to, i.arg[0], i.cls == Ks ? Ks : Kd, e);
+		if (i.cls == Ks)
+			emitf(i.op == Oordadd	? "addss %S1, %S="
+			      : i.op == Oordsub ? "subss %S1, %S="
+						: "mulss %S1, %S=",
+			      &i, e);
+		else
+			emitf(i.op == Oordadd	? "addsd %D1, %D="
+			      : i.op == Oordsub ? "subsd %D1, %D="
+			      : i.op == Oordmul ? "mulsd %D1, %D="
+			      : i.op == Ovadd	? "addpd %D1, %D="
+			      : i.op == Ovsub	? "subpd %D1, %D="
+						: "mulpd %D1, %D=",
+			      &i, e);
 		break;
 	default:
 		if (isxsel(i.op))

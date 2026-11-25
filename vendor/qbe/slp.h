@@ -136,6 +136,8 @@ slppair(Fn *f, Lane *v, int l, int r)
 		case Oordadd:
 		case Oordsub:
 		case Oordmul:
+			if (a->cls != Kd)
+				return;
 			break;
 		default:
 			return;
@@ -266,7 +268,7 @@ slpschedule(Fn *f, Lane *v, SlpSeq *s, Ins *ins, int *ids, uint count)
 			int l = ids[k];
 			Ins a = ins[k];
 			if (!l || !v[l].other) {
-				if (a.op == Oordadd && rtype(a.arg[0]) == RTmp &&
+				if (a.op == Oordadd && a.cls == Kd && rtype(a.arg[0]) == RTmp &&
 				    rtype(a.arg[1]) == RTmp &&
 				    v[a.arg[0].val].other == (int)a.arg[1].val) {
 					a.op = Ovsum;
@@ -314,8 +316,13 @@ slpbuild(Fn *f, signed char *order)
 		SlpSeq s = {vnew(0, sizeof(Ins), PFn), 0};
 		for (uint j = 0; j < b->nins; j++) {
 			Ins i = b->ins[j];
-			if (i.cls == Kd && (i.op == Oadd || i.op == Osub || i.op == Omul ||
-					    i.op == Odiv)) {
+			/* Every scalar add / sub / mul, Ks included, keeps the operand
+			 * order of the scalar allocation: rega(packet) may assign
+			 * registers differently, and the x86 two-address form decides
+			 * which NaN payload wins. Only Kd ones are packed. */
+			if ((i.cls == Kd && (i.op == Oadd || i.op == Osub || i.op == Omul ||
+					     i.op == Odiv)) ||
+			    (i.cls == Ks && (i.op == Oadd || i.op == Osub || i.op == Omul))) {
 				if (i.op != Odiv) {
 					if (x86 && (!order[i.to.val] ||
 						    (i.op == Osub && order[i.to.val] == 2)))
@@ -331,9 +338,9 @@ slpbuild(Fn *f, signed char *order)
 				}
 				for (uint k = 0; k < 2; k++)
 					if (rtype(i.arg[k]) == RMem) {
-						Ref t = newtmp("load", Kd, f);
+						Ref t = newtmp("load", i.cls, f);
 						slpput(&s,
-						       (Ins){Oload, Kd, t, {i.arg[k], R}});
+						       (Ins){Oload, i.cls, t, {i.arg[k], R}});
 						i.arg[k] = t;
 					} else if (rtype(i.arg[k]) != RTmp)
 						return 0;
@@ -390,7 +397,7 @@ slpbuild(Fn *f, signed char *order)
 	for (b = f->start; b; b = b->link)
 		for (uint j = 0; j < b->nins; j++) {
 			Ins *a = &b->ins[j];
-			if (a->op != Oordadd || rtype(a->arg[0]) != RTmp ||
+			if (a->op != Oordadd || a->cls != Kd || rtype(a->arg[0]) != RTmp ||
 			    rtype(a->arg[1]) != RTmp)
 				continue;
 			int x = a->arg[0].val, y = a->arg[1].val;

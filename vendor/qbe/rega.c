@@ -461,7 +461,7 @@ doblk(Blk *b, RMap *cur)
 			 * the newly freed rt, but in this case
 			 * the above loop must be changed */
 		}
-		if (slporder && i1->cls == Kd && rtype(i1->to) == RTmp &&
+		if (slporder && (i1->cls == Kd || i1->cls == Ks) && rtype(i1->to) == RTmp &&
 		    (i1->op == Oadd || i1->op == Omul || i1->op == Osub))
 			slporder[i1->to.val] =
 			    1 + (req(i->to, i->arg[1]) && !req(i->to, i->arg[0]));
