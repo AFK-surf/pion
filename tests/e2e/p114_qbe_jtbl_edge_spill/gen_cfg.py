@@ -31,6 +31,9 @@ multi  arm @a0 continues into the default arm @a7: a target that reads a home
        an edge-copy block on table -> @a7, that block is the sole-predecessor
        target instead).
 flat   one dispatch without a loop: nothing may move.
+dup    the duplicated arm @a3 (entries 3 and 4) calls as well as the default
+       arm: 3 of 10 entries need the homes, and the shared @a3 target gets
+       the store exactly once.
 """
 import sys
 from pathlib import Path
@@ -42,6 +45,9 @@ def spec(kind, n):
     if kind == 'major':
         touched = lambda k, i: k == 7 or i % 7 == k or (k != 6 and i % 3 == 0)
         calls = lambda k, i: k != 6 and i % 3 == 0
+    elif kind == 'dup':
+        touched = lambda k, i: k in (3, 7) or i % 7 == k
+        calls = lambda k, i: k in (3, 7) and i % 3 == 0
     else:
         touched = lambda k, i: k == 7 or i % 7 == k
         calls = lambda k, i: k == 7 and i % 3 == 0
@@ -178,7 +184,7 @@ static void round_{name}(U *x, unsigned k) {{
 def main():
     out = Path(sys.argv[1])
     funcs = [(f'sink{n}', 'sink', n) for n in (7, 11, 14, 18, 23)]
-    funcs += [('pred14', 'pred', 14)]
+    funcs += [('pred14', 'pred', 14), ('dup14', 'dup', 14), ('dup23', 'dup', 23)]
     funcs += [('major23', 'major', 23), ('head23', 'head', 23), ('multi14', 'multi', 14), ('multi23', 'multi', 23),
               ('flat14', 'flat', 14)]
     ssa = []

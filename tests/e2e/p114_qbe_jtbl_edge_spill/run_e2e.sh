@@ -18,9 +18,11 @@
 #   2. gen_cfg.py fixture: `qbe -d SR` structure (check_dump.py) for
 #      amd64_sysv, arm64_apple and arm64 (moved stores, sole-predecessor
 #      targets, hot entries without the store, kept homes for majority /
-#      late-read / multi-predecessor cases); C reference differential of
-#      11 functions x 10244 inputs through `qbe --obj` and text assembly on
-#      the host (x86-64 ELF or AArch64 Mach-O), with non-zero counts.
+#      late-read / multi-predecessor cases, one store on a target shared by
+#      duplicate entries, register = end-of-table map); mutate_dump.py checks
+#      that the checker rejects tampered dumps; C reference differential of
+#      13 functions x 10244 inputs through `qbe --obj` and text assembly on
+#      the host (x86-64 ELF or AArch64 Mach-O), every function counted.
 #   3. benchmarks/v2/pion/bytecode_vm.pion: dev and --release print the same
 #      line as the C version; `run_vm` sinks at least one dispatch home.
 #   4. An ASan + UBSan QBE (when the compiler can build one) replays every
@@ -51,8 +53,7 @@ if [ "$LINES" -ne 36 ]; then
 fi
 
 check() { # $1 label, $2 output file
-  if ! cmp -s "$TMP_DIR/expected.txt" "$2"; then
-    diff -u "$TMP_DIR/expected.txt" "$2" >&2 || true
+  if ! diff -u "$TMP_DIR/expected.txt" "$2" >&2; then
     echo "FAIL: p114 $1" >&2
     exit 1
   fi
@@ -124,7 +125,7 @@ else
 fi
 # LeakSanitizer is not available everywhere (e.g. Apple Clang on macOS ARM64).
 ASAN_RUN_OPTS=""
-if [ "$ASAN" = 1 ] && ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe" >/dev/null 2>&1; then
+if [ "$ASAN" = 1 ] && (ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe") >/dev/null 2>&1; then
   ASAN_RUN_OPTS="detect_leaks=1"
 fi
 if [ "$ASAN" = 1 ]; then
@@ -146,23 +147,34 @@ for T in amd64_sysv arm64_apple arm64; do
   "$QBE" -t "$T" -d SR -o /dev/null "$TMP_DIR/cfg/cfg.ssa" 2> "$TMP_DIR/cfg/sr_$T.txt"
   python3 -E "$DIR/check_dump.py" "$TMP_DIR/cfg/sr_$T.txt" "$TMP_DIR/cfg/expect.txt" "$T"
 done
-NFUNC=$(wc -l < "$TMP_DIR/cfg/expect.txt" | tr -d ' ')
-WANT=$((NFUNC * 10244))
+# The checker itself must reject a duplicated, wrong-register, moved or extra store.
+python3 -E "$DIR/mutate_dump.py" "$TMP_DIR/cfg/sr_amd64_sysv.txt" "$TMP_DIR/cfg/expect.txt" "$DIR/check_dump.py" "$TMP_DIR/cfg"
 fixture_run() { # $1 label, $2 object or assembly file
   "$CC_BIN" -O1 "$TMP_DIR/cfg/check.c" "$2" -o "$TMP_DIR/cfg/check_$1"
   "$TMP_DIR/cfg/check_$1" > "$TMP_DIR/cfg/$1.out"
-  TOTAL=$(sed -n 's/^total \([0-9][0-9]*\) bad 0$/\1/p' "$TMP_DIR/cfg/$1.out")
-  if [ "$TOTAL" != "$WANT" ]; then
-    cat "$TMP_DIR/cfg/$1.out" >&2
-    echo "FAIL: p114 fixture $1: want total $WANT bad 0" >&2
-    exit 1
-  fi
-  ZERO=$(grep -c ' 0 [0-9a-f]*$' "$TMP_DIR/cfg/$1.out") || ZERO=0
-  if [ "$ZERO" -ne 0 ]; then
-    echo "FAIL: p114 fixture $1: a function ran no inputs" >&2
-    exit 1
-  fi
-  echo "p114 fixture $1: $TOTAL inputs equal the C reference ($(tail -n 1 "$TMP_DIR/cfg/$1.out"))"
+  # Every function exactly once with all 10244 inputs, then `total N bad 0`.
+  python3 -E - "$TMP_DIR/cfg/expect.txt" "$TMP_DIR/cfg/$1.out" "$1" <<'PYEOF'
+import re, sys
+def need(ok, msg):
+    if not ok:
+        raise SystemExit(f"FAIL: p114 fixture {sys.argv[3]}: {msg}")
+names = [ln.split()[0] for ln in open(sys.argv[1]).read().split('\n') if ln.strip()]
+need(len(names) > 0 and len(set(names)) == len(names), f"bad function list {names}")
+lines = open(sys.argv[2]).read().split('\n')
+need(lines[-1] == '', "output does not end with a newline")
+lines = lines[:-1]
+need(len(lines) == len(names) + 1, f"{len(lines)} lines, want {len(names) + 1}: {lines}")
+seen = []
+for ln in lines[:-1]:
+    m = re.fullmatch(r'(\w+) (\d+) ([0-9a-f]{8})', ln)
+    need(m is not None, f"unexpected line {ln!r}")
+    need(int(m.group(2)) == 10244, f"{m.group(1)} ran {m.group(2)} inputs, want 10244")
+    seen.append(m.group(1))
+need(seen == names, f"functions {seen} != {names}")
+want = 10244 * len(names)
+need(lines[-1] == f"total {want} bad 0", f"last line {lines[-1]!r}, want 'total {want} bad 0'")
+print(f"p114 fixture {sys.argv[3]}: {len(names)} functions x 10244 = {want} inputs equal the C reference")
+PYEOF
 }
 HOST_S="$(uname -s)"
 HOST_M="$(uname -m)"
@@ -175,8 +187,7 @@ esac
 if [ "$OBJ" = 1 ]; then
   "$QBE" --obj -o "$TMP_DIR/cfg/cfg.o" "$TMP_DIR/cfg/cfg.ssa"
   fixture_run obj "$TMP_DIR/cfg/cfg.o"
-  if ! cmp -s "$TMP_DIR/cfg/text.out" "$TMP_DIR/cfg/obj.out"; then
-    diff -u "$TMP_DIR/cfg/text.out" "$TMP_DIR/cfg/obj.out" >&2 || true
+  if ! diff -u "$TMP_DIR/cfg/text.out" "$TMP_DIR/cfg/obj.out" >&2; then
     echo "FAIL: p114 fixture --obj and text assembly disagree" >&2
     exit 1
   fi
@@ -197,8 +208,7 @@ for MODE in dev release; do
   [ "$MODE" = "release" ] && FLAG="--release"
   "$PIONC" build $FLAG --emit-ssa "$TMP_DIR/vm_$MODE.ssa" -o "$TMP_DIR/vm_$MODE" "$VM"
   "$TMP_DIR/vm_$MODE" > "$TMP_DIR/vm_$MODE.out"
-  if ! cmp -s "$TMP_DIR/vm_c.out" "$TMP_DIR/vm_$MODE.out"; then
-    diff -u "$TMP_DIR/vm_c.out" "$TMP_DIR/vm_$MODE.out" >&2 || true
+  if ! diff -u "$TMP_DIR/vm_c.out" "$TMP_DIR/vm_$MODE.out" >&2; then
     echo "FAIL: p114 bytecode_vm $MODE output differs from C" >&2
     exit 1
   fi
