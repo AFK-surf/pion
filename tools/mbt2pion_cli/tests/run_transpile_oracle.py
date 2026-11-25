@@ -104,7 +104,7 @@ CASES = {
     "transpile_core": ("ok", 7),
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
-    "transpile_upper_tier": ("ok", 10),
+    "transpile_upper_tier": ("ok", 12),
 }
 
 MOON_TRAPS = {
@@ -1449,10 +1449,17 @@ pub fn ut_array_add_chain() -> Array[Int] {
     c
 }
 
-pub fn ut_json_literals() -> (String, Bool, Bool) {
+pub fn ut_json_literals() -> (String, Bool, Bool, Bool) {
   let j : Json = {
     "neg0": -0,
     "big": 9007199254740993,
+    "hex_a": 0xA,
+    "hex_aa": 0xAA,
+    "hex_10": 0x10,
+    "neg_hex": -0x10,
+    "u64_max": 0xFFFFFFFFFFFFFFFF,
+    "nested": { "arr": [0xA, 0x10, -0x10, 0xFFFFFFFFFFFFFFFF] },
+    "flt": 0.12345678901234567,
     "arr": [true, false, null, "hi"],
     "empty": {},
   }
@@ -1461,6 +1468,13 @@ pub fn ut_json_literals() -> (String, Bool, Bool) {
   let j2 : Json = {
     "neg0": -0,
     "big": 9007199254740993,
+    "hex_a": 0xA,
+    "hex_aa": 0xAA,
+    "hex_10": 0x10,
+    "neg_hex": -0x10,
+    "u64_max": 0xFFFFFFFFFFFFFFFF,
+    "nested": { "arr": [0xA, 0x10, -0x10, 0xFFFFFFFFFFFFFFFF] },
+    "flt": 0.12345678901234567,
     "arr": [true, false, null, "hi"],
     "empty": {},
   }
@@ -1469,8 +1483,25 @@ pub fn ut_json_literals() -> (String, Bool, Bool) {
     Number(d, ..) => d.reinterpret_as_uint64() == 0x8000000000000000UL
     _ => false
   }
+  let j_hex_aa : Json = 0xAA
+  let j_hex_10 : Json = 0x10
+  let j_neg_hex : Json = -0x10
+  let j_u64_max : Json = 0xFFFFFFFFFFFFFFFF
+  let j_flt : Json = 0.12345678901234567
+  let j_match : Json = match 1 {
+    1 => "a"
+    _ => "b"
+  }
+  let hex_ok = match (j_hex_aa, j_hex_10, j_neg_hex, j_u64_max, j_flt, j_match) {
+    (Number(a, ..), Number(b, ..), Number(nh, ..), Number(um, ..), Number(c, ..), String(ms)) =>
+      a == 170.0 && b == 16.0 && nh == -16.0 &&
+      um.reinterpret_as_uint64() == 0x43F0000000000000UL &&
+      c.reinterpret_as_uint64() == (0.12345678901234567).reinterpret_as_uint64() &&
+      ms == "a"
+    _ => false
+  }
   let _ = j_pos0
-  (j.stringify(), eq_same, neg0_sign)
+  (j.stringify(), eq_same, neg0_sign, hex_ok)
 }
 
 #derive(Eq, Hash)
@@ -1479,8 +1510,19 @@ pub(all) struct UtTag {
   name : String
 }
 
-pub fn[K : Hash + Eq] ut_set_has(s : Set[K], k : K) -> Bool {
-  s.contains(k)
+pub fn[K : Hash + Eq] ut_set_has(s : Set[K], k1 : K, k2 : K, k3 : K) -> (Bool, Int) {
+  let ok = s.contains(k1) && k1 == k2 && k1 != k3
+  (ok, Hash::hash(k1))
+}
+
+pub fn ut_fixed_arr_guard_mut() -> (Int, Int) {
+  let a = [1]
+  let r = match a {
+    [x] if { a[0] = 9; false } => 0
+    [x] => x
+    _ => -1
+  }
+  (r, a[0])
 }
 
 pub fn ut_set_and_arr_helpers() -> (Int, Int, Bool, Int, Int) {
@@ -1494,9 +1536,13 @@ pub fn ut_set_and_arr_helpers() -> (Int, Int, Bool, Int, Int) {
     iter_sum = iter_sum * 10 + x
   }
   let ts : Set[UtTag] = Set::new()
-  ts.add(UtTag::{ id: 1, name: "a" })
-  ts.add(UtTag::{ id: 1, name: "a" })
-  let has_tag = ut_set_has(ts, UtTag::{ id: 1, name: "a" })
+  let t1 = UtTag::{ id: 1, name: "a" }
+  let t2 = UtTag::{ id: 1, name: "a" }
+  let t3 = UtTag::{ id: 1, name: "b" }
+  ts.add(t1)
+  ts.add(t2)
+  let (has_tag, th) = ut_set_has(ts, t1, t2, t3)
+  let _ = th
   let xs = [1, 2, 3, 4, 5]
   xs.retain(fn(v) { v % 2 == 1 })
   let ys = xs.filter_map(fn(v) { if v > 1 { Option::Some(v * 10) } else { Option::None } })
@@ -2084,16 +2130,19 @@ fn main {
     let (rv, bv, vc, vm) = @m12.ut_val_and_compound()
     let (bl, ss, sb) = @m12.ut_slices_and_sb()
     let ac = @m12.ut_array_add_chain()
-    let (js, jeq, jneg0) = @m12.ut_json_literals()
+    let (js, jeq, jneg0, jhex) = @m12.ut_json_literals()
+    let (fg_r, fg_a0) = @m12.ut_fixed_arr_guard_mut()
     let (sis, tsl, thas, xsl, ysum) = @m12.ut_set_and_arr_helpers()
     let (lv1, lv2) = @m12.ut_labeled_enum(3, 4)
     let (ms, mstr, meq, elen, mok) = @m12.ut_misc_syntax()
-    trace("ut", "\{rv}:\{bv}:\{vc}:\{vm},\{bl}:\{ss}:\{sb},\{ac.length()}:\{ac[0]}:\{ac[4]},\{js}:\{jeq}:\{jneg0},\{sis}:\{tsl}:\{thas}:\{xsl}:\{ysum},\{lv1}:\{lv2},\{ms}:\{mstr}:\{meq}:\{elen}:\{mok}")
+    trace("ut", "\{rv}:\{bv}:\{vc}:\{vm},\{bl}:\{ss}:\{sb},\{ac.length()}:\{ac[0]}:\{ac[4]},\{js}:\{jeq}:\{jneg0}:\{jhex},\{fg_r}:\{fg_a0},\{sis}:\{tsl}:\{thas}:\{xsl}:\{ysum},\{lv1}:\{lv2},\{ms}:\{mstr}:\{meq}:\{elen}:\{mok}")
     check("ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
     check("ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
     check("ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
     check("ut.json_eq", jeq)
     check("ut.json_neg0_sign", jneg0)
+    check("ut.json_hex_float", jhex)
+    check("ut.fixed_arr_guard_mut", fg_r == 1 && fg_a0 == 9)
     check("ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
     check("ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
     check("ut.labeled_enum", lv1 == 308 && lv2 == 4)
@@ -2653,16 +2702,19 @@ pub fn main(w : World) -> Int {
     let (rv, bv, vc, vm) = m12::ut_val_and_compound()
     let (bl, ss, sb) = m12::ut_slices_and_sb()
     let ac = m12::ut_array_add_chain()
-    let (js, jeq, jneg0) = m12::ut_json_literals()
+    let (js, jeq, jneg0, jhex) = m12::ut_json_literals()
+    let (fg_r, fg_a0) = m12::ut_fixed_arr_guard_mut()
     let (sis, tsl, thas, xsl, ysum) = m12::ut_set_and_arr_helpers()
     let (lv1, lv2) = m12::ut_labeled_enum(3, 4)
     let (ms, mstr, meq, elen, mok) = m12::ut_misc_syntax()
-    trace(w, "ut", rv.to_string() + ":" + bv.to_string() + ":" + vc.to_string() + ":" + vm.to_string() + "," + bl.to_string() + ":" + ss + ":" + sb + "," + ac.length().to_string() + ":" + ac[0].to_string() + ":" + ac[4].to_string() + "," + js + ":" + jeq.to_string() + ":" + jneg0.to_string() + "," + sis.to_string() + ":" + tsl.to_string() + ":" + thas.to_string() + ":" + xsl.to_string() + ":" + ysum.to_string() + "," + lv1.to_string() + ":" + lv2.to_string() + "," + ms.to_string() + ":" + mstr + ":" + meq.to_string() + ":" + elen.to_string() + ":" + mok.to_string())
+    trace(w, "ut", rv.to_string() + ":" + bv.to_string() + ":" + vc.to_string() + ":" + vm.to_string() + "," + bl.to_string() + ":" + ss + ":" + sb + "," + ac.length().to_string() + ":" + ac[0].to_string() + ":" + ac[4].to_string() + "," + js + ":" + jeq.to_string() + ":" + jneg0.to_string() + ":" + jhex.to_string() + "," + fg_r.to_string() + ":" + fg_a0.to_string() + "," + sis.to_string() + ":" + tsl.to_string() + ":" + thas.to_string() + ":" + xsl.to_string() + ":" + ysum.to_string() + "," + lv1.to_string() + ":" + lv2.to_string() + "," + ms.to_string() + ":" + mstr + ":" + meq.to_string() + ":" + elen.to_string() + ":" + mok.to_string())
     check(w, "ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
     check(w, "ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
     check(w, "ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
     check(w, "ut.json_eq", jeq)
     check(w, "ut.json_neg0_sign", jneg0)
+    check(w, "ut.json_hex_float", jhex)
+    check(w, "ut.fixed_arr_guard_mut", fg_r == 1 && fg_a0 == 9)
     check(w, "ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
     check(w, "ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
     check(w, "ut.labeled_enum", lv1 == 308 && lv2 == 4)

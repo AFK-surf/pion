@@ -3680,12 +3680,12 @@ fn lower_one_token_or_form(
     if t.kind == TokenKind::Minus && i + 1 < end &&
     (tokens[i + 1].kind == TokenKind::IntLit || tokens[i + 1].kind == TokenKind::FloatLit) &&
     !next_tok_breaks_json_lit(tokens, i + 2, end) {
-      return (trivia + lower_json_number_lit(true, tokens[i + 1].raw, tokens[i + 1].kind == TokenKind::FloatLit), i + 2)
+      return (trivia + lower_json_number_lit(ctx, true, tokens[i + 1].raw, tokens[i + 1].kind == TokenKind::FloatLit, file, t.line, t.col), i + 2)
     }
     if (t.kind == TokenKind::IntLit || t.kind == TokenKind::FloatLit) &&
     !(i > 0 && tokens[i - 1].kind == TokenKind::Dot) &&
     !next_tok_breaks_json_lit(tokens, i + 1, end) {
-      return (trivia + lower_json_number_lit(false, t.raw, t.kind == TokenKind::FloatLit), i + 1)
+      return (trivia + lower_json_number_lit(ctx, false, t.raw, t.kind == TokenKind::FloatLit, file, t.line, t.col), i + 1)
     }
   }
   // Raw multiline `#|...` is Pion-native: preserve verbatim!
@@ -4276,6 +4276,14 @@ fn lower_one_token_or_form(
   }
 
   // 3. Nested `{ ... }` block, Map literal, Ref literal `{ val: e }`, or anonymous struct literal `S::{ ... }`
+  if !in_pattern && (t.kind == TokenKind::Keyword || t.kind == TokenKind::Ident) &&
+  t.raw == "try" && i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace {
+    let close_tb = find_matching_delim(tokens, i + 1)
+    ctx.in_try_catch_depth = ctx.in_try_catch_depth + 1
+    let tbody = lower_block_range(ctx, tokens, i + 1, close_tb, file, "")
+    ctx.in_try_catch_depth = ctx.in_try_catch_depth - 1
+    return (trivia + "try" + tokens[i + 1].leading_trivia + tbody, close_tb + 1)
+  }
   if t.kind == TokenKind::LBrace {
     let close_b = find_matching_delim(tokens, i)
     if !in_pattern {
@@ -4452,7 +4460,9 @@ fn lower_one_token_or_form(
     if brace_i < end {
       let close_b = find_matching_delim(tokens, brace_i)
       let scrut_ty = infer_simple_expr_type(ctx, tokens, i + 1, brace_i)
+      push_expected_type(ctx, "")
       let scrut = lower_expr_range(ctx, tokens, i + 1, brace_i, file, false)
+      pop_expected_type(ctx)
       // P0-2: Push sentinel so outer match's array element cache NEVER leaks into a nested `match`!
       ctx.match_arr_cache_ctor.push("__BLOCKED__")
       ctx.match_arr_cache_elems.push([])
@@ -4989,8 +4999,7 @@ fn lower_one_token_or_form(
     tokens[i + 2].raw == "new" && tokens[i + 3].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 3)
       let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
-      let ctor = if ctx.recipes.ref_recipe.enabled { ctx.recipes.ref_recipe.ctor_call } else { "mbt_compat::mbt_ref" }
-      return (trivia + ctor + "(" + inner + ")", close_p + 1)
+      return (trivia + effective_ref_ctor(ctx.recipes) + "(" + inner + ")", close_p + 1)
     }
     // `Set::new()` / `Set::from_array(...)` / `Set::from_iter(...)` (guarded against local/generic `Set`)
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Set" &&
@@ -9462,6 +9471,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         }
         let mut lb = close_p + 1
         let mut ret_str = ""
+        let mut fn_has_raise = false
         if lb < n && tokens[lb].kind == TokenKind::Arrow {
           let mut r_end = lb + 1
           let mut rd = 0
@@ -9472,9 +9482,11 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               (tokens[r_end].newline_before && is_top_level_decl_start(tokens, r_end))) {
               break
             }
-            if rd == 0 && sf.is_test && test_raise_i < 0 &&
-            (rk == TokenKind::Keyword || rk == TokenKind::Ident) && tokens[r_end].raw == "raise" {
-              test_raise_i = r_end
+            if rd == 0 && (rk == TokenKind::Keyword || rk == TokenKind::Ident) && tokens[r_end].raw == "raise" {
+              fn_has_raise = true
+              if sf.is_test && test_raise_i < 0 {
+                test_raise_i = r_end
+              }
             }
             if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace {
               rd = rd + 1
@@ -9507,6 +9519,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           let is_test_bare_raise = sf.is_test && lb > sig_start &&
           (tokens[sig_start].kind == TokenKind::Keyword || tokens[sig_start].kind == TokenKind::Ident) &&
           tokens[sig_start].raw == "raise"
+          if lb > sig_start && (tokens[sig_start].kind == TokenKind::Keyword || tokens[sig_start].kind == TokenKind::Ident) &&
+          tokens[sig_start].raw == "raise" {
+            fn_has_raise = true
+          }
           if is_test_bare_raise {
             ret_str = " -> Unit"
           } else {
@@ -9528,7 +9544,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           ctx.fn_bodies.push(FnBodyRefs::{ name: fn_name, referenced_idents: refs, called_fns: calls, arg_closure_refs: fn_arg_closures })
           let saved_enclosing = ctx.cur_enclosing_fn
           let saved_ret_ty = ctx.cur_fn_ret_ty
+          let saved_raising = ctx.cur_fn_is_raising
           ctx.cur_enclosing_fn = fn_name_base
+          ctx.cur_fn_is_raising = fn_has_raise
           let clean_ret_ty = if ret_str.starts_with(" -> ") {
             ret_str.slice(4, ret_str.length()).trim()
           } else {
@@ -9556,6 +9574,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           restore_scope_vars(ctx, saved_sc)
           ctx.cur_enclosing_fn = saved_enclosing
           ctx.cur_fn_ret_ty = saved_ret_ty
+          ctx.cur_fn_is_raising = saved_raising
           for gn in fn_generic_names {
             ctx.active_generics.remove(gn)
             ctx.symtab.active_generics.remove(gn)
