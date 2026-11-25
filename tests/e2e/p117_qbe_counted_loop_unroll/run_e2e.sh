@@ -14,19 +14,21 @@
 #      crossing, unsigned bound, extsw / extuw tests, 1 and 8 trips, a 64-bit
 #      induction, aliasing loads and stores, three loops in one function (two
 #      expanded, the 9-trip one kept), a nested loop expanded in the second
-#      round; none for 9 trips, a call, a division, a variable start or a
-#      second phi.
+#      round, five 8-trip loops in one function of which only four fit the
+#      192-instruction budget shared by both rounds; none for 9 trips, a
+#      call, a division, a variable start or a second phi.
 #   2. Host differential: `qbe` + `cc -c` (no assembler warning) and, on
 #      x86-64 ELF / AArch64 Mach-O, `qbe --obj`, linked with driver.c and the
-#      independent C oracle.c: 19 functions x 40 memory layouts (separate,
+#      independent C oracle.c: 20 functions x 40 memory layouts (separate,
 #      identical, shifted dst/src) compare the return value and the whole
-#      buffer, `total 760 bad 0`, identical on both routes.
+#      buffer, `total 800 bad 0`, identical on both routes.
 #   3. Linux x86-64: the executable sections of `--obj` equal those of the
 #      assembled text byte for byte (relocated fields compared as relocations),
 #      or as canonical instruction streams where the pre-existing --obj-only
 #      differences apply (loop-header NOP padding spelling, elf.c's flags-dead
-#      mov+add -> lea rewrite); the 13 fully expanded functions have no
-#      backward branch, the others exactly one.
+#      mov+add -> lea rewrite, fused only where a later instruction rewrites
+#      all flags first, with self-checked negative cases); the 13 fully
+#      expanded functions have no backward branch, the others exactly one.
 #   4. benchmarks/pion/fannkuchredux.pion dev and --release print the C
 #      result (`73196 38` for n = 10) and the release SSA expands loops.
 #   5. An ASan + UBSan QBE (when the compiler can build one) replays loops.ssa
@@ -62,6 +64,7 @@ WANT = {
     'alias6': [('body', 6)], 'multi': [('l1', 4), ('l2', 5)],
     'nested': [('inner', 3), ('outer', 2)],
     'callbody': [], 'divbody': [], 'varstart': [], 'twophi': [],
+    'overbudget': [('b0', 8), ('b1', 8), ('b2', 8), ('b3', 8)],
 }
 text = open(sys.argv[1]).read()
 parts = re.split(r'\*\*\*\* Function (\S+) \*\*\*\*', text)
@@ -96,12 +99,12 @@ run_driver() { # $1 label, $2 object
 import sys
 NAMES = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5',
          'extuw3', 'once1', 'eight8', 'nine9', 'alias6', 'multi', 'nested',
-         'callbody', 'divbody', 'varstart', 'twophi', 'long7']
+         'callbody', 'divbody', 'varstart', 'twophi', 'overbudget', 'long7']
 want = ''.join(f'{n} 40\n' for n in NAMES) + f'total {40 * len(NAMES)} bad 0\n'
 got = open(sys.argv[1]).read()
-if got != want or len(NAMES) != 19:
+if got != want or len(NAMES) != 20:
     raise SystemExit(f"FAIL: p117 {sys.argv[2]} driver output\n{got}")
-print(f"p117 {sys.argv[2]}: 19 functions x 40 layouts = 760 calls equal the C oracle")
+print(f"p117 {sys.argv[2]}: 20 functions x 40 layouts = 800 calls equal the C oracle")
 PYEOF
 }
 asm() { # $1 qbe, $2 input, $3 output object (fails on any assembler message)
@@ -149,9 +152,23 @@ for k in range(8, 16):
         R64[f'r{k}{suf}'] = f'r{k}'
 def r64(r):
     return R64.get(r.lstrip('%'), r)
+# The lea fusion is only sound where the add's flags are dead: some later
+# instruction must overwrite all arithmetic flags before anything that reads
+# them, branches, calls or returns. Unknown instructions stop the scan.
+FLAGS_WRITE = re.compile(r'^(cmp|test|add|sub|xor|and|or)[bwlq]? ')
+FLAGS_NEUTRAL = re.compile(r'^(mov[a-z]*|lea[lq]?|push[q]?|pop[q]?|endbr64|cltq|cqto|cltd)( |$)')
+def flags_dead(ins, j):
+    for _, t in ins[j:]:
+        if FLAGS_WRITE.match(t):
+            return True
+        if not FLAGS_NEUTRAL.match(t):
+            return False
+    return False
 def canon(path):
+    return canon_text(open(path).read())
+def canon_text(text):
     out, cur = {}, None
-    for ln in open(path).read().split('\n'):
+    for ln in text.split('\n'):
         m = re.match(r'^[0-9a-f]+ <(\w+)>:', ln)
         if m:
             cur = m.group(1)
@@ -168,7 +185,7 @@ def canon(path):
             a, t = ins[k]
             m1 = re.match(r'^mov (%\w+),(%\w+)$', t)
             m2 = k + 1 < len(ins) and re.match(r'^add (\$0x[0-9a-f]+|%\w+),(%\w+)$', ins[k + 1][1])
-            if m1 and m2 and m1.group(2) == m2.group(2):
+            if m1 and m2 and m1.group(2) == m2.group(2) and flags_dead(ins, k + 2):
                 d, v = m1.group(2).lstrip('%'), m2.group(1)
                 if v.startswith('$'):
                     w = 64 if d.startswith('r') and not d.endswith('d') else 32
@@ -197,6 +214,20 @@ def canon(path):
 def need(ok, msg):
     if not ok:
         raise SystemExit("FAIL: p117 ELF " + msg)
+# Self-check of the canonicalization: `mov; add` == `lea` only when the flags
+# are dead (input 0: `setne` after the add returns 1, after the lea 0).
+def probe(middle, tail):
+    rows = ['xor %eax,%eax'] + middle + tail
+    return canon_text('0000000000000000 <probe>:\n'
+                      + ''.join(f'  {4 * n:x}:\t{r}\n' for n, r in enumerate(rows)))['probe']
+ADD, LEA = ['mov %edi,%edx', 'add $0x1,%edx'], ['lea 0x1(%rdi),%edx']
+need(probe(ADD, ['setne %al', 'ret']) != probe(LEA, ['setne %al', 'ret']),
+     "canon self-check: a flags-live mov+add matched a lea")
+need(probe(ADD, ['ret']) != probe(LEA, ['ret']), "canon self-check: mov+add before ret matched a lea")
+need(probe(ADD, ['mov %edx,(%rsi)', 'call 0 <probe>', 'cmp $0x9,%edx']) != probe(LEA, ['mov %edx,(%rsi)', 'call 0 <probe>', 'cmp $0x9,%edx']),
+     "canon self-check: mov+add before a call matched a lea")
+need(probe(ADD, ['mov %edx,(%rsi)', 'cmp $0x9,%edx', 'setne %al']) == probe(LEA, ['mov %edx,(%rsi)', 'cmp $0x9,%edx', 'setne %al']),
+     "canon self-check: a flags-dead mov+add did not match its lea")
 def exec_sections(path):
     # Executable sections with the 4-byte fields their RELA relocations patch
     # zeroed (the linker ignores them; as and --obj may leave different
@@ -235,7 +266,7 @@ def exec_sections(path):
 a, b = exec_sections(sys.argv[1]), exec_sections(sys.argv[2])
 CAN_A, CAN_B = canon(sys.argv[3]), canon(sys.argv[4])
 exact, rewritten = 0, []
-need(len(a) == 19, f"want 19 function sections, got {sorted(a)}")
+need(len(a) == 20, f"want 20 function sections, got {sorted(a)}")
 need(sorted(a) == sorted(b), f"section sets differ: {sorted(a)} vs {sorted(b)}")
 total = nrel = 0
 for n in sorted(a):
@@ -257,16 +288,16 @@ for n in sorted(a):
 LOOPFREE = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5', 'extuw3',
             'once1', 'eight8', 'long7', 'alias6', 'nested']
 need(not set(LOOPFREE) & set(rewritten), f"expanded functions differ: {sorted(set(LOOPFREE) & set(rewritten))}")
-need(sorted(rewritten) == ['callbody', 'multi', 'nine9', 'twophi', 'varstart'], f"unexpected canonical-only set {rewritten}")
+need(sorted(rewritten) == ['callbody', 'multi', 'nine9', 'overbudget', 'twophi', 'varstart'], f"unexpected canonical-only set {rewritten}")
 print(f"p117 --obj == as: {len(a)} function sections ({total} bytes, {nrel} relocations): {exact} byte-identical, "
       f"{len(rewritten)} equal up to NOP padding / the --obj lea rewrite ({', '.join(rewritten) or '-'})")
 PYEOF
   python3 -E - "$TMP_DIR/direct.dis" <<'PYEOF'
 import re, sys
-BACK = {'nine9': 1, 'multi': 1, 'callbody': 1, 'divbody': 1, 'varstart': 1, 'twophi': 1}
+BACK = {'nine9': 1, 'multi': 1, 'callbody': 1, 'divbody': 1, 'varstart': 1, 'twophi': 1, 'overbudget': 1}
 FUNCS = ['up4', 'down4', 'falseback5', 'wrap3', 'signcross2', 'udown4', 'extsw5', 'extuw3',
          'once1', 'eight8', 'nine9', 'long7', 'alias6', 'multi', 'nested',
-         'callbody', 'divbody', 'varstart', 'twophi']
+         'callbody', 'divbody', 'varstart', 'twophi', 'overbudget']
 cur, back = None, {}
 for ln in open(sys.argv[1]):
     m = re.match(r'^[0-9a-f]+ <(\w+)>:', ln)

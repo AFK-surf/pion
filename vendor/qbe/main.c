@@ -266,18 +266,21 @@ expandable(Ins *i)
 		&& virtualtmp(i->arg[1]);
 }
 
+/* budget: the expanded instructions the function may still spend, shared
+ * by both rounds. */
 static int
-expandloops(Fn *fn)
+expandloops(Fn *fn, int *budget)
 {
 	Blk *b;
 	Ins *dst, op;
 	Ref *map = 0, orig, iv[MaxTrips];
 	uint n, j, mapcap = 0;
-	int t, count, changed = 0, budget = 2 * MaxExpanded;
+	int t, count, changed = 0;
 
 	for (b=fn->start; b; b=b->link) {
 		if (b->nins > MaxExpanded || !(count = trips(fn, b, iv))
-		|| b->nins * count > MaxExpanded || b->nins * count > (uint)budget)
+		|| b->nins * count > MaxExpanded || *budget <= 0
+		|| b->nins * count > (uint)*budget)
 			continue;
 		for (n=0; n<b->nins; n++)
 			if (!expandable(&b->ins[n]))
@@ -320,7 +323,7 @@ expandloops(Fn *fn)
 		if (debug['G'])
 			fprintf(stderr, "\n> Expanded counted loop @%s: %d trips, %u ins\n",
 				b->name, count, j - 1);
-		budget -= j - 1;
+		*budget -= (int)(j - 1);
 		b->phi = 0;
 		b->ins = dst;
 		b->nins = j;
@@ -368,7 +371,10 @@ func(Fn *fn)
 	gcm(fn);
 	filluse(fn);
 	ssacheck(fn);
-	for (int round=0; round<2 && expandloops(fn); round++) {
+	/* At most two rounds (a nested loop can become a single block after
+	 * the first), sharing one budget of 2 * MaxExpanded instructions. */
+	int budget = 2 * MaxExpanded;
+	for (int round=0; round<2 && budget > 0 && expandloops(fn, &budget); round++) {
 		fillcfg(fn);
 		filluse(fn);
 		filldom(fn);

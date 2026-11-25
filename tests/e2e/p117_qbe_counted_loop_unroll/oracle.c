@@ -324,3 +324,23 @@ uint32_t o_twophi(uint32_t *dst, uint32_t *src)
 	}
 	return v + acc;
 }
+
+uint32_t o_overbudget(uint32_t *dst, uint32_t *src)
+{
+	uint32_t i, next, m = 0, acc = 0;
+	int k;
+
+	for (k = 0; k < 5; k++) {
+		for (i = 0; ; ) {
+			uint32_t v = *src + i;
+			m = v * (uint32_t)(k + 3);
+			*dst = m;
+			next = i + 1;
+			if (!((int32_t)next < 8))
+				break;
+			i = next;
+		}
+		acc = acc + m + next;
+	}
+	return acc;
+}

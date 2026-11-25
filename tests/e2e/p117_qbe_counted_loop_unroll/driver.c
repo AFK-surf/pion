@@ -7,7 +7,7 @@
 
 #define WFUNCS(X) X(up4) X(down4) X(falseback5) X(wrap3) X(signcross2) \
 	X(udown4) X(extsw5) X(extuw3) X(once1) X(eight8) X(nine9) X(alias6) \
-	X(multi) X(nested) X(callbody) X(divbody) X(varstart) X(twophi)
+	X(multi) X(nested) X(callbody) X(divbody) X(varstart) X(twophi) X(overbudget)
 
 #define DECL(n) uint32_t n(uint32_t *, uint32_t *); \
 	uint32_t o_##n(uint32_t *, uint32_t *); \
