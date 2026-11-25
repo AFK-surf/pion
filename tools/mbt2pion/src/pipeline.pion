@@ -860,6 +860,38 @@ pub fn transpile_package_with_abis(
   run_probes : Bool,
   check_fn : (Array[(String, String)]) -> String,
 ) -> TranspileResult {
+  transpile_package_with_abis_and_companions(
+    sources,
+    api_map,
+    recipes,
+    overlays,
+    mbti_files,
+    dep_doc_jsons,
+    dep_abis,
+    [],
+    asset_bypass_rules,
+    opts,
+    pre_diags,
+    run_probes,
+    check_fn,
+  )
+}
+
+pub fn transpile_package_with_abis_and_companions(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+  companion_files : Array[(String, String, String)],
+  asset_bypass_rules : Array[AssetBypassRule],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+) -> TranspileResult {
   let sorted_sources = sort_source_files(sources)
   let symtab = empty_symbol_table()
   symtab_load_api_map(symtab, api_map)
@@ -1119,12 +1151,22 @@ pub fn transpile_package_with_abis(
     }
   }
 
+  // Record original source SHA-256 before operator-trait pre-pass
+  let orig_source_shas : Map[String, String] = Map()
+  for sf in selected {
+    orig_source_shas[sf.rel_path] = content_sha256(sf.content)
+  }
+
+  // §D1-3 pre-pass: lower `impl (Add|Sub|Mul|Neg|Div) for <Type>` into collision-free top-level functions
+  let (op_selected, local_op_impls) = preprocess_op_trait_impls(selected, ctx.self_pkg_name)
+  let op_lookup = build_op_impl_lookup(local_op_impls, dep_abis)
+
   // Stage A.0: prescan intra-package symbols
-  prescan_package_symbols(ctx, selected)
+  prescan_package_symbols(ctx, op_selected)
 
   // Stage A: lower every file
   let mut gen_files : Array[GeneratedFile] = []
-  for sf in selected {
+  for sf in op_selected {
     gen_files.push(lower_file_stage_a(ctx, sf))
   }
 
@@ -1172,6 +1214,7 @@ pub fn transpile_package_with_abis(
 
   // Global output path uniqueness gate (fail-closed): reject any two outputs targeting the same `rel_path`!
   let seen_out_paths : Map[String, String] = Map()
+  let seen_out_paths_lower : Map[String, String] = Map()
   for gf in gen_files {
     match seen_out_paths.get(gf.rel_path) {
       Some(prev_src) =>
@@ -1182,23 +1225,45 @@ pub fn transpile_package_with_abis(
         1,
         "output path collision on `" + gf.rel_path + "` between `" + prev_src + "` and `" + gf.source_file + "`",
       ))
-      None => seen_out_paths[gf.rel_path] = gf.source_file
+      None => {
+        seen_out_paths[gf.rel_path] = gf.source_file
+        seen_out_paths_lower[ascii_to_lower(gf.rel_path)] = gf.rel_path
+      }
+    }
+  }
+  // §D1-1: Validate companion files against generated filenames and generated public types
+  if companion_files.length() > 0 {
+    let gen_types = collect_generated_type_names(gen_files)
+    for cf in companion_files {
+      let cname = cf.0
+      let ctxt = cf.1
+      let clow = ascii_to_lower(cname)
+      if seen_out_paths.contains(cname) || seen_out_paths_lower.contains(clow) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_ABI_COMPANION_ERROR",
+          cname,
+          1,
+          1,
+          "companion filename `" + cname + "` collides with a generated `.pion` output file",
+        ))
+      }
+      validate_companion_declarations(cname, ctxt, gen_types, ctx.diags)
     }
   }
 
   // Declaration-granularity double-hash-anchored Overlays
   gen_files = apply_overlays(gen_files, overlays, opts.target, ctx.diags, ctx.dispositions)
 
-  // Stage B pre-pass + Stage A.5 Type-Probe Pass + Stage B final fixpoint pass:
+  // Stage B pre-pass + Stage A.5 Type-Probe Pass + Active Neg probe pass + Stage B final fixpoint pass:
   // Running Stage B first fixes compile-time errors (`for k, v in m`, `for i, ch in s`,
-  // `String` slices, missing methods) so Stage A.5 probes see exact resolved types!
+  // `String` slices, missing methods, custom binary ops) so Stage A.5 & Neg probes see exact resolved types!
   let mut probe_rounds = 0
   let mut probes_instrumented = 0
   let mut probes_resolved = 0
   let mut pre_b_iters = 0
   let probe_dispositions : Array[ProbeDisposition] = []
   if run_probes {
-    let (pre_files, pre_it, _) = run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+    let (pre_files, pre_it, _) = run_stage_b_with_ops(gen_files, api_map, op_lookup, check_fn, ctx.diags, ctx.drift_ledger)
     gen_files = pre_files
     pre_b_iters = pre_it
     let combined_val_fields : Map[String, String] = Map()
@@ -1231,22 +1296,33 @@ pub fn transpile_package_with_abis(
     probe_rounds = pr
     probes_instrumented = pi
     probes_resolved = pres
+    // §D1-3: Active type-directed `Neg` (`-p`) lowering (zero overhead when no `Neg` impl exists)
+    if has_any_neg_impl(op_lookup) {
+      let (neg_files, _) = run_neg_probe_pass(gen_files, op_lookup, check_fn, ctx.diags)
+      gen_files = neg_files
+    }
   }
 
   // Stage B: Type-Directed Fixpoint Pass (`pionc check --json`)
   let (b_files, post_b_iters, diag_hist) = if run_probes {
-    run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+    run_stage_b_with_ops(gen_files, api_map, op_lookup, check_fn, ctx.diags, ctx.drift_ledger)
   } else {
     (gen_files, 0, [])
   }
   let stage_b_iters = pre_b_iters + post_b_iters
   gen_files = b_files
 
-  // Build deterministic PackageAbi and embed `// abi-sha256: <hex>` in every emitted `.pion` header!
+  // Build deterministic PackageAbi (v2) and embed `// abi-sha256: <hex>` in every emitted `.pion` header!
+  let abi_comps : Array[AbiCompanionFile] = []
+  for cf in companion_files {
+    abi_comps.push(AbiCompanionFile::{ path: cf.0, sha256: cf.2 })
+  }
   let pkg_abi = PackageAbi::{
     package_name: ctx.self_pkg_name,
     enums: ctx.exported_abi_enums,
     struct_val_fields: ctx.exported_abi_struct_vals,
+    companion_files: abi_comps,
+    op_impls: local_op_impls,
   }
   let abi_sha = compute_abi_payload_sha256(pkg_abi)
   let opts_with_abi = TranspileOptions::{
@@ -1284,9 +1360,13 @@ pub fn transpile_package_with_abis(
 
   let emitted_sources : Array[FileAccountingEntry] = []
   for sf in selected {
+    let orig_sha = match orig_source_shas.get(sf.rel_path) {
+      Some(s) => s
+      None => content_sha256(sf.content)
+    }
     emitted_sources.push(FileAccountingEntry::{
       path: sf.rel_path,
-      sha256: content_sha256(sf.content),
+      sha256: orig_sha,
       reason: "emitted",
     })
   }

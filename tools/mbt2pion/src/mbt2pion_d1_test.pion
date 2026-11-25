@@ -1,0 +1,133 @@
+///| Wave M2-D1 unit tests:
+///| - §D1-1: ABI v1 backward compat + ABI v2 library file set (`*_test.pion` excluded, `*_wbtest.pion` kept),
+///|          companion parsing & declaration validation, tamper & undeclared-file fail-closed checks
+///| - §D1-2: `stage_b_scope_may_mutate` fail-closed on `get().push(9)` / `get()[0] = 9`
+///| - §D1-3: Collision-free operator trait lowering (`impl Add/Sub/Mul/Neg/Div`), `P::add` coexistence,
+///|          custom binary operator precedence (`a + b * c`, `a - b - c`)
+///| - §D1-4: Static compat call rewriting (`Float::is_nan`, `Float::from_uint`, `Float::reinterpret_from_uint`, `Bytes::make`)
+
+test "d1_abi_v1_and_v2_verification" {
+  // 1. ABI v1 backward compatibility (covers ALL `.pion` including `*_test.pion`)
+  let abi1 = empty_package_abi("dep_v1")
+  let sha1 = compute_abi_payload_sha256_v(abi1, 1)
+  let f_lib = ("lib.pion", "// abi-sha256: " + sha1 + "\npub fn f() -> Int { 1 }\n")
+  let f_test = ("lib_test.pion", "// abi-sha256: " + sha1 + "\ntest \"t\" { let _ = f() }\n")
+  let files1 = [f_lib, f_test]
+  let files_sha1 = compute_abi_files_sha256_v(files1, 1)
+  let json1 = "{\"schema_version\":1,\"package\":\"dep_v1\",\"abi_sha256\":\"" + sha1 + "\",\"files_sha256\":\"" + files_sha1 + "\",\"payload\":" + json::stringify(abi_payload_to_json_versioned(abi1, 1)) + "}\n"
+  let diags1 : Array[Diag] = []
+  let parsed1 = verify_and_parse_dep_abi("dep_v1", "/dep_v1", files1, Some(json1), diags1)
+  assert_true(parsed1 is Some(_) && diags1.length() == 0, "v1 backward compat passes")
+
+  // 2. ABI v2: excludes ONLY `*_test.pion`, KEEPS `*_wbtest.pion` and validates declared companions
+  let comp_txt = "pub fn helper_v2() -> Int { 42 }\n"
+  let comp_sha = content_sha256(comp_txt)
+  let abi2 = PackageAbi::{
+    package_name: "dep_v2",
+    enums: [],
+    struct_val_fields: [],
+    companion_files: [AbiCompanionFile::{ path: "zz_compat.pion", sha256: comp_sha }],
+    op_impls: [OpImplEntry::{ pkg: "dep_v2", type_name: "Vec2", op: "add", fn_name: "mbt_op_add_Vec2" }],
+  }
+  let sha2 = compute_abi_payload_sha256(abi2)
+  let g_lib = ("lib.pion", "// abi-sha256: " + sha2 + "\npub fn g() -> Int { 2 }\n")
+  let g_wb = ("lib_wbtest.pion", "// abi-sha256: " + sha2 + "\npub fn wb() -> Int { 3 }\n")
+  let g_test = ("lib_test.pion", "// abi-sha256: " + sha2 + "\ntest \"orig\" { () }\n")
+  let json2 = render_abi_json(abi2, [g_lib, g_wb, g_test])
+
+  // Mutating `*_test.pion` leaves v2 verification passing!
+  let g_test_mut = ("lib_test.pion", "// mutated test\ntest \"mut\" { () }\n")
+  let diags2_ok : Array[Diag] = []
+  let parsed2 = verify_and_parse_dep_abi("dep_v2", "/dep_v2", [g_lib, g_wb, g_test_mut, ("zz_compat.pion", comp_txt)], Some(json2), diags2_ok)
+  assert_true(parsed2 is Some(_) && diags2_ok.length() == 0, "v2 *_test.pion mutation passes")
+
+  // Mutating `*_wbtest.pion` MUST fail with `MBT2PION_DEP_ABI_ERROR`!
+  let g_wb_mut = ("lib_wbtest.pion", "// abi-sha256: " + sha2 + "\npub fn wb() -> Int { 999 }\n")
+  let diags2_wb : Array[Diag] = []
+  let parsed2_wb = verify_and_parse_dep_abi("dep_v2", "/dep_v2", [g_lib, g_wb_mut, g_test, ("zz_compat.pion", comp_txt)], Some(json2), diags2_wb)
+  assert_true(parsed2_wb is None && diags2_wb.length() > 0 && diags2_wb[0].code == "MBT2PION_DEP_ABI_ERROR", "v2 *_wbtest.pion mutation fails")
+
+  // Undeclared extra `.pion` file MUST fail with `MBT2PION_DEP_ABI_ERROR`!
+  let diags2_extra : Array[Diag] = []
+  let parsed2_extra = verify_and_parse_dep_abi("dep_v2", "/dep_v2", [g_lib, g_wb, ("zz_compat.pion", comp_txt), ("rogue.pion", "pub fn r() -> Int { 0 }\n")], Some(json2), diags2_extra)
+  assert_true(parsed2_extra is None && diags2_extra.length() > 0 && diags2_extra[0].code == "MBT2PION_DEP_ABI_ERROR", "undeclared companion fails")
+}
+
+test "d1_companion_toml_and_decl_validation" {
+  let ok_toml = "[[abi.companions]]\nname = \"zz_compat.pion\"\nsource = \"../companions/zz_compat.pion\"\n"
+  let d_ok : Array[Diag] = []
+  let specs = parse_abi_companions_toml(ok_toml, "recipes.toml", d_ok)
+  assert_true(specs.length() == 1 && specs[0].name == "zz_compat.pion" && d_ok.length() == 0, "valid companion toml")
+
+  let bad_toml = "[[abi.companions]]\nname = \"../escape.pion\"\nsource = \"a.pion\"\n[[abi.companions]]\nname = \"bad_test.pion\"\nsource = \"b.pion\"\n"
+  let d_bad : Array[Diag] = []
+  let bad_specs = parse_abi_companions_toml(bad_toml, "recipes.toml", d_bad)
+  assert_true(bad_specs.length() == 0 && d_bad.length() == 2, "invalid companion toml rejected")
+
+  let gen_types : Map[String, Bool] = Map()
+  gen_types["Color"] = true
+  let d_decl : Array[Diag] = []
+  validate_companion_declarations(
+    "zz_compat.pion",
+    "pub struct Color { r : Int }\npub struct Box { val : Int }\npub enum E { A(x~ : Int) }\n",
+    gen_types,
+    d_decl,
+  )
+  assert_true(d_decl.length() == 3, "companion decl validation catches 3 errors")
+}
+
+test "d1_op_trait_preprocess_and_binop_prec" {
+  let sf = SourceFile::{
+    rel_path: "p.mbt",
+    content: "pub struct P { x : Int }\npub fn mbt_op_add_P() -> Int { 0 }\npub fn P::add(self : P, other : P) -> P { P::{ x: self.x - other.x } }\npub impl Add for P with add(self, other) { P::{ x: self.x + other.x } }\npub impl Neg for P with neg(self) { P::{ x: -self.x } }\n",
+    is_test: false,
+  }
+  let (out_sfs, ops) = preprocess_op_trait_impls([sf], "pkg")
+  assert_true(ops.length() == 2, "2 op impls")
+  assert_true(ops[0].op == "add" && ops[0].fn_name == "mbt_op_add_P_1", "collision-free add name")
+  assert_true(ops[1].op == "neg" && ops[1].fn_name == "mbt_op_neg_P", "neg name")
+  assert_true(str_has(out_sfs[0].content, "pub fn mbt_op_add_P_1(self : P, other : P) -> P"), "filled param & ret types")
+  assert_true(str_has(out_sfs[0].content, "pub fn P::add("), "inherent P::add preserved")
+
+  // Precedence check: `mk(1) + mk(2) * mk(3)` with `+` at col 15 -> `add(mk(1), mk(2) * mk(3))`
+  let lines1 = ["let r = mk(1) + mk(2) * mk(3)"]
+  let mut1 : Map[Int, Bool] = Map()
+  let ok1 = rewrite_custom_binop_at(lines1, 0, 15, "+", "mbt_op_add_P", mut1)
+  assert_true(ok1 && lines1[0] == "let r = mbt_op_add_P(mk(1), mk(2) * mk(3))", "mul tighter than add")
+
+  // Left-associativity check: `a - b - c` with first `-` -> `sub(a, b) - c`
+  let lines2 = ["let r = a - b - c"]
+  let mut2 : Map[Int, Bool] = Map()
+  let ok2 = rewrite_custom_binop_at(lines2, 0, 11, "-", "mbt_op_sub_P", mut2)
+  assert_true(ok2 && lines2[0] == "let r = mbt_op_sub_P(a, b) - c", "left-associative sub")
+
+  // Static compat call rewrite
+  assert_true(
+    match rewrite_static_compat_call_at("let b = Bytes::make(-1, b'x')", 9) {
+      Some(s) => s == "let b = mbt_compat::bytes_make(-1, b'x')"
+      None => false
+    },
+    "Bytes::make rewrite",
+  )
+  assert_true(
+    match rewrite_static_compat_call_at("let f = Float::from_uint(1U)", 9) {
+      Some(s) => s == "let f = mbt_compat::float_from_uint(1U)"
+      None => false
+    },
+    "Float::from_uint rewrite",
+  )
+}
+
+test "d1_retain_call_result_mutation_fail_closed" {
+  let code = "pub fn f(xs : Array[Int]) -> Unit {\n  xs.retain(fn(x) { get().push(9); x > 0 })\n}\n"
+  let gf = GeneratedFile::{ rel_path: "a.pion", content: code, source_file: "a.mbt", anchors: [] }
+  let diags : Array[Diag] = []
+  stage_b_check_array_retain_mutation([gf], "a.pion", code, 2, 6, "retain", diags)
+  assert_true(diags.length() == 1 && diags[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "get().push(9) fail-closed")
+
+  let code2 = "pub fn f(xs : Array[Int]) -> Unit {\n  xs.retain(fn(x) { get()[0] = 9; x > 0 })\n}\n"
+  let gf2 = GeneratedFile::{ rel_path: "b.pion", content: code2, source_file: "b.mbt", anchors: [] }
+  let diags2 : Array[Diag] = []
+  stage_b_check_array_retain_mutation([gf2], "b.pion", code2, 2, 6, "retain", diags2)
+  assert_true(diags2.length() == 1 && diags2[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "get()[0] = 9 fail-closed")
+}

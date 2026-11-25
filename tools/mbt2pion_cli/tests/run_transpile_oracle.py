@@ -105,6 +105,7 @@ CASES = {
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
     "transpile_upper_tier": ("ok", 34),
+    "wave_m2_d1": ("ok", 7),
 }
 
 MOON_TRAPS = {
@@ -1858,6 +1859,101 @@ pub fn ut_r5_p1_2_custom_holder_retain() -> Int {
   h.retain(fn() { h.count = 9 })
   h.count
 }
+
+// Wave M2-D1: Collision-free operator trait lowering + Neg + Float/Bytes compat
+pub(all) struct D1P {
+  n : Int
+}
+
+pub(all) struct D1Pair {
+  x : D1P
+  y : D1P
+}
+
+pub fn D1P::add(self : D1P, other : D1P) -> D1P {
+  D1P::{ n: self.n - other.n }
+}
+
+pub impl Add for D1P with add(self, other) {
+  D1P::{ n: self.n + other.n }
+}
+
+pub impl Sub for D1P with sub(self, other) {
+  D1P::{ n: self.n - other.n }
+}
+
+pub impl Mul for D1P with mul(self, other) {
+  D1P::{ n: self.n * other.n }
+}
+
+pub impl Div for D1P with div(self, other) {
+  D1P::{ n: self.n / other.n }
+}
+
+pub impl Neg for D1P with neg(self) {
+  D1P::{ n: -self.n }
+}
+
+fn d1_get_pair() -> D1Pair {
+  D1Pair::{ x: D1P::{ n: 5 }, y: D1P::{ n: 9 } }
+}
+
+pub fn d1_op_coexist_and_neg() -> (Int, Int, Int, Int, Int, Int) {
+  let a = D1P::{ n: 7 }
+  let b = D1P::{ n: 3 }
+  let r_plus = (a + b).n
+  let r_method = a.add(b).n
+  let p = D1Pair::{ x: D1P::{ n: 4 }, y: D1P::{ n: 6 } }
+  let n1 = (-a).n
+  let n2 = (-p.x).n
+  let n3 = (-d1_get_pair().y).n
+  let n4 = (-(a + b)).n
+  (r_plus, r_method, n1, n2, n3, n4)
+}
+
+pub fn d1_op_prec_and_order() -> (Int, Int, Int, Int, Int, Int) {
+  let a = D1P::{ n: 10 }
+  let b = D1P::{ n: 3 }
+  let c = D1P::{ n: 2 }
+  let r1 = (a + b - c).n
+  let r2 = (a + b * c).n
+  let r3 = ((a - b) * c).n
+  let r4 = (a - b - c).n
+  let log : Ref[Int] = { val: 0 }
+  fn mk(k : Int) -> D1P {
+    log.val = log.val * 10 + k
+    D1P::{ n: k }
+  }
+  let r5 = (mk(1) + mk(2) * mk(3)).n
+  (r1, r2, r3, r4, r5, log.val)
+}
+
+pub fn d1_float_and_bytes_compat() -> (Bool, Bool, String, String, Int, Int, Int, Int, Int) {
+  let qnan = Float::reinterpret_from_uint(0x7FC00000U)
+  let snan = Float::reinterpret_from_uint(0x7F800001U)
+  let pz = Float::reinterpret_from_uint(0x00000000U)
+  let nz = Float::reinterpret_from_uint(0x80000000U)
+  let pinf = Float::reinterpret_from_uint(0x7F800000U)
+  let one = Float::reinterpret_from_uint(0x3F800000U)
+  let nan_ok = Float::is_nan(qnan) && qnan.is_nan() && Float::is_nan(snan) && !Float::is_nan(pz) && !Float::is_nan(nz) && !Float::is_nan(pinf) && !Float::is_nan(one)
+  let u_vals : Array[UInt] = [0U, 1U, 0xFFFFFFU, 0x1000001U, 0x7FFFFFFFU, 0xFFFFFFFFU]
+  let fu_sb = StringBuilder::new()
+  for i = 0; i < u_vals.length(); i = i + 1 {
+    if i > 0 { fu_sb.write_string(",") }
+    fu_sb.write_string(Float::from_uint(u_vals[i]).reinterpret_as_int().to_string())
+  }
+  let r_vals : Array[UInt] = [0x00000000U, 0x80000000U, 0x3F800000U, 0x00000001U, 0x7F800000U, 0x7FC00000U]
+  let ru_sb = StringBuilder::new()
+  for i = 0; i < r_vals.length(); i = i + 1 {
+    if i > 0 { ru_sb.write_string(",") }
+    ru_sb.write_string(Float::reinterpret_from_uint(r_vals[i]).reinterpret_as_int().to_string())
+  }
+  let b_neg = Bytes::make(-1, b'\xAB')
+  let b_zero = Bytes::make(0, b'\xAB')
+  let b_four = Bytes::make(4, b'\xAB')
+  let b_ok = b_four[0] == b'\xAB' && b_four[3] == b'\xAB'
+  (nan_ok, b_ok, fu_sb.to_string(), ru_sb.to_string(), b_neg.length(), b_zero.length(), b_four.length(), b_four[0].to_int(), b_four[3].to_int())
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -2453,6 +2549,19 @@ fn main {
     check("ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
     check("ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
     check("ut.r5_p1_2_custom_holder_retain", r5h == 9)
+  } else if kase == "wave_m2_d1" {
+    let (rp, rm, n1, n2, n3, n4) = @m12.d1_op_coexist_and_neg()
+    let (p1, p2, p3, p4, p5, ord) = @m12.d1_op_prec_and_order()
+    let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = @m12.d1_float_and_bytes_compat()
+    trace("d1_ops", "\{rp}:\{rm}:\{n1}:\{n2}:\{n3}:\{n4},\{p1}:\{p2}:\{p3}:\{p4}:\{p5}:\{ord}")
+    trace("d1_compat", "\{nan_ok}:\{b_ok},\{fu_s},\{ru_s},\{bn}:\{bz}:\{bf}:\{bf0}:\{bf3}")
+    check("d1.op_coexist", rp == 10 && rm == 4)
+    check("d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
+    check("d1.op_prec", p1 == 11 && p2 == 16 && p3 == 14 && p4 == 5 && p5 == 7)
+    check("d1.op_eval_order", ord == 123)
+    check("d1.float_is_nan", nan_ok)
+    check("d1.float_uint_bits", fu_s.length() > 0 && ru_s.length() > 0)
+    check("d1.bytes_make", bn == 0 && bz == 0 && bf == 4 && b_ok && bf0 == 171 && bf3 == 171)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3065,6 +3174,19 @@ pub fn main(w : World) -> Int {
     check(w, "ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
     check(w, "ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
     check(w, "ut.r5_p1_2_custom_holder_retain", r5h == 9)
+  } else if kase == "wave_m2_d1" {
+    let (rp, rm, n1, n2, n3, n4) = m12::d1_op_coexist_and_neg()
+    let (p1, p2, p3, p4, p5, ord) = m12::d1_op_prec_and_order()
+    let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = m12::d1_float_and_bytes_compat()
+    trace(w, "d1_ops", rp.to_string() + ":" + rm.to_string() + ":" + n1.to_string() + ":" + n2.to_string() + ":" + n3.to_string() + ":" + n4.to_string() + "," + p1.to_string() + ":" + p2.to_string() + ":" + p3.to_string() + ":" + p4.to_string() + ":" + p5.to_string() + ":" + ord.to_string())
+    trace(w, "d1_compat", nan_ok.to_string() + ":" + b_ok.to_string() + "," + fu_s + "," + ru_s + "," + bn.to_string() + ":" + bz.to_string() + ":" + bf.to_string() + ":" + bf0.to_string() + ":" + bf3.to_string())
+    check(w, "d1.op_coexist", rp == 10 && rm == 4)
+    check(w, "d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
+    check(w, "d1.op_prec", p1 == 11 && p2 == 16 && p3 == 14 && p4 == 5 && p5 == 7)
+    check(w, "d1.op_eval_order", ord == 123)
+    check(w, "d1.float_is_nan", nan_ok)
+    check(w, "d1.float_uint_bits", fu_s.length() > 0 && ru_s.length() > 0)
+    check(w, "d1.bytes_make", bn == 0 && bz == 0 && bf == 4 && b_ok && bf0 == 171 && bf3 == 171)
   } else {
     panic("abort: unknown case " + kase)
   }

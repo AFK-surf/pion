@@ -844,6 +844,25 @@ fn case_compat_parse_numbers() -> Unit {
 }
 
 ///|
+fn case_set_retain_nan() -> Unit {
+  let nan = 0.0 / 0.0
+  let s1 : Set[Double] = Set::new()
+  s1.add(nan)
+  s1.add(1.0)
+  s1.retain(fn(_) { false })
+  trace("s1_len", s1.length().to_string())
+  check("set.retain_nan_all_false", s1.length() == 0)
+
+  let s2 : Set[Double] = Set::new()
+  s2.add(nan)
+  s2.add(1.0)
+  s2.retain(fn(x) { x == x })
+  let rem = s2.to_array()
+  trace("s2_rem", "\{s2.length()}:\{rem[0]}")
+  check("set.retain_nan_keep_finite", s2.length() == 1 && rem.length() == 1 && rem[0] == 1.0)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -871,6 +890,7 @@ fn main {
     "compat.basics" => case_compat_basics()
     "compat.round2" => case_compat_round2()
     "compat.parse_numbers" => case_compat_parse_numbers()
+    "set.retain_nan" => case_set_retain_nan()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)
