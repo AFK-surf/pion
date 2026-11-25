@@ -149,6 +149,86 @@ layout_cold_blocks(Fn *fn)
 	}
 }
 
+/* Give frequently revisited switch arms separate indirect branch sites.
+ * A hot loop-internal predecessor (b->loop >= head->loop, not only a strict
+ * back edge) that jumps to a short guard whose one side is a private short
+ * jump table takes the guard and its own copy of the table block. The copy
+ * branches to exactly the same arms and default. Work after allocation: the
+ * incoming edge has already reconciled registers. */
+enum { MaxSites = 24, MaxTable = 32 };
+
+static int
+shortdispatchblock(Blk *b)
+{
+	uint j;
+
+	if (b->nins > 16)
+		return 0;
+	for (j=0; j<b->nins; j++)
+		if (b->ins[j].op == Ocall || b->ins[j].op == Odbgloc)
+			return 0;
+	return 1;
+}
+
+static int
+guardedtable(Blk *head, Blk *t)
+{
+	return t && t->jmp.type == Jjtbl && t->npred == 1 && t->pred[0] == head
+		&& !t->phi && t->njtbl <= MaxTable && shortdispatchblock(t);
+}
+
+static void
+replicatedispatch(Fn *fn)
+{
+	Blk *b, *head, *table, *other, *clone;
+	Ins *seq;
+	uint n, sites = 0;
+
+	for (n=0; n<fn->nblk && sites<MaxSites; n++) {
+		b = fn->rpo[n];
+		head = b->s1;
+		if (b->jmp.type != Jjmp || !head || b == head
+		|| head->loop <= 1 || b->loop < head->loop
+		|| head->npred < 3 || head->phi || !shortdispatchblock(head)
+		|| !head->s1 || !head->s2)
+			continue;
+		/* Either side may be the table; check both in full. */
+		if (guardedtable(head, head->s1))
+			table = head->s1;
+		else if (guardedtable(head, head->s2))
+			table = head->s2;
+		else
+			continue;
+		clone = newblk();
+		clone->name = strf(PFn, "dispatch.%u", sites++);
+		/* ARM64 text emission may lower instructions in place. */
+		idup(clone, table->ins, table->nins);
+		clone->jmp = table->jmp;
+		clone->s1 = table->s1;
+		clone->jtbl = table->jtbl;
+		clone->njtbl = table->njtbl;
+		clone->loop = table->loop;
+		clone->link = b->link;
+		b->link = clone;
+		if (b->nins + head->nins > 0) {
+			seq = alloc((b->nins + head->nins) * sizeof *seq);
+			icpy(icpy(seq, b->ins, b->nins), head->ins, head->nins);
+			b->ins = seq;
+			b->nins += head->nins;
+		}
+		b->jmp = head->jmp;
+		b->s1 = head->s1 == table ? clone : head->s1;
+		b->s2 = head->s2 == table ? clone : head->s2;
+		/* The other side gained b as a predecessor: keep a table there
+		 * from passing as private until fillcfg recounts. */
+		other = table == head->s1 ? head->s2 : head->s1;
+		if (other != table)
+			other->npred++;
+	}
+	if (sites)
+		fillcfg(fn);
+}
+
 /* Counted-loop expansion. A single-block loop whose only phi is an integer
  * induction variable with a constant start, a constant add/sub stride and an
  * exit test against a constant (optionally through extsw/extuw) is evaluated
@@ -417,6 +497,8 @@ func(Fn *fn)
 	fillcfg(fn);
 	simpljmp(fn);
 	fillcfg(fn);
+	if (strcmp(T.name, "arm64_apple") == 0)
+		replicatedispatch(fn);
 	assert(fn->rpo[0] == fn->start);
 	for (n=0;; n++)
 		if (n == fn->nblk-1) {

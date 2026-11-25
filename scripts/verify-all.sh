@@ -414,6 +414,8 @@ sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
 # Generic arithmetic operator instantiation checks & QBE monomorphization (dev, --release, wasm32, ASan).
 sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC2"
+# P122: arm64_apple guarded jump-table dispatch copies (main.c replicatedispatch; br sites on 6 targets, text == Mach-O --obj, checker mutations, both-sides-table symmetry, no copy of a table shared by a rewritten edge, 24-copy limit, 8 QBE mutants of the match conditions and limit, 243712-input C reference via arm64_apple text and --obj on macOS ARM64, bytecode_vm == C with 24 run_vm sites, ASan+UBSan QBE replay).
+sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC2"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
