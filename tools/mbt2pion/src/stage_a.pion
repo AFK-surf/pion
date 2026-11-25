@@ -2920,10 +2920,72 @@ fn is_simple_closure_param_type(ctx : StageAContext, ty : String) -> Bool {
   ctx.symtab.local_types.contains(ty) && !ctx.active_generics.contains(ty)
 }
 
+///| True iff identifier `name` is (re)bound anywhere inside `(body_s, body_e)`: after `let`/`mut`/`for`/`as`/`fn`/`is`
+///| within the same statement (covers tuple/struct `let` patterns, `for i, x`, nested closure parameters and
+///| `is` patterns), or inside a `match` arm pattern (a later `=>` in the same arm head). Deliberately
+///| over-approximate: any doubt counts as a binding.
+fn closure_body_binds_name(tokens : Array[Token], body_s : Int, body_e : Int, name : String) -> Bool {
+  let mut j = body_s + 1
+  while j < body_e {
+    if tokens[j].kind == TokenKind::Ident && tokens[j].raw == name {
+      // Backward to the start of the statement / enclosing group chain.
+      let mut m = j - 1
+      let mut d = 0
+      while m > body_s {
+        if d <= 0 && tokens[m + 1].newline_before {
+          break
+        }
+        let mk = tokens[m].kind
+        if mk == TokenKind::RParen || mk == TokenKind::RBracket || mk == TokenKind::RBrace {
+          d = d + 1
+        } else if mk == TokenKind::LParen || mk == TokenKind::LBracket {
+          d = d - 1
+        } else if mk == TokenKind::LBrace {
+          if d <= 0 { break }
+          d = d - 1
+        } else if d <= 0 && (mk == TokenKind::Eq || mk == TokenKind::Semi || mk == TokenKind::FatArrow) {
+          break
+        } else if d <= 0 && mk == TokenKind::Keyword {
+          let r = tokens[m].raw
+          if r == "let" || r == "mut" || r == "for" || r == "as" || r == "fn" || r == "is" {
+            return true
+          }
+        }
+        m = m - 1
+      }
+      // Forward: an arm head `Pat(.., name, ..) [if guard] =>`.
+      let mut n = j + 1
+      let mut d2 = 0
+      while n < body_e {
+        if d2 <= 0 && tokens[n].newline_before {
+          break
+        }
+        let nk = tokens[n].kind
+        if d2 <= 0 && (nk == TokenKind::LBrace || nk == TokenKind::Eq || nk == TokenKind::Semi) {
+          break
+        }
+        if d2 <= 0 && nk == TokenKind::FatArrow {
+          return true
+        }
+        if nk == TokenKind::LParen || nk == TokenKind::LBracket || nk == TokenKind::LBrace {
+          d2 = d2 + 1
+        } else if nk == TokenKind::RParen || nk == TokenKind::RBracket || nk == TokenKind::RBrace {
+          d2 = d2 - 1
+        }
+        n = n + 1
+      }
+    }
+    j = j + 1
+  }
+  false
+}
+
 ///| Infer the type of untyped closure parameter `pname` from its uses in `[body_s, body_e)`: every use as a whole
-///| positional argument of `recv.m(...)` (receiver a scope variable of known type with a known `Type::m`) or of a
-///| known local function `f(...)` must agree on one simple type. Returns "" when there is no such use, any use
-///| disagrees, or the type is not simple (fail-closed: pionc then reports the unannotated parameter).
+///| positional argument of `recv.m(...)` (receiver a plain scope variable of known type, not a field `a.recv`, with a
+///| known `Type::m`) or of a known local function `f(...)` must agree on one simple type. Fail-closed (returns "")
+///| when `pname`, the receiver or the callee is rebound in the body, when a call has named/labeled arguments or a
+///| different argument count than the callee's parameters (so positions map 1:1), when there is no such use, any use
+///| disagrees, or the type is not simple; pionc then reports the unannotated parameter.
 fn infer_closure_param_type_from_body(
   ctx : StageAContext,
   tokens : Array[Token],
@@ -2931,6 +2993,9 @@ fn infer_closure_param_type_from_body(
   body_e : Int,
   pname : String,
 ) -> String {
+  if closure_body_binds_name(tokens, body_s, body_e, pname) {
+    return ""
+  }
   let mut found = ""
   let mut j = body_s + 1
   while j < body_e {
@@ -2958,11 +3023,43 @@ fn infer_closure_param_type_from_body(
       tokens[k - 1].kind != TokenKind::Ident {
         return ""
       }
+      // All arguments must be positional: no `name=`, `name~`, `name?=`, `name?` or `~` at depth 0.
+      let close_p = find_matching_delim(tokens, k)
+      let mut commas = 0
+      let mut q = k + 1
+      let mut qd = 0
+      while q < close_p {
+        let qk = tokens[q].kind
+        if qk == TokenKind::LParen || qk == TokenKind::LBracket || qk == TokenKind::LBrace {
+          qd = qd + 1
+        } else if qk == TokenKind::RParen || qk == TokenKind::RBracket || qk == TokenKind::RBrace {
+          qd = qd - 1
+        } else if qd == 0 && qk == TokenKind::Comma {
+          commas = commas + 1
+        } else if qd == 0 && (qk == TokenKind::Tilde || qk == TokenKind::QuestionEq ||
+          (qk == TokenKind::Ident && q + 1 < close_p &&
+            (tokens[q + 1].kind == TokenKind::Eq || tokens[q + 1].kind == TokenKind::Question ||
+              tokens[q + 1].kind == TokenKind::QuestionEq || tokens[q + 1].kind == TokenKind::Tilde))) {
+          return ""
+        }
+        q = q + 1
+      }
+      // `(a, b)` has 2 arguments; a trailing comma `(a, b,)` does not add one. `pname` itself is one, so >= 1.
+      let n_args = if tokens[close_p - 1].kind == TokenKind::Comma { commas } else { commas + 1 }
       let callee = tokens[k - 1].raw
       let mut pts : Array[(String, String)] = []
       let mut strip_self = false
       if k >= 3 && tokens[k - 2].kind == TokenKind::Dot && tokens[k - 3].kind == TokenKind::Ident {
-        match lookup_scope_var(ctx, rename_keyword_ident(tokens[k - 3].raw)) {
+        // The receiver must be a plain variable (`recv.m(..)`), never a field (`a.recv.m(..)`, `T::recv.m(..)`),
+        // and must not be rebound inside the closure body.
+        if k >= 4 && (tokens[k - 4].kind == TokenKind::Dot || tokens[k - 4].kind == TokenKind::ColonColon) {
+          return ""
+        }
+        let recv = tokens[k - 3].raw
+        if recv == pname || closure_body_binds_name(tokens, body_s, body_e, recv) {
+          return ""
+        }
+        match lookup_scope_var(ctx, rename_keyword_ident(recv)) {
           Some(sv) => {
             let rbase = strip_type_args_sym(sv.ty)
             if rbase.length() > 0 {
@@ -2978,7 +3075,8 @@ fn infer_closure_param_type_from_body(
           None => ()
         }
       } else if k >= 2 && tokens[k - 2].kind != TokenKind::Dot && tokens[k - 2].kind != TokenKind::ColonColon &&
-      ctx.symtab.local_fn_names.contains(callee) && lookup_scope_var(ctx, callee) is None {
+      ctx.symtab.local_fn_names.contains(callee) && lookup_scope_var(ctx, callee) is None &&
+      !closure_body_binds_name(tokens, body_s, body_e, callee) {
         match ctx.symtab.fn_param_types.get(callee) {
           Some(p) => pts = p
           None => ()
@@ -2988,7 +3086,9 @@ fn infer_closure_param_type_from_body(
       if strip_self && off == 0 {
         return ""
       }
-      if arg_idx + off >= pts.length() {
+      // Positions map 1:1 only when every parameter is passed positionally (labeled/optional/autofill parameters
+      // are either named, which was rejected above, or omitted, which changes the count).
+      if pts.length() == 0 || pts.length() - off != n_args || arg_idx + off >= pts.length() {
         return ""
       }
       let ty = pts[arg_idx + off].1.trim()

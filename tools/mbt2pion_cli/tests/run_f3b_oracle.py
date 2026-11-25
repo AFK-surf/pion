@@ -9,6 +9,10 @@ Covers (a two-package project: `f3dep` transpiled first, then `f3b` against it v
   5. `@dep.Type::method(.., Alpha)` where the caller also has a private enum with an `Alpha` constructor
   6. `fresh[:]` / `fresh[a:b]` / `fresh[a:]` passed to a dependency's `ArrayView[Int]` parameter
   7. `trim_end(chars=...)` with ASCII, multi-byte, astral and fully-trimmed inputs
+Negative cases (must fail closed, never silently change semantics):
+  - a borrowed slice of a user `copy()` that returns an alias must block with MBT2PION_BORROWED_ARRAY_SLICE
+  - untyped closure params shadowed in the body, used via a field receiver `a.b.m(k)`, or passed next to a named
+    argument must never be inferred (here: never as `Int64`)
 """
 import argparse, os, shutil, subprocess, tempfile
 
@@ -203,6 +207,71 @@ pub fn run_all() -> String {
 '''
 
 
+NEG_COPY_MBT = r'''
+priv struct Bag {
+  values : Array[Int]
+}
+
+fn Bag::copy(self : Bag) -> Array[Int] {
+  self.values
+}
+
+pub fn copy_alias() -> Int {
+  let bag : Bag = { values: [1, 2] }
+  let v = bag.copy()[0:2]
+  bag.values[1] = 9
+  v[1]
+}
+'''
+
+NEG_CLOSURE_MBT = r'''
+fn use_wide(_w : Int64) -> Unit {
+  ()
+}
+
+pub fn scope_case() -> Int {
+  let g = fn(k) { let neg = (k + 1) < 0; { let k = 1L; use_wide(k) }; if neg { 1 } else { 0 } }
+  g(2147483647)
+}
+
+priv struct Decoy {
+  n : Int
+}
+
+fn Decoy::touch(self : Decoy, _v : Int64) -> Int {
+  self.n
+}
+
+priv struct Inner {
+  n : Int
+}
+
+fn Inner::touch(self : Inner, v : Int) -> Int {
+  self.n + v
+}
+
+priv struct Parent {
+  b : Inner
+}
+
+pub fn field_case() -> Int {
+  let a : Parent = { b: { n: 0 } }
+  let b : Decoy = { n: 0 }
+  let g = fn(k) { let neg = (k + 1) < 0; let _ = a.b.touch(k); if neg { 1 } else { 0 } }
+  g(2147483647) + b.n
+}
+
+fn[X] consume(_v : X, wide~ : Int64) -> Unit {
+  ignore(wide)
+}
+
+pub fn named_case() -> Int {
+  let g = fn(k) { let neg = (k + 1) < 0; consume(wide=0L, k); if neg { 1 } else { 0 } }
+  g(2147483647)
+}
+'''
+
+
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
     if p.returncode != 0:
@@ -265,7 +334,42 @@ def main():
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
         )
+        # Negative 1: borrowed slice of an aliasing user `copy()` must fail closed (Moon answers 9 via the alias).
+        neg = os.path.join(md, "f3neg")
+        os.makedirs(neg)
+        with open(os.path.join(neg, "moon.pkg"), "w") as fh:
+            fh.write("\n")
+        with open(os.path.join(neg, "neg.mbt"), "w") as fh:
+            fh.write(NEG_COPY_MBT)
+        nout = os.path.join(work, "p_neg", "src")
+        os.makedirs(nout)
+        p = subprocess.run([bin_path, "--src", neg, "--out", nout, "--target", "native", "--mode", "publish",
+                            "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        assert p.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in (p.stdout + p.stderr), (
+            f"copy-alias slice must block publish with MBT2PION_BORROWED_ARRAY_SLICE:\n{p.stdout}\n{p.stderr}"
+        )
+        assert not os.listdir(nout), "blocked publish must not write --out"
+
+        # Negative 2: shadowed / field-receiver / named-argument closure params are never inferred.
+        cneg = os.path.join(md, "f3cneg")
+        os.makedirs(cneg)
+        with open(os.path.join(cneg, "moon.pkg"), "w") as fh:
+            fh.write("\n")
+        with open(os.path.join(cneg, "neg.mbt"), "w") as fh:
+            fh.write(NEG_CLOSURE_MBT)
+        cout = os.path.join(work, "p_cneg", "src")
+        os.makedirs(cout)
+        subprocess.run([bin_path, "--src", cneg, "--out", cout, "--target", "native", "--mode", "audit",
+                        "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", os.path.join(work, "cneg.json")],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        gen = open(os.path.join(cout, "neg.pion"), encoding="utf-8").read()
+        assert gen.count("let g = fn(k) {") == 3 and "k : Int64" not in gen, (
+            "closure params must stay unannotated in all 3 negative cases:\n" + gen
+        )
+
         print("[f3b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
+        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; 3 closure params not inferred)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

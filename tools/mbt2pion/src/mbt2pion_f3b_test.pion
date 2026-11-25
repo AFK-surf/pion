@@ -7,6 +7,8 @@
 ///| 6. Dependency signatures qualify the dependency's own enums (`k: MaskType` -> `dep::MaskType`)
 ///| 7. Fresh-receiver borrowed slices are tagged for an exact `ArrayBuf` view
 ///| 8. `String::trim_end` routes to `mbt_compat::str_trim_end`
+///| 9. Review regressions: user `.copy()` is never a fresh array; closure inference fails closed on shadowing,
+///|    field receivers, named/labeled arguments and omitted labeled parameters
 
 fn f3b_transpile(rel : String, src : String) -> (Int, String) {
   let res = transpile_package([SourceFile::{ rel_path: rel, content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
@@ -191,4 +193,79 @@ test "F3b-8: String.trim_end routes to mbt_compat::str_trim_end" {
     Some(h) => assert_true(h == "mbt_compat::str_trim_end", "trim_end helper")
     None => assert_true(false, "trim_end mapped")
   }
+}
+
+test "F3b-9a: borrowed-slice freshness never trusts a user-defined .copy() or the identity arr_to_array" {
+  let fresh = fn(src : String) -> Bool {
+    let toks = lex_moonbit(src)
+    let n = if toks.length() > 0 && toks[toks.length() - 1].kind == TokenKind::Eof { toks.length() - 1 } else { toks.length() }
+    is_proven_fresh_array_alloc(toks, 0, n)
+  }
+  assert_true(fresh("[1, 2]"), "array literal is fresh")
+  assert_true(fresh("mbt_compat::arr_copy(xs)"), "mbt_compat::arr_copy is fresh")
+  assert_true(fresh("mbt_compat::arr_map(xs, f)"), "arr_map is fresh")
+  assert_true(!fresh("bag.copy()"), "user Bag::copy may return an alias")
+  assert_true(!fresh("mbt_compat::arr_to_array(xs)"), "arr_to_array is the identity")
+  assert_true(!fresh("mbt_compat::arr_copy(xs).foo"), "only a whole helper call counts")
+  let toks = lex_moonbit("let __mbt_sl_1 = bag.copy(); mbt_compat::__mbt_slice_borrow(__mbt_sl_1, 0, 2)")
+  let mut site = -1
+  let mut k = 0
+  while k < toks.length() {
+    if toks[k].raw == "mbt_compat" && k + 2 < toks.length() && toks[k + 2].raw == "__mbt_slice_borrow" { site = k }
+    k = k + 1
+  }
+  assert_true(site > 0 && !slice_temp_bound_fresh(toks, site, "__mbt_sl_1"), "temp bound to bag.copy() is not fresh")
+}
+
+test "F3b-9b: closure param inference fails closed on shadowing, field receivers and named arguments" {
+  let scope_src = "fn use_wide(_w : Int64) -> Unit { () }\n" +
+  "pub fn f() -> Int {\n" +
+  "  let g = fn(k) { let neg = (k + 1) < 0; { let k = 1L; use_wide(k) }; if neg { 1 } else { 0 } }\n" +
+  "  g(2147483647)\n" +
+  "}\n"
+  let (_, scope_out) = f3b_transpile("scope.mbt", scope_src)
+  assert_true(str_has(scope_out, "let g = fn(k) {") && !str_has(scope_out, "k : Int64"), "inner `let k` shadowing: no inference")
+
+  let field_src = "struct Decoy {\n  n : Int\n}\n" +
+  "fn Decoy::touch(self : Decoy, _v : Int64) -> Int { self.n }\n" +
+  "struct Inner {\n  n : Int\n}\n" +
+  "fn Inner::touch(self : Inner, v : Int) -> Int { self.n + v }\n" +
+  "struct Parent {\n  b : Inner\n}\n" +
+  "pub fn f() -> Int {\n" +
+  "  let a : Parent = { b: { n: 0 } }\n" +
+  "  let b : Decoy = { n: 0 }\n" +
+  "  let g = fn(k) { let neg = (k + 1) < 0; let _ = a.b.touch(k); if neg { 1 } else { 0 } }\n" +
+  "  g(2147483647) + b.n\n" +
+  "}\n"
+  let (_, field_out) = f3b_transpile("field.mbt", field_src)
+  assert_true(str_has(field_out, "let g = fn(k) {") && !str_has(field_out, "k : Int64"), "a.b.touch(k) never consults local `b`")
+
+  let named_src = "fn[X] consume(_v : X, wide~ : Int64) -> Unit { ignore(wide) }\n" +
+  "pub fn f() -> Int {\n" +
+  "  let g = fn(k) { let neg = (k + 1) < 0; consume(wide=0L, k); if neg { 1 } else { 0 } }\n" +
+  "  g(2147483647)\n" +
+  "}\n"
+  let (_, named_out) = f3b_transpile("named.mbt", named_src)
+  assert_true(str_has(named_out, "let g = fn(k) {") && !str_has(named_out, "k : Int64"), "named argument call: no inference")
+
+  let omitted_src = "fn tw(x : Int64, scale~ : Int = 2) -> Int64 { x * scale.to_int64() }\n" +
+  "pub fn f() -> Int64 {\n" +
+  "  let g = fn(v) { tw(v) }\n" +
+  "  g(3L)\n" +
+  "}\n"
+  let (_, omitted_out) = f3b_transpile("omitted.mbt", omitted_src)
+  assert_true(str_has(omitted_out, "let g = fn(v) {"), "omitted labeled parameter: positions not proven, no inference")
+
+  let arm_src = "fn twice(x : Int) -> Int {\n  x * 2\n}\n" +
+  "pub fn f(o : Int64?) -> Int {\n" +
+  "  let g = fn(k) {\n    match o {\n      Some(k) => k.to_int()\n      None => twice(k)\n    }\n  }\n" +
+  "  g(1)\n" +
+  "}\n"
+  let (_, arm_out) = f3b_transpile("arm.mbt", arm_src)
+  assert_true(str_has(arm_out, "let g = fn(k) {"), "match-arm rebinding: no inference")
+
+  let ok_src = "fn twice(x : Int) -> Int {\n  x * 2\n}\n" +
+  "pub fn f() -> Int {\n  let g = fn(k) { let neg = (k + 1) < 0; if neg { 1 } else { twice(k) } }\n  g(1)\n}\n"
+  let (_, ok_out) = f3b_transpile("ok.mbt", ok_src)
+  assert_true(str_has(ok_out, "let g = fn(k : Int) {"), "a plain positional use still infers")
 }
