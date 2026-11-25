@@ -2190,6 +2190,10 @@ with open(os.path.join(m2b_pkg, "mbt_src", "lib_test.mbt"), "w") as f:
         '  assert_eq(sh_for(), 8)\n'
         '  assert_eq(sh_if(Some(7)), 7)\n'
         '  assert_eq(sh_if(None), 5)\n'
+        '  // Astra P0-1: local `__mbt_bbtest_limit = 99` must NEVER hijack renamed top-level `limit` (5)!\n'
+        '  let __mbt_bbtest_limit = 99\n'
+        '  assert_eq(limit, 5)\n'
+        '  assert_eq(__mbt_bbtest_limit, 99)\n'
         '}\n'
     )
 m2b_pub = subprocess.run(
@@ -2203,7 +2207,81 @@ with open(os.path.join(m2b_pkg, "pion.toml"), "w") as f:
     f.write(f'[package]\nname = "pkg"\nversion = "0.1.0"\n\n[dependencies]\ndep = {{ path = "../dep" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
 m2b_t = subprocess.run([pionc, "test", m2b_pkg], capture_output=True, text=True)
 assert m2b_t.returncode == 0 and "1 passed; 0 failed" in m2b_t.stdout, f"Wave M2-B pionc test failed:\n{m2b_t.stdout}\n{m2b_t.stderr}"
-print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest + black-box private fn isolation)")
+
+# Astra P0-1 negative check: assert_eq(limit, 99) MUST fail!
+with open(os.path.join(m2b_pkg, "mbt_src", "lib_test.mbt"), "w") as f:
+    f.write('let limit : Int = 5\ntest "p0_1_neg" { let __mbt_bbtest_limit = 99; assert_eq(limit, 99) }\n')
+m2b_p01_neg_pub = subprocess.run(
+    [bin_path, "--src", "../pkg/mbt_src", "--out", "../pkg/src", "--package-manifest", "../pkg/pion.toml",
+     "--mbt-compat", os.path.relpath(os.path.realpath(compat_dir), os.path.realpath(m2b_sub)), "--target", "native", "--mode", "publish",
+     "--with-tests", "--pionc", pionc],
+    cwd=m2b_sub, capture_output=True, text=True
+)
+assert m2b_p01_neg_pub.returncode == 0
+m2b_p01_neg_t = subprocess.run([pionc, "test", m2b_pkg], capture_output=True, text=True)
+assert m2b_p01_neg_t.returncode != 0, "Astra P0-1 negative: assert_eq(limit, 99) MUST fail!"
+
+# Astra P0-3: symlink `link -> real/nested`, `--dep dep=link/../dep` MUST resolve to `real/dep` (String), NOT root `dep` (Int)!
+p03_root = os.path.join(root, "p03_sym")
+p03_dep_root = os.path.join(p03_root, "dep")
+p03_dep_real = os.path.join(p03_root, "real", "dep")
+p03_nested = os.path.join(p03_root, "real", "nested")
+p03_src = os.path.join(p03_root, "app_src")
+p03_out = os.path.join(p03_root, "app_out")
+os.makedirs(os.path.join(p03_dep_root, "src"), exist_ok=True)
+os.makedirs(os.path.join(p03_dep_real, "src"), exist_ok=True)
+os.makedirs(p03_nested, exist_ok=True)
+os.makedirs(p03_src, exist_ok=True)
+os.symlink(os.path.join("real", "nested"), os.path.join(p03_root, "link"))
+with open(os.path.join(p03_dep_root, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "dep"\nversion = "0.1.0"\n')
+with open(os.path.join(p03_dep_root, "src", "dep.pion"), "w") as f:
+    f.write("pub fn val_fn() -> Int { 1 }\n")
+with open(os.path.join(p03_dep_real, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "dep"\nversion = "0.1.0"\n')
+with open(os.path.join(p03_dep_real, "src", "dep.pion"), "w") as f:
+    f.write('pub fn val_fn() -> String { "real" }\n')
+with open(os.path.join(p03_src, "app.mbt"), "w") as f:
+    f.write("pub fn f() -> Int { @dep.val_fn() }\n")
+p03_r = subprocess.run(
+    [bin_path, "--src", p03_src, "--out", p03_out, "--dep", "dep=link/../dep",
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    cwd=p03_root, capture_output=True, text=True
+)
+assert p03_r.returncode != 0, f"Astra P0-3 symlink `link/../dep` MUST fail with E_TYPE_MISMATCH against real/dep (String), got rc=0!"
+
+# Astra P0-4: local `enum Json` returns "domain" AND user `@string` import returns 73!
+p04_root = os.path.join(root, "p04_shadow")
+p04_ust = os.path.join(p04_root, "custom_str")
+p04_app = os.path.join(p04_root, "app")
+os.makedirs(os.path.join(p04_ust, "src"), exist_ok=True)
+os.makedirs(os.path.join(p04_app, "mbt_src"), exist_ok=True)
+with open(os.path.join(p04_ust, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "custom_str"\nversion = "0.1.0"\n')
+with open(os.path.join(p04_ust, "src", "custom_str.pion"), "w") as f:
+    f.write('pub fn parse_int(_s : String) -> Int { 73 }\n')
+with open(os.path.join(p04_app, "mbt_src", "moon.pkg"), "w") as f:
+    f.write('import {\n  "acme/custom_str" @string,\n}\n')
+with open(os.path.join(p04_app, "mbt_src", "lib.mbt"), "w") as f:
+    f.write(
+        'pub(all) enum Json { Null }\n'
+        'pub fn Json::stringify(self : Json) -> String { match self { Json::Null => "domain" } }\n'
+        'pub fn check_all() -> (String, Int) { (Json::Null.stringify(), @string.parse_int("7")) }\n'
+    )
+with open(os.path.join(p04_app, "mbt_src", "lib_test.mbt"), "w") as f:
+    f.write('test "p0_4" { let (s, n) = check_all(); assert_eq(s, "domain"); assert_eq(n, 73) }\n')
+with open(os.path.join(p04_app, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ncustom_str = {{ path = "../custom_str" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+p04_pub = subprocess.run(
+    [bin_path, "--src", os.path.join(p04_app, "mbt_src"), "--out", os.path.join(p04_app, "src"),
+     "--package-manifest", os.path.join(p04_app, "pion.toml"), "--mbt-compat", compat_dir,
+     "--target", "native", "--mode", "publish", "--with-tests", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert p04_pub.returncode == 0, f"Astra P0-4 publish failed:\n{p04_pub.stdout}\n{p04_pub.stderr}"
+p04_t = subprocess.run([pionc, "test", p04_app], capture_output=True, text=True)
+assert p04_t.returncode == 0 and "1 passed; 0 failed" in p04_t.stdout, f"Astra P0-4 pionc test failed:\n{p04_t.stdout}\n{p04_t.stderr}"
+print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest, black-box private isolation + P0-1/P0-3/P0-4)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

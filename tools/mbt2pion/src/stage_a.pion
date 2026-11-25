@@ -204,7 +204,7 @@ pub fn lower_type_tokens(
         None => raw_pkg
       }
       if i + 2 < end && tokens[i + 1].kind == TokenKind::Dot {
-        if raw_pkg == "json" && tokens[i + 2].raw == "Json" {
+        if is_moonbit_core_pkg(symtab, raw_pkg, "json") && tokens[i + 2].raw == "Json" {
           piece = "mbt_compat::MbtJson"
           i = i + 3
         } else {
@@ -249,7 +249,7 @@ pub fn lower_type_tokens(
         name = "String"
       } else if name == "BytesView" {
         name = "Bytes"
-      } else if name == "Json" {
+      } else if name == "Json" && !symtab.local_types.contains("Json") {
         name = "mbt_compat::MbtJson"
       } else if name == "Map" {
         name = "mbt_compat::OrderedMap"
@@ -403,6 +403,8 @@ pub struct StageAContext {
   lifted_local_fns : Map[String, LiftedLocalFn]
   lifted_fns : Array[String]
   expected_type_stack : Array[String]
+  match_arr_cache_ctor : Array[String]
+  match_arr_cache_elems : Array[Array[String]]
   active_generics : Map[String, Bool]
   used_idents : Map[String, Bool]
   mut cur_is_test : Bool
@@ -441,6 +443,8 @@ pub fn stage_a_context_new(
     lifted_local_fns: Map(),
     lifted_fns: [],
     expected_type_stack: [],
+    match_arr_cache_ctor: [],
+    match_arr_cache_elems: [],
     active_generics: Map(),
     used_idents: Map(),
     cur_is_test: false,
@@ -3102,17 +3106,18 @@ pub fn lower_expr_range(
 }
 
 ///| Map allowlisted raising `@pkg.fn` calls to their non-panicking `Result` helpers for controlled `catch`.
-fn lookup_controlled_catch_result_fn(raw_pkg : String, sym_raw : String) -> String {
-  if raw_pkg == "json" && sym_raw == "parse" {
+///| Uses `is_moonbit_core_pkg` so user packages aliased as `@string` / `@json` / `@utf8` are NEVER hijacked!
+fn lookup_controlled_catch_result_fn(symtab : SymbolTable, raw_pkg : String, sym_raw : String) -> String {
+  if is_moonbit_core_pkg(symtab, raw_pkg, "json") && sym_raw == "parse" {
     return "mbt_compat::mbt_json_parse"
   }
-  if raw_pkg == "utf8" && sym_raw == "decode" {
+  if is_moonbit_core_pkg(symtab, raw_pkg, "encoding/utf8") && sym_raw == "decode" {
     return "mbt_compat::utf8_decode_strict"
   }
-  if (raw_pkg == "string" || raw_pkg == "strconv") && sym_raw == "parse_int" {
+  if (is_moonbit_core_pkg(symtab, raw_pkg, "string") || is_moonbit_core_pkg(symtab, raw_pkg, "strconv")) && sym_raw == "parse_int" {
     return "mbt_compat::str_try_parse_int"
   }
-  if (raw_pkg == "string" || raw_pkg == "strconv") && sym_raw == "parse_double" {
+  if (is_moonbit_core_pkg(symtab, raw_pkg, "string") || is_moonbit_core_pkg(symtab, raw_pkg, "strconv")) && sym_raw == "parse_double" {
     return "mbt_compat::str_try_parse_double"
   }
   ""
@@ -3176,7 +3181,7 @@ fn try_lower_controlled_catch(
   }
   let raw_pkg = tokens[pkg_i].raw.slice(1, tokens[pkg_i].raw.length())
   let sym_raw = tokens[pkg_i + 2].raw
-  let res_fn = lookup_controlled_catch_result_fn(raw_pkg, sym_raw)
+  let res_fn = lookup_controlled_catch_result_fn(ctx.symtab, raw_pkg, sym_raw)
   if res_fn.length() == 0 {
     return None
   }
@@ -3222,9 +3227,16 @@ fn try_lower_controlled_catch(
     let fb_str = lower_expr_range(ctx, tokens, arm_s + 2, fb_end, file, false).trim()
     return Some((trivia + "match " + call_str + " { Ok(" + ok_var + ") => " + ok_expr + ", Err(_) => " + fb_str + " }", catch_rb + 1))
   }
-  let err_var = fresh_temp(ctx, "err")
-  let arms_str = lower_match_arms_with_ty(ctx, tokens, catch_lb + 1, catch_rb, file, "String").trim()
-  Some((trivia + "match " + call_str + " { Ok(" + ok_var + ") => " + ok_expr + ", Err(" + err_var + ") => match " + err_var + " { " + arms_str + " } }", catch_rb + 1))
+  // P1-2 + Opus P2-1: Controlled `catch` that binds or matches the error value MUST fail closed
+  // (never silently substitute a fake `String` error where MoonBit yields `Failure`/`ParseError`).
+  ctx.diags.push(diag_error(
+    "MBT2PION_UNSUPPORTED_SYNTAX",
+    file,
+    tokens[catch_lb].line,
+    tokens[catch_lb].col,
+    "controlled `catch` only supports wildcard `_ => <fallback>` (binding or matching error values requires an overlay)",
+  ))
+  Some((trivia + "MBT2PION_MANUAL", catch_rb + 1))
 }
 
 ///| Find a top-level `:` inside `[open_br .. close_br]`, returning its index or `-1`.
@@ -4084,21 +4096,32 @@ fn lower_one_token_or_form(
     let raw_pkg = t.raw.slice(1, t.raw.length())
     let mapped_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
       Some(p) => p
-      None => raw_pkg
+      None =>
+      match ctx.symtab.moon_import_paths.get(raw_pkg) {
+        Some(fp) => {
+          let def_al = moon_import_default_alias(fp)
+          if !ctx.symtab.dep_pkg_names.contains(raw_pkg) && ctx.symtab.dep_pkg_names.contains(def_al) {
+            def_al
+          } else {
+            raw_pkg
+          }
+        }
+        None => raw_pkg
+      }
     }
     if i + 2 < end && tokens[i + 1].kind == TokenKind::Dot {
       let sym_tok = tokens[i + 2]
       let sym_raw = sym_tok.raw
-      // Built-in MoonBit stdlib package mappings (project-agnostic)
+      // Built-in MoonBit stdlib package mappings (project-agnostic; guarded by `is_moonbit_core_pkg`)
       if !ctx.symtab.api_by_key.contains(raw_pkg + "::" + sym_raw) {
-        if raw_pkg == "double" {
+        if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "double") {
           if sym_raw == "not_a_number" { return (trivia + "mbt_compat::double_nan()", i + 3) }
           if sym_raw == "infinity" { return (trivia + "mbt_compat::double_inf()", i + 3) }
           if sym_raw == "neg_infinity" { return (trivia + "mbt_compat::double_neg_inf()", i + 3) }
           if sym_raw == "max_value" { return (trivia + "mbt_compat::double_max_value()", i + 3) }
           if sym_raw == "min_value" { return (trivia + "mbt_compat::double_min_value()", i + 3) }
           if sym_raw == "min_positive" { return (trivia + "mbt_compat::double_min_positive()", i + 3) }
-        } else if raw_pkg == "math" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "math") {
           if sym_raw == "PI" { return (trivia + "mbt_compat::double_pi()", i + 3) }
           if sym_raw == "sin" || sym_raw == "cos" || sym_raw == "tan" || sym_raw == "asin" ||
           sym_raw == "acos" || sym_raw == "atan" || sym_raw == "atan2" || sym_raw == "exp" ||
@@ -4113,7 +4136,7 @@ fn lower_one_token_or_form(
             }
             return (trivia + fn_name, i + 3)
           }
-        } else if raw_pkg == "utf8" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "encoding/utf8") {
           if sym_raw == "decode_lossy" || sym_raw == "encode" {
             let fn_name = "mbt_compat::utf8_" + sym_raw
             if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
@@ -4123,7 +4146,7 @@ fn lower_one_token_or_form(
             }
             return (trivia + fn_name, i + 3)
           }
-        } else if raw_pkg == "string" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "string") {
           if sym_raw == "parse_int" {
             let fn_name = "mbt_compat::str_parse_int"
             if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
@@ -4133,16 +4156,16 @@ fn lower_one_token_or_form(
             }
             return (trivia + fn_name, i + 3)
           }
-        } else if raw_pkg == "int" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "int") {
           if sym_raw == "max_value" { return (trivia + "2147483647", i + 3) }
           if sym_raw == "min_value" { return (trivia + "(-2147483647 - 1)", i + 3) }
-        } else if raw_pkg == "int64" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "int64") {
           if sym_raw == "max_value" { return (trivia + "9223372036854775807L", i + 3) }
           if sym_raw == "min_value" { return (trivia + "(-9223372036854775807L - 1L)", i + 3) }
-        } else if raw_pkg == "uint" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "uint") {
           if sym_raw == "max_value" { return (trivia + "4294967295U", i + 3) }
           if sym_raw == "min_value" { return (trivia + "0U", i + 3) }
-        } else if raw_pkg == "uint64" {
+        } else if is_moonbit_core_pkg(ctx.symtab, raw_pkg, "uint64") {
           if sym_raw == "max_value" { return (trivia + "18446744073709551615UL", i + 3) }
           if sym_raw == "min_value" { return (trivia + "0UL", i + 3) }
         }
@@ -4268,8 +4291,18 @@ fn lower_one_token_or_form(
       sb.write_string(" }")
       return (trivia + sb.to_string(), close_p + 1)
     }
-    // `Json::*` constructors, helpers, and patterns -> `mbt_compat::MbtJson::*`
+    // `Hash::hash(expr)` -> `mbt_compat::mbt_hash(expr)` (guarded against local `Hash` type/trait!)
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Hash" &&
+    !ctx.symtab.local_types.contains("Hash") &&
+    i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].raw == "hash" && tokens[i + 3].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 3)
+      let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+      return (trivia + "mbt_compat::mbt_hash(" + inner + ")", close_p + 1)
+    }
+    // `Json::*` constructors, helpers, and patterns -> `mbt_compat::MbtJson::*` (guarded against local `Json`!)
     if !prev_colon2 && !prev_dot && t.raw == "Json" &&
+    !ctx.symtab.local_types.contains("Json") &&
     i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon {
       let member = tokens[i + 2].raw
       if member == "Number" && i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
@@ -5965,33 +5998,73 @@ fn lower_match_arms_with_ty(
           let full_g = if guard_str.length() > 0 { len_cond + " && (" + guard_str + ")" } else { len_cond }
           sb.write_string(lead_triv + ctor_head + "(" + arr_var + ") if " + full_g + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
         } else {
+          let cached_c : Array[String] = if ctx.match_arr_cache_ctor.length() > 0 &&
+          ctx.match_arr_cache_ctor[ctx.match_arr_cache_ctor.length() - 1] == ctor_head {
+            ctx.match_arr_cache_elems[ctx.match_arr_cache_elems.length() - 1]
+          } else {
+            []
+          }
           let tup_exprs : Array[String] = []
           let mut idx = 0
           while idx < elem_pats.length() {
-            tup_exprs.push(arr_var + "[" + idx.to_string() + "]")
+            if idx < cached_c.length() {
+              tup_exprs.push(cached_c[idx])
+            } else {
+              tup_exprs.push(arr_var + "[" + idx.to_string() + "]")
+            }
             idx = idx + 1
           }
           let tup_e = if elem_pats.length() == 1 { tup_exprs[0] } else { "(" + join_comma(tup_exprs) + ")" }
           let tup_p = if elem_pats.length() == 1 { elem_pats[0] } else { "(" + join_comma(elem_pats) + ")" }
           if guard_str.length() > 0 {
-            // Single-binding semantics before guard so guard mutations cannot corrupt bound element values,
-            // matching the whole scrutinee once with `__mc` so `rest_arms` is emitted once and stays exhaustive!
+            // P0-2: Pre-read prefix elements BEFORE guard so guard mutations cannot corrupt bound values OR
+            // subsequent fallback array patterns reading already-inspected indices, while leaving uninspected
+            // indices and wildcard `rest => rest[0]` observing the live mutated array!
             let mc_var = fresh_temp(ctx, "mc")
-            let inner_opt = "match " + mc_var + " { " + ctor_head + "(" + arr_var + ") => if " + len_cond + " { match " + tup_e + " { " + tup_p + " => if (" + guard_str + ") { Option::Some(" + body_raw.trim() + ") } else { Option::None }, _ => Option::None } } else { Option::None }, _ => Option::None }"
             let res_var = fresh_temp(ctx, "apr")
-            let rest_arms = if next_i < end {
+            let ext_cached : Array[String] = []
+            for ce in cached_c { ext_cached.push(ce) }
+            let bind_sb = StringBuilder()
+            let mut bi = cached_c.length()
+            while bi < elem_pats.length() {
+              let el_v = fresh_temp(ctx, "el")
+              bind_sb.write_string("let " + el_v + " = " + arr_var + "[" + bi.to_string() + "]; ")
+              ext_cached.push(el_v)
+              bi = bi + 1
+            }
+            let el_tup_exprs : Array[String] = []
+            let mut ei2 = 0
+            while ei2 < elem_pats.length() {
+              el_tup_exprs.push(ext_cached[ei2])
+              ei2 = ei2 + 1
+            }
+            let el_tup_e = if elem_pats.length() == 1 { el_tup_exprs[0] } else { "(" + join_comma(el_tup_exprs) + ")" }
+            let rest_uncached = if next_i < end {
               lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
             } else {
               ""
             }
-            let none_arm = if rest_arms.length() > 0 {
-              "match " + mc_var + " { " + rest_arms + " }"
+            ctx.match_arr_cache_ctor.push(ctor_head)
+            ctx.match_arr_cache_elems.push(ext_cached)
+            let rest_cached = if next_i < end {
+              lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
+            } else {
+              ""
+            }
+            let _ = ctx.match_arr_cache_ctor.pop()
+            let _ = ctx.match_arr_cache_elems.pop()
+            let none_uncached = if rest_uncached.length() > 0 {
+              "match " + mc_var + " { " + rest_uncached + " }"
             } else {
               "panic(\"unreachable\")"
             }
-            sb.write_string(
-              lead_triv + mc_var + tokens[fa].leading_trivia + "=> match (" + inner_opt + ") { Option::Some(" + res_var + ") => " + res_var + ", Option::None => " + none_arm + " }" + trail_sep,
-            )
+            let none_cached = if rest_cached.length() > 0 {
+              "match " + mc_var + " { " + rest_cached + " }"
+            } else {
+              "panic(\"unreachable\")"
+            }
+            let inner_match = "match " + mc_var + " { " + ctor_head + "(" + arr_var + ") => if " + len_cond + " { " + bind_sb.to_string() + "match (match " + el_tup_e + " { " + tup_p + " => if (" + guard_str + ") { Option::Some(" + body_raw.trim() + ") } else { Option::None }, _ => Option::None }) { Option::Some(" + res_var + ") => " + res_var + ", Option::None => " + none_cached + " } } else { " + none_uncached + " }, _ => " + none_uncached + " }"
+            sb.write_string(lead_triv + mc_var + tokens[fa].leading_trivia + "=> " + inner_match + trail_sep)
             pop_expected_type(ctx)
             break
           } else {
@@ -6066,37 +6139,74 @@ fn lower_match_arms_with_ty(
             }
             sb.write_string(lead_triv + arr_var + " if " + full_g + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
           } else {
-            let scrut_e = if elem_pats.length() == 1 {
-              arr_var + "[0]"
+            let cached_d : Array[String] = if ctx.match_arr_cache_ctor.length() > 0 &&
+            ctx.match_arr_cache_ctor[ctx.match_arr_cache_ctor.length() - 1] == "" {
+              ctx.match_arr_cache_elems[ctx.match_arr_cache_elems.length() - 1]
             } else {
-              let es : Array[String] = []
-              let mut idx = 0
-              while idx < elem_pats.length() {
-                es.push(arr_var + "[" + idx.to_string() + "]")
-                idx = idx + 1
-              }
-              "(" + join_comma(es) + ")"
+              []
             }
+            let es : Array[String] = []
+            let mut idx = 0
+            while idx < elem_pats.length() {
+              if idx < cached_d.length() {
+                es.push(cached_d[idx])
+              } else {
+                es.push(arr_var + "[" + idx.to_string() + "]")
+              }
+              idx = idx + 1
+            }
+            let scrut_e = if elem_pats.length() == 1 { es[0] } else { "(" + join_comma(es) + ")" }
             let pat_e = if elem_pats.length() == 1 {
               elem_pats[0]
             } else {
               "(" + join_comma(elem_pats) + ")"
             }
             if guard_str.length() > 0 {
-              let inner_opt = "if " + len_cond + " { match " + scrut_e + " { " + pat_e + " => if (" + guard_str + ") { Option::Some(" + body_raw.trim() + ") } else { Option::None }, _ => Option::None } } else { Option::None }"
+              // P0-2: Cache pre-guard prefix elements for subsequent fallback array patterns!
               let res_var = fresh_temp(ctx, "apr")
-              let rest_arms = if next_i < end {
+              let ext_cached : Array[String] = []
+              for ce in cached_d { ext_cached.push(ce) }
+              let bind_sb = StringBuilder()
+              let mut bi = cached_d.length()
+              while bi < elem_pats.length() {
+                let el_v = fresh_temp(ctx, "el")
+                bind_sb.write_string("let " + el_v + " = " + arr_var + "[" + bi.to_string() + "]; ")
+                ext_cached.push(el_v)
+                bi = bi + 1
+              }
+              let el_es : Array[String] = []
+              let mut ei2 = 0
+              while ei2 < elem_pats.length() {
+                el_es.push(ext_cached[ei2])
+                ei2 = ei2 + 1
+              }
+              let el_scrut_e = if elem_pats.length() == 1 { el_es[0] } else { "(" + join_comma(el_es) + ")" }
+              let rest_uncached = if next_i < end {
                 lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
               } else {
                 ""
               }
-              let none_arm = if rest_arms.length() > 0 {
-                "match " + arr_var + " { " + rest_arms + " }"
+              ctx.match_arr_cache_ctor.push("")
+              ctx.match_arr_cache_elems.push(ext_cached)
+              let rest_cached = if next_i < end {
+                lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
+              } else {
+                ""
+              }
+              let _ = ctx.match_arr_cache_ctor.pop()
+              let _ = ctx.match_arr_cache_elems.pop()
+              let none_uncached = if rest_uncached.length() > 0 {
+                "match " + arr_var + " { " + rest_uncached + " }"
+              } else {
+                "panic(\"unreachable\")"
+              }
+              let none_cached = if rest_cached.length() > 0 {
+                "match " + arr_var + " { " + rest_cached + " }"
               } else {
                 "panic(\"unreachable\")"
               }
               sb.write_string(
-                lead_triv + arr_var + tokens[fa].leading_trivia + "=> match (" + inner_opt + ") { Option::Some(" + res_var + ") => " + res_var + ", Option::None => " + none_arm + " }" + trail_sep,
+                lead_triv + arr_var + tokens[fa].leading_trivia + "=> if " + len_cond + " { " + bind_sb.to_string() + "match (match " + el_scrut_e + " { " + pat_e + " => if (" + guard_str + ") { Option::Some(" + body_raw.trim() + ") } else { Option::None }, _ => Option::None }) { Option::Some(" + res_var + ") => " + res_var + ", Option::None => " + none_cached + " } } else { " + none_uncached + " }" + trail_sep,
               )
               pop_expected_type(ctx)
               break
@@ -6819,12 +6929,23 @@ fn collect_init_probe_origins(tokens : Array[Token], start : Int, end : Int) -> 
 pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -> Unit {
   let prod_all_decls : Map[String, Bool] = Map()
   let bb_priv_decls : Array[String] = []
+  let bb_all_idents : Map[String, Bool] = Map()
   let method_seen_count : Map[String, Int] = Map()
   for sf in files {
     let is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
     let bb_decls : Map[String, Bool] = if is_blackbox { ctx.symtab.blackbox_decls } else { Map() }
     let tokens = lex_moonbit(sf.content)
     let n = tokens.length() - 1
+    if is_blackbox {
+      let mut bi = 0
+      while bi < n {
+        let bt = tokens[bi]
+        if bt.kind == TokenKind::Ident || bt.kind == TokenKind::UpperIdent {
+          bb_all_idents[bt.raw] = true
+        }
+        bi = bi + 1
+      }
+    }
     let mut i = 0
     let mut next_autofill = false
     let mut next_cfg_excluded = false
@@ -6848,6 +6969,13 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         next_autofill = false
         i = skip_top_level_decl(tokens, i, n)
         continue
+      }
+      // P0-4: Record all locally defined types (`struct`, `enum`, `type`, `suberror`, `trait`) so stdlib rewrites
+      // (`Json` -> `mbt_compat::MbtJson`, `Hash::hash` -> `mbt_compat::mbt_hash`) NEVER hijack local types!
+      if t.kind == TokenKind::Keyword &&
+      (t.raw == "struct" || t.raw == "enum" || t.raw == "type" || t.raw == "suberror" || t.raw == "trait") &&
+      i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        ctx.symtab.local_types[tokens[i + 1].raw] = true
       }
       if t.kind == TokenKind::Keyword && t.raw == "struct" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
         next_autofill = false
@@ -7428,15 +7556,18 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       i = i + 1
     }
   }
-  // Compute black-box `*_test.mbt` private top-level collisions against production declarations
+  // Compute black-box `*_test.mbt` private top-level collisions against production declarations (P0-1: avoid ALL local idents!)
   for nm in bb_priv_decls {
     if prod_all_decls.contains(nm) && !ctx.symtab.blackbox_colliding_privs.contains(nm) {
       let mut cand = "__mbt_bbtest_" + nm
       let mut seq = 1
-      while prod_all_decls.contains(cand) || ctx.symtab.blackbox_decls.contains(cand) {
+      while prod_all_decls.contains(cand) || ctx.symtab.blackbox_decls.contains(cand) ||
+      bb_all_idents.contains(cand) || ctx.used_idents.contains(cand) {
         cand = "__mbt_bbtest_" + nm + "_" + seq.to_string()
         seq = seq + 1
       }
+      bb_all_idents[cand] = true
+      ctx.used_idents[cand] = true
       ctx.symtab.blackbox_colliding_privs[nm] = cand
       match ctx.symtab.blackbox_fn_param_types.get(nm) {
         Some(pts) => ctx.symtab.blackbox_fn_param_types[cand] = pts
@@ -8076,6 +8207,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                   gen_enum_hash_body("self", enum_variants)
                 }
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  " + hash_body + "\n}\n")
+                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash(self : " + tname + ") -> Int {\n    self.hash()\n  }\n}\n")
               }
             }
             // Declarative recipe trait-impl synthesis for BOTH `struct` and `enum` (zero hardcoded project symbols!)
@@ -8295,6 +8427,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 ctx.symtab.hashable_types[tname] = true
                 let hash_body = gen_struct_hash_body("self", field_types)
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  " + hash_body + "\n}\n")
+                recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash(self : " + tname + ") -> Int {\n    self.hash()\n  }\n}\n")
               }
             }
             for tr in ctx.recipes.trait_recipes {

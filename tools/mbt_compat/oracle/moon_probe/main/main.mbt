@@ -797,6 +797,41 @@ fn case_wave_m2b_parse() -> Unit {
   let j9 = Json::number(-0.0).stringify()
   trace("json_repr", "\{j1}|\{j2}|\{j3}|\{j4}|\{j5}|\{j6}|\{j7}|\{j8}|\{j9}")
   check("m2b.json_repr_and_nonfinite", j1 == "9007199254740993" && j2 == "-9007199254740993" && j3 == "1e500" && j4 == "-1e500" && j6 == "\"NaN\"" && j7 == "\"Infinity\"" && j8 == "\"-Infinity\"")
+
+  // P1-1: parse_int underscore rules across radixes
+  let iu1 = try { Some(@string.parse_int("0x_FF")) } catch { _ => None }
+  let iu2 = try { Some(@string.parse_int("1_0", base=10)) } catch { _ => None }
+  let iu3 = try { Some(@string.parse_int("0xF_F", base=16)) } catch { _ => None }
+  let iub1 = try { Some(@string.parse_int("_10")) } catch { _ => None }
+  let iub2 = try { Some(@string.parse_int("10_")) } catch { _ => None }
+  let iub3 = try { Some(@string.parse_int("1__0")) } catch { _ => None }
+  let iub4 = try { Some(@string.parse_int("0x__FF")) } catch { _ => None }
+  let iub5 = try { Some(@string.parse_int("0x_FF", base=10)) } catch { _ => None }
+  trace("int_under", "\{iu1.unwrap_or(-1)},\{iu2.unwrap_or(-1)},\{iu3.unwrap_or(-1)},\{iub1 is None},\{iub2 is None},\{iub3 is None},\{iub4 is None},\{iub5 is None}")
+  check("m2b.int_underscores", iu1 == Some(255) && iu2 == Some(10) && iu3 == Some(255) && iub1 is None && iub2 is None && iub3 is None && iub4 is None && iub5 is None)
+
+  // P1-3: JSON nesting depth 513 (Ok), 1024 (Ok), 1025 (Err)
+  let mk_nest = fn(d : Int) -> String {
+    let sb = StringBuilder::new()
+    for _i = 0; _i < d; _i = _i + 1 { sb.write_char('[') }
+    sb.write_char('0')
+    for _i = 0; _i < d; _i = _i + 1 { sb.write_char(']') }
+    sb.to_string()
+  }
+  let jd513 = try { let _ = @json.parse(mk_nest(513)); true } catch { _ => false }
+  let jd1024 = try { let _ = @json.parse(mk_nest(1024)); true } catch { _ => false }
+  let jd1025 = try { let _ = @json.parse(mk_nest(1025)); true } catch { _ => false }
+  trace("json_depth", "\{jd513},\{jd1024},\{jd1025}")
+  check("m2b.json_depth_1024", jd513 && jd1024 && !jd1025)
+
+  // P1-4: String::view vs String::clamped_view
+  let sv1 = "abc".view(start_offset=1).to_string()
+  let sv2 = "abc".view(start_offset=1, end_offset=2).to_string()
+  let cv1 = "abc".clamped_view(start=1).to_string()
+  let cv2 = "abc".clamped_view(start=-5, end=99).to_string()
+  let cv3 = "abc".clamped_view(start=2, end=1).to_string()
+  trace("str_views", "\{sv1}|\{sv2}|\{cv1}|\{cv2}|\{cv3}")
+  check("m2b.str_views", sv1 == "bc" && sv2 == "b" && cv1 == "bc" && cv2 == "abc" && cv3 == "")
 }
 
 ///|

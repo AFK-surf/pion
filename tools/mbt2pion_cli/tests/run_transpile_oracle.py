@@ -103,7 +103,7 @@ CASES = {
     "q2_mechanical_compat": ("ok", 10),
     "wave_m2_core": ("ok", 7),
     "wave_m2_round2": ("ok", 8),
-    "wave_m2b_mid_tier": ("ok", 10),
+    "wave_m2b_mid_tier": ("ok", 14),
 }
 
 MOON_TRAPS = {
@@ -1269,6 +1269,58 @@ pub fn m2b_p1_json_repr_and_double() -> (String, String, String, Int64, Int64, B
   let d_und = @string.parse_double("1_000.5") catch { _ => 0.0 }
   (r_big, j_ovf.stringify(), j_nan + "|" + j_inf, d_max.reinterpret_as_int64(), d_sub.reinterpret_as_int64(), d_und == 1000.5)
 }
+
+pub fn m2b_p0_2_guard_array_mutation() -> (Int, Int, Int, Int, Int, Int, Int, Int) {
+  // t1: false guard mutates a[0]=9 -> subsequent [y, ..] reads pre-guard 1, a[0] is 9
+  let a1 = [1, 2]
+  let r1 = match a1 {
+    [x, ..] if { a1[0] = 9; false } => x
+    [y, ..] => y
+    _ => -1
+  }
+  // t2: false guard mutates a[0]=9 -> wildcard `rest` binds live array, rest[0] is 9
+  let a2 = [1, 2]
+  let r2 = match a2 {
+    [x, ..] if { a2[0] = 9; false } => x
+    rest => rest[0]
+  }
+  // t3: false guard mutates a[1]=9 (uninspected by arm 1) -> [_, y, ..] reads live 9
+  let a3 = [1, 2]
+  let r3 = match a3 {
+    [x, ..] if { a3[1] = 9; false } => x
+    [_, y, ..] => y
+    _ => -1
+  }
+  // t4: Option::Some([x, ..]) false guard mutates a[0]=9 -> Option::Some([y, ..]) reads pre-guard 1
+  let a4 = [1, 2]
+  let o4 : Array[Int]? = Option::Some(a4)
+  let r4 = match o4 {
+    Option::Some([x, ..]) if { a4[0] = 9; false } => x
+    Option::Some([y, ..]) => y
+    _ => -1
+  }
+  (r1, a1[0], r2, a2[0], r3, a3[1], r4, a4[0])
+}
+
+pub fn m2b_p1_views_map_and_hash() -> (String, Int, Bool) {
+  // P1-4: String::view vs String::clamped_view
+  let vs = "abc".view(start_offset=1).to_string() + "|" +
+    "abc".view(start_offset=1, end_offset=2).to_string() + "|" +
+    "abc".clamped_view(start=1).to_string() + "|" +
+    "abc".clamped_view(start=-5, end=99).to_string() + "|" +
+    "abc".clamped_view(start=2, end=1).to_string()
+  // P1-5: Multiline Map assignment with trailing binary operator
+  let m : Map[Int, Int] = Map([])
+  m[0] = ({
+    let x = 5
+    x
+  }) + 2
+  // P1-6: #derive(Hash) supports Hash::hash(k)
+  let k1 = M2bKey::{ a: 7, b: 1.5, c: "abc" }
+  let k2 = M2bKey::{ a: 7, b: 1.5, c: "abc" }
+  let h_ok = Hash::hash(k1) == Hash::hash(k2) && Hash::hash(k1) != 0
+  (vs, m.get(0).unwrap_or(-1), h_ok)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1785,7 +1837,9 @@ fn main {
     let (vc, vf, vn) = @m12.m2b_val_contexts_and_noraise(3.5)
     let hk = @m12.m2b_hash_consistency()
     let (p1r, p1o, p1nf, p1max, p1sub, p1u) = @m12.m2b_p1_json_repr_and_double()
-    trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk},\{p1r}:\{p1o}:\{p1nf}:\{p1max}:\{p1sub}:\{p1u}")
+    let (g1, g1a, g2, g2a, g3, g3a, g4, g4a) = @m12.m2b_p0_2_guard_array_mutation()
+    let (p1vs, p1mv, p1hk) = @m12.m2b_p1_views_map_and_hash()
+    trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk},\{p1r}:\{p1o}:\{p1nf}:\{p1max}:\{p1sub}:\{p1u},\{g1}:\{g1a}:\{g2}:\{g2a}:\{g3}:\{g3a}:\{g4}:\{g4a},\{p1vs},\{p1mv},\{p1hk}")
     check("m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
     check("m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check("m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
@@ -1796,6 +1850,10 @@ fn main {
     check("m2b.val_match_neg", vf == 42 && vn == -7.0)
     check("m2b.derive_debug_hash", hk)
     check("m2b.p1_json_repr_double", p1r == "9007199254740993" && p1o == "1e500" && p1nf == "\"NaN\"|\"Infinity\"" && p1max == 9218868437227405311L && p1sub == 1L && p1u)
+    check("m2b.p0_2_guard_arr_mut", g1 == 1 && g1a == 9 && g2 == 9 && g2a == 9 && g3 == 9 && g3a == 9 && g4 == 1 && g4a == 9)
+    check("m2b.p1_4_str_views", p1vs == "bc|b|bc|abc|")
+    check("m2b.p1_5_multiline_map_rhs", p1mv == 7)
+    check("m2b.p1_6_hash_call", p1hk)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2329,7 +2387,9 @@ pub fn main(w : World) -> Int {
     let (vc, vf, vn) = m12::m2b_val_contexts_and_noraise(3.5)
     let hk = m12::m2b_hash_consistency()
     let (p1r, p1o, p1nf, p1max, p1sub, p1u) = m12::m2b_p1_json_repr_and_double()
-    trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string() + "," + p1r + ":" + p1o + ":" + p1nf + ":" + p1max.to_string() + ":" + p1sub.to_string() + ":" + p1u.to_string())
+    let (g1, g1a, g2, g2a, g3, g3a, g4, g4a) = m12::m2b_p0_2_guard_array_mutation()
+    let (p1vs, p1mv, p1hk) = m12::m2b_p1_views_map_and_hash()
+    trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string() + "," + p1r + ":" + p1o + ":" + p1nf + ":" + p1max.to_string() + ":" + p1sub.to_string() + ":" + p1u.to_string() + "," + g1.to_string() + ":" + g1a.to_string() + ":" + g2.to_string() + ":" + g2a.to_string() + ":" + g3.to_string() + ":" + g3a.to_string() + ":" + g4.to_string() + ":" + g4a.to_string() + "," + p1vs + "," + p1mv.to_string() + "," + p1hk.to_string())
     check(w, "m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
     check(w, "m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check(w, "m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
@@ -2340,6 +2400,10 @@ pub fn main(w : World) -> Int {
     check(w, "m2b.val_match_neg", vf == 42 && vn == -7.0)
     check(w, "m2b.derive_debug_hash", hk)
     check(w, "m2b.p1_json_repr_double", p1r == "9007199254740993" && p1o == "1e500" && p1nf == "\"NaN\"|\"Infinity\"" && p1max == 9218868437227405311L && p1sub == 1L && p1u)
+    check(w, "m2b.p0_2_guard_arr_mut", g1 == 1 && g1a == 9 && g2 == 9 && g2a == 9 && g3 == 9 && g3a == 9 && g4 == 1 && g4a == 9)
+    check(w, "m2b.p1_4_str_views", p1vs == "bc|b|bc|abc|")
+    check(w, "m2b.p1_5_multiline_map_rhs", p1mv == 7)
+    check(w, "m2b.p1_6_hash_call", p1hk)
   } else {
     panic("abort: unknown case " + kase)
   }
