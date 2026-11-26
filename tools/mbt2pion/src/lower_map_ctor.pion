@@ -1,0 +1,320 @@
+///| Wave M2-F3d-1a: MoonBit `Map` constructors that build from an array.
+///|
+///| `Map::Map(arr : ArrayView[(K, V)], capacity? : Int)` (alias `Map::from_array`) evaluates `arr` (taking a view
+///| of it), then `capacity`, aborts on a negative capacity or one above core's largest table, and inserts the
+///| entries in order (a duplicate key keeps its first position and takes the last value). The capacity only sizes
+///| MoonBit's hash table, so it is otherwise unobservable: `mbt_compat::ordered_map_from_array_cap` /
+///| `ordered_map_new_cap` reproduce the checks, and Pion's left-to-right argument order keeps `[arr, cap]`.
+///|
+///| A view of a non-fresh array is shared with it, so a capacity expression that may run code (any call) between
+///| taking the view and reading it could change what MoonBit inserts in ways a Pion `Array` cannot reproduce (a
+///| write after a reallocating push stays invisible to the view). Such a pair fails closed; a fresh array literal
+///| (nothing else can reach it) or a call-free capacity expression is exact.
+
+///| True iff `[s, e)` is a call-free value: literals, identifiers, field reads, unary minus and arithmetic.
+fn is_call_free_capacity_expr(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if s >= e {
+    return false
+  }
+  let mut k = s
+  while k < e {
+    let tk = tokens[k].kind
+    let ok = tk == TokenKind::Ident || tk == TokenKind::IntLit || tk == TokenKind::Dot ||
+    tk == TokenKind::Plus || tk == TokenKind::Minus || tk == TokenKind::Star ||
+    tk == TokenKind::Slash || tk == TokenKind::Percent
+    if !ok {
+      return false
+    }
+    // `a.b` is a field read only when not followed by `(` (checked above: `(` is not accepted at all).
+    k = k + 1
+  }
+  true
+}
+
+///| Index of the depth-0 `capacity=` named argument inside `(open, close)`, or -1.
+fn find_capacity_named_arg(tokens : Array[Token], open : Int, close : Int) -> Int {
+  let mut d = 0
+  let mut k = open + 1
+  while k < close {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      d = d - 1
+    } else if d == 0 && kk == TokenKind::Comma && k + 3 < close + 1 && tokens[k + 1].kind == TokenKind::Ident &&
+    tokens[k + 1].raw == "capacity" && tokens[k + 2].kind == TokenKind::Eq {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+///| End (exclusive) of the expression starting at `s` inside an argument list closed at `close`: the next depth-0
+///| comma, or `close`.
+fn arg_end_before_comma(tokens : Array[Token], s : Int, close : Int) -> Int {
+  let mut d = 0
+  let mut k = s
+  while k < close {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      d = d - 1
+    } else if d == 0 && kk == TokenKind::Comma {
+      return k
+    }
+    k = k + 1
+  }
+  close
+}
+
+///| `_pair` / `_triple` when the expected type is an `OrderedMap` keyed by a 2- / 3-tuple (Pion has no trait impls
+///| on tuple types, so those keys take the component-wise `MapKey` constructors), else "". Stage B repairs the
+///| constructors whose key type was not known here from pionc's `MapKey` diagnostic.
+fn tuple_key_ctor_suffix(ctx : StageAContext) -> String {
+  let ty = current_expected_type(ctx).trim()
+  let pre = "mbt_compat::OrderedMap["
+  if !ty.starts_with(pre) || !ty.ends_with("]") {
+    return ""
+  }
+  let inner = ty.slice(pre.length(), ty.length() - 1)
+  let mut d = 0
+  let mut k = 0
+  while k < inner.length() {
+    let ch = inner.code_unit_at(k)
+    if ch == 40 || ch == 91 {
+      d = d + 1
+    } else if ch == 41 || ch == 93 {
+      d = d - 1
+    } else if ch == 44 && d == 0 {
+      break
+    }
+    k = k + 1
+  }
+  let arity = tuple_type_arity(inner.slice(0, k).trim())
+  if arity == 2 { "_pair" } else if arity == 3 { "_triple" } else { "" }
+}
+
+///| `Map` is MoonBit core's map here (no local type, value, generic or constructor of that name).
+fn map_ctor_is_core(ctx : StageAContext) -> Bool {
+  !ctx.symtab.local_types.contains("Map") && !ctx.symtab.local_value_names.contains("Map") &&
+  !ctx.active_generics.contains("Map") && !(lookup_scope_var(ctx, "Map") is Some(_)) &&
+  !has_local_ctor(ctx.symtab, "Map") && !ctx.symtab.using_types.contains("Map") &&
+  !ctx.symtab.type_aliases.contains("Map")
+}
+
+///| `[s, e)` without redundant outer parentheses (`((xs))` -> `xs`).
+fn strip_outer_parens(tokens : Array[Token], s : Int, e : Int) -> (Int, Int) {
+  let mut a = s
+  let mut b = e
+  while b - a >= 2 && tokens[a].kind == TokenKind::LParen && find_matching_delim(tokens, a) == b - 1 {
+    a = a + 1
+    b = b - 1
+  }
+  (a, b)
+}
+
+///| The expression `[s, e)` is an array literal, possibly parenthesized.
+fn is_paren_array_literal(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  let (a, b) = strip_outer_parens(tokens, s, e)
+  b > a && tokens[a].kind == TokenKind::LBracket && find_matching_delim(tokens, a) == b - 1
+}
+
+///| The expression `[s, e)` is the whole right-hand side of `let x : T = ..` / `x = ..` / `return ..`, ending its
+///| statement (so the expected type on the stack is its own).
+fn is_direct_statement_value(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if s < 1 {
+    return false
+  }
+  let before = tokens[s - 1]
+  let starts = before.kind == TokenKind::Eq || before.raw == "return"
+  let ends = e >= tokens.length() || tokens[e].newline_before || tokens[e].kind == TokenKind::Semi ||
+  tokens[e].kind == TokenKind::RBrace || tokens[e].kind == TokenKind::Eof
+  starts && ends
+}
+
+///| Lower `Map(arr, capacity=cap)`, `Map::from_array(arr)`, `Map::Map(arr, ..)` and a bare `Map::from_array` (a
+///| function value, e.g. the target of `|>`) starting at `i` (the `Map` token). `None` leaves the tokens to the
+///| existing rules (`Map([])`, `Map::new()`).
+fn try_lower_map_from_array_ctor(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  i : Int,
+  end : Int,
+  file : String,
+  trivia : String,
+) -> Option[(String, Int)] {
+  if !map_ctor_is_core(ctx) || i + 1 >= end {
+    return None
+  }
+  // `Map::from_array` / `Map::Map` (static form)
+  if i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
+  (tokens[i + 2].raw == "from_array" || tokens[i + 2].raw == "Map") {
+    if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
+      return lower_map_from_array_call(ctx, tokens, i, i + 3, file, trivia)
+    }
+    if tokens[i + 2].raw == "from_array" {
+      if i >= 2 && tokens[i - 1].kind == TokenKind::PipeGt && pipe_lhs_is_array_literal(tokens, i - 2) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          tokens[i].line,
+          tokens[i].col,
+          "an array literal piped into `Map::from_array` is not supported (fail-closed: pionc 0.1.0 misreads a tuple-array literal passed straight to a generic parameter; call `Map::from_array([..])`)",
+        ))
+        return None
+      }
+      return Some((trivia + "mbt_compat::ordered_map_from_array" + tuple_key_ctor_suffix(ctx), i + 3))
+    }
+    return None
+  }
+  // `Map(arr, capacity=cap)` (the `Map([])` form without capacity stays with the existing rule)
+  if tokens[i + 1].kind == TokenKind::LParen {
+    let close_p = find_matching_delim(tokens, i + 1)
+    if find_capacity_named_arg(tokens, i + 1, close_p) < 0 {
+      return None
+    }
+    return lower_map_from_array_call(ctx, tokens, i, i + 1, file, trivia)
+  }
+  None
+}
+
+///| The pipe operand ending at `end_i` (`.. |>`) is an array literal, possibly parenthesized.
+fn pipe_lhs_is_array_literal(tokens : Array[Token], end_i : Int) -> Bool {
+  let mut e = end_i
+  while e >= 0 && tokens[e].kind == TokenKind::RParen {
+    let o = find_open_before(tokens, e, 0)
+    // A call `f(..)` ends in `)` too: only a bare parenthesized group counts.
+    if o < 0 || (o > 0 && (tokens[o - 1].kind == TokenKind::Ident || tokens[o - 1].kind == TokenKind::UpperIdent ||
+      tokens[o - 1].kind == TokenKind::RParen || tokens[o - 1].kind == TokenKind::RBracket)) {
+      return false
+    }
+    e = e - 1
+  }
+  is_array_literal_end(tokens, e)
+}
+
+fn lower_map_from_array_call(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  i : Int,
+  open : Int,
+  file : String,
+  trivia : String,
+) -> Option[(String, Int)] {
+  let close_p = find_matching_delim(tokens, open)
+  if close_p <= open + 1 {
+    return None
+  }
+  let arr_s = open + 1
+  let arr_e = arg_end_before_comma(tokens, arr_s, close_p)
+  if arr_e <= arr_s || tokens[arr_s].kind == TokenKind::Ident && arr_s + 1 < arr_e &&
+  tokens[arr_s + 1].kind == TokenKind::Eq {
+    // A named first argument (`Map(capacity=..)`): not a shape MoonBit accepts for `arr`; leave it to pionc.
+    return None
+  }
+  let cap_comma = find_capacity_named_arg(tokens, open, close_p)
+  let mut cap_s = -1
+  let mut cap_e = -1
+  if cap_comma >= 0 {
+    if cap_comma != arr_e {
+      // `Map(arr, other, capacity=..)`: no such overload.
+      return None
+    }
+    cap_s = cap_comma + 3
+    cap_e = arg_end_before_comma(tokens, cap_s, close_p)
+    // Only a trailing comma may follow the capacity.
+    if cap_e < close_p && !(cap_e + 1 == close_p && tokens[cap_e].kind == TokenKind::Comma) {
+      return None
+    }
+    if cap_e <= cap_s {
+      return None
+    }
+  } else if arr_e < close_p && !(arr_e + 1 == close_p && tokens[arr_e].kind == TokenKind::Comma) {
+    return None
+  }
+  let (lit_s, lit_e) = strip_outer_parens(tokens, arr_s, arr_e)
+  let arr_is_empty_lit = lit_e == lit_s + 2 && tokens[lit_s].kind == TokenKind::LBracket &&
+  tokens[lit_s + 1].kind == TokenKind::RBracket
+  let arr_is_fresh_lit = is_paren_array_literal(tokens, arr_s, arr_e)
+  if cap_s >= 0 && !arr_is_fresh_lit && !is_call_free_capacity_expr(tokens, cap_s, cap_e) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[i].line,
+      tokens[i].col,
+      "`Map(arr, capacity=...)` with a capacity expression that may run code after the view of a non-fresh `arr` is taken is not supported (fail-closed: it could change the entries MoonBit inserts)",
+    ))
+    return None
+  }
+  let chained = close_p + 1 < tokens.length() && tokens[close_p + 1].kind == TokenKind::Dot
+  let esfx = if chained { "" } else { tuple_key_ctor_suffix(ctx) }
+  if arr_is_empty_lit {
+    if cap_s < 0 {
+      return Some((trivia + "mbt_compat::ordered_map_new" + esfx + "()", close_p + 1))
+    }
+    let cap_str = lower_expr_range(ctx, tokens, cap_s, cap_e, file, false).trim()
+    return Some((trivia + "mbt_compat::ordered_map_new_cap" + esfx + "(" + cap_str + ")", close_p + 1))
+  }
+  let arr_str = lower_expr_range(ctx, tokens, lit_s, lit_e, file, false).trim()
+  // A chained call (`Map::from_array(..).m()`): the expected type is the chain's, not this map's.
+  let has_chain = close_p + 1 < tokens.length() && tokens[close_p + 1].kind == TokenKind::Dot
+  let sfx = if has_chain { "" } else { tuple_key_ctor_suffix(ctx) }
+  let direct = is_direct_statement_value(tokens, i, close_p + 1)
+  let (pre, arg, post) = hoist_pairs_literal(ctx, arr_str, arr_is_fresh_lit, direct, has_chain, tokens[i].line, tokens[i].col)
+  if cap_s < 0 {
+    return Some((trivia + pre + "mbt_compat::ordered_map_from_array" + sfx + "(" + arg + ")" + post, close_p + 1))
+  }
+  let cap_str = lower_expr_range(ctx, tokens, cap_s, cap_e, file, false).trim()
+  Some((trivia + pre + "mbt_compat::ordered_map_from_array_cap" + sfx + "(" + arg + ", " + cap_str + ")" + post, close_p + 1))
+}
+
+///| pionc 0.1.0 miscompiles an array-of-tuples literal passed straight to a generic `Array[(K, V)]` parameter whose
+///| instantiation comes from that literal (`let m = f([(1, 10), (2, 20), (1, 30)])`, also under `.length()`,
+///| `Some(..)`, a call argument: it reads `(1, 10), (0, 0), (2, 20), ..`); the same literal bound by `let` first,
+///| or the call as the whole value of a `let x : OrderedMap[..] =` / `return`, is exact. So a pairs literal of
+///| `Map::from_array([..])` / `Map([..], capacity=..)` / `{ k: v, .. }` is bound to a hygienic `let` first
+///| (still evaluated before the capacity) unless the call is such a direct value; the `let` is annotated
+///| `Array[(K, V)]` when the expected `OrderedMap[K, V]` is known, so the elements keep their expected types.
+pub fn hoist_pairs_literal(
+  ctx : StageAContext,
+  arr_str : String,
+  is_literal : Bool,
+  direct : Bool,
+  has_chain : Bool,
+  line : Int,
+  col : Int,
+) -> (String, String, String) {
+  let kv = if has_chain { "" } else { expected_map_kv(ctx) }
+  if !is_literal || direct && kv.length() > 0 {
+    return ("", arr_str, "")
+  }
+  let nm = alloc_pairs_name(ctx, line, col)
+  let ann = if kv.length() > 0 { " : Array[(" + kv + ")]" } else { "" }
+  ("({ let " + nm + ann + " = " + arr_str + "; ", nm, " })")
+}
+
+///| `__mbt_pairs_<line>_<col>` (then `_1`, `_2`, ..) not used by any identifier of the package (the name stays
+///| the same whenever the site is lowered again).
+pub fn alloc_pairs_name(ctx : StageAContext, line : Int, col : Int) -> String {
+  let base = "__mbt_pairs_" + line.to_string() + "_" + col.to_string()
+  let mut nm = base
+  let mut bump = 1
+  while ctx.used_idents.contains(nm) {
+    nm = base + "_" + bump.to_string()
+    bump = bump + 1
+  }
+  nm
+}
+
+///| `K, V` of an expected `mbt_compat::OrderedMap[K, V]`, or "".
+fn expected_map_kv(ctx : StageAContext) -> String {
+  let ty = current_expected_type(ctx).trim()
+  let pre = "mbt_compat::OrderedMap["
+  if ty.starts_with(pre) && ty.ends_with("]") {
+    ty.slice(pre.length(), ty.length() - 1)
+  } else {
+    ""
+  }
+}

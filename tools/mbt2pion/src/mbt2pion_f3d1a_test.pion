@@ -1,0 +1,424 @@
+///| Wave M2-F3d-1a unit tests:
+///| 1. Built-in `Int32` lowers to `Int` in every type position; a local / `using` type of that name is kept
+///| 2. `Map::from_array` (call and bare `|>` target) and `Map(arr, capacity=cap)` lowering, fail-closed on a
+///|    non-fresh `arr` with a capacity that may run code
+///| 3. Tuple `MapKey` constructors: `_pair` / `_triple` rewrite from the pionc diagnostic
+///| 4. `shrink_to_fit`: `Array(capacity=n)` locals with borrowed views become `ArrayBuf::with_capacity(n)`; a plain
+///|    array's shrink is refused under a `for .. in` body, an iteration callback or a kept iterator
+///| 5. `Array(capacity=n)` keeps MoonBit's negative-capacity abort
+///| (2 also covers binding an untyped pairs literal before a generic call: pionc 0.1.0 misreads it inline)
+
+fn f3d1a_transpile(rel : String, src : String) -> (Int, String, Array[Diag]) {
+  let res = transpile_package([SourceFile::{ rel_path: rel, content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let sb = StringBuilder()
+  for f in res.files {
+    sb.write_string(f.content)
+    sb.write_string("\n")
+  }
+  (res.blockers, sb.to_string(), res.diagnostics)
+}
+
+fn f3d1a_has_diag(ds : Array[Diag], code : String, needle : String) -> Bool {
+  for d in ds {
+    if d.code == code && str_has(d.message, needle) {
+      return true
+    }
+  }
+  false
+}
+
+test "F3d1a-1: built-in Int32 lowers to Int in fields, params, returns, Option/Array/tuple and ascriptions" {
+  let src = "struct P {\n  at : Int32\n  gens : Array[(Int32?, Int32)]\n}\n" +
+  "fn f(a : Int32, b : Int32?) -> Int32 {\n" +
+  "  let c : Int32 = a + b.unwrap_or(0)\n" +
+  "  let g : (Int32) -> Int32 = fn(x : Int32) -> Int32 { x }\n" +
+  "  g(c) + (1 : Int32)\n" +
+  "}\n"
+  let (blockers, out, _) = f3d1a_transpile("i32.mbt", src)
+  assert_true(blockers == 0, "Int32 transpiles with 0 blockers")
+  assert_true(!str_has(out, "Int32"), "no Int32 left:\n" + out)
+  assert_true(str_has(out, "at : Int"), "field")
+  assert_true(str_has(out, "gens : Array[(Option[Int], Int)]"), "nested Option/Array/tuple")
+  assert_true(str_has(out, "fn f(a : Int, b : Option[Int]) -> Int"), "params and return")
+  assert_true(str_has(out, "let c : Int ="), "let annotation")
+  assert_true(str_has(out, "(Int) -> Int"), "function type")
+  let src2 = "struct Int32 {\n  v : Int\n}\nfn h(x : Int32) -> Int {\n  x.v\n}\n"
+  let (_, out2, _) = f3d1a_transpile("own.mbt", src2)
+  assert_true(str_has(out2, "fn h(x : Int32) -> Int"), "a local type named Int32 is kept:\n" + out2)
+}
+
+test "F3d1a-2: Map::from_array / Map(arr, capacity=cap) keep [arr, cap] order and fail closed on aliasing" {
+  let src = "fn note(v : Int) -> Int {\n  v\n}\n" +
+  "fn mk(ks : Array[Int], ps : Array[(Int, Int)], c : Int) -> Int {\n" +
+  "  let m1 = Map::from_array([(1, 2), (1, 3)])\n" +
+  "  let m2 : Map[Int, Int] = ps |> Map::from_array\n" +
+  "  let m3 : Map[Int, Unit] = Map([], capacity=ks.length())\n" +
+  "  let m4 : Map[Int, Int] = Map([(note(1), 2)], capacity=note(3))\n" +
+  "  let m5 : Map[Int, Int] = Map(ps, capacity=c + 1)\n" +
+  "  m1.length() + m2.length() + m3.length() + m4.length() + m5.length()\n" +
+  "}\n"
+  let (blockers, out, _) = f3d1a_transpile("maps.mbt", src)
+  assert_true(blockers == 0, "map constructors transpile with 0 blockers:\n" + out)
+  assert_true(str_has(out, "let m1 = ({ let __mbt_pairs_") && str_has(out, " = [(1, 2), (1, 3)]; mbt_compat::ordered_map_from_array(__mbt_pairs_"), "untyped from_array binds its literal first:\n" + out)
+  assert_true(str_has(out, "let m2 : mbt_compat::OrderedMap[Int, Int] = ps |> mbt_compat::ordered_map_from_array"), "bare from_array as a pipe target")
+  assert_true(str_has(out, "mbt_compat::ordered_map_new_cap(ks.length())"), "empty literal + capacity")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from_array_cap([(note(1), 2)], note(3))"), "fresh literal + call capacity")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from_array_cap(ps, c + 1)"), "non-fresh array + call-free capacity")
+  let neg = "fn cap() -> Int {\n  4\n}\nfn bad(ps : Array[(Int, Int)]) -> Int {\n" +
+  "  let m : Map[Int, Int] = Map(ps, capacity=cap())\n  m.length()\n}\n"
+  let lit = "fn lit() -> Int {\n  let m = { 1: 10, 2: 20 }\n  let t : Map[Int, Int] = { 3: 30 }\n  m.length() + t.length()\n}\n"
+  let (_, lout, _) = f3d1a_transpile("lit.mbt", lit)
+  assert_true(str_has(lout, " = [(1, 10), (2, 20)]; mbt_compat::ordered_map_from_array(__mbt_pairs_"), "untyped map literal binds its pairs first:\n" + lout)
+  assert_true(str_has(lout, "= mbt_compat::ordered_map_from_array([(3, 30)])"), "typed map literal stays inline:\n" + lout)
+  let typed = "fn t() -> Int {\n  let n : Int = Map::from_array([(1, 10), (2, 20)]).length()\n  let p = Map::from_array(([(3, 30)]))\n  let v : Int = { 1: 10, 2: 20 }.length()\n  n + p.length() + v\n}\n"
+  let (_, tout, _) = f3d1a_transpile("typed.mbt", typed)
+  assert_true(!str_has(tout, "ordered_map_from_array([") && !str_has(tout, "ordered_map_from_array(([") &&
+    str_has(tout, " = [(3, 30)]; mbt_compat::ordered_map_from_array(__mbt_pairs_"), "every non-direct pairs literal is bound first:\n" + tout)
+  let ppipe = "fn q() -> Int {\n  let m : Map[Int, Int] = ([(1, 2)]) |> Map::from_array\n  m.length()\n}\n"
+  let (qb, _, qds) = f3d1a_transpile("ppipe.mbt", ppipe)
+  assert_true(qb > 0 && f3d1a_has_diag(qds, "MBT2PION_UNSUPPORTED_SYNTAX", "piped into `Map::from_array`"), "parenthesized literal pipe fails closed")
+  let shadow = "using @dep { type Map }\nfn s(xs : Array[Int]) -> Int {\n  Map::from_array(xs).n\n}\n"
+  let (_, sout, _) = f3d1a_transpile("shadow.mbt", shadow)
+  assert_true(!str_has(sout, "ordered_map_from_array"), "a `using` type named Map is not MoonBit core's:\n" + sout)
+  let chain = "fn ch() -> Int {\n  let m : Map[String, Int] = Map::from_array([(1, 2)]).to_str_map()\n  m.length()\n}\n"
+  let (_, chout, _) = f3d1a_transpile("chain.mbt", chain)
+  assert_true(!str_has(chout, "Array[(String, Int)]") && str_has(chout, "__mbt_pairs_"), "a chained call takes no expected-type annotation:\n" + chout)
+  let mcap = "fn c(n : Int) -> Int {\n  let m : Map[Int, Int] = Map::new(capacity=n)\n  m.length()\n}\n"
+  let (_, cout, _) = f3d1a_transpile("mcap.mbt", mcap)
+  assert_true(str_has(cout, "mbt_compat::ordered_map_new_cap(n)"), "Map::new(capacity=n):\n" + cout)
+  let pipe = "fn p() -> Int {\n  let m = [(1, 2)] |> Map::from_array\n  m.length()\n}\n"
+  let (pb, _, pds) = f3d1a_transpile("pipe.mbt", pipe)
+  assert_true(pb > 0 && f3d1a_has_diag(pds, "MBT2PION_UNSUPPORTED_SYNTAX", "piped into `Map::from_array`"), "untyped literal pipe fails closed")
+  let (nb, _, nds) = f3d1a_transpile("neg.mbt", neg)
+  assert_true(nb > 0, "non-fresh array + capacity call blocks")
+  assert_true(f3d1a_has_diag(nds, "MBT2PION_UNSUPPORTED_SYNTAX", "`Map(arr, capacity=...)`"), "with its diagnostic")
+  assert_true(is_call_free_capacity_expr(lex_moonbit("a.b * 2 + -c"), 0, 8), "field reads and arithmetic are call-free")
+  assert_true(!is_call_free_capacity_expr(lex_moonbit("xs.length()"), 0, 5), "a method call is not")
+  assert_true(!is_call_free_capacity_expr(lex_moonbit("{ x = 1; 2 }"), 0, 7), "a block is not")
+}
+
+test "F3d1a-3: tuple map keys switch MapKey constructors to their pair / triple forms" {
+  let ln = "  let s = S::{ sids: mbt_compat::ordered_map_new() }"
+  let msg = "type `(Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg) == Some("  let s = S::{ sids: mbt_compat::ordered_map_new_pair() }"), "pair")
+  let ln2 = "  let m = mbt_compat::ordered_map_from_array([((1, \"a\", true), 2)])"
+  let msg2 = "type `(Int, String, Bool)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_from_array`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln2, 11, msg2) == Some("  let m = mbt_compat::ordered_map_from_array_triple([((1, \"a\", true), 2)])"), "triple")
+  let ln3 = "  let m = mbt_compat::ordered_map_from_array_cap(ps, 4)"
+  let msg3 = "type `(Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_from_array_cap`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln3, 11, msg3) == Some("  let m = mbt_compat::ordered_map_from_array_cap_pair(ps, 4)"), "cap form")
+  let msg4 = "type `Foo` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg4) is None, "a non-tuple key is left to fail")
+  let msg5 = "type `(Int, Int, Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg5) is None, "4-tuples have no form")
+  assert_true(tuple_type_arity("(Int, (Int, Int))") == 2, "nested tuple counts once")
+  assert_true(tuple_type_arity("(Int, Int) -> Int") == 0, "a function type is not a tuple")
+  assert_true(tuple_type_arity("(Array[(Int, Int)], Bool)") == 2, "brackets nest")
+}
+
+test "F3d1a-4: shrink_to_fit keeps MoonBit's buffer semantics or fails closed" {
+  let src = "fn astra() -> (Int, Int, Int, Int) {\n" +
+  "  let xs : Array[Int] = Array(capacity=8)\n" +
+  "  xs.push(1)\n  xs.push(2)\n  let v = xs[:]\n  let c0 = xs.capacity()\n" +
+  "  xs.shrink_to_fit()\n  xs[0] = 9\n  (c0, xs.capacity(), v[0], xs[0])\n}\n"
+  let (blockers, out, _) = f3d1a_transpile("buf.mbt", src)
+  assert_true(blockers == 0, "ArrayBuf shrink transpiles:\n" + out)
+  assert_true(str_has(out, "let xs : mbt_compat::ArrayBuf[Int] = mbt_compat::ArrayBuf::with_capacity(8)"), "reserved capacity kept:\n" + out)
+  assert_true(str_has(out, "xs.shrink_to_fit()"), "ArrayBuf::shrink_to_fit")
+  // Plain arrays: the guard over the lowered text.
+  let ok = "fn f(n : N) -> Unit {\n  let faded : Array[Int] = []\n" +
+  "  later(fn() { faded.clear(); faded.shrink_to_fit() })\n" +
+  "  if !n.props.is_empty() {\n    let props = n.props.copy()\n    n.props.clear()\n    n.props.shrink_to_fit()\n" +
+  "    for p in props {\n      p()\n    }\n  }\n" +
+  "  let any = n.props.iter().any(fn(x) { x > 0 })\n}\n"
+  let okt = lex_moonbit(ok)
+  let mut seen = 0
+  for i, t in okt {
+    if t.raw == "shrink_to_fit" {
+      seen = seen + 1
+      assert_true(shrink_snapshot_hazard(okt, i, ShrinkPkg::empty()) == "", "no snapshot around call " + seen.to_string())
+    }
+  }
+  assert_true(seen == 2, "both calls checked")
+  let fields = collect_array_fields(["struct T {\n  g : Array[Int]\n  bag : Bag\n  mut h : Array[Int]\n}\nstruct U {\n  g : Array[String]\n}\n"])
+  assert_true(fields.get("g") == Some(true) && fields.get("bag") == Some(false), "array-typed fields")
+  let loops = [
+    ("fn f(t : T) -> Unit {\n  let g = mbt_compat::arr_copy(t.g)\n  t.g.clear()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", ""),
+    ("fn f(t : T) -> Unit {\n  let g = t.g.copy()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", ""),
+    ("fn f(t : T) -> Unit {\n  let g = t.bag.copy()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", "for .. in"),
+    ("fn f(t : T) -> Unit {\n  let g = mbt_compat::arr_copy(t.g)\n  t.h = g\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", "for .. in"),
+    ("fn f(t : T) -> Unit {\n  let g = t.g\n  for e in g {\n    t.g.shrink_to_fit()\n  }\n}\n", "for .. in"),
+  ]
+  for c in loops {
+    let ts = lex_moonbit(c.0)
+    let mut hit = "?"
+    for i, t in ts {
+      if t.raw == "shrink_to_fit" {
+        hit = shrink_snapshot_hazard(ts, i, ShrinkPkg::{ array_fields: fields, iterated_tails: Map(), risky_fns: Map(), iter_fns: Map(), visible_fields: Map() })
+      }
+    }
+    assert_true(if c.1 == "" { hit == c.1 } else { str_has(hit, c.1) }, "loop over a private copy:\n" + c.0 + "got: " + hit)
+  }
+  let cases = [
+    ("fn f(xs : Array[Int]) -> Unit {\n  for x in xs {\n    if x == 1 {\n      xs.shrink_to_fit()\n    }\n  }\n}\n", "for .. in"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  mbt_compat::arr_each(xs, fn(x) { xs.shrink_to_fit() })\n}\n", "callback passed to `arr_each"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  later(fn() { xs.clear(); xs.shrink_to_fit() })\n}\n", "runs in a closure"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  xs.each(fn(x) {\n    if x > 0 { xs.shrink_to_fit() }\n  })\n}\n", "callback passed to `each"),
+    ("fn f(xs : Array[Int]) -> Array[Int] {\n  let it = mbt_compat::arr_iter(xs)\n  xs.shrink_to_fit()\n  it.collect()\n}\n", "keeps an `Array::iter()`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let it = xs.iter().map(fn(x) { x })\n  xs.shrink_to_fit()\n  it.count()\n}\n", "keeps an `Array::iter()`"),
+  ]
+  for c in cases {
+    let ts = lex_moonbit(c.0)
+    let mut hit = ""
+    for i, t in ts {
+      if t.raw == "shrink_to_fit" {
+        hit = shrink_snapshot_hazard(ts, i, ShrinkPkg::empty())
+      }
+    }
+    assert_true(str_has(hit, c.1), "hazard `" + c.1 + "` for:\n" + c.0 + "got: " + hit)
+  }
+  // Kept iterators: appends alone or in-place writes alone are exact; removals, or appends + writes, are not.
+  let iters = [
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.push(2)\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs[0] = 2\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let n = xs.iter().count()\n  xs.pop()\n  n\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.pop()\n  it.count()\n}\n", "`xs.pop(..)`"),
+    ("fn f(d : Array[Int]) -> Bool {\n  let xs = [1]\n  d.push_iter(xs.iter())\n  f(xs)\n  d.iter().zip(xs.iter()).all(fn(p) { p.0 == p.1 })\n}\n", ""),
+    ("fn f(d : Array[Int]) -> Int {\n  let xs = [1]\n  let z = xs.iter()\n  xs.pop()\n  z.count()\n}\n", "`xs.pop(..)`"),
+    ("fn f(d : Array[Int]) -> Int {\n  d.push_iter([7].iter())\n  let z = [1, 2].iter().zip([3].iter().map(fn(x) { x }))\n  d.pop()\n  z.count()\n}\n", ""),
+    ("fn f(d : Array[Array[Int]]) -> Int {\n  let z = d[0].iter()\n  d[0].pop()\n  z.count()\n}\n", "computed array"),
+    ("fn f(xs : Array[Int]) -> MbtIter[Int] {\n  let it = xs.iter()\n  it\n}\n", "leaves its expression"),
+    ("fn f(xs : Array[Int], b : B) -> Unit {\n  b.it = xs.iter()\n}\n", "not bound by `let`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let mut n = 0\n  for x in xs.iter() {\n    n = n + x\n  }\n  n\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.push(2)\n  xs[0] = 3\n  it.count()\n}\n", "appended to and written"),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  mbt_compat::arr_truncate(xs, 0)\n  it.count()\n}\n", "passed to `arr_truncate"),
+    // Review round: a removal before the iterator exists is not seen by it; one in the loop around it is.
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let _ = xs.pop()\n  let it = xs.iter()\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let mut n = 0\n  while n < 9 {\n    let it = xs.iter()\n    n = n + it.count()\n    let _ = xs.pop()\n  }\n  n\n}\n", "`xs.pop(..)`"),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  xs.iter().map(fn(x) { if x == 1 { let _ = xs.pop() }; x }).count()\n}\n", "inside the iterator chain"),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let ys = xs\n  let it = xs.iter()\n  let _ = ys.pop()\n  it.count()\n}\n", "pop(..)`"),
+    ("fn f(self : S) -> Int {\n  let it = self.xs.iter()\n  self.clear_me()\n  it.count()\n}\n", "clear_me(..)`"),
+    ("fn f(h : H) -> Int {\n  let it = h.items.iter()\n  mutate(h.items)\n  it.count()\n}\n", "`mutate(..)`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let it = xs.iter()\n  let m = it.map(fn(x) { x })\n  m.count()\n}\n", "leaves its expression"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let it = xs.iter()\n  let _ = it.next()\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let ys : Array[Int] = xs\n  let it = xs.iter()\n  let _ = ys.pop()\n  it.count()\n}\n", "pop(..)`"),
+    ("fn f(b : B) -> Int {\n  let it = b.items.iter()\n  let ys = b.items\n  let _ = ys.pop()\n  it.count()\n}\n", "pop(..)`"),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let g = fn() { let _ = xs.pop() }\n  let it = xs.iter()\n  g()\n  it.count()\n}\n", "closure defined before"),
+    // Review round 3: a named / opaque callback in a consumed chain, `let b = (a)`, a parameter's iterator, an
+    // interpolation hole.
+    ("fn f(key : (Int) -> Int) -> Int {\n  let a = [1, 2, 3]\n  a.iter().map(key).count()\n}\n", "named callback"),
+    ("fn f() -> Int {\n  let a = [1, 2, 3]\n  let key = fn(x : Int) { x }\n  a.iter().map(key).count()\n}\n", ""),
+    ("fn f() -> Int {\n  let a = [1, 2, 3]\n  let key = fn(x : Int) { let _ = a.pop(); x }\n  a.iter().map(key).count()\n}\n", "closure defined before"),
+    ("fn f(touch : () -> Unit) -> Int {\n  let a = [1, 2, 3]\n  a.iter().map(fn(x) { touch(); x }).count()\n}\n", "a call to `touch(..)`"),
+    ("fn f() -> Int {\n  let a = [1, 2, 3]\n  let b = (a)\n  let it = a.iter()\n  let _ = b.pop()\n  it.count()\n}\n", "pop(..)`"),
+    ("fn f(a : Array[Int], b : Array[Int]) -> Int {\n  let it = a.iter()\n  let _ = b.pop()\n  it.count()\n}\n", "computed array"),
+    ("fn f() -> Int {\n  let a = [1, 2, 3]\n  let it = a.iter()\n  let s = \"\\{a.pop().unwrap_or(0)}\"\n  it.count() + s.length()\n}\n", "string interpolation"),
+    // Closures defined before run while it reads only if named there (transitively) or handed out.
+    ("fn f(look : () -> Unit, xs : Array[Int]) -> Int {\n  let g = fn() { look() }\n  g()\n  xs.iter().count()\n}\n", ""),
+    ("fn f(look : () -> Unit, xs : Array[Int]) -> Int {\n  on(fn() { look() })\n  xs.iter().count()\n}\n", ""),
+    ("fn f(look : () -> Unit, xs : Array[Int]) -> Int {\n  let g = fn() { look() }\n  let h = fn() { g() }\n  xs.iter().map(fn(x) { h(); x }).count()\n}\n", "a call to `look(..)`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let g = fn() { let _ = xs.pop() }\n  let h = fn() { g() }\n  let it = xs.iter()\n  h()\n  it.count()\n}\n", "closure defined before"),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  let g = fn() { let _ = xs.pop() }\n  on(g)\n  let it = xs.iter()\n  fire()\n  it.count()\n}\n", "closure defined before"),
+    ("fn f() -> Int {\n  let xs = [1, 2, 3]\n  on(fn() { let _ = xs.pop() })\n  let it = xs.iter()\n  fire()\n  it.count()\n}\n", "closure defined before"),
+    // Review round 4: `let mut` / rebound closures are opaque, interpolated local closures are followed, a handed-out
+    // closure over a non-local array counts once a call runs while it reads.
+    ("fn f(touch : (Int) -> Int, xs : Array[Int]) -> Int {\n  let mut g = fn(x : Int) { x }\n  g = touch\n  xs.iter().map(fn(x) { g(x) }).count()\n}\n", "a call to `g(..)`"),
+    ("fn f(touch : () -> Unit, xs : Array[Int], c : Bool) -> Int {\n  let g = fn(x : Int) { touch(); x }\n  let g = fn(x : Int) { x }\n  xs.iter().map(fn(x) { g(x) }).count()\n}\n", "a call to `g(..)`"),
+    ("fn f(xs : Array[Int], o : Int?) -> Int {\n  let g = fn(x : Int) { x }\n  match o {\n    Some(g) => xs.iter().map(fn(x) { g(x) }).count()\n    None => 0\n  }\n}\n", "a call to `g(..)`"),
+    ("fn f(touch : () -> Unit, xs : Array[Int]) -> Int {\n  let g = fn() { touch() }\n  xs.iter().map(fn(x) { let _ = \"\\{g()}\"; x }).count()\n}\n", "a call to `touch(..)`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let g = fn() { let _ = xs.pop() }\n  on(g)\n  let it = xs.iter()\n  fire()\n  it.count()\n}\n", "closure defined before"),
+    ("fn f(xs : Array[Int]) -> Int {\n  on(fn() { let _ = xs.pop() })\n  xs.iter().map(fn(x) { fire(); x }).count()\n}\n", "closure defined before"),
+    ("fn f(xs : Array[Int]) -> Int {\n  on(fn() { let _ = xs.pop() })\n  xs.iter().count()\n}\n", ""),
+    ("fn f(xs : Array[Int], cb : () -> Unit, look : () -> Unit) -> Int {\n  let g = fn() { look() }\n  on(fn() { (cb)(); g() })\n  xs.iter().map(fn(x) { fire(); x }).count()\n}\n", ""),
+    ("fn f(xs : Array[Int], look : (Array[Int]) -> Unit) -> Int {\n  on(fn() { look(xs) })\n  xs.iter().map(fn(x) { fire(); x }).count()\n}\n", "`xs` is passed to `look(..)`"),
+    // Final review: a user `copy()` is not a fresh array, a `let` in a closed block does not bind it here,
+    // interpolation holes and closures defined before share the append/write state, a closure value handed on.
+    ("fn f(h : H) -> Int {\n  let c = h.copy()\n  let it = c.iter()\n  let _ = h.data.pop()\n  it.count()\n}\n", "computed array"),
+    ("fn f(a : Array[Int], b : Array[Int]) -> Int {\n  if a.length() > 0 {\n    let a = [3]\n    a.push(1)\n  }\n  let it = a.iter()\n  let _ = b.pop()\n  it.count()\n}\n", "computed array"),
+    ("fn f() -> Int {\n  let xs = [1, 2]\n  let it = xs.iter()\n  let s = \"\\{ { xs.push(3); 0 } }\"\n  xs[0] = 9\n  it.count() + s.length()\n}\n", "appended to and written"),
+    ("fn f() -> Int {\n  let xs = [1, 2]\n  let g = fn() { xs.push(3) }\n  let it = xs.iter()\n  g()\n  xs[0] = 9\n  it.count()\n}\n", "appended to and written"),
+    ("fn f(touch : () -> Unit, xs : Array[Int]) -> Int {\n  xs.iter().map(fn(x) { apply(touch); x }).count()\n}\n", "a call handing `apply(..)` a closure value"),
+    ("fn f(xs : Array[Int], n : Int) -> Int {\n  xs.iter().map(fn(x) { add(x, n) }).count()\n}\n", ""),
+  ]
+  for c in iters {
+    let ts = lex_moonbit(c.0)
+    let mut hit = "?"
+    for i, t in ts {
+      if t.kind == TokenKind::Dot && i + 1 < ts.length() && ts[i + 1].raw == "iter" {
+        hit = kept_iter_hazard(ts, i)
+      }
+    }
+    assert_true(if c.1 == "" { hit == "" } else { str_has(hit, c.1) }, "kept iterator:\n" + c.0 + "got: " + hit)
+  }
+  // Review round: a shrink in another function called from a caller's iteration; a block expression in the
+  // `for` header.
+  let pkg_src = "fn trim(xs : Array[Int]) -> Unit {\n  xs.shrink_to_fit()\n}\n" +
+  "fn caller(xs : Array[Int]) -> Unit {\n  for x in xs {\n    if x == 1 {\n      trim(xs)\n      xs[1] = 9\n    }\n  }\n}\n"
+  let pkg = collect_shrink_pkg([pkg_src])
+  let pts = lex_moonbit(pkg_src)
+  let mut phit = "?"
+  for i, t in pts {
+    if t.raw == "shrink_to_fit" {
+      phit = shrink_snapshot_hazard(pts, i, pkg)
+    }
+  }
+  assert_true(str_has(phit, "iterates an array named `xs`"), "cross-function shrink:\n" + phit)
+  assert_true(pkg.iter_fns.contains("trim"), "trim is called inside an iteration")
+  let pub_src = "pub fn trim2(xs : Array[Int]) -> Unit {\n  xs.clear()\n  xs.shrink_to_fit()\n}\n"
+  let ppkg = collect_shrink_pkg([pub_src])
+  let pp = lex_moonbit(pub_src)
+  let mut pphit = "?"
+  for i, t in pp {
+    if t.raw == "shrink_to_fit" {
+      pphit = shrink_snapshot_hazard(pp, i, ppkg)
+    }
+  }
+  assert_true(str_has(pphit, "is `pub`"), "a pub function's parameter:\n" + pphit)
+  let hop_src = "fn trim(ys : Array[Int]) -> Unit {\n  ys.shrink_to_fit()\n}\n" +
+  "fn helper(zs : Array[Int]) -> Unit {\n  trim(zs)\n}\n" +
+  "fn caller(xs : Array[Int]) -> Unit {\n  for x in xs {\n    helper(xs)\n  }\n}\n"
+  let hpkg = collect_shrink_pkg([hop_src])
+  let hts = lex_moonbit(hop_src)
+  let mut hhit = "?"
+  for i, t in hts {
+    if t.raw == "shrink_to_fit" {
+      hhit = shrink_snapshot_hazard(hts, i, hpkg)
+    }
+  }
+  assert_true(str_has(hhit, "reached from `helper`"), "multi-hop shrink:\n" + hhit)
+  let alias_src = "fn trim(src : Array[Int]) -> Unit {\n  let buf = src\n  buf.shrink_to_fit()\n}\n" +
+  "fn caller(xs : Array[Int]) -> Unit {\n  for x in xs {\n    trim(xs)\n  }\n}\n"
+  let apkg = collect_shrink_pkg([alias_src])
+  let ats = lex_moonbit(alias_src)
+  let mut ahit = "?"
+  for i, t in ats {
+    if t.raw == "shrink_to_fit" {
+      ahit = shrink_snapshot_hazard(ats, i, apkg)
+    }
+  }
+  assert_true(str_has(ahit, "comes from outside `trim`"), "a local alias of a parameter is not private:\n" + ahit)
+  // Final review: shrinking a `copy()` (a user method may return the array it holds), a parameter shadowed only in
+  // a closed block; a private array is not blocked by an iterator over another one.
+  for sc in [
+    ("struct H { data : Array[Int] }\nfn H::copy(self : H) -> Array[Int] {\n  self.data\n}\nfn trim_copy(h : H) -> Unit {\n  let buf = h.copy()\n  buf.shrink_to_fit()\n}\nfn caller(h : H) -> Unit {\n  for x in h.data {\n    trim_copy(h)\n  }\n}\n", "comes from outside `trim_copy`"),
+    ("fn trim_shadow(src : Array[Int]) -> Unit {\n  if src.length() > 0 {\n    let src = [3]\n    src.push(1)\n  }\n  src.shrink_to_fit()\n}\nfn caller(xs : Array[Int]) -> Unit {\n  for x in xs {\n    trim_shadow(xs)\n  }\n}\n", "comes from outside `trim_shadow`"),
+    ("fn ok() -> Int {\n  let a : Array[Int] = Array::new(capacity=10)\n  a.push(1)\n  a.shrink_to_fit()\n  let sorted = [3, 1, 2]\n  let it = sorted.iter()\n  it.count() + a.length()\n}\n", ""),
+    ("fn bad() -> Int {\n  let a : Array[Int] = Array::new(capacity=10)\n  a.push(1)\n  let it = a.iter()\n  a.shrink_to_fit()\n  it.count()\n}\n", "keeps an `Array::iter()`"),
+    ("fn bad2(o : Array[Int]) -> Int {\n  let a : Array[Int] = Array::new(capacity=10)\n  a.push(1)\n  keep(a)\n  let it = o.iter()\n  a.shrink_to_fit()\n  it.count()\n}\n", "keeps an `Array::iter()`"),
+    ("fn ok2(o : Array[Int]) -> Int {\n  let a : Array[Int] = Array::new(capacity=10)\n  for x in o {\n    a.push(x)\n    a.shrink_to_fit()\n  }\n  a.length()\n}\n", ""),
+  ] {
+    let spkg = collect_shrink_pkg([sc.0])
+    let sts = lex_moonbit(sc.0)
+    let mut shh = "?"
+    for i, t in sts {
+      if t.raw == "shrink_to_fit" {
+        shh = shrink_snapshot_hazard(sts, i, spkg)
+      }
+    }
+    assert_true(if sc.1 == "" { shh == "" } else { str_has(shh, sc.1) }, "shrink:\n" + sc.0 + "got: " + shh)
+  }
+  let opq = lex_moonbit("fn f() {\n  let log = []\n  xs.sort_by_key(fn(x) { log.push(x); touch(); x })\n}\n")
+  let mut ob = -1
+  for i, t in opq {
+    if t.raw == "{" && i > 0 && opq[i - 1].kind == TokenKind::RParen && ob < 0 && i > 5 {
+      ob = i
+    }
+  }
+  assert_true(ob > 0 && str_has(closure_body_opacity(opq, ob, find_matching_delim(opq, ob), { let m : Map[String, Bool] = Map(); m["touch"] = true; m }), "touch(..)"), "opaque call in a key closure")
+  // Sort keys: a `let mut` closure or an interpolated local closure that makes an opaque call.
+  for sk in [
+    ("fn f(touch : (Int) -> Int, xs : Array[Int]) -> Unit {\n  let mut g = fn(x : Int) { x }\n  g = touch\n  xs.sort_by_key(fn(x) { g(x) })\n}\n", "a call to `g(..)`"),
+    ("fn f(touch : () -> Unit, xs : Array[Int]) -> Unit {\n  let g = fn() { touch() }\n  xs.sort_by_key(fn(x) { let _ = \"\\{g()}\"; x })\n}\n", "interpolates a string"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let g = fn(x : Int) { x * 2 }\n  xs.sort_by_key(fn(x) { g(x) })\n}\n", ""),
+    ("fn f(xs : Array[Int], touch : () -> Unit) -> Unit {\n  xs.sort_by_key(fn(x) { apply(touch); x })\n}\n", "a call to `apply(..)`"),
+    ("fn f(xs : Array[Int], touch : () -> Unit) -> Unit {\n  let g = touch\n  xs.sort_by_key(fn(x) { apply(g); x })\n}\n", "a call to `apply(..)`"),
+    ("fn f(xs : Array[Int], hook : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { apply(hook.f); x })\n}\n", "a call to `apply(..)`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let trace : Array[Int] = []\n  xs.sort_by_key(fn(x) { trace.push(x); x })\n}\n", ""),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let trace = []\n  xs.sort_by_key(fn(x) {\n    match xs {\n      trace => {\n        trace.push(7)\n        x\n      }\n    }\n  })\n}\n", "`.push(..)`, which is not a known pure method"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let trace = []\n  xs.sort_by_key(fn(x) {\n    let trace = xs\n    trace.push(7)\n    x\n  })\n}\n", "`.push(..)`, which is not a known pure method"),
+    // A binding is in sight only after its whole initializer, in a block still open (not a later `let`, not one in
+    // a closed block, not inside its own initializer).
+    ("fn f(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { key(x) })\n  let key = fn(v : Int) { v }\n  ignore(key(0))\n}\n", "a call to `key(..)`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  if true {\n    let key = fn(v : Int) { v }\n    ignore(key(0))\n  }\n  xs.sort_by_key(fn(x) { key(x) })\n}\n", "a call to `key(..)`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let key = fn(v : Int) { v }\n  xs.sort_by_key(fn(x) { key(x) })\n}\n", ""),
+    ("fn f(xs : Array[Int], touch : (Int) -> Int) -> Unit {\n  let key : (Int) -> Int = fn(f : (Int) -> Int) { f }(touch)\n  xs.sort_by_key(fn(x) { key(x) })\n}\n", "a call to `key(..)`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let key : (Int) -> Int = fn(v : Int) { v }\n  xs.sort_by_key(fn(x) { key(x) })\n}\n", ""),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h : Int = 0 +\n    { xs.sort_by_key(fn(x) { x + h.length() }); 0 }\n  ignore(h)\n}\n", "not proven built-in"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let key = fn(v : Int) { v }\n  -{ xs.sort_by_key(fn(x) { key(x) }); xs[0] }\n}\n", ""),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h : Int = 0\n    + { xs.sort_by_key(fn(x) { x + h.length() }); 0 }\n  ignore(h)\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h : Array[Int] = [1]\n  xs.sort_by_key(fn(x) { x + h.length() })\n}\n", ""),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h : Array[Int] = { xs.sort_by_key(fn(x) { x + h.length() }); [0] }\n  ignore(h)\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h = [{ xs.sort_by_key(fn(x) { x + h.length() }); 0 }]\n  ignore(h)\n}\n", "not proven built-in"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let trace : Array[Int] = { xs.sort_by_key(fn(x) { trace.push(7); x }); [] }\n  ignore(trace)\n}\n", "`.push(..)`, which is not a known pure method"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let calls = mbt_compat::ref_new({ xs.sort_by_key(fn(x) { calls.v = 1; x }); 0 })\n  ignore(calls)\n}\n", "writes the field `v`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { xs.push(x); x })\n}\n", "`.push(..)`, which is not a known pure method"),
+    ("fn f(xs : Array[Int], m : Map[Int, Int]) -> Unit {\n  xs.sort_by_key(fn(x) { m.get(x).unwrap_or(0) + Some(x).unwrap() })\n}\n", ""),
+    ("fn f(xs : Array[Int], hook : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { (hook.f)(); x })\n}\n", "an indirect call"),
+    ("fn f(xs : Array[Int], laid_at : Map[Int, Int]) -> Unit {\n  xs.sort_by_key(fn(x) { laid_at.get(x).unwrap_or(-1) })\n}\n", ""),
+    ("fn f(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { [x].map(fn(y) { y }).length() })\n}\n", "`.map(..)`, which is not a known pure method"),
+    // Final review: user methods of pure-looking names, `|>`, an index call, interpolation, writes, `==` with an
+    // `impl Eq`; a built-in receiver keeps working while a user type has a method of that name.
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], h : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { h.length() + x })\n}\n", "not proven built-in"),
+    ("fn Hook::get(self : Hook, x : Int) -> Int {\n  x\n}\nfn f(xs : Array[Int], h : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { h.get(x) })\n}\n", "not proven built-in"),
+    ("fn Hook::get(self : Hook, x : Int) -> Int {\n  x\n}\nfn f(xs : Array[Int], holes : Map[Int, Int]) -> Unit {\n  xs.sort_by_key(fn(x) { holes.get(x).unwrap_or(0) })\n}\n", ""),
+    ("fn f(xs : Array[Int], touch : (Int) -> Int) -> Unit {\n  xs.sort_by_key(fn(x) { x |> touch })\n}\n", "`|>`"),
+    ("fn f(xs : Array[Int], fs : Array[(Int) -> Int]) -> Unit {\n  xs.sort_by_key(fn(x) { fs[0](x) })\n}\n", "an indirect call"),
+    ("fn f(xs : Array[Int], h : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { let _ = \"\\{h}\"; x })\n}\n", "interpolates a string"),
+    ("fn f(xs : Array[Int], h : Hook) -> Unit {\n  xs.sort_by_key(fn(x) { h.n = x; x })\n}\n", "writes the field `n`"),
+    ("fn f(xs : Array[Int], ys : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { ys[0] = x; x })\n}\n", "writes an element"),
+    ("impl Eq for K {\n  fn op_equal(self : K, o : K) -> Bool {\n    true\n  }\n}\nfn f(xs : Array[K], k : K) -> Unit {\n  xs.sort_by_key(fn(x) { if x == k { 1 } else { 0 } })\n}\n", "`impl Eq`"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  let calls = mbt_compat::ref_new(0)\n  xs.sort_by_key(fn(x) { calls.v = calls.v + 1; x })\n}\n", ""),
+    // An initializer with a suffix (`[src][0]`), a qualified or user-shadowed `Some`, a shadowed type name.
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], src : Hook) -> Unit {\n  let h = [src][0]\n  xs.sort_by_key(fn(x) { x + h.length() })\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h = [1, 2]\n  xs.sort_by_key(fn(x) { x + h.length() })\n}\n", ""),
+    ("enum Hook {\n  Some(Array[Int])\n}\nfn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], ys : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x + Hook::Some(ys).length() })\n}\n", "not proven built-in"),
+    ("enum Hook {\n  Some(Array[Int])\n}\nfn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], ys : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x + Some(ys).length() })\n}\n", "not proven built-in"),
+    ("struct Map {\n  n : Int\n}\nfn Map::length(self : Map) -> Int {\n  0\n}\nfn f(xs : Array[Int], m : Map) -> Unit {\n  xs.sort_by_key(fn(x) { x + m.length() })\n}\n", "not proven built-in"),
+    // Any other possible binding before the use (a pattern, a `let` in the key) or none before it (a later `let`).
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], src : Hook) -> Unit {\n  let h = [0]\n  match src {\n    h => xs.sort_by_key(fn(x) { x + h.length() })\n  }\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], o : Hook?) -> Unit {\n  let h = [0]\n  match o {\n    Some(h) => xs.sort_by_key(fn(x) { x + h.length() })\n    None => ()\n  }\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], src : Hook) -> Unit {\n  let h = [0]\n  xs.sort_by_key(fn(x) {\n    let h = src\n    x + h.length()\n  })\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x + h.length() })\n  let h = [0]\n  ignore(h)\n}\n", "not proven built-in"),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int]) -> Unit {\n  let h = [1, 2]\n  ignore(h)\n  xs.sort_by_key(fn(x) { x + h.length() })\n}\n", ""),
+    ("fn Hook::length(self : Hook) -> Int {\n  0\n}\nfn f(xs : Array[Int], src : Hook) -> Unit {\n  let calls = mbt_compat::ref_new(0)\n  match src {\n    calls => xs.sort_by_key(fn(x) { calls.v = 1; x })\n  }\n}\n", "writes the field `v`"),
+  ] {
+    let st = lex_moonbit(sk.0)
+    let mut shit = "?"
+    for i, t in st {
+      if t.raw == "sort_by_key" {
+        shit = sort_key_closure_opacity(st, i + 1, sort_key_env_of([st]))
+      }
+    }
+    assert_true(if sk.1 == "" { shit == "" } else { str_has(shit, sk.1) }, "sort key:\n" + sk.0 + "got: " + shit)
+  }
+  // After Stage B: an operator lowered to a free call later (`mbt_op_add_K(k, k)`) is seen by the final audit.
+  let ov_diags : Array[Diag] = []
+  let ov_src = "fn f(xs : Array[K]) -> Unit {\n  mbt_compat::arr_sort_by_key(xs, fn(k) { mbt_op_add_K(k, k).value })\n}\n" +
+  "fn g(xs : Array[Int]) -> Unit {\n  mbt_compat::arr_sort_by_key(xs, fn(k) { k + 1 })\n}\n"
+  stage_b_audit_final_sort_keys([GeneratedFile::{ rel_path: "ov.pion", content: ov_src, source_file: "ov.mbt", anchors: [] }], ov_diags)
+  assert_true(ov_diags.length() == 1 && str_has(ov_diags[0].message, "a call to `mbt_op_add_K(..)`") && ov_diags[0].line == 2,
+    "final sort-key audit")
+  let blk = "fn f(xs : Array[Int], ys : Array[Int], flag : Bool) -> Unit {\n  for x in if flag { xs } else { ys } {\n    xs.shrink_to_fit()\n  }\n}\n"
+  let bts = lex_moonbit(blk)
+  let mut bhit = "?"
+  for i, t in bts {
+    if t.raw == "shrink_to_fit" {
+      bhit = shrink_snapshot_hazard(bts, i, ShrinkPkg::empty())
+    }
+  }
+  assert_true(str_has(bhit, "for .. in"), "block expression in the for header:\n" + bhit)
+  let (r1, a1, b1) = array_ctor_capacity_range(lex_moonbit("Array::new(capacity=n + 1,)"), 0, 11)
+  assert_true(r1 == 10 && a1 == 6 && b1 == 9, "Array::new(capacity=..) with a trailing comma")
+  let (r0, a0, _) = array_ctor_capacity_range(lex_moonbit("Array()"), 0, 3)
+  assert_true(r0 == 2 && a0 < 0, "Array() has no capacity")
+  let (r2, _, _) = array_ctor_capacity_range(lex_moonbit("Array(1, 2)"), 0, 6)
+  assert_true(r2 < 0, "positional arguments are not a capacity constructor")
+}
+
+test "F3d1a-5: Array(capacity=n) keeps the negative-capacity abort" {
+  let src = "fn mk(n : Int) -> Array[Int] {\n  let a : Array[Int] = Array(capacity=n)\n  let b : Array[Int] = Array::new(capacity=n)\n  a\n}\n"
+  let (blockers, out, _) = f3d1a_transpile("cap.mbt", src)
+  assert_true(blockers == 0, "capacity constructors transpile")
+  assert_true(str_has(out, "{ mbt_compat::arr_capacity_check(n); [] }"), "both forms check:\n" + out)
+  assert_true(!str_has(out, "let _ = n"), "the old discard is gone")
+}
