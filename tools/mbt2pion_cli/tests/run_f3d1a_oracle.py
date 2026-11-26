@@ -1189,6 +1189,73 @@ pub fn init_self_shadow() -> Int {
   h.items[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "iife_closure": (r'''
+fn sortit(xs : Array[Int], touch : (Int) -> Int) -> Unit {
+  let key : (Int) -> Int = fn(f : (Int) -> Int) { f }(touch)
+  xs.sort_by_key(fn(x) { key(x) })
+}
+
+pub fn iife_closure() -> Int {
+  let a = [2, 1]
+  sortit(a, fn(x) {
+    a.push(7)
+    x
+  })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `key(..)`"),
+    "multiline_op_init": (r'''
+priv struct Hook {
+  items : Array[Int]
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.items.push(7)
+  0
+}
+
+let h : Hook = { items: [2, 1] }
+
+fn sortit(xs : Array[Int]) -> Unit {
+  let h : Int = 0 +
+    {
+      xs.sort_by_key(fn(x) { x + h.length() })
+      0
+    }
+  ignore(h)
+}
+
+pub fn multiline_op_init() -> Int {
+  sortit(h.items)
+  h.items[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "multiline_lead_op_init": (r'''
+priv struct Hook {
+  items : Array[Int]
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.items.push(7)
+  0
+}
+
+let h : Hook = { items: [2, 1] }
+
+fn sortit(xs : Array[Int]) -> Unit {
+  let h : Int = 0
+    + {
+      xs.sort_by_key(fn(x) { x + h.length() })
+      0
+    }
+  ignore(h)
+}
+
+pub fn multiline_lead_op_init() -> Int {
+  sortit(h.items)
+  h.items[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
