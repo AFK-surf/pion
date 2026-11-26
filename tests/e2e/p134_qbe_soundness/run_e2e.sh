@@ -225,6 +225,7 @@ cat > "$WS/app/src/main.pion" <<'EOF'
 import "pkg_root_a" as s
 import "pkg_collide"
 import "dep_mid"
+import "dep_mid" as dm
 
 pub struct BytesBox[T] {
   pub tag : T
@@ -260,6 +261,10 @@ fn xpkg_method_top[T](b : dep_mid::EqBox, a : T, c : T) -> Bool {
 
 fn xpkg_static_top[T](a : T, c : T) -> Bool {
   dep_mid::EqBox::check_static(a, c)
+}
+
+fn xpkg_alias_static_top[T](a : T, c : T) -> Bool {
+  dm::EqBox::check_static(a, c)
 }
 
 fn erased_count_for_underscore[T](arr : Array[T]) -> Int {
@@ -329,6 +334,7 @@ pub fn main(world : World) -> Int {
   let dyn_s2 = "pion" + "_str"
   let xmeth_ok = xpkg_method_top(eq_box, dyn_s1, dyn_s2)
   let xstat_ok = xpkg_static_top(dyn_s1, dyn_s2)
+  let xalias_ok = xpkg_alias_static_top(dyn_s1, dyn_s2)
 
   let out =
     "eq=" + eq_same.to_string() + "," + eq_diff.to_string() +
@@ -341,13 +347,13 @@ pub fn main(world : World) -> Int {
     " trdef=" + tr_def.to_string() + ":" + log_def.length().to_string() + ":" + log_def[0].to_string() + "," + log_def[1].to_string() + "," + log_def[2].to_string() +
     " trexp=" + tr_exp.to_string() + ":" + log_exp.length().to_string() + ":" + log_exp[0].to_string() + "," + log_exp[1].to_string() + "," + log_exp[2].to_string() +
     " for_=" + wlen.to_string() + ":" + joined + ":" + erased_cnt.to_string() +
-    " xmeth=" + xmeth_ok.to_string() + "," + xstat_ok.to_string()
+    " xmeth=" + xmeth_ok.to_string() + "," + xstat_ok.to_string() + "," + xalias_ok.to_string()
   io_println(world, out)
   0
 }
 EOF
 
-EXPECTED="eq=true,false inl=203,102 noninl=2501,85 mono=404,303 trait=111 nested=203101 after=404 trdef=202203:3:202,203,900 trexp=101303:3:101,303,900 for_=14:alphabetagamma:3 xmeth=true,true"
+EXPECTED="eq=true,false inl=203,102 noninl=2501,85 mono=404,303 trait=111 nested=203101 after=404 trdef=202203:3:202,203,900 trexp=101303:3:101,303,900 for_=14:alphabetagamma:3 xmeth=true,true,true"
 
 # Mode 1: Native dev
 "$PIONC" build -o "$TMP_DIR/app_dev" "$WS/app"
