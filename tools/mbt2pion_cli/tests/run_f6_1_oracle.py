@@ -340,6 +340,39 @@ fn pick_raise_chain(
   y
 }
 
+fn val() -> Int raise LocalErr {
+  raise Empty
+}
+
+fn pick_later_shadow(
+  x? : Int = always_fail_g(),
+  always_fail_g : () -> Result[Int, LocalErr],
+) -> Int raise LocalErr {
+  match always_fail_g() {
+    Ok(v) => x + v
+    Err(_) => x
+  }
+}
+
+fn pick_kw_rename(
+  val : () -> Int,
+  val_ : () -> Int,
+  x? : Int = val(),
+) -> Int {
+  let _ = val_
+  x
+}
+
+fn pick_kw_later(
+  x? : Int = val(),
+  val : () -> Int,
+  val_ : () -> Int,
+) -> Int raise LocalErr {
+  let _ = val
+  let _ = val_
+  x
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -610,7 +643,12 @@ fn case_r5_paren_and_guard() -> String {
   let p35 = pick_raise_def(x=42) catch { _ => 7 }
   let p36 = pick_raise_chain(10) catch { _ => 7 }
   let p37 = pick_raise_chain(10, y=42) catch { _ => 7 }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string()
+  // R14: later positional param deferred binding & prior keyword param rename in defaults
+  let p38 = pick_later_shadow(fn() { Ok(42) }) catch { _ => 7 }
+  let p39 = pick_later_shadow(x=10, fn() { Ok(42) }) catch { _ => 7 }
+  let p40 = pick_kw_rename(fn() { 42 }, fn() { 9 })
+  let p41 = pick_kw_later(fn() { 42 }, fn() { 9 }) catch { _ => 7 }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -666,6 +704,14 @@ NEGATIVE_CASES = [
     (
         "incomplete_catch",
         "priv suberror E { A; B(Int) }\nfn g() -> Int raise E { raise A }\npub fn f() -> Int { g() catch { A => 1 } }\n",
+    ),
+    (
+        "default_param_labeled_shadow",
+        "priv suberror E { Bad }\nfn g() -> Int raise E { raise Bad }\npub fn pick_labeled_shadow(x? : Int = g(), g~ : () -> Result[Int, E]) -> Int raise E { let _ = g; x }\n",
+    ),
+    (
+        "default_param_self_shadow",
+        "priv suberror E { Bad }\nfn g() -> Int raise E { raise Bad }\npub fn pick_self_shadow(g? : Int = g()) -> Int raise E { g }\n",
     ),
     (
         "incomplete_bool_catch",
@@ -785,7 +831,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
