@@ -14372,10 +14372,18 @@ test "wave_aa2_inline_rc_unreachable_giant_scc_cap_and_forward_dag" {
   assert_true(out_giant.contains("@arm0\n    call $pion_rc_dec(l %x)"), out_giant)
 
   // 3. AA2-2b: Large function (>128 eff_insts) with multiple compact loops exceeding
-  //    the per-function cap prioritizes smaller loops and bounds total expanded sites.
+  //    the per-function cap (24) prioritizes smaller loops (rank 1) over larger loops
+  //    (rank 6), and truncates equal-rank sites in deterministic source order.
   let cap_sb = StringBuilder()
-  cap_sb.write_string("export function w $many_inner_loops(l %x, l %y, l %slot, w %c) {\n@entry\n    jmp @big_loop0\n")
-  // First: a 6-block loop with 30 RC sites (rank = 6, lower priority than self-loop rank = 1)
+  cap_sb.write_string("export function w $many_inner_loops(l %x, l %y, l %slot, w %c) {\n@entry\n")
+  // Pad in @entry BEFORE branching so @big_loop5's jnz is a true terminator.
+  let mut pi = 0
+  while pi < 70 {
+    cap_sb.write_string("    %pad" + pi.to_string() + " =w add %c, 1\n")
+    pi = pi + 1
+  }
+  cap_sb.write_string("    jnz %c, @big_loop0, @tight_spin\n")
+  // 6-block loop with 30 RC sites on %x (rank = 6): first 22 expand, last 8 stay compact.
   let mut li = 0
   while li < 6 {
     cap_sb.write_string("@big_loop" + li.to_string() + "\n")
@@ -14391,23 +14399,109 @@ test "wave_aa2_inline_rc_unreachable_giant_scc_cap_and_forward_dag" {
     }
     li = li + 1
   }
-  // Pad to ensure eff_insts > 128
-  let mut pi = 0
-  while pi < 70 {
-    cap_sb.write_string("    %pad" + pi.to_string() + " =w add %c, 1\n")
-    pi = pi + 1
-  }
-  // Second: a 1-block self-loop with 2 RC sites on %y (rank = 1, highest priority)
-  cap_sb.write_string("@tight_spin\n    call $pion_rc_inc(l %y)\n    storel %y, %slot\n    call $pion_rc_dec(l %y)\n    storel %y, %slot\n    jnz %c, @tight_spin, @done\n")
+  // 1-block self-loop with 2 RC sites on %y (rank = 1, dec then inc -> ids 22 & 23):
+  cap_sb.write_string("@tight_spin\n    call $pion_rc_dec(l %y)\n    storel %y, %slot\n    call $pion_rc_inc(l %y)\n    storel %y, %slot\n    jnz %c, @tight_spin, @done\n")
   cap_sb.write_string("@done\n    ret 0\n}\n")
   let out_cap = inline_native_rc_ssa(cap_sb.to_string())
-  // Tight self-loop (%y) MUST be prioritized and expanded:
+  // Exact 24 expansions total: 0..21 (%x inc), 22 (%y dec), 23 (%y inc); zero id 24.
+  assert_true(out_cap.contains("@_rci_fast_21"), out_cap)
+  assert_true(out_cap.contains("@_rcd_fast_22"), out_cap)
+  assert_true(out_cap.contains("@_rci_fast_23"), out_cap)
+  assert_eq(out_cap.contains("@_rci_fast_24"), false)
+  assert_eq(out_cap.contains("@_rcd_fast_24"), false)
+  // Both %y sites in @tight_spin (rank 1) MUST expand:
   assert_eq(out_cap.contains("call $pion_rc_inc(l %y)\n    storel"), false)
   assert_eq(out_cap.contains("call $pion_rc_dec(l %y)\n    storel"), false)
-  // Total expanded sites must be capped (not all 32 expanded, so some %x calls stay compact):
-  assert_true(out_cap.contains("call $pion_rc_inc(l %x)\n    storel"), out_cap)
+  // Source-order truncation on equal-rank %x sites: @big_loop0 expands, @big_loop5 stays compact:
+  let bl0_pos = p18_find_from(out_cap, "@big_loop0\n", 0)
+  let bl1_pos = p18_find_from(out_cap, "@big_loop1\n", bl0_pos)
+  let bl5_pos = p18_find_from(out_cap, "@big_loop5\n", 0)
+  let ts_pos = p18_find_from(out_cap, "@tight_spin\n", bl5_pos)
+  assert_true(bl0_pos >= 0 && bl1_pos > bl0_pos && bl5_pos > bl1_pos && ts_pos > bl5_pos, out_cap)
+  let bl0_slice = slice_str(out_cap, bl0_pos, bl1_pos)
+  let bl5_slice = slice_str(out_cap, bl5_pos, ts_pos)
+  assert_true(bl0_slice.contains("@_rci_fast_0"), bl0_slice)
+  assert_eq(bl0_slice.contains("call $pion_rc_inc(l %x)\n    storel"), false)
+  assert_eq(bl5_slice.contains("@_rci_fast_"), false)
+  assert_true(bl5_slice.contains("call $pion_rc_inc(l %x)\n    storel"), bl5_slice)
 
-  // 4. AA2-3: Strictly-forward diamond DAG skips Tarjan cleanly (no expansion when
+  // 4. AA2-2c: Mixed SCC per-block uncapped isolation:
+  //    A 25-block linear cycle (branch_blks <= 1, 0 RC sites) in the SAME function
+  //    must NOT exempt a separate 6-block 30-RC-site loop from the 24-site cap.
+  let mix_sb = StringBuilder()
+  mix_sb.write_string("export function w $mixed_linear_and_hot_scc(l %x, l %slot, w %c) {\n@entry\n")
+  let mut mp = 0
+  while mp < 70 {
+    mix_sb.write_string("    %mp" + mp.to_string() + " =w add %c, 1\n")
+    mp = mp + 1
+  }
+  mix_sb.write_string("    jmp @lin0\n")
+  let mut mi = 0
+  while mi < 25 {
+    mix_sb.write_string("@lin" + mi.to_string() + "\n    %lv" + mi.to_string() + " =w add %c, 1\n")
+    mi = mi + 1
+  }
+  mix_sb.write_string("    jnz %c, @lin0, @hot0\n")
+  let mut hi = 0
+  while hi < 6 {
+    mix_sb.write_string("@hot" + hi.to_string() + "\n")
+    let mut hr = 0
+    while hr < 5 {
+      mix_sb.write_string("    call $pion_rc_inc(l %x)\n    storel %x, %slot\n")
+      hr = hr + 1
+    }
+    if hi + 1 < 6 {
+      mix_sb.write_string("    jmp @hot" + (hi + 1).to_string() + "\n")
+    } else {
+      mix_sb.write_string("    jnz %c, @hot0, @done\n")
+    }
+    hi = hi + 1
+  }
+  mix_sb.write_string("@done\n    ret 0\n}\n")
+  let out_mix_scc = inline_native_rc_ssa(mix_sb.to_string())
+  assert_true(out_mix_scc.contains("@_rci_fast_23"), out_mix_scc)
+  assert_eq(out_mix_scc.contains("@_rci_fast_24"), false)
+  let hot5_pos = p18_find_from(out_mix_scc, "@hot5\n", 0)
+  let hot_done_pos = p18_find_from(out_mix_scc, "@done\n", hot5_pos)
+  assert_true(hot5_pos >= 0 && hot_done_pos > hot5_pos, out_mix_scc)
+  let hot5_slice = slice_str(out_mix_scc, hot5_pos, hot_done_pos)
+  assert_eq(hot5_slice.contains("@_rci_fast_"), false)
+  assert_true(hot5_slice.contains("call $pion_rc_inc(l %x)\n    storel"), hot5_slice)
+
+  // 5. AA2-2d: Oversized self-loop (>64 eff_insts) inside a branched giant SCC
+  //    must NOT bypass compact filtering; a compact self-loop (<=64 eff_insts)
+  //    in the same giant SCC MUST still expand.
+  let self_giant_sb = StringBuilder()
+  self_giant_sb.write_string("export function w $giant_scc_self_loops(l %x, l %y, l %slot, w %c) {\n@entry\n    jmp @outer_hdr\n")
+  self_giant_sb.write_string("@outer_hdr\n    jnz %c, @arm0, @huge_self\n")
+  let mut sbi = 0
+  while sbi < 25 {
+    self_giant_sb.write_string("@arm" + sbi.to_string() + "\n    %av" + sbi.to_string() + " =w add %c, 1\n")
+    if sbi + 1 < 25 {
+      self_giant_sb.write_string("    jnz %c, @arm" + (sbi + 1).to_string() + ", @outer_hdr\n")
+    } else {
+      self_giant_sb.write_string("    jnz %c, @tiny_self, @done\n")
+    }
+    sbi = sbi + 1
+  }
+  // Oversized self-loop (>64 eff_insts): must NOT expand
+  self_giant_sb.write_string("@huge_self\n")
+  let mut hsi = 0
+  while hsi < 66 {
+    self_giant_sb.write_string("    %hs" + hsi.to_string() + " =w add %c, 1\n")
+    hsi = hsi + 1
+  }
+  self_giant_sb.write_string("    call $pion_rc_inc(l %x)\n    storel %x, %slot\n    jnz %c, @huge_self, @outer_hdr\n")
+  // Compact self-loop (<=64 eff_insts): MUST expand
+  self_giant_sb.write_string("@tiny_self\n    call $pion_rc_inc(l %y)\n    storel %y, %slot\n    jnz %c, @tiny_self, @outer_hdr\n")
+  self_giant_sb.write_string("@done\n    ret 0\n}\n")
+  let out_sg = inline_native_rc_ssa(self_giant_sb.to_string())
+  assert_true(out_sg.contains("@_rci_fast_0"), out_sg)
+  assert_eq(out_sg.contains("@_rci_fast_1"), false)
+  assert_true(out_sg.contains("call $pion_rc_inc(l %x)\n    storel"), out_sg)
+  assert_eq(out_sg.contains("call $pion_rc_inc(l %y)\n    storel"), false)
+
+  // 6. AA2-3: Strictly-forward diamond DAG skips Tarjan cleanly (no expansion when
   //    large & cold, still propagates 1-hop callees when called from a loop).
   let ssa_dag =
     #|export function w $dag_driver(l %x, l %slot, w %n) {

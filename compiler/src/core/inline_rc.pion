@@ -1355,7 +1355,40 @@ struct IrcLoopInfo {
   reachable : Array[Bool]
   in_loop : Array[Bool]
   hot_rank : Array[Int]
-  uncapped : Bool
+  block_uncapped : Array[Bool]
+}
+
+///|
+/// Reusable scratch buffers for `irc_mark_compact_inner_loops`, allocated at
+/// most once per function (lazily on the first branched giant SCC) and sparsely
+/// reset over each SCC's blocks so multiple giant SCCs never incur O(nblk)
+/// re-allocation overhead.
+struct IrcInnerScratch {
+  in_scc : Array[Bool]
+  preds_in_scc : Array[Array[Int]]
+  blk_insts : Array[Int]
+  has_back_hdr : Array[Bool]
+  visited : Array[Bool]
+  is_compact_hdr : Array[Bool]
+}
+
+///|
+fn irc_new_inner_scratch(nblk : Int) -> IrcInnerScratch {
+  let preds_in_scc : Array[Array[Int]] = []
+  let mut bi = 0
+  while bi < nblk {
+    let empty_p : Array[Int] = []
+    preds_in_scc.push(empty_p)
+    bi = bi + 1
+  }
+  IrcInnerScratch::{
+    in_scc: Array::make(nblk, false),
+    preds_in_scc: preds_in_scc,
+    blk_insts: Array::make(nblk, 0),
+    has_back_hdr: Array::make(nblk, false),
+    visited: Array::make(nblk, false),
+    is_compact_hdr: Array::make(nblk, false),
+  }
 }
 
 ///|
@@ -1420,11 +1453,17 @@ fn irc_block_eff_insts(fn_lines : Array[String], bs : Int, be : Int) -> Int {
 }
 
 ///|
-/// AA2-2: Inside a giant SCC (`scc.length() > max_small_scc_blocks` with
-/// internal branches), identify compact innermost natural loops (`blocks <=
-/// max_inner_blocks` and `eff_insts <= max_inner_insts`, bounded reverse walk
-/// from in-SCC back-edges `latch -> hdr` with `latch >= hdr` and no escape
-/// `p < hdr`) and mark only those compact inner loops hot.
+/// AA2-2: Block-order-dependent reverse-predecessor selection heuristic inside
+/// a branched giant SCC (`scc.length() > max_small_scc_blocks` with
+/// `branch_blks > 1`). Relies on Pion's frontend emitting loop headers before
+/// loop bodies (`latch >= hdr`) rather than a dominator-tree natural-loop
+/// analysis: from each in-SCC back-edge `latch -> hdr` (`latch >= hdr`), walks
+/// in-SCC predecessors backwards within `<= max_inner_blocks` blocks and
+/// `<= max_inner_insts` effective instructions (rejecting any walk that escapes
+/// to `p < hdr`), then marks innermost compact candidates hot. Every selected
+/// block is guaranteed to lie inside a reachable SCC, and semantic correctness
+/// does not depend on this heuristic (any expansion mask is semantically
+/// equivalent). Reuses `scratch` and sparsely resets only blocks in `scc`.
 fn irc_mark_compact_inner_loops(
   fn_lines : Array[String],
   cfg : IrcCfg,
@@ -1433,26 +1472,24 @@ fn irc_mark_compact_inner_loops(
   hot_rank : Array[Int],
   max_inner_blocks : Int,
   max_inner_insts : Int,
+  scratch : IrcInnerScratch,
 ) -> Unit {
-  let nblk = cfg.blk_starts.length()
-  let in_scc = Array::make(nblk, false)
+  let in_scc = scratch.in_scc
+  let preds_in_scc = scratch.preds_in_scc
+  let blk_insts = scratch.blk_insts
+  let has_back_hdr = scratch.has_back_hdr
+  let visited = scratch.visited
+  let is_compact_hdr = scratch.is_compact_hdr
+
+  let scc_len = scc.length()
   let mut si = 0
-  while si < scc.length() {
+  while si < scc_len {
     in_scc[scc[si]] = true
     si = si + 1
   }
-  let preds_in_scc : Array[Array[Int]] = []
-  let blk_insts = Array::make(nblk, 0)
-  let mut bi = 0
-  while bi < nblk {
-    let empty_p : Array[Int] = []
-    preds_in_scc.push(empty_p)
-    bi = bi + 1
-  }
-  let has_back_hdr = Array::make(nblk, false)
   let cand_hdrs : Array[Int] = []
   si = 0
-  while si < scc.length() {
+  while si < scc_len {
     let u = scc[si]
     blk_insts[u] = irc_block_eff_insts(fn_lines, cfg.blk_starts[u], cfg.blk_ends[u])
     let adj = cfg.succs[u]
@@ -1471,7 +1508,6 @@ fn irc_mark_compact_inner_loops(
     si = si + 1
   }
 
-  let visited = Array::make(nblk, false)
   let compact_hdrs : Array[Int] = []
   let compact_blks : Array[Array[Int]] = []
   let mut hi = 0
@@ -1537,7 +1573,6 @@ fn irc_mark_compact_inner_loops(
 
   // Filter to innermost compact loops: drop loop A if it strictly contains
   // another compact loop's header `h_b > h_a`.
-  let is_compact_hdr = Array::make(nblk, false)
   let mut li = 0
   while li < compact_hdrs.length() {
     is_compact_hdr[compact_hdrs[li]] = true
@@ -1571,6 +1606,20 @@ fn irc_mark_compact_inner_loops(
     }
     li = li + 1
   }
+
+  // Sparse reset of scratch entries touched by this SCC.
+  si = 0
+  while si < scc_len {
+    let u = scc[si]
+    in_scc[u] = false
+    has_back_hdr[u] = false
+    is_compact_hdr[u] = false
+    let ps = preds_in_scc[u]
+    while ps.length() > 0 {
+      let _ = ps.pop()
+    }
+    si = si + 1
+  }
 }
 
 ///|
@@ -1579,8 +1628,10 @@ fn irc_mark_compact_inner_loops(
 /// - Deterministic iterative Tarjan SCC rooted solely at entry `0` restricts
 ///   `reachable` and `in_loop` to entry-reachable blocks (excluding unreachable
 ///   dead cycles).
-/// - Small SCCs (`<= max_small_scc_blocks`) keep all blocks hot; giant SCCs
-///   with internal branches filter down to compact innermost natural loops.
+/// - Small SCCs (`<= max_small_scc_blocks`) keep all blocks hot; giant linear
+///   cycles (`branch_blks <= 1`) mark only their own blocks `block_uncapped`;
+///   branched giant SCCs filter down to compact inner loops (including compact
+///   self-loops `<= max_inner_insts`, rejecting oversized self-loops).
 fn irc_compute_hot_loops(
   fn_lines : Array[String],
   cfg : IrcCfg,
@@ -1590,14 +1641,19 @@ fn irc_compute_hot_loops(
 ) -> IrcLoopInfo {
   let nblk = cfg.blk_starts.length()
   if cfg.disable_cfg || nblk == 0 {
-    return IrcLoopInfo::{ reachable: [], in_loop: [], hot_rank: [], uncapped: false }
+    return IrcLoopInfo::{
+      reachable: [],
+      in_loop: [],
+      hot_rank: [],
+      block_uncapped: [],
+    }
   }
   if irc_cfg_is_strictly_forward(cfg) {
     return IrcLoopInfo::{
       reachable: irc_compute_forward_reachable(cfg),
       in_loop: [],
       hot_rank: [],
-      uncapped: false,
+      block_uncapped: [],
     }
   }
   let index = Array::make(nblk, -1)
@@ -1606,7 +1662,9 @@ fn irc_compute_hot_loops(
   let reachable = Array::make(nblk, false)
   let in_loop = Array::make(nblk, false)
   let hot_rank = Array::make(nblk, 0)
-  let mut uncapped = false
+  let block_uncapped = Array::make(nblk, false)
+  let has_self_loop = Array::make(nblk, false)
+  let mut inner_scratch : Option[IrcInnerScratch] = None
 
   let tarjan_stack : Array[Int] = []
   let dfs_node : Array[Int] = []
@@ -1631,8 +1689,7 @@ fn irc_compute_hot_loops(
       dfs_edge[top] = ei + 1
       let w = adj[ei]
       if w == v {
-        in_loop[v] = true
-        hot_rank[v] = 1
+        has_self_loop[v] = true
       }
       if index[w] == -1 {
         index[w] = next_index
@@ -1666,11 +1723,37 @@ fn irc_compute_hot_loops(
           }
         }
         let scc_len = scc.length()
-        if scc_len > 1 {
-          if scc_len <= max_small_scc_blocks {
-            let mut si = 0
+        if scc_len == 1 {
+          let u = scc[0]
+          if has_self_loop[u] {
+            in_loop[u] = true
+            hot_rank[u] = 1
+          }
+        } else if scc_len <= max_small_scc_blocks {
+          let mut si = 0
+          while si < scc_len {
+            let b = scc[si]
+            in_loop[b] = true
+            let rank = if has_self_loop[b] { 1 } else { scc_len }
+            if hot_rank[b] == 0 || rank < hot_rank[b] {
+              hot_rank[b] = rank
+            }
+            si = si + 1
+          }
+        } else {
+          let mut branch_blks = 0
+          let mut si = 0
+          while si < scc_len {
+            if cfg.succs[scc[si]].length() > 1 {
+              branch_blks = branch_blks + 1
+            }
+            si = si + 1
+          }
+          if branch_blks <= 1 {
+            si = 0
             while si < scc_len {
               let b = scc[si]
+              block_uncapped[b] = true
               in_loop[b] = true
               if hot_rank[b] == 0 || scc_len < hot_rank[b] {
                 hot_rank[b] = scc_len
@@ -1678,36 +1761,24 @@ fn irc_compute_hot_loops(
               si = si + 1
             }
           } else {
-            let mut branch_blks = 0
-            let mut si = 0
-            while si < scc_len {
-              if cfg.succs[scc[si]].length() > 1 {
-                branch_blks = branch_blks + 1
+            let scratch = match inner_scratch {
+              Some(sc) => sc
+              None => {
+                let sc = irc_new_inner_scratch(nblk)
+                inner_scratch = Some(sc)
+                sc
               }
-              si = si + 1
             }
-            if branch_blks <= 1 {
-              uncapped = true
-              si = 0
-              while si < scc_len {
-                let b = scc[si]
-                in_loop[b] = true
-                if hot_rank[b] == 0 || scc_len < hot_rank[b] {
-                  hot_rank[b] = scc_len
-                }
-                si = si + 1
-              }
-            } else {
-              irc_mark_compact_inner_loops(
-                fn_lines,
-                cfg,
-                scc,
-                in_loop,
-                hot_rank,
-                max_inner_blocks,
-                max_inner_insts,
-              )
-            }
+            irc_mark_compact_inner_loops(
+              fn_lines,
+              cfg,
+              scc,
+              in_loop,
+              hot_rank,
+              max_inner_blocks,
+              max_inner_insts,
+              scratch,
+            )
           }
         }
       }
@@ -1723,7 +1794,7 @@ fn irc_compute_hot_loops(
     reachable: reachable,
     in_loop: in_loop,
     hot_rank: hot_rank,
-    uncapped: uncapped,
+    block_uncapped: block_uncapped,
   }
 }
 
@@ -3077,14 +3148,18 @@ fn irc_build_expand_mask(
     return (mask, 0)
   }
   let nblk = cfg.blk_starts.length()
+  let need_cap = !expand_whole_fn && eff_insts > 128 && large_fn_site_cap > 0
   let cand_lines : Array[Int] = []
   let cand_ranks : Array[Int] = []
+  let mut fixed_sel = 0
   let mut bi = 0
   while bi < nblk {
     let blk_reach = bi < loop_info.reachable.length() && loop_info.reachable[bi]
     let want_blk = blk_reach &&
       (expand_whole_fn || (bi < loop_info.in_loop.length() && loop_info.in_loop[bi]))
     if want_blk {
+      let blk_uncap = !need_cap ||
+        (bi < loop_info.block_uncapped.length() && loop_info.block_uncapped[bi])
       let rank = if expand_whole_fn {
         1
       } else if bi < loop_info.hot_rank.length() && loop_info.hot_rank[bi] > 0 {
@@ -3102,8 +3177,13 @@ fn irc_build_expand_mask(
           let t = irc_strip_comment(raw)
           let kind = irc_match_rc_call(t)
           if kind != 0 && irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
-            cand_lines.push(li)
-            cand_ranks.push(rank)
+            if blk_uncap {
+              mask[li] = true
+              fixed_sel = fixed_sel + 1
+            } else {
+              cand_lines.push(li)
+              cand_ranks.push(rank)
+            }
           }
         }
         li = li + 1
@@ -3113,22 +3193,17 @@ fn irc_build_expand_mask(
   }
   let total_cands = cand_lines.length()
   if total_cands == 0 {
-    return (mask, 0)
+    return (mask, fixed_sel)
   }
-  let apply_cap = !expand_whole_fn &&
-    !loop_info.uncapped &&
-    eff_insts > 128 &&
-    large_fn_site_cap > 0 &&
-    total_cands > large_fn_site_cap
-  if !apply_cap {
+  if total_cands <= large_fn_site_cap {
     let mut ci = 0
     while ci < total_cands {
       mask[cand_lines[ci]] = true
       ci = ci + 1
     }
-    return (mask, total_cands)
+    return (mask, fixed_sel + total_cands)
   }
-  // Deterministically select the `large_fn_site_cap` sites with smallest
+  // Deterministically select the `large_fn_site_cap` capped sites with smallest
   // `hot_rank` (tightest/innermost loop first), breaking ties by source order.
   let chosen = Array::make(total_cands, false)
   let mut picked = 0
@@ -3150,7 +3225,7 @@ fn irc_build_expand_mask(
     mask[cand_lines[best_idx]] = true
     picked = picked + 1
   }
-  (mask, picked)
+  (mask, fixed_sel + picked)
 }
 
 ///|

@@ -1,17 +1,26 @@
 /-
 Wave AA2 formal verification (`compiler/src/core/inline_rc.pion`):
   1. `SingleSite`: Exact state-machine bisimulation between the inlined QBE SSA
-     fast path (`@_rci_*` / `@_rcd_*`, including 32-bit modular wrap, single
-     `pion_destroy_obj` trigger on zero, immortal/frozen/MT branches, and
-     post-split `phi` predecessor remapping) and the runtime reference
-     `pion_rc_inc` / `pion_rc_dec`.
+     fast path (`@_rci_*` / `@_rcd_*`, including 32-bit modular wrap, exact-once
+     `pion_destroy_obj` trigger on zero, `isImmortal` flag check, `mtFlag` slow
+     path delegation, and post-split `phi` predecessor remapping) and the C
+     runtime check order in `runtime/pion_rt.c:802-837` (which checks
+     `PION_FLAG_IMMORTAL` before `g_pion_mt` and `owner_tid`), under the heap
+     well-formedness invariant `HeapWf` matching `runtime/pion_rt.c:928-934`
+     (`isImmortal h = true -> h.ownerTid = 0`).
+     Scope boundary: models the flag/owner_tid/counter state machine and
+     `HeapWf` preservation; does not model concurrency memory-ordering or
+     higher-level freeze/adoption protocols beyond `HeapWf`.
   2. `MaskEquiv`: Compositional semantic equivalence for any selection mask
-     `mask : Nat → Bool`, proving that arbitrary selective RC expansion
-     (unreachable exclusion, compact inner-loop filtering, per-function site
-     budget, and acyclic fast-path skipping) preserves observable behavior.
+     `mask : Nat -> Bool` under `HeapWf`-preserving program steps, proving that
+     arbitrary selective RC expansion preserves observable state and destruction
+     traces regardless of how AA2-2's heuristic selects candidate sites.
+     Scope boundary: proves soundness of arbitrary subset masking, not
+     optimality or dominance properties of AA2-2's block-order heuristic.
   3. `ForwardDag`: Strictly-forward CFG acyclic certificate
-     (`∀ (u, v) ∈ E, u < v ⟹ ¬∃ cycle`), proving the completeness and soundness
-     of AA2-3's O(V + E) linear check that skips Tarjan SCC on forward-only CFGs.
+     (`forall (u, v) in E, u < v -> not (exists cycle)`), proving soundness of
+     AA2-3's O(V + E) linear check that skips Tarjan SCC on forward-only CFGs,
+     plus entry-reachability exclusion for AA2-1.
 
 Plain kernel checks, no proof holes, standard axioms only
 (`propext`, `Classical.choice`, `Quot.sound`).
@@ -43,40 +52,60 @@ def updateObj (objs : Ptr → Option RcHeader) (p : Ptr) (h : RcHeader) :
 def isImmortal (h : RcHeader) : Bool :=
   (h.flags &&& (2 : UInt16)) != (0 : UInt16)
 
-/-- Reference runtime semantics of `pion_rc_inc(p)` in ST mode, delegating to
-    `mtInc` when `mtFlag != 0`. -/
+/-- Heap well-formedness invariant matching `runtime/pion_rt.c:928-934`:
+    every immortal object has `ownerTid = 0` (`pion_rc_immortalize` clears
+    `owner_tid = 0`, and static immortal headers are emitted with `owner_tid = 0`). -/
+def HeapWf (st : HeapState) : Prop :=
+  ∀ p h, st.objs p = some h → isImmortal h = true → h.ownerTid = 0
+
+/-- Contract on the delegated MT slow-path (`pion_rc_inc` / `pion_rc_dec` when
+    `mtFlag != 0`): returns immediately without modifying state on immortal
+    objects, matching `runtime/pion_rt.c:805` and `824`. -/
+def MtImmortalNoop (mtOp : HeapState → Ptr → HeapState) : Prop :=
+  ∀ st p h, st.objs p = some h → isImmortal h = true → mtOp st p = st
+
+/-- Preservation of `HeapWf` across an opaque transition. -/
+def PreservesWf (op : HeapState → HeapState) : Prop :=
+  ∀ st, HeapWf st → HeapWf (op st)
+
+/-- Reference runtime semantics of `pion_rc_inc(p)` matching
+    `runtime/pion_rt.c:802-819`: checks `p == 0`, then `isImmortal h`, then
+    `mtFlag != 0`, then `ownerTid != 0` (`local_rc`) vs `shared_rc`. -/
 def rtRcInc (mtInc : HeapState → Ptr → HeapState) (st : HeapState) (p : Ptr) :
     HeapState :=
   if p == 0 then st
-  else if st.mtFlag != 0 then mtInc st p
   else
     match st.objs p with
-    | none => st
+    | none => if st.mtFlag != 0 then mtInc st p else st
     | some h =>
-      if h.ownerTid != 0 then
-        { st with objs := updateObj st.objs p { h with localRc := h.localRc + 1 } }
-      else if isImmortal h then
+      if isImmortal h then
         st
+      else if st.mtFlag != 0 then
+        mtInc st p
+      else if h.ownerTid != 0 then
+        { st with objs := updateObj st.objs p { h with localRc := h.localRc + 1 } }
       else
         { st with objs := updateObj st.objs p { h with sharedRc := h.sharedRc + 1 } }
 
-/-- Reference runtime semantics of `pion_rc_dec(p)` in ST mode, delegating to
-    `mtDec` when `mtFlag != 0`. Appends `p` to `destroyed` iff the decremented
-    32-bit counter becomes `0`. -/
+/-- Reference runtime semantics of `pion_rc_dec(p)` matching
+    `runtime/pion_rt.c:821-845`: checks `p == 0`, then `isImmortal h`, then
+    `mtFlag != 0`, then `ownerTid != 0` (`local_rc`) vs `shared_rc`, invoking
+    `pion_destroy_obj` iff the decremented 32-bit counter becomes `0`. -/
 def rtRcDec (mtDec : HeapState → Ptr → HeapState) (st : HeapState) (p : Ptr) :
     HeapState :=
   if p == 0 then st
-  else if st.mtFlag != 0 then mtDec st p
   else
     match st.objs p with
-    | none => st
+    | none => if st.mtFlag != 0 then mtDec st p else st
     | some h =>
-      if h.ownerTid != 0 then
+      if isImmortal h then
+        st
+      else if st.mtFlag != 0 then
+        mtDec st p
+      else if h.ownerTid != 0 then
         let r1 := h.localRc - 1
         let st1 := { st with objs := updateObj st.objs p { h with localRc := r1 } }
         if r1 == 0 then { st1 with destroyed := st1.destroyed ++ [p] } else st1
-      else if isImmortal h then
-        st
       else
         let r1 := h.sharedRc - 1
         let st1 := { st with objs := updateObj st.objs p { h with sharedRc := r1 } }
@@ -112,30 +141,26 @@ def writeSlot (h : RcHeader) (slot : RcSlot) (v : UInt32) : RcHeader :=
 
 /-- Block-by-block state-machine execution of the inlined `pion_rc_inc` QBE SSA
     template (`@_rci_nn`, `@_rci_st`, `@_rci_imm`, `@_rci_fast`, `@_rci_slow`,
-    `@_rci_end`). -/
+    `@_rci_end`): checks `p == 0`, then `mtFlag != 0`, then `ownerTid != 0`,
+    and only checks `isImmortal` on the `ownerTid == 0` path. -/
 def inlineRcInc (mtInc : HeapState → Ptr → HeapState) (st : HeapState) (p : Ptr) :
     HeapState :=
-  -- Entry: `%nz =w cnel arg, 0; jnz %nz, @_rci_nn, @_rci_end`
   if p == 0 then st
   else
-    -- `@_rci_nn`: `%mt =w loaduw $pion_mt_flag; jnz %mt, @_rci_slow, @_rci_st`
     if st.mtFlag != 0 then mtInc st p
     else
       match st.objs p with
       | none => st
       | some h =>
-        -- `@_rci_st`: `%ot =w loaduw (arg - 24); jnz %ot, @_rci_fast, @_rci_imm`
         let fastPred? : Option FastPred :=
           if h.ownerTid != 0 then
             some .fromSt
           else
-            -- `@_rci_imm`: `%fl =w loaduh (arg - 10); %im =w and %fl, 2; jnz %im, @_rci_end, @_rci_fast`
-            if (h.flags &&& (2 : UInt16)) != (0 : UInt16) then none
+            if isImmortal h then none
             else some .fromImm
         match fastPred? with
         | none => st
         | some pred =>
-          -- `@_rci_fast`: `%ra =l phi ...; %rc =w loaduw %ra; %r1 =w add %rc, 1; storew %r1, %ra`
           let slot := fastPhiSlot pred
           let r1 := readSlot h slot + 1
           { st with objs := updateObj st.objs p (writeSlot h slot r1) }
@@ -156,7 +181,7 @@ def inlineRcDec (mtDec : HeapState → Ptr → HeapState) (st : HeapState) (p : 
           if h.ownerTid != 0 then
             some .fromSt
           else
-            if (h.flags &&& (2 : UInt16)) != (0 : UInt16) then none
+            if isImmortal h then none
             else some .fromImm
         match fastPred? with
         | none => st
@@ -164,61 +189,160 @@ def inlineRcDec (mtDec : HeapState → Ptr → HeapState) (st : HeapState) (p : 
           let slot := fastPhiSlot pred
           let r1 := readSlot h slot - 1
           let st1 := { st with objs := updateObj st.objs p (writeSlot h slot r1) }
-          -- `jnz %r1, @_rcd_end, @_rcd_drop`
           if r1 != 0 then st1
-          else
-            -- `@_rcd_drop`: `call $pion_destroy_obj(l arg); jmp @_rcd_end`
-            { st1 with destroyed := st1.destroyed ++ [p] }
+          else { st1 with destroyed := st1.destroyed ++ [p] }
 
 theorem inline_rc_inc_bisim (mtInc : HeapState → Ptr → HeapState)
-    (st : HeapState) (p : Ptr) :
+    (st : HeapState) (p : Ptr)
+    (hwf : HeapWf st) (hmt_imm : MtImmortalNoop mtInc) :
     inlineRcInc mtInc st p = rtRcInc mtInc st p := by
-  unfold inlineRcInc rtRcInc isImmortal
+  unfold inlineRcInc rtRcInc
   by_cases hp : (p == 0) = true
   · simp [hp]
   · simp only [hp]
-    by_cases hmt : (st.mtFlag != 0) = true
-    · simp [hmt]
-    · simp only [hmt]
-      cases hobj : st.objs p with
-      | none => rfl
-      | some h =>
-        by_cases hot : (h.ownerTid != 0) = true
-        · simp [hot, fastPhiSlot, readSlot, writeSlot]
-        · simp only [hot]
-          by_cases himm : ((h.flags &&& (2 : UInt16)) != (0 : UInt16)) = true
-          · simp [himm]
-          · simp [himm, fastPhiSlot, readSlot, writeSlot]
+    cases hobj : st.objs p with
+    | none =>
+      by_cases hmt : (st.mtFlag != 0) = true <;> simp [hmt]
+    | some h =>
+      by_cases himm : isImmortal h = true
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp only [hmt, himm, ite_true]
+          exact hmt_imm st p h hobj himm
+        · have hot0 : h.ownerTid = 0 := hwf p h hobj himm
+          have hot : (h.ownerTid != 0) = false := by simp [hot0]
+          simp [hmt, himm, hot]
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp [hmt, himm]
+        · by_cases hot : (h.ownerTid != 0) = true
+          · simp [hmt, himm, hot, fastPhiSlot, readSlot, writeSlot]
+          · simp [hmt, himm, hot, fastPhiSlot, readSlot, writeSlot]
 
 theorem inline_rc_dec_bisim (mtDec : HeapState → Ptr → HeapState)
-    (st : HeapState) (p : Ptr) :
+    (st : HeapState) (p : Ptr)
+    (hwf : HeapWf st) (hmt_imm : MtImmortalNoop mtDec) :
     inlineRcDec mtDec st p = rtRcDec mtDec st p := by
-  unfold inlineRcDec rtRcDec isImmortal
+  unfold inlineRcDec rtRcDec
   by_cases hp : (p == 0) = true
   · simp [hp]
   · simp only [hp]
-    by_cases hmt : (st.mtFlag != 0) = true
-    · simp [hmt]
-    · simp only [hmt]
-      cases hobj : st.objs p with
-      | none => rfl
-      | some h =>
-        by_cases hot : (h.ownerTid != 0) = true
-        · simp only [hot, ite_true, fastPhiSlot, readSlot, writeSlot]
-          by_cases hz : (h.localRc - 1 == 0) = true
-          · have hnz : (h.localRc - 1 != 0) = false := by simp [bne, hz]
-            simp [hz, hnz]
-          · have hnz : (h.localRc - 1 != 0) = true := by simp [bne, hz]
-            simp [hz, hnz]
-        · simp only [hot]
-          by_cases himm : ((h.flags &&& (2 : UInt16)) != (0 : UInt16)) = true
-          · simp [himm]
-          · simp only [himm, fastPhiSlot, readSlot, writeSlot]
+    cases hobj : st.objs p with
+    | none =>
+      by_cases hmt : (st.mtFlag != 0) = true <;> simp [hmt]
+    | some h =>
+      by_cases himm : isImmortal h = true
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp only [hmt, himm, ite_true]
+          exact hmt_imm st p h hobj himm
+        · have hot0 : h.ownerTid = 0 := hwf p h hobj himm
+          have hot : (h.ownerTid != 0) = false := by simp [hot0]
+          simp [hmt, himm, hot]
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp [hmt, himm]
+        · by_cases hot : (h.ownerTid != 0) = true
+          · simp only [hmt, himm, hot, ite_true, fastPhiSlot, readSlot, writeSlot]
+            by_cases hz : (h.localRc - 1 == 0) = true
+            · have hnz : (h.localRc - 1 != 0) = false := by simp [bne, hz]
+              simp [hz, hnz]
+            · have hnz : (h.localRc - 1 != 0) = true := by simp [bne, hz]
+              simp [hz, hnz]
+          · simp only [hmt, himm, hot, fastPhiSlot, readSlot, writeSlot]
             by_cases hz : (h.sharedRc - 1 == 0) = true
             · have hnz : (h.sharedRc - 1 != 0) = false := by simp [bne, hz]
               simp [hz, hnz]
             · have hnz : (h.sharedRc - 1 != 0) = true := by simp [bne, hz]
               simp [hz, hnz]
+
+private theorem updateObj_preserves_wf (st : HeapState) (p : Ptr) (h h' : RcHeader)
+    (hwf : HeapWf st) (hobj : st.objs p = some h)
+    (hflags : h'.flags = h.flags) (hot : h'.ownerTid = h.ownerTid) :
+    HeapWf { st with objs := updateObj st.objs p h' } := by
+  intro q hq hqobj hqimm
+  unfold updateObj at hqobj
+  by_cases hqp : (q == p) = true
+  · simp only [hqp, ite_true, Option.some.injEq] at hqobj
+    subst hqobj
+    have himm_h : isImmortal h = true := by
+      unfold isImmortal at hqimm ⊢
+      rw [← hflags]
+      exact hqimm
+    rw [hot]
+    exact hwf p h hobj himm_h
+  · simp only [hqp] at hqobj
+    exact hwf q hq hqobj hqimm
+
+theorem rt_rc_inc_preserves_wf (mtInc : HeapState → Ptr → HeapState)
+    (hmt_wf : ∀ p, PreservesWf (fun st => mtInc st p))
+    (st : HeapState) (p : Ptr) (hwf : HeapWf st) :
+    HeapWf (rtRcInc mtInc st p) := by
+  unfold rtRcInc
+  by_cases hp : (p == 0) = true
+  · simp [hp, hwf]
+  · simp only [hp]
+    cases hobj : st.objs p with
+    | none =>
+      by_cases hmt : (st.mtFlag != 0) = true
+      · simp only [hmt, ite_true]
+        exact hmt_wf p st hwf
+      · simp [hmt, hwf]
+    | some h =>
+      by_cases himm : isImmortal h = true
+      · simp [himm, hwf]
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp only [himm, hmt, ite_true]
+          exact hmt_wf p st hwf
+        · by_cases hot : (h.ownerTid != 0) = true
+          · simp only [himm, hmt, hot, ite_true]
+            exact updateObj_preserves_wf st p h { h with localRc := h.localRc + 1 } hwf hobj rfl rfl
+          · simp only [himm, hmt, hot]
+            exact updateObj_preserves_wf st p h { h with sharedRc := h.sharedRc + 1 } hwf hobj rfl rfl
+
+theorem rt_rc_dec_preserves_wf (mtDec : HeapState → Ptr → HeapState)
+    (hmt_wf : ∀ p, PreservesWf (fun st => mtDec st p))
+    (st : HeapState) (p : Ptr) (hwf : HeapWf st) :
+    HeapWf (rtRcDec mtDec st p) := by
+  unfold rtRcDec
+  by_cases hp : (p == 0) = true
+  · simp [hp, hwf]
+  · simp only [hp]
+    cases hobj : st.objs p with
+    | none =>
+      by_cases hmt : (st.mtFlag != 0) = true
+      · simp only [hmt, ite_true]
+        exact hmt_wf p st hwf
+      · simp [hmt, hwf]
+    | some h =>
+      by_cases himm : isImmortal h = true
+      · simp [himm, hwf]
+      · by_cases hmt : (st.mtFlag != 0) = true
+        · simp only [himm, hmt, ite_true]
+          exact hmt_wf p st hwf
+        · by_cases hot : (h.ownerTid != 0) = true
+          · simp only [himm, hmt, hot, ite_true]
+            have hstep := updateObj_preserves_wf st p h { h with localRc := h.localRc - 1 } hwf hobj rfl rfl
+            by_cases hz : (h.localRc - 1 == 0) = true
+            · simpa [hz, HeapWf] using hstep
+            · simpa [hz] using hstep
+          · simp only [himm, hmt, hot]
+            have hstep := updateObj_preserves_wf st p h { h with sharedRc := h.sharedRc - 1 } hwf hobj rfl rfl
+            by_cases hz : (h.sharedRc - 1 == 0) = true
+            · simpa [hz, HeapWf] using hstep
+            · simpa [hz] using hstep
+
+theorem inline_rc_inc_preserves_wf (mtInc : HeapState → Ptr → HeapState)
+    (hmt_wf : ∀ p, PreservesWf (fun st => mtInc st p))
+    (hmt_imm : MtImmortalNoop mtInc)
+    (st : HeapState) (p : Ptr) (hwf : HeapWf st) :
+    HeapWf (inlineRcInc mtInc st p) := by
+  rw [inline_rc_inc_bisim mtInc st p hwf hmt_imm]
+  exact rt_rc_inc_preserves_wf mtInc hmt_wf st p hwf
+
+theorem inline_rc_dec_preserves_wf (mtDec : HeapState → Ptr → HeapState)
+    (hmt_wf : ∀ p, PreservesWf (fun st => mtDec st p))
+    (hmt_imm : MtImmortalNoop mtDec)
+    (st : HeapState) (p : Ptr) (hwf : HeapWf st) :
+    HeapWf (inlineRcDec mtDec st p) := by
+  rw [inline_rc_dec_bisim mtDec st p hwf hmt_imm]
+  exact rt_rc_dec_preserves_wf mtDec hmt_wf st p hwf
 
 /-- 32-bit modular arithmetic wrap on `local_rc` / `shared_rc` increment. -/
 theorem rc_inc_wrap32 :
@@ -229,26 +353,21 @@ theorem rc_inc_wrap32 :
     exact-once iff the selected 32-bit counter decrements to zero. -/
 theorem inline_rc_dec_destroy_exact_once
     (mtDec : HeapState → Ptr → HeapState) (st : HeapState) (p : Ptr) (h : RcHeader)
+    (hwf : HeapWf st) (hmt_imm : MtImmortalNoop mtDec)
     (hp : p ≠ 0) (hmt : st.mtFlag = 0) (hobj : st.objs p = some h)
-    (hmut : h.ownerTid ≠ 0 ∨ isImmortal h = false) :
+    (hmut : isImmortal h = false) :
     let cur := if h.ownerTid != 0 then h.localRc else h.sharedRc
     (inlineRcDec mtDec st p).destroyed =
       if cur - 1 == 0 then st.destroyed ++ [p] else st.destroyed := by
-  rw [inline_rc_dec_bisim]
+  rw [inline_rc_dec_bisim mtDec st p hwf hmt_imm]
   unfold rtRcDec
   have hp' : (p == 0) = false := beq_false_of_ne hp
   have hmt' : (st.mtFlag != 0) = false := by simp [hmt]
-  simp only [hp', hmt', hobj, Bool.false_eq_true, ite_false]
+  simp only [hp', hobj, hmut, hmt', Bool.false_eq_true, ite_false]
   by_cases hot : (h.ownerTid != 0) = true
   · simp only [hot, ite_true]
     by_cases hz : (h.localRc - 1 == 0) = true <;> simp [hz]
   · simp only [hot]
-    have hot0 : h.ownerTid = 0 := by
-      cases heq : (h.ownerTid == 0)
-      · exfalso; apply hot; simp [bne, heq]
-      · exact beq_iff_eq.mp heq
-    have himm : isImmortal h = false := hmut.resolve_left (fun c => c hot0)
-    simp only [himm, Bool.false_eq_true, ite_false]
     by_cases hz : (h.sharedRc - 1 == 0) = true <;> simp [hz]
 
 /-- Post-split `phi` predecessor remapping:
@@ -298,6 +417,12 @@ inductive Inst where
   | rcDec (p : Ptr)
   | other (f : HeapState → HeapState)
 
+/-- Every non-RC instruction in `prog` preserves `HeapWf`. -/
+def ProgOtherWf : List Inst → Prop
+  | [] => True
+  | .other f :: rest => PreservesWf f ∧ ProgOtherWf rest
+  | _ :: rest => ProgOtherWf rest
+
 def stepRef (mtInc mtDec : HeapState → Ptr → HeapState)
     (ins : Inst) (st : HeapState) : HeapState :=
   match ins with
@@ -328,38 +453,63 @@ def execWithMask (mtInc mtDec : HeapState → Ptr → HeapState)
       (stepMask mtInc mtDec (mask idx) ins st)
 
 theorem step_mask_equiv (mtInc mtDec : HeapState → Ptr → HeapState)
-    (expand : Bool) (ins : Inst) (st : HeapState) :
+    (expand : Bool) (ins : Inst) (st : HeapState)
+    (hwf : HeapWf st)
+    (hinc_imm : MtImmortalNoop mtInc) (hdec_imm : MtImmortalNoop mtDec) :
     stepMask mtInc mtDec expand ins st = stepRef mtInc mtDec ins st := by
   cases ins with
   | rcInc p =>
     cases expand with
     | false => rfl
-    | true => exact inline_rc_inc_bisim mtInc st p
+    | true => exact inline_rc_inc_bisim mtInc st p hwf hinc_imm
   | rcDec p =>
     cases expand with
     | false => rfl
-    | true => exact inline_rc_dec_bisim mtDec st p
+    | true => exact inline_rc_dec_bisim mtDec st p hwf hdec_imm
   | other f => rfl
 
 /-- Any subset selection mask `mask : Nat → Bool` produces the exact same final
-    heap state and destruction trace as unexpanded runtime RC calls. -/
+    heap state and destruction trace as unexpanded runtime RC calls, assuming
+    initial `HeapWf` and `HeapWf`-preserving external steps. -/
 theorem exec_with_mask_equiv (mtInc mtDec : HeapState → Ptr → HeapState)
-    (mask : Nat → Bool) (idx : Nat) (prog : List Inst) (st : HeapState) :
+    (mask : Nat → Bool) (idx : Nat) (prog : List Inst) (st : HeapState)
+    (hwf : HeapWf st)
+    (hinc_wf : ∀ p, PreservesWf (fun s => mtInc s p))
+    (hdec_wf : ∀ p, PreservesWf (fun s => mtDec s p))
+    (hinc_imm : MtImmortalNoop mtInc)
+    (hdec_imm : MtImmortalNoop mtDec)
+    (hprog_wf : ProgOtherWf prog) :
     execWithMask mtInc mtDec mask idx prog st = execRef mtInc mtDec prog st := by
   induction prog generalizing idx st with
   | nil => rfl
   | cons ins rest ih =>
     simp only [execWithMask, execRef]
-    rw [step_mask_equiv]
-    exact ih (idx + 1) (stepRef mtInc mtDec ins st)
+    rw [step_mask_equiv mtInc mtDec (mask idx) ins st hwf hinc_imm hdec_imm]
+    cases ins with
+    | rcInc p =>
+      exact ih (idx + 1) (rtRcInc mtInc st p)
+        (rt_rc_inc_preserves_wf mtInc hinc_wf st p hwf) hprog_wf
+    | rcDec p =>
+      exact ih (idx + 1) (rtRcDec mtDec st p)
+        (rt_rc_dec_preserves_wf mtDec hdec_wf st p hwf) hprog_wf
+    | other f =>
+      exact ih (idx + 1) (f st) (hprog_wf.1 st hwf) hprog_wf.2
 
 /-- Any two selection policies `mask1` and `mask2` (e.g. baseline all-SCC vs
-    Wave AA2 compact-inner-loop + per-function cap) are observationally identical. -/
+    Wave AA2 compact-inner-loop + per-function cap) are observationally identical
+    under `HeapWf`. -/
 theorem any_two_masks_equiv (mtInc mtDec : HeapState → Ptr → HeapState)
-    (mask1 mask2 : Nat → Bool) (idx : Nat) (prog : List Inst) (st : HeapState) :
+    (mask1 mask2 : Nat → Bool) (idx : Nat) (prog : List Inst) (st : HeapState)
+    (hwf : HeapWf st)
+    (hinc_wf : ∀ p, PreservesWf (fun s => mtInc s p))
+    (hdec_wf : ∀ p, PreservesWf (fun s => mtDec s p))
+    (hinc_imm : MtImmortalNoop mtInc)
+    (hdec_imm : MtImmortalNoop mtDec)
+    (hprog_wf : ProgOtherWf prog) :
     execWithMask mtInc mtDec mask1 idx prog st =
     execWithMask mtInc mtDec mask2 idx prog st := by
-  rw [exec_with_mask_equiv, exec_with_mask_equiv]
+  rw [exec_with_mask_equiv mtInc mtDec mask1 idx prog st hwf hinc_wf hdec_wf hinc_imm hdec_imm hprog_wf]
+  rw [exec_with_mask_equiv mtInc mtDec mask2 idx prog st hwf hinc_wf hdec_wf hinc_imm hdec_imm hprog_wf]
 
 end MaskEquiv
 

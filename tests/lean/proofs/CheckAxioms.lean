@@ -882,6 +882,10 @@ import PionProofs.WaveAA2InlineRc
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget_4096
 #print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_inc_bisim
 #print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_bisim
+#print axioms PionWaveAA2InlineRc.SingleSite.rt_rc_inc_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.rt_rc_dec_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_inc_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_preserves_wf
 #print axioms PionWaveAA2InlineRc.SingleSite.rc_inc_wrap32
 #print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_destroy_exact_once
 #print axioms PionWaveAA2InlineRc.SingleSite.phi_remap_bisim
