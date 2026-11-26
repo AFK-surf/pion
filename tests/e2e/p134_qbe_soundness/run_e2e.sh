@@ -11,7 +11,7 @@ mkdir -p "$CAS_DIR"
 export PION_CACHE_DIR="$CAS_DIR"
 
 # =====================================================================
-# P133: QBE Soundness 4-Mode Matrix
+# P134: QBE Soundness 4-Mode Matrix
 # 1. Local generic `impl[T : Eq] Eq for BytesBox[T]` calling cross-pkg `dep::bytes_eq`
 # 2. Same-alias-different-pkg sentinels (local->imported default, imported mono->own default,
 #    imported->root trait impl default, nested default + caller sentinel after return,
@@ -191,6 +191,23 @@ pub trait ProbeTrait {
 pub fn run_trait_probe[T : ProbeTrait](x : T) -> Int {
   x.probe()
 }
+
+fn priv_generic_eq[T](a : T, b : T) -> Bool {
+  a == b
+}
+
+pub struct EqBox {
+  pub id : Int
+}
+
+pub fn EqBox::check[T](self : EqBox, a : T, b : T) -> Bool {
+  let _ = self.id
+  priv_generic_eq(a, b)
+}
+
+pub fn EqBox::check_static[T](a : T, b : T) -> Bool {
+  priv_generic_eq(a, b)
+}
 EOF
 
 cat > "$WS/app/pion.toml" <<'EOF'
@@ -237,6 +254,22 @@ fn local_nested_default(
   x * 1000 + y
 }
 
+fn xpkg_method_top[T](b : dep_mid::EqBox, a : T, c : T) -> Bool {
+  b.check(a, c)
+}
+
+fn xpkg_static_top[T](a : T, c : T) -> Bool {
+  dep_mid::EqBox::check_static(a, c)
+}
+
+fn erased_count_for_underscore[T](arr : Array[T]) -> Int {
+  let mut c = 0
+  for _ in arr {
+    c = c + 1
+  }
+  c
+}
+
 pub fn main(world : World) -> Int {
   // 1. Original repro: local generic impl[T : Eq] Eq calling cross-pkg bytes_eq
   let b1 = BytesBox::{ tag: 7, data: "pion".to_bytes() }
@@ -279,6 +312,24 @@ pub fn main(world : World) -> Int {
     },
   )
 
+  // 2f. SForIn `for _ in arr { use(_) }` with RC String elements + erased generic TParam
+  let words : Array[String] = ["alpha", "beta", "gamma"]
+  let mut wlen = 0
+  let mut joined = ""
+  for _ in words {
+    wlen = wlen + _.length()
+    joined = joined + _
+  }
+  let dyn_words : Array[String] = ["he" + "llo", "wo" + "rld", "pi" + "on"]
+  let erased_cnt = erased_count_for_underscore(dyn_words)
+
+  // 2g. Cross-pkg generic method & static method calling dep-private `a == b` on dynamic Strings
+  let eq_box = dep_mid::EqBox::{ id: 1 }
+  let dyn_s1 = "pi" + "on_str"
+  let dyn_s2 = "pion" + "_str"
+  let xmeth_ok = xpkg_method_top(eq_box, dyn_s1, dyn_s2)
+  let xstat_ok = xpkg_static_top(dyn_s1, dyn_s2)
+
   let out =
     "eq=" + eq_same.to_string() + "," + eq_diff.to_string() +
     " inl=" + inl_def.to_string() + "," + inl_exp.to_string() +
@@ -288,36 +339,38 @@ pub fn main(world : World) -> Int {
     " nested=" + nested.to_string() +
     " after=" + after_caller.to_string() +
     " trdef=" + tr_def.to_string() + ":" + log_def.length().to_string() + ":" + log_def[0].to_string() + "," + log_def[1].to_string() + "," + log_def[2].to_string() +
-    " trexp=" + tr_exp.to_string() + ":" + log_exp.length().to_string() + ":" + log_exp[0].to_string() + "," + log_exp[1].to_string() + "," + log_exp[2].to_string()
+    " trexp=" + tr_exp.to_string() + ":" + log_exp.length().to_string() + ":" + log_exp[0].to_string() + "," + log_exp[1].to_string() + "," + log_exp[2].to_string() +
+    " for_=" + wlen.to_string() + ":" + joined + ":" + erased_cnt.to_string() +
+    " xmeth=" + xmeth_ok.to_string() + "," + xstat_ok.to_string()
   io_println(world, out)
   0
 }
 EOF
 
-EXPECTED="eq=true,false inl=203,102 noninl=2501,85 mono=404,303 trait=111 nested=203101 after=404 trdef=202203:3:202,203,900 trexp=101303:3:101,303,900"
+EXPECTED="eq=true,false inl=203,102 noninl=2501,85 mono=404,303 trait=111 nested=203101 after=404 trdef=202203:3:202,203,900 trexp=101303:3:101,303,900 for_=14:alphabetagamma:3 xmeth=true,true"
 
 # Mode 1: Native dev
 "$PIONC" build -o "$TMP_DIR/app_dev" "$WS/app"
 OUT_DEV="$("$TMP_DIR/app_dev")"
-echo "p133 native dev:     $OUT_DEV"
+echo "p134 native dev:     $OUT_DEV"
 [ "$OUT_DEV" = "$EXPECTED" ] || { echo "FAIL native dev: expected '$EXPECTED', got '$OUT_DEV'" >&2; exit 1; }
 
 # Mode 2: Native release
 "$PIONC" build --release -o "$TMP_DIR/app_rel" "$WS/app"
 OUT_REL="$("$TMP_DIR/app_rel")"
-echo "p133 native release: $OUT_REL"
+echo "p134 native release: $OUT_REL"
 [ "$OUT_REL" = "$EXPECTED" ] || { echo "FAIL native release: expected '$EXPECTED', got '$OUT_REL'" >&2; exit 1; }
 
 # Mode 3 & 4: Wasm32 dev & release
 if command -v node >/dev/null 2>&1; then
   "$PIONC" build --target wasm32 -o "$TMP_DIR/app_dev.wasm" "$WS/app"
   OUT_WDEV="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/app_dev.wasm")"
-  echo "p133 wasm32 dev:     $OUT_WDEV"
+  echo "p134 wasm32 dev:     $OUT_WDEV"
   [ "$OUT_WDEV" = "$EXPECTED" ] || { echo "FAIL wasm32 dev: expected '$EXPECTED', got '$OUT_WDEV'" >&2; exit 1; }
 
   "$PIONC" build --release --target wasm32 -o "$TMP_DIR/app_rel.wasm" "$WS/app"
   OUT_WREL="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/app_rel.wasm")"
-  echo "p133 wasm32 release: $OUT_WREL"
+  echo "p134 wasm32 release: $OUT_WREL"
   [ "$OUT_WREL" = "$EXPECTED" ] || { echo "FAIL wasm32 release: expected '$EXPECTED', got '$OUT_WREL'" >&2; exit 1; }
 fi
 
@@ -342,7 +395,7 @@ set +e
 NEG_OUT="$("$PIONC" check --json "$TMP_DIR/neg" 2>&1)"
 NEG_RC=$?
 set -e
-echo "p133 frontend neg rc=$NEG_RC"
+echo "p134 frontend neg rc=$NEG_RC"
 [ "$NEG_RC" -ne 0 ] || { echo "FAIL: expected frontend check error on private/missing symbol" >&2; exit 1; }
 printf '%s' "$NEG_OUT" | grep -q '"ok":false' || { echo "FAIL: expected JSON ok:false, got: $NEG_OUT" >&2; exit 1; }
 if printf '%s' "$NEG_OUT" | grep -q 'ICE:'; then
@@ -365,11 +418,11 @@ set +e
 ICE_OUT="$("$TMP_DIR/ice_probe" 2>&1)"
 ICE_RC=$?
 set -e
-echo "p133 backend ice rc=$ICE_RC out=$ICE_OUT"
+echo "p134 backend ice rc=$ICE_RC out=$ICE_OUT"
 [ "$ICE_RC" -ne 0 ] || { echo "FAIL: expected ICE panic on unresolved binding with clean tc" >&2; exit 1; }
 printf '%s' "$ICE_OUT" | grep -q 'ICE: unresolved qualified_call qual=ghost_pkg mem=ghost_fn' || {
   echo "FAIL: expected ICE diagnostic message, got: $ICE_OUT" >&2
   exit 1
 }
 
-echo "[PASS] p133_qbe_soundness (4-mode native/wasm32 dev/release + frontend diag + backend ICE)"
+echo "[PASS] p134_qbe_soundness (4-mode native/wasm32 dev/release + SForIn _ + frontend diag + backend ICE)"
