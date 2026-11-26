@@ -1054,6 +1054,52 @@ pub fn f(xs : Array[Int]) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_local_push_escape": (r'''
+pub fn f() -> Int {
+  let xs = [1, 2, 3]
+  let g : Array[Array[Int]] = []
+  g.push(xs)
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      g[0].push(4)
+      g[0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_fresh_2d_late_assign": (r'''
+pub fn f(xs : Array[Int]) -> Int {
+  let pauses : Array[Array[Int]] = [[], []]
+  let mut s = 0
+  for x in xs {
+    if x == 2 {
+      pauses[0].push(4)
+      pauses[0][1] = 9
+    }
+    if x == 1 {
+      pauses[0] = xs
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_param_3d_indexed": (r'''
+pub fn f(xs : Array[Int], g3 : Array[Array[Array[Int]]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      g3[0][0].push(4)
+      g3[0][0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
 }
 
 
