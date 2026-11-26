@@ -88,3 +88,93 @@ test "F6-3a: mutation_summary all 7 fail-closed soundness classes" {
   assert_true(match lookup_fn_mutation_summary(pkg7, "write_ufcs") { Some(s) => summary_may_mutate_array(s, "String") && !summary_may_mutate_array(s, "Int"), None => false }, "Class 7: UFCS Array::push mutates Array[String]")
   assert_true(match lookup_fn_mutation_summary(pkg7, "write_swap") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 7: swap mutates Array[Int]")
 }
+
+test "F6-3a: Gate A shrink_to_fit non-escaping local vs kept-iter fail-closed" {
+  // Positive: non-escaping local array iterated then cleared & shrunk
+  let ok_src = "fn helper(x : Int) -> Int { x + 1 }\n\nfn run_ok() -> Int {\n  let faded : Array[Int] = Array::make(3, 1)\n  let mut acc = 0\n  for v in faded {\n    acc = acc + helper(v)\n  }\n  faded.clear()\n  faded.shrink_to_fit()\n  acc\n}\n"
+  let ok_toks = lex_moonbit(ok_src)
+  let ok_ms = collect_pkg_mutation_summary_tokens([ok_toks])
+  let ok_base = collect_shrink_pkg_tokens([ok_toks])
+  let ok_sp = collect_shrink_pkg_tokens_with_summary([ok_toks], [], [], empty_pkg_query_types(), ok_ms)
+  let mut shrink_i = -1
+  for idx, tk in ok_toks {
+    if tk.raw == "shrink_to_fit" { shrink_i = idx }
+  }
+  let (why_ok, allowed_ms) = shrink_snapshot_hazard_with_summary(ok_toks, shrink_i, ok_base, ok_sp, ok_ms, ok_src, None)
+  assert_true(why_ok.length() == 0 && allowed_ms, "Gate A: non-escaping Array::make local shrink allowed by mutation_summary")
+
+  // Negative: capacity 8, push(1), let it = a.iter(), a.shrink_to_fit(), a[0] = 9 -> MUST stay fail-closed!
+  let bad_src = "fn run_bad() -> Int {\n  let a : Array[Int] = Array::new(capacity=8)\n  a.push(1)\n  let it = a.iter()\n  a.shrink_to_fit()\n  a[0] = 9\n  match it.head() { Some(v) => v, None => -1 }\n}\n"
+  let bad_toks = lex_moonbit(bad_src)
+  let bad_ms = collect_pkg_mutation_summary_tokens([bad_toks])
+  let bad_base = collect_shrink_pkg_tokens([bad_toks])
+  let bad_sp = collect_shrink_pkg_tokens_with_summary([bad_toks], [], [], empty_pkg_query_types(), bad_ms)
+  let mut bad_si = -1
+  for idx, tk in bad_toks {
+    if tk.raw == "shrink_to_fit" { bad_si = idx }
+  }
+  let (why_bad, _) = shrink_snapshot_hazard_with_summary(bad_toks, bad_si, bad_base, bad_sp, bad_ms, bad_src, None)
+  assert_true(why_bad.length() > 0, "Gate A negative: kept iter before shrink_to_fit + write slot 0 MUST fail closed")
+}
+
+test "F6-3a: Gate B search_by & Gate C immediate .iter().(any|all|find_first) positive & negative" {
+  let src = "struct View { id : Int }\n\nfn View::same(self : View, other : View) -> Bool {\n  self.id == other.id\n}\n\nfn live(v : View) -> Bool {\n  v.id > 0\n}\n\nfn View::alive(self : View) -> Bool {\n  live(self)\n}\n\nfn check_pure_search(xs : Array[(View, Int)], target : View) -> Option[Int] {\n  xs.search_by(fn(e) { e.0.same(target) })\n}\n\nfn check_pure_any(xs : Array[View]) -> Bool {\n  let dead_sibling = fn() { xs.clear() }\n  let _ = dead_sibling\n  xs.iter().any(fn(o) { o.alive() })\n}\n\nfn check_bad_param_cb(xs : Array[String], has : (String) -> Bool) -> Bool {\n  xs.iter().all(fn(k) { has(k) })\n}\n\nfn check_bad_reentrant(xs : Array[View]) -> Bool {\n  let killer = fn() { xs.clear() }\n  let box_fn : Array[() -> Unit] = [killer]\n  xs.iter().any(fn(o) {\n    box_fn[0]()\n    o.alive()\n  })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+
+  // Gate B positive: `xs.search_by(fn(e) { e.0.same(target) })`
+  let dl_b : Array[DriftEntry] = []
+  let mut sb_line = 0
+  let mut sb_col = 0
+  for tk in toks {
+    if tk.raw == "search_by" { sb_line = tk.line; sb_col = tk.col }
+  }
+  let b_ok = stage_b_check_search_by_with_summary(toks, ms, "t.pion", src, None, "(View, Int)", sb_line, sb_col, true, dl_b)
+  assert_true(b_ok && dl_b.length() == 1 && dl_b[0].category == "mutation_summary_allow_b", "Gate B allows pure search_by penetrating View::same and logs ledger")
+
+  // Gate C positive & negatives
+  let iter_dots : Array[Int] = []
+  for idx, tk in toks {
+    if idx + 1 < toks.length() && tk.kind == TokenKind::Dot && toks[idx + 1].raw == "iter" {
+      iter_dots.push(idx)
+    }
+  }
+  assert_true(iter_dots.length() == 3, "found 3 .iter() sites")
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[0], ms, src, None, "View") {
+    Some(_) => ()
+    None => assert_true(false, "Gate C allows pure immediate .iter().any penetrating View::alive -> live even with uncalled sibling closure")
+  }
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[1], ms, src, None, "String") {
+    Some(_) => assert_true(false, "Gate C MUST fail-closed on param closure `has(k)`")
+    None => ()
+  }
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[2], ms, src, None, "View") {
+    Some(_) => assert_true(false, "Gate C MUST fail-closed on re-entrant stored closure `box_fn[0]()`")
+    None => ()
+  }
+}
+
+test "F6-3a: Gate D borrowed slice for-loop clamped rewrite & fail-closed on mutation" {
+  let ok_src = "struct Row { id : Int }\n\nfn Row::ok(self : Row) -> Bool { self.id > 0 }\n\nfn scan(visible : Array[Row]) -> Int {\n  let mut found = -1\n  for k in mbt_compat::__mbt_slice_borrow(visible, 1, visible.length()) {\n    if !k.ok() { break }\n    if k.id == 5 { found = k.id; break }\n  }\n  found\n}\n"
+  let ok_toks = lex_moonbit(ok_src)
+  let ok_ms = collect_pkg_mutation_summary_tokens([ok_toks])
+  let ok_lines = ok_src.split("\n")
+  let ok_used = collect_used_idents_from_tokens(ok_toks)
+  let ok_mut : Map[Int, Bool] = Map()
+  let ok_dl : Array[DriftEntry] = []
+  let ch_ok = stage_b_rewrite_borrowed_slice_for_loops(ok_lines, ok_toks, ok_ms, "scan.pion", ok_src, None, ok_used, ok_mut, ok_dl)
+  assert_true(ch_ok && ok_dl.length() == 1 && ok_dl[0].category == "mutation_summary_allow_d", "Gate D rewrites pure borrowed slice for-loop and logs ledger")
+  let joined = ok_lines.join("\n")
+  assert_true(!str_has(joined, "__mbt_slice_borrow") && str_has(joined, "while ") && str_has(joined, "break"), "Gate D emits clamped while loop preserving break")
+
+  // Negative: loop body mutates `visible` -> MUST NOT rewrite (stays `__mbt_slice_borrow` for fail-closed!)
+  let bad_src = "fn scan_bad(visible : Array[Int]) -> Int {\n  let mut s = 0\n  for k in mbt_compat::__mbt_slice_borrow(visible, 1, visible.length()) {\n    visible.push(k)\n    s = s + k\n  }\n  s\n}\n"
+  let bad_toks = lex_moonbit(bad_src)
+  let bad_ms = collect_pkg_mutation_summary_tokens([bad_toks])
+  let bad_lines = bad_src.split("\n")
+  let bad_used = collect_used_idents_from_tokens(bad_toks)
+  let bad_mut : Map[Int, Bool] = Map()
+  let bad_dl : Array[DriftEntry] = []
+  let ch_bad = stage_b_rewrite_borrowed_slice_for_loops(bad_lines, bad_toks, bad_ms, "bad.pion", bad_src, None, bad_used, bad_mut, bad_dl)
+  assert_true(!ch_bad && bad_dl.length() == 0, "Gate D negative: mutating loop body MUST fail closed")
+}
