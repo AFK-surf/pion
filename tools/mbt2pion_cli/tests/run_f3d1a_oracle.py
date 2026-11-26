@@ -995,6 +995,52 @@ pub fn interp_show() -> Int {
   a[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback interpolates a string"),
+    "index_result": (r'''
+struct Hook {
+  mut n : Int
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.n = self.n + 1
+  self.n
+}
+
+fn sort_index_result(xs : Array[Int], src : Hook) -> Unit {
+  let h = [src][0]
+  xs.sort_by_key(fn(x) { x + h.length() })
+}
+
+pub fn index_result() -> Int {
+  let h = { n: 0 }
+  let a = [3, 1, 2]
+  sort_index_result(a, h)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "qualified_some": (r'''
+priv enum Hook {
+  Some(Array[Int])
+}
+
+fn Hook::length(self : Hook) -> Int {
+  match self {
+    Some(a) => {
+      a.push(8)
+      a.length()
+    }
+  }
+}
+
+fn sort_qualified_some(xs : Array[Int], ys : Array[Int]) -> Unit {
+  xs.sort_by_key(fn(x) { x + Hook::Some(ys).length() })
+}
+
+pub fn qualified_some() -> Int {
+  let a = [3, 1, 2]
+  sort_qualified_some(a, a)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
