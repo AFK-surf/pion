@@ -378,6 +378,41 @@ def main():
             "MBT2PION_UINT16_ESCAPE",
         )
         assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_guard_is_shadow_physical_equal",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n'
+            'pub fn probe() -> Int {\n'
+            '  let f = first_for("a"[0])\n'
+            '  guard Some(f) is Some(physical_equal) else { return 0 }\n'
+            '  let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '  (n + n).to_int()\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_if_is_shadow_physical_equal",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n'
+            'pub fn probe() -> Int {\n'
+            '  let f = first_for("a"[0])\n'
+            '  if Some(f) is Some(physical_equal) {\n'
+            '    let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '    (n + n).to_int()\n'
+            '  } else { 0 }\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_match_guard_shadow_physical_equal",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n'
+            'pub fn probe() -> Int {\n'
+            '  let f = first_for("a"[0])\n'
+            '  match Some(f) {\n'
+            '    Some(physical_equal) if (physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1)) + 1).to_int() > 0 => 1\n'
+            '    _ => 0\n'
+            '  }\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
             bin_path, args.pionc, work, "u16_array_elem_eq",
             'pub fn probe() -> Int {\n'
             '  let t = "\\u{8001}"\n'
