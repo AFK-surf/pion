@@ -1087,6 +1087,43 @@ pub fn later_let_shadow() -> Int {
   h.items[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "trace_match_shadow": (r'''
+fn sort_trace_match(xs : Array[Int]) -> Unit {
+  let trace : Array[Int] = []
+  xs.sort_by_key(fn(x) {
+    match xs {
+      trace => {
+        trace.push(7)
+        x
+      }
+    }
+  })
+  ignore(trace)
+}
+
+pub fn trace_match_shadow() -> Int {
+  let a = [3, 1, 2]
+  sort_trace_match(a)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "the callback calls `.push(..)`, which is not a known pure method"),
+    "trace_let_shadow": (r'''
+fn sort_trace_let(xs : Array[Int]) -> Unit {
+  let trace : Array[Int] = []
+  xs.sort_by_key(fn(x) {
+    let trace = xs
+    trace.push(7)
+    x
+  })
+  ignore(trace)
+}
+
+pub fn trace_let_shadow() -> Int {
+  let a = [3, 1, 2]
+  sort_trace_let(a)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "the callback calls `.push(..)`, which is not a known pure method"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
