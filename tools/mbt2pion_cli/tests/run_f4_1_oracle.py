@@ -317,6 +317,94 @@ pub fn f(keys : Array[Int], off : (Int) -> Bool) -> Int? {
   active_of(keys, off)
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "a call to `off(..)`"),
+    "for_in_inner_break_remove": (r'''
+pub fn f(xs : Array[Int], ys : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    for y in ys {
+      if y == 1 {
+        let _ = xs.remove(0)
+        break
+      }
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "arr_remove(..)"),
+    "for_in_closure_return_clear": (r'''
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    let g = fn() -> Int { xs.clear(); return 0 }
+    s = s + g() + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_opaque_cb_with_arr": (r'''
+pub fn f(xs : Array[Int], cb : (Array[Int]) -> Unit) -> Int {
+  let mut s = 0
+  for x in xs {
+    cb(xs)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "cb(..)"),
+    "for_in_global_clear_pool": (r'''
+let pool : Array[Int] = [1, 2, 3]
+fn clear_pool() -> Unit { pool.clear() }
+pub fn f() -> Int {
+  let mut s = 0
+  for x in pool {
+    clear_pool()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "clear_pool(..)"),
+    "for_in_reset_self": (r'''
+struct Box { items : Array[Int] }
+fn reset(b : Box) -> Unit { b.items.clear() }
+pub fn run(b : Box) -> Int {
+  let mut s = 0
+  for x in b.items {
+    reset(b)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "reset(..)"),
+    "for_in_cross_fn_grow_write": (r'''
+fn g(xs : Array[Int]) -> Unit { xs.push(4) }
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    g(xs)
+    xs[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "search_by_iter_any_opaque_cb": (r'''
+pub fn f(xs : Array[Int], cb : (Int) -> Bool) -> Int? {
+  xs.search_by(fn(x) { [x].iter().any(cb) })
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "opaque `cb`"),
+    "confined_for_in_reenter_shrink": (r'''
+struct S { items : Array[Int] }
+pub fn iter_cb(s : S, cb : (S) -> Unit) -> Unit {
+  for x in s.items {
+    let _ = x
+    cb(s)
+  }
+}
+pub fn reset(s : S) -> Unit {
+  s.items.shrink_to_fit()
+}
+''', "MBT2PION_ARRAY_SHRINK_ITER", "iterates an array named `items`"),
 }
 
 
