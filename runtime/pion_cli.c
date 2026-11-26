@@ -1390,7 +1390,7 @@ char *pion_cli_sha256_file(const char *path) {
 
     char *out = (char *)malloc(65);
     if (!out) return NULL;
-    static const char HEX[16] = "0123456789abcdef";
+    static const char HEX[] = "0123456789abcdef";
     for (int i = 0; i < 8; i++) {
         uint32_t w = state[i];
         for (int j = 0; j < 8; j++) {
