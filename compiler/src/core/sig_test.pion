@@ -219,3 +219,194 @@ test "sig: cslot prefix-chain hub avoids O(C*K) fmutlink blowup and preserves cy
   let plan_ret = compute_const_init_plan_from_sigs([cyclic_ret_sig])
   assert_true(plan_ret.has_cycle, "cyclic $ret: fold must terminate and preserve E_CONST_CYCLE")
 }
+
+///|
+fn sigt_assert_demand_parity(
+  label : String,
+  paths : Array[String],
+  sources : Array[String],
+  imported : Array[ImportedPkg],
+) -> ConstInitDemandResult {
+  let cr = check_source_files_with_imports(label, paths, sources, imported, false)
+  let demand = compute_const_init_plan_from_pkg_tc_with_stats(cr.pkg, cr.tc)
+  let full = compute_const_init_plan_from_pkg_tc_full(cr.pkg, cr.tc)
+  assert_true(
+    sig_const_init_plans_equal(demand.plan, full),
+    label + ": demand plan mismatch vs full",
+  )
+  demand
+}
+
+///|
+test "sig: demand BFS parity on cslot hub, competing cycles, ambiguity, multi-file, $ret:, default callbacks, xpkg & dead field writes" {
+  // 1. Feed sig_test.pion:188-220 cases through the demand-driven pkg/tc entry.
+  let sb = StringBuilder()
+  sb.write_string("fn opaque(x : Int) -> Int { x }\n")
+  sb.write_string("fn sink(x : Int) -> Int { x }\n")
+  sb.write_string("fn big_ui(n : Int) -> Int {\n")
+  let mut i = 0
+  while i < 40 {
+    sb.write_string("  let a" + i.to_string() + " : Array[Int] = [" + i.to_string() + "]\n")
+    i = i + 1
+  }
+  sb.write_string("  let _ = sink(opaque(n))\n  a0.length()\n}\n")
+  sb.write_string("let K : Int = 42\n")
+  let r_big = sigt_assert_demand_parity("demand_big_ui", ["big_ui.pion"], [sb.to_string()], [])
+  assert_true(r_big.stage == 1, "r_big.stage=" + r_big.stage.to_string())
+  assert_true(r_big.scanned_fns == 0, "r_big.scanned=" + r_big.scanned_fns.to_string())
+
+  let src_cyc = "fn safe() -> Int { 1 }\nfn read_b() -> Int { B }\nfn inject(xs : Array[() -> Int]) -> Unit { xs[0] = read_b }\nfn mk_other() -> Array[() -> Int] { [safe] }\nfn trig() -> Int {\n  let a : Array[() -> Int] = [safe]\n  inject(mk_other())\n  a[0]()\n}\nfn dead_noise() -> Int { 99 }\nlet A : Int = trig()\nlet B : Int = A\n"
+  let r_cyc = sigt_assert_demand_parity("demand_cslot_cyc", ["cyc.pion"], [src_cyc], [])
+  assert_true(r_cyc.plan.has_cycle, "cslot hub cycle must be preserved in demand mode")
+
+  let src_ok = "fn safe() -> Int { 1 }\nfn read_b() -> Int { B }\nfn inject(xs : Array[() -> Int]) -> Unit { xs[0] = read_b }\nfn mk_other() -> Array[() -> Int] { [safe] }\nfn trig() -> Int {\n  let prev : Array[() -> Int] = [safe]\n  let _ = prev\n  inject(mk_other())\n  let later : Array[() -> Int] = [safe]\n  later[0]()\n}\nfn dead_noise() -> Int { 99 }\nlet A : Int = trig()\nlet B : Int = A\n"
+  let r_ok = sigt_assert_demand_parity("demand_cslot_ok", ["ok.pion"], [src_ok], [])
+  assert_true(!r_ok.plan.has_cycle, "cslot hub prefix non-cycle must be preserved in demand mode")
+
+  // 2. Competing dual cycles: verify exact `cycle_path` & `order` replay parity.
+  let dual_cyc =
+  #|fn f_ab() -> Int { B }
+  #|fn f_ba() -> Int { A }
+  #|fn f_cd() -> Int { D }
+  #|fn f_dc() -> Int { C }
+  #|fn dead1() -> Int { 1 }
+  #|let A : Int = f_ab()
+  #|let B : Int = f_ba()
+  #|let C : Int = f_cd()
+  #|let D : Int = f_dc()
+  let r_dual = sigt_assert_demand_parity("demand_dual_cyc", ["dual.pion"], [dual_cyc], [])
+  assert_true(r_dual.plan.has_cycle, "dual cycle must detect cycle")
+  assert_true(r_dual.stage == 2, "r_dual.stage=" + r_dual.stage.to_string() + " fb=" + r_dual.fallback_reason)
+  assert_true(r_dual.scanned_fns < r_dual.total_fns, "dead1 must not be scanned")
+
+  // 3. Same-name method ambiguity across types: verify `has_ambiguous_method` parity.
+  let ambig_src =
+  #|trait Getter { fn get(self) -> Int }
+  #|struct S1 { v : Int }
+  #|struct S2 { v : Int }
+  #|impl Getter for S1 { fn get(self) -> Int { self.v + Y } }
+  #|impl Getter for S2 { fn get(self) -> Int { self.v } }
+  #|fn dead_m() -> Int { 0 }
+  #|fn call_get[T: Getter](x : T) -> Int { x.get() }
+  #|let X : Int = call_get(S1::{ v: 1 })
+  #|let Y : Int = 2
+  let r_amb = sigt_assert_demand_parity("demand_method_ambig", ["ambig.pion"], [ambig_src], [])
+  assert_true(r_amb.stage == 2, "r_amb.stage=" + r_amb.stage.to_string() + " fb=" + r_amb.fallback_reason)
+  assert_true(r_amb.scanned_fns < r_amb.total_fns, "dead_m must not be scanned")
+
+  // 4. Multi-file source-order replay parity.
+  let mf_a =
+  #|fn dead_a() -> Int { 10 }
+  #|fn helper_a() -> Int { helper_b() }
+  #|let A : Int = helper_a()
+  #|let C : Int = B + 1
+  let mf_b =
+  #|fn dead_b() -> Int { 20 }
+  #|fn helper_b() -> Int { B }
+  #|let B : Int = 7
+  let r_mf = sigt_assert_demand_parity("demand_multifile", ["a.pion", "b.pion"], [mf_a, mf_b], [])
+  assert_true(r_mf.stage == 2, "r_mf.stage=" + r_mf.stage.to_string() + " fb=" + r_mf.fallback_reason)
+  assert_true(r_mf.scanned_fns == 2, "r_mf.scanned=" + r_mf.scanned_fns.to_string())
+  assert_true(r_mf.total_fns == 4, "r_mf.total=" + r_mf.total_fns.to_string())
+
+  // 5. Recursive `$ret:` return triggers Fail-Closed fallback and matches full plan.
+  let ret_src =
+  #|fn read_a() -> Int { A }
+  #|fn make_cb() -> () -> Int { read_a }
+  #|fn invoke() -> Int {
+    #| let f = make_cb()
+    #| f()
+    #|}
+  #|let A : Int = invoke()
+  let r_ret = sigt_assert_demand_parity("demand_ret_fallback", ["ret.pion"], [ret_src], [])
+  assert_true(r_ret.plan.has_cycle, "$ret: cycle must be detected via fail-closed fallback")
+  assert_true(r_ret.stage == 3, "r_ret.stage=" + r_ret.stage.to_string() + " fb=" + r_ret.fallback_reason)
+
+  // 6. Paired default-callback tests: omitted default callback `C` reading `A` (cycle)
+  //    vs explicit safe callback argument (no cycle).
+  let defcb_cyc =
+  #|fn read_a() -> Int { A }
+  #|let C : () -> Int = read_a
+  #|fn safe() -> Int { 0 }
+  #|fn run(f : () -> Int = C) -> Int { f() }
+  #|fn dead_other() -> Int { 123 }
+  #|let A : Int = run()
+  let r_defcb_cyc = sigt_assert_demand_parity("demand_defcb_cyc", ["defcb_cyc.pion"], [defcb_cyc], [])
+  assert_true(r_defcb_cyc.plan.has_cycle, "omitted default callback C reading A must detect cycle")
+  assert_true(r_defcb_cyc.stage == 2, "r_defcb_cyc.stage=" + r_defcb_cyc.stage.to_string() + " fb=" + r_defcb_cyc.fallback_reason)
+  assert_true(r_defcb_cyc.scanned_fns < r_defcb_cyc.total_fns, "dead_other must not be scanned")
+
+  let defcb_ok =
+  #|fn read_a() -> Int { A }
+  #|let C : () -> Int = read_a
+  #|fn safe() -> Int { 0 }
+  #|fn run(f : () -> Int = C) -> Int { f() }
+  #|fn dead_other() -> Int { 123 }
+  #|let A : Int = run(safe)
+  let r_defcb_ok = sigt_assert_demand_parity("demand_defcb_ok", ["defcb_ok.pion"], [defcb_ok], [])
+  assert_true(!r_defcb_ok.plan.has_cycle, "explicit safe callback must not report cycle")
+  assert_true(r_defcb_ok.stage == 2, "r_defcb_ok.stage=" + r_defcb_ok.stage.to_string() + " fb=" + r_defcb_ok.fallback_reason)
+  assert_true(r_defcb_ok.scanned_fns < r_defcb_ok.total_fns, "dead_other must not be scanned")
+
+  // 7. Cross-package call in const initializer (lg_pages `signals::signal(0)` pattern: 0 scanned, 0 fallback)
+  //    AND cross-package callback passing local function (`wave_j1_soundness` pattern).
+  let dep_src =
+  #|pub fn make_sig(v : Int) -> Int { v }
+  #|pub fn apply_cb(f : () -> Int) -> Int { f() }
+  let dep_cr = check_source_files_with_imports("xdep", ["xdep.pion"], [dep_src], [], true)
+  assert_true(dep_cr.diagnostics.length() == 0, "dep_cr diags=" + dep_cr.diagnostics.length().to_string())
+  let imported = [imported_pkg_new("xdep", dep_cr.tc)]
+
+  let xpkg_nocb =
+  #|import "xdep"
+  #|fn dead_ui_1() -> Int { 1 }
+  #|fn dead_ui_2() -> Int { 2 }
+  #|let S : Int = xdep::make_sig(0)
+  let r_xnocb = sigt_assert_demand_parity("demand_xpkg_nocb", ["main.pion"], [xpkg_nocb], imported)
+  assert_true(r_xnocb.stage == 2, "r_xnocb.stage=" + r_xnocb.stage.to_string() + " fb=" + r_xnocb.fallback_reason)
+  assert_true(r_xnocb.scanned_fns == 0, "r_xnocb.scanned=" + r_xnocb.scanned_fns.to_string())
+  assert_true(r_xnocb.fallback_reason == "", "r_xnocb.fb=" + r_xnocb.fallback_reason)
+
+  let xpkg_cb =
+  #|import "xdep"
+  #|fn read_a() -> Int { A }
+  #|fn dead_ui() -> Int { 1 }
+  #|let A : Int = xdep::apply_cb(read_a)
+  let r_xcb = sigt_assert_demand_parity("demand_xpkg_cb", ["main.pion"], [xpkg_cb], imported)
+  assert_true(r_xcb.plan.has_cycle, "cross-package callback must detect cycle through local callback")
+  assert_true(r_xcb.stage == 2, "r_xcb.stage=" + r_xcb.stage.to_string() + " fb=" + r_xcb.fallback_reason)
+  assert_true(r_xcb.scanned_fns == 1, "r_xcb.scanned=" + r_xcb.scanned_fns.to_string())
+  assert_true(r_xcb.total_fns == 2, "r_xcb.total=" + r_xcb.total_fns.to_string())
+
+  // 8. Unreachable field write (frontend_test.pion:11203-11212) must remain acyclic.
+  let dead_fw =
+  #|struct Live { mut run : () -> Int }
+  #|fn zero() -> Int { 0 }
+  #|fn read_a() -> Int { A }
+  #|fn unused(x : Live) -> Unit { x.run = read_a }
+  #|let H : Live = Live::{ run: zero }
+  #|let A : Int = H.run()
+  let r_dfw = sigt_assert_demand_parity("demand_dead_fw", ["dfw.pion"], [dead_fw], [])
+  assert_true(!r_dfw.plan.has_cycle, "unreachable field write must remain acyclic")
+  assert_true(r_dfw.stage == 3, "r_dfw.stage=" + r_dfw.stage.to_string() + " fb=" + r_dfw.fallback_reason)
+
+  // 9. Plain value call `box_val(mk_val())` must NOT false-fallback on `$ret:mk_val`,
+  //    while `apply(mk_cb())` where `apply` invokes its callback MUST fallback and catch cycle.
+  let val_nest =
+  #|fn box_val(x : Int) -> Int { x + 1 }
+  #|fn mk_val() -> Int { 41 }
+  #|fn dead_u() -> Int { 0 }
+  #|let V : Int = box_val(mk_val())
+  let r_vn = sigt_assert_demand_parity("demand_val_nest", ["vn.pion"], [val_nest], [])
+  assert_true(r_vn.stage == 2, "r_vn.stage=" + r_vn.stage.to_string() + " fb=" + r_vn.fallback_reason)
+  assert_true(r_vn.scanned_fns == 2 && r_vn.total_fns == 3, "r_vn scanned=" + r_vn.scanned_fns.to_string())
+
+  let cb_nest =
+  #|fn apply(f : () -> Int) -> Int { f() }
+  #|fn read_a() -> Int { A }
+  #|fn mk_cb() -> () -> Int { read_a }
+  #|let A : Int = apply(mk_cb())
+  let r_cn = sigt_assert_demand_parity("demand_cb_nest", ["cn.pion"], [cb_nest], [])
+  assert_true(r_cn.plan.has_cycle, "apply(mk_cb()) must detect cycle")
+  assert_true(r_cn.stage == 3, "r_cn.stage=" + r_cn.stage.to_string() + " fb=" + r_cn.fallback_reason)
+}
