@@ -367,7 +367,45 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string()
+  // R8 P1-1 & P1-2: `false == (... is ...) && ...`, `true != (... is ...) && ...` MUST NOT leak;
+  // newline-started `(Some(local_fn) is Some(always_fail_g)) && ...` MUST propagate!
+  let p9 = try {
+    let _ = false == (opt_none() is Some(always_fail_g)) && yes_helper(always_fail_g())
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  let p10 = try {
+    let _ = true != (opt_none() is Some(always_fail_g)) && yes_helper(always_fail_g())
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  let p11 = try {
+    let keep = yes_helper(1)
+    let _ = keep
+    let ok =
+      (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g())
+    if ok {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p12 = try {
+    let keep = yes_helper(1)
+    (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g()) |> ignore
+    if keep {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -542,7 +580,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -768,6 +806,47 @@ def main():
             dup_pw = run_cmd([args.pionc, "run", "--target", "wasm32", dup_pd]).stdout.strip()
             assert dup_pn == "2" and dup_pw == "2", f"Dup alias Pion ({ord_name}) mismatch: nat={dup_pn!r} wasm={dup_pw!r}"
         print("[f6-1-oracle] PASS R7 P2-2 duplicate --dep aliases to same verified package (both orders): 4-target == 2")
+
+        # 3a-6. R8 P1-3 negative check: two DIFFERENT implementations with same canonical name `x` and same ABI
+        # MUST fail closed with MBT2PION_DEP_ABI_ERROR (in both --dep orders)!
+        diff_l_src = os.path.join(work, "diff_l_src")
+        diff_r_src = os.path.join(work, "diff_r_src")
+        diff_l_out = os.path.join(work, "diff_l_out")
+        diff_r_out = os.path.join(work, "diff_r_out")
+        for s_dir, o_dir, ret_val in [(diff_l_src, diff_l_out, "1"), (diff_r_src, diff_r_out, "2")]:
+            os.makedirs(s_dir)
+            os.makedirs(os.path.join(o_dir, "src"))
+            with open(os.path.join(s_dir, "moon.pkg"), "w") as f:
+                f.write("\n")
+            with open(os.path.join(s_dir, "x.mbt"), "w") as f:
+                f.write(f"pub fn get() -> Int {{ {ret_val} }}\n")
+            with open(os.path.join(o_dir, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "x"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+            run_cmd([bin_path, "--src", s_dir, "--out", os.path.join(o_dir, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        diff_dn_src = os.path.join(work, "diff_dn_src")
+        os.makedirs(diff_dn_src)
+        with open(os.path.join(diff_dn_src, "moon.pkg"), "w") as f:
+            f.write('import { "audit/check/x" @other }\n')
+        with open(os.path.join(diff_dn_src, "dn.mbt"), "w") as f:
+            f.write("pub fn run_diff() -> Int { @other.get() }\n")
+        for ord_name, dep_flags in [
+            ("lr", ["--dep", f"x={diff_l_out}", "--dep", f"other={diff_r_out}"]),
+            ("rl", ["--dep", f"other={diff_r_out}", "--dep", f"x={diff_l_out}"]),
+        ]:
+            diff_dn_out = os.path.join(work, f"diff_dn_out_{ord_name}")
+            os.makedirs(diff_dn_out)
+            res = run_cmd(
+                [bin_path, "--src", diff_dn_src, "--out", diff_dn_out, "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc],
+                check=False,
+            )
+            combined = res.stdout + "\n" + res.stderr
+            rep_p = os.path.join(diff_dn_out, "migration_report.json")
+            if os.path.isfile(rep_p):
+                combined += "\n" + open(rep_p).read()
+            assert res.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in combined, (
+                f"R8 P1-3 different impls ({ord_name}) MUST fail closed with MBT2PION_DEP_ABI_ERROR:\n{combined}"
+            )
+        print("[f6-1-oracle] PASS R8 P1-3 different impls with same canonical name & ABI fail closed (both orders)")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
