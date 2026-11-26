@@ -525,6 +525,32 @@ pub fn run() -> Int {
         "MBT2PION_UNSUPPORTED_SYNTAX",
     ),
     (
+        "neg_r8_nested_interp_rbrace_labeled_loop",
+        r'''fn pick(_s : String, x : Int) -> Int { x }
+pub fn probe() -> Int {
+  "\{pick("\{"}"}", outer~: for x in [3] { break outer~ x } nobreak { 4 })}".length()
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r8_nested_interp_lbrace_labeled_loop",
+        r'''fn pick(_s : String, x : Int) -> Int { x }
+pub fn probe() -> Int {
+  "\{pick("\{"{"}", outer~: for x in [3] { break outer~ x } nobreak { 4 })}".length()
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r8_keyword_label_loop",
+        r'''pub fn probe() -> Int {
+  not~: loop 3 { v => break not~ v }
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
         "neg_gate_a_kept_iter2_shrink",
         r'''
 pub fn run() -> Int {
@@ -811,6 +837,22 @@ def main():
                 if disps.get("fn:run") != "unsupported" or disps.get("fn:probe") != "transpiled":
                     raise RuntimeError(
                         f"REPORT DISPOSITION MISMATCH for `{name}`: expected fn:run=unsupported, fn:probe=transpiled; got {disps}"
+                    )
+            elif name in ("neg_r8_nested_interp_rbrace_labeled_loop", "neg_r8_nested_interp_lbrace_labeled_loop"):
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:probe") != "unsupported" or "bad.mbt:3:21" not in combined_err:
+                    raise RuntimeError(
+                        f"REPORT/LOC MISMATCH for `{name}`: expected bad.mbt:3:21 and fn:probe=unsupported; got disps={disps}\n{combined_err}"
+                    )
+            elif name == "neg_r8_keyword_label_loop":
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:probe") != "unsupported" or "bad.mbt:2:3" not in combined_err:
+                    raise RuntimeError(
+                        f"REPORT/LOC MISMATCH for `{name}`: expected bad.mbt:2:3 and fn:probe=unsupported; got disps={disps}\n{combined_err}"
                     )
             print(f"[NEG PASS] {name}: moon check OK, fail-closed with {expected_diag} (rc={p.returncode})")
 
