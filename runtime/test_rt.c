@@ -3509,6 +3509,38 @@ static void test_fs_lstat_kind(void) {
     assert(pion_fs_rmdir(base) == 0);
     assert(pion_fs_lstat_kind(base) == 0);
     printf("[PASS] fs_lstat_kind (missing / file / dir / symlink / query errors)\n");
+
+    /* pion_cli_sha256_file: empty, "abc", non-UTF-8 raw bytes, missing, directory */
+    assert(pion_fs_mkdir_excl(base) == 0);
+    assert(pion_cli_sha256_file(NULL) == NULL);
+    assert(pion_cli_sha256_file("") == NULL);
+    assert(pion_cli_sha256_file(missing) == NULL);
+    assert(pion_cli_sha256_file(base) == NULL);
+    f = fopen(file, "wb");
+    assert(f);
+    fclose(f);
+    char *h_empty = pion_cli_sha256_file(file);
+    assert(h_empty && strcmp(h_empty, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") == 0);
+    free(h_empty);
+    f = fopen(file, "wb");
+    assert(f);
+    assert(fwrite("abc", 1, 3, f) == 3);
+    fclose(f);
+    char *h_abc = pion_cli_sha256_file(file);
+    assert(h_abc && strcmp(h_abc, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 0);
+    free(h_abc);
+    f = fopen(file, "wb");
+    assert(f);
+    unsigned char raw_b[128];
+    for (int ri = 0; ri < 128; ri++) raw_b[ri] = (unsigned char)(128 + ri);
+    assert(fwrite(raw_b, 1, 128, f) == 128);
+    fclose(f);
+    char *h_raw = pion_cli_sha256_file(file);
+    assert(h_raw && strlen(h_raw) == 64);
+    free(h_raw);
+    assert(remove(file) == 0);
+    assert(pion_fs_rmdir(base) == 0);
+    printf("[PASS] pion_cli_sha256_file (empty / abc / non-UTF-8 / missing / dir)\n");
 }
 
 static const char *g_lock_path;

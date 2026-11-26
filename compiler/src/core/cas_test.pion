@@ -1,12 +1,34 @@
-///| Unit tests for CAS batch pinning, post-run eviction, depfile parsing,
-///  MSVC /showIncludes parsing, and raw-bytes SHA-256.
+///| Unit tests for CAS key validation, batch pinning, post-run eviction,
+///  depfile parsing (incl. UTF-8 & fail-closed), MSVC /sourceDependencies,
+///  MSVC /showIncludes, and raw-bytes SHA-256.
+
+///|
+test "cas_is_safe_key_whitelist_and_index_filtering" {
+  assert_true(cas_is_safe_key("abc123_def-0.o"), "normal key")
+  assert_true(cas_is_safe_key("testbin:deadbeef.exe"), "testbin key")
+  assert_true(cas_is_safe_key("wasmbin:0123456789abcdef"), "wasmbin key")
+  assert_true(!cas_is_safe_key(""), "empty rejected")
+  assert_true(!cas_is_safe_key("."), "dot rejected")
+  assert_true(!cas_is_safe_key(".."), "dotdot rejected")
+  assert_true(!cas_is_safe_key("a..b"), "embedded dotdot rejected")
+  assert_true(!cas_is_safe_key("../evil"), "slash traversal rejected")
+  assert_true(!cas_is_safe_key("testbin:../evil"), "prefixed traversal rejected")
+  assert_true(!cas_is_safe_key("a\\b"), "backslash rejected")
+  assert_true(!cas_is_safe_key("testbin:"), "empty body after prefix rejected")
+  assert_true(!cas_is_safe_key("bad:key"), "unknown colon rejected")
+
+  // cas_parse_index drops unsafe keys silently
+  let parsed = cas_parse_index(
+    "good_key\t100\t10\n../escape\t200\t20\ntestbin:ok.exe\t300\t30\ntestbin:../x\t400\t40\n",
+  )
+  assert_eq(parsed.length(), 2)
+  assert_eq(parsed[0].key, "good_key")
+  assert_eq(parsed[1].key, "testbin:ok.exe")
+}
 
 ///|
 test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
-  // Initial index: k_old1 (t=10, 400B), k_old2 (t=20, 400B), k_hit (t=30, 300B)
   let entries = cas_parse_index("k_old1\t400\t10\nk_old2\t400\t20\nk_hit\t300\t30\n")
-  // Batch adds k_new1 (500B) and k_new2 (500B); total exceeds max_bytes=1000B.
-  // k_hit is pinned as a hot HIT from the same run.
   let res = cas_touch_batch_and_evict(
     entries,
     ["k_new1", "k_new2"],
@@ -15,7 +37,6 @@ test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
     1000L,
     ["k_hit"],
   )
-  // Both unpinned old entries must be evicted; k_hit, k_new1, k_new2 must all be kept!
   assert_eq(res.evicted.length(), 2)
   assert_eq(res.evicted[0], "k_old1")
   assert_eq(res.evicted[1], "k_old2")
@@ -29,7 +50,6 @@ test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
     if e.key == "k_hit" {
       saw_hit = true
       assert_eq(e.bytes, 300L)
-      // Hot HIT timestamp must be refreshed to now_ms=500L
       assert_eq(e.last_access_ms, 500L)
     } else if e.key == "k_new1" {
       saw_new1 = true
@@ -50,8 +70,6 @@ test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
 ///|
 test "cas_touch_batch_and_evict_duplicate_key_takes_last_size_and_80pct_watermark" {
   let entries = cas_parse_index("a\t300\t10\nb\t300\t20\nc\t300\t30\n")
-  // Add d=200 then d=350 (last wins -> 350B). Total = 1250 > 1000 -> watermark = 800.
-  // Evicting a (300) -> 950 > 800; evicting b (300) -> 650 <= 800 -> stops! c stays.
   let res = cas_touch_batch_and_evict(
     entries,
     ["d", "d"],
@@ -81,40 +99,45 @@ test "cas_touch_batch_and_evict_duplicate_key_takes_last_size_and_80pct_watermar
 }
 
 ///|
-test "cas_evict_post_run_protects_concurrent_process_entries" {
-  // run_start_ms = 1000.
-  // old_k: t=500 (< 1000) -> evictable
-  // my_k1: t=1050 (in run_keys) -> evictable
-  // peer_k: t=1020 (>= 1000, NOT in run_keys) -> MUST NOT be evicted!
-  // my_k2: t=1100 (in run_keys) -> evictable
+test "cas_evict_post_run_refreshes_lru_and_protects_peer_and_keep_keys" {
   let entries = cas_parse_index(
-    "old_k\t400\t500\nmy_k1\t400\t1050\npeer_k\t500\t1020\nmy_k2\t400\t1100\n",
+    "old_k\t400\t500\nmy_k1\t400\t600\npeer_k\t500\t100\nkeep_k\t300\t200\n",
   )
-  // Total = 1700 > max_bytes=1000 (watermark=800).
-  // LRU order: old_k (500), peer_k (1020, protected!), my_k1 (1050), my_k2 (1100).
-  // Evict old_k -> 1300; skip peer_k -> 1300; evict my_k1 -> 900; evict my_k2 -> 500 <= 800.
-  let res = cas_evict_post_run(entries, 1000L, 1000L, ["my_k1", "my_k2"])
-  assert_eq(res.evicted.length(), 3)
+  // Total = 1600 > max_bytes=1000 (watermark=800).
+  // `peer_k` (active peer pin) and `keep_k` (returned output) are protected.
+  // `my_k1` is in run_keys so its timestamp refreshes to 2000L, while `old_k` stays 500L.
+  // Evict old_k -> 1200; evict my_k1 -> 800 <= 800 -> stops; peer_k & keep_k kept with ts=2000L!
+  let res = cas_evict_post_run(
+    entries,
+    2000L,
+    1000L,
+    ["my_k1"],
+    ["peer_k", "keep_k"],
+  )
+  assert_eq(res.evicted.length(), 2)
   assert_eq(res.evicted[0], "old_k")
   assert_eq(res.evicted[1], "my_k1")
-  assert_eq(res.evicted[2], "my_k2")
-  assert_eq(res.kept.length(), 1)
-  assert_eq(res.kept[0].key, "peer_k")
+  assert_eq(res.kept.length(), 2)
+  let mut i = 0
+  while i < res.kept.length() {
+    assert_eq(res.kept[i].last_access_ms, 2000L)
+    i = i + 1
+  }
 }
 
 ///|
-test "cas_parse_depfile_unix_crlf_continuations_escapes_and_windows_drives" {
-  // 1. Unix multiline with \\\n, escaped space, \#, $$, duplicates
-  let d1 = "/tmp/obj_0.o: /src/a.c \\\n  /inc/my\\ dir/foo\\#1.h \\\n  /inc/cost$$2.h /inc/a.h /inc/a.h\n"
+test "cas_parse_depfile_unix_utf8_crlf_continuations_escapes_and_fail_closed" {
+  // 1. Unix multiline with \\\n, escaped space, \#, $$, UTF-8 Chinese path, duplicates
+  let d1 = "/tmp/obj_0.o: /src/a.c \\\n  /inc/中文目录/foo\\#1.h \\\n  /inc/my\\ dir/cost$$2.h /inc/a.h /inc/a.h\n"
   match cas_parse_depfile(d1) {
     Some(deps) => {
       assert_eq(deps.length(), 4)
       assert_eq(deps[0], "/inc/a.h")
-      assert_eq(deps[1], "/inc/cost$2.h")
-      assert_eq(deps[2], "/inc/my dir/foo#1.h")
+      assert_eq(deps[1], "/inc/my dir/cost$2.h")
+      assert_eq(deps[2], "/inc/中文目录/foo#1.h")
       assert_eq(deps[3], "/src/a.c")
     }
-    None => assert_true(false, "expected Some for Unix depfile")
+    None => assert_true(false, "expected Some for Unix UTF-8 depfile")
   }
 
   // 2. Windows CRLF + drive colons (both C:\ and C:/)
@@ -142,6 +165,31 @@ test "cas_parse_depfile_unix_crlf_continuations_escapes_and_windows_drives" {
     None => ()
     Some(_) => assert_true(false, "expected None for depfile with empty target")
   }
+  match cas_parse_depfile("/tmp/obj_0.o:\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for empty prerequisite list")
+  }
+  match cas_parse_depfile("/tmp/obj_0.o: /src/a.c\nextra_rule.o: /src/b.c\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for extra unparsed rule line")
+  }
+}
+
+///|
+test "cas_parse_msvc_source_deps_json_and_fail_closed" {
+  let j = "{\"Version\":\"1.2\",\"Data\":{\"Source\":\"C:\\\\proj\\\\a.c\",\"Includes\":[\"C:\\\\proj\\\\b.h\",\"C:\\\\proj\\\\a.h\",\"C:\\\\proj\\\\b.h\"]}}"
+  match cas_parse_msvc_source_deps(j) {
+    Some(deps) => {
+      assert_eq(deps.length(), 2)
+      assert_eq(deps[0], "C:\\proj\\a.h")
+      assert_eq(deps[1], "C:\\proj\\b.h")
+    }
+    None => assert_true(false, "expected Some for valid /sourceDependencies JSON")
+  }
+  match cas_parse_msvc_source_deps("{\"Version\":\"1.2\"}") {
+    None => ()
+    Some(_) => assert_true(false, "expected None when Includes missing")
+  }
 }
 
 ///|
@@ -155,12 +203,10 @@ test "cas_parse_msvc_show_includes_parses_trims_dedups_and_sorts" {
 
 ///|
 test "cas_sha256_bytes_empty_ascii_and_non_utf8" {
-  // Empty bytes == SHA-256("")
   assert_eq(
     cas_sha256_bytes(Bytes::new(0)),
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   )
-  // ASCII "abc" == NIST vector
   let abc = Bytes::new(3)
   abc[0] = (97).to_byte()
   abc[1] = (98).to_byte()
@@ -169,7 +215,6 @@ test "cas_sha256_bytes_empty_ascii_and_non_utf8" {
     cas_sha256_bytes(abc),
     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
   )
-  // Non-UTF-8 raw bytes 0x80..0xFF (128 bytes): must produce distinct deterministic 64-hex digest
   let raw = Bytes::new(128)
   let mut i = 0
   while i < 128 {
@@ -178,7 +223,6 @@ test "cas_sha256_bytes_empty_ascii_and_non_utf8" {
   }
   let h1 = cas_sha256_bytes(raw)
   assert_eq(h1.length(), 64)
-  // Mutating one high byte must change the digest
   raw[64] = (0x00).to_byte()
   let h2 = cas_sha256_bytes(raw)
   assert_true(h1 != h2, "mutated byte changes sha256")

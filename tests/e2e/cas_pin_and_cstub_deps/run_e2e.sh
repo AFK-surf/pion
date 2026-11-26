@@ -429,4 +429,267 @@ for label, path in [("build", sys.argv[2]), ("test", sys.argv[3])]:
 PYEOF
 
 echo "(C) cross-runner mtime perturbation (sources + headers + external .a + CAS) -> 0 MISS / 100% HIT OK"
+
+# ============================================================================
+# Scenario D (Round 2 #1): Cross-process kernel-locked pins & stale crash cleanup
+# ============================================================================
+CAS_D="$TMP_DIR/cas_d"
+mkdir -p "$CAS_D/pins"
+
+# Populate CAS_D with WS_C (dep + app)
+PION_CACHE_DIR="$CAS_D" "$PIONC" test --jobs 2 --json "$WS_C" > /dev/null
+
+# Pick one real CAS object key from CAS_D/obj/ to simulate an active peer holding it
+PEER_OBJ_FILE="$(ls "$CAS_D/obj/"*.o | head -n 1)"
+PEER_OBJ_KEY="$(basename "$PEER_OBJ_FILE" .o)"
+[ -n "$PEER_OBJ_KEY" ] || fail "Scenario D: no .o found in CAS_D/obj"
+
+# Create an unlocked stale pin (simulating a SIGKILLed process)
+printf '%s\n' "$PEER_OBJ_KEY" > "$CAS_D/pins/stale_99999_0.pin"
+: > "$CAS_D/pins/stale_99999_0.pin.lock"
+
+# Hold an active flock on peer_live.pin.lock while Process B runs with PION_CACHE_MAX_KB=1
+python3 - "$CAS_D" "$PEER_OBJ_KEY" "$PEER_OBJ_FILE" "$PIONC" "$WS_C" <<'PYEOF'
+import fcntl, json, os, subprocess, sys
+
+cas_dir, peer_key, peer_obj, pionc, ws_c = sys.argv[1:6]
+live_lock = os.path.join(cas_dir, "pins", "live_peer_0.pin.lock")
+live_data = os.path.join(cas_dir, "pins", "live_peer_0.pin")
+stale_lock = os.path.join(cas_dir, "pins", "stale_99999_0.pin.lock")
+stale_data = os.path.join(cas_dir, "pins", "stale_99999_0.pin")
+
+with open(live_data, "w") as f:
+    f.write(peer_key + "\n")
+
+fd = os.open(live_lock, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    env = os.environ.copy()
+    env["PION_CACHE_DIR"] = cas_dir
+    env["PION_CACHE_MAX_KB"] = "1"
+    proc = subprocess.run(
+        [pionc, "test", "--jobs", "2", "--json", ws_c],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    d = json.loads(proc.stdout)
+    assert d["ok"] is True and d["passed"] == 2 and d["failed"] == 0, d
+    # Active peer's pinned object MUST survive post-run eviction!
+    assert os.path.isfile(peer_obj), f"active peer pinned object was evicted: {peer_obj}"
+    # Crashed peer's stale lock & data files MUST be auto-cleaned!
+    assert not os.path.exists(stale_lock), "stale pin lock was not cleaned"
+    assert not os.path.exists(stale_data), "stale pin data was not cleaned"
+finally:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+# Once peer releases its lock, the next run trims the cache and cleans live_peer_0.*
+env = os.environ.copy()
+env["PION_CACHE_DIR"] = cas_dir
+env["PION_CACHE_MAX_KB"] = "1"
+proc2 = subprocess.run(
+    [pionc, "test", "--jobs", "2", "--json", ws_c],
+    env=env, capture_output=True, text=True, check=True,
+)
+d2 = json.loads(proc2.stdout)
+assert d2["ok"] is True and d2["passed"] == 2 and d2["failed"] == 0, d2
+assert not os.path.exists(live_lock), "released peer pin lock was not cleaned"
+assert not os.path.exists(live_data), "released peer pin data was not cleaned"
+PYEOF
+
+echo "(D) cross-process kernel-locked CAS pin + stale crash cleanup -> OK"
+
+# ============================================================================
+# Scenario E (Round 2 #2): Wasm32 build without `-o` under PION_CACHE_MAX_KB=1
+# ============================================================================
+WS_E="$TMP_DIR/ws_wasm_pin"
+mkdir -p "$WS_E/lib_w/src" "$WS_E/app_w/src"
+cat > "$WS_E/lib_w/pion.toml" <<'EOF'
+[package]
+name = "lib_w"
+version = "0.1.0"
+EOF
+cat > "$WS_E/lib_w/src/lib.pion" <<'EOF'
+pub fn answer() -> Int { 42 }
+EOF
+cat > "$WS_E/app_w/pion.toml" <<'EOF'
+[package]
+name = "app_w"
+version = "0.1.0"
+
+[dependencies]
+lib_w = { path = "../lib_w" }
+EOF
+cat > "$WS_E/app_w/src/main.pion" <<'EOF'
+import "lib_w"
+fn main(world : World) -> Unit {
+  io_println(world, "wasm_pin=" + lib_w::answer().to_string())
+}
+EOF
+
+CAS_E="$TMP_DIR/cas_e"
+mkdir -p "$CAS_E"
+PION_TRACE_CAS=1 PION_CACHE_DIR="$CAS_E" PION_CACHE_MAX_KB=1 "$PIONC" build --target wasm32 "$WS_E/app_w" 2>"$TMP_DIR/e1.trace"
+WASM_OUT1="$(ls "$CAS_E/bin/"wasm_*.wasm 2>/dev/null | head -n 1 || true)"
+[ -n "$WASM_OUT1" ] && [ -s "$WASM_OUT1" ] || fail "Scenario E run 1 evicted or missed wasm binary in $CAS_E/bin"
+PION_TRACE_CAS=1 PION_CACHE_DIR="$CAS_E" PION_CACHE_MAX_KB=1 "$PIONC" build --target wasm32 "$WS_E/app_w" 2>"$TMP_DIR/e2.trace"
+WASM_OUT2="$(ls "$CAS_E/bin/"wasm_*.wasm 2>/dev/null | head -n 1 || true)"
+[ -n "$WASM_OUT2" ] && [ -s "$WASM_OUT2" ] || fail "Scenario E run 2 evicted wasm binary in $CAS_E/bin"
+grep -q "\[cas-wasm-bin\] HIT" "$TMP_DIR/e2.trace" || fail "Scenario E run 2 expected wasmbin HIT"
+if command -v node >/dev/null 2>&1; then
+  WASM_RUN="$(PION_TRACE_CAS=1 PION_CACHE_DIR="$CAS_E" PION_CACHE_MAX_KB=1 "$PIONC" run --target wasm32 "$WS_E/app_w" 2>"$TMP_DIR/e3.trace")"
+  [ "$WASM_RUN" = "wasm_pin=42" ] || fail "Scenario E pionc run --target wasm32 output mismatch: $WASM_RUN"
+  grep -q "\[cas-wasm-bin\] HIT" "$TMP_DIR/e3.trace" || fail "Scenario E pionc run expected wasmbin HIT"
+fi
+echo "(E) Wasm32 build/run without -o under PION_CACHE_MAX_KB=1 (keep_keys + HIT) -> OK"
+
+# ============================================================================
+# Scenario F (Round 2 #3): Same-size + same-mtime external .a edit invalidates
+# ============================================================================
+cp -p "$WS_C/app/libext_mtime.a" "$TMP_DIR/libext_mtime.ref"
+cat > "$WS_C/ext_obj.c" <<'EOF'
+#include <stdint.h>
+int64_t mtime_ext_lib_val(void) { return 99; }
+EOF
+"${CC:-cc}" -c "$WS_C/ext_obj.c" -o "$WS_C/ext_obj.o"
+rm -f "$WS_C/app/libext_mtime.a"
+ar rcs "$WS_C/app/libext_mtime.a" "$WS_C/ext_obj.o"
+touch -r "$TMP_DIR/libext_mtime.ref" "$WS_C/app/libext_mtime.a"
+PION_CACHE_DIR="$CAS_C" "$PIONC" build -o "$TMP_DIR/f_bin" "$WS_C/app"
+OUT_F="$("$TMP_DIR/f_bin")"
+[ "$OUT_F" = "mtime_sum=114" ] || fail "Scenario F expected mtime_sum=114 after same-size/same-mtime .a edit, got $OUT_F"
+echo "(F) external .a content edit with identical size & mtime -> MISS & relink OK"
+
+# ============================================================================
+# Scenario G (Round 2 #5): -I shadowing, UTF-8 Chinese path, racy compile edit
+# ============================================================================
+# G1: -I search-order shadowing
+WS_G="$TMP_DIR/ws_shadow"
+mkdir -p "$WS_G/pkg/src" "$WS_G/inc_first" "$WS_G/inc_second"
+cat > "$WS_G/inc_second/val.h" <<'EOF'
+#define SHADOW_VAL 10
+EOF
+cat > "$WS_G/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "val.h"
+int64_t shadow_val(void) { return SHADOW_VAL; }
+EOF
+cat > "$WS_G/pkg/pion.toml" <<'EOF'
+[package]
+name = "shadow_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../inc_first", "-I../inc_second"]
+EOF
+cat > "$WS_G/pkg/src/main.pion" <<'EOF'
+extern "C" fn shadow_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, shadow_val().to_string()) }
+EOF
+CAS_G="$TMP_DIR/cas_g"
+mkdir -p "$CAS_G"
+PION_CACHE_DIR="$CAS_G" "$PIONC" build -o "$TMP_DIR/g1_bin1" "$WS_G/pkg"
+[ "$("$TMP_DIR/g1_bin1")" = "10" ] || fail "Scenario G1 cold expected 10"
+# Add shadowing header in higher-priority -I../inc_first
+cat > "$WS_G/inc_first/val.h" <<'EOF'
+#define SHADOW_VAL 99
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_G" "$PIONC" build -o "$TMP_DIR/g1_bin2" "$WS_G/pkg" 2>"$TMP_DIR/g1_shadow.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/g1_shadow.trace" || fail "Scenario G1 expected MISS when higher-priority -I shadows header"
+[ "$("$TMP_DIR/g1_bin2")" = "99" ] || fail "Scenario G1 expected 99 after -I shadowing"
+
+# G2: UTF-8 Chinese directory & header path
+WS_U8="$TMP_DIR/中文目录"
+mkdir -p "$WS_U8/pkg/src" "$WS_U8/头文件"
+cat > "$WS_U8/头文件/配置.h" <<'EOF'
+#define U8_VAL 101
+EOF
+cat > "$WS_U8/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "配置.h"
+int64_t u8_val(void) { return U8_VAL; }
+EOF
+cat > "$WS_U8/pkg/pion.toml" <<'EOF'
+[package]
+name = "u8_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../头文件"]
+EOF
+cat > "$WS_U8/pkg/src/main.pion" <<'EOF'
+extern "C" fn u8_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, u8_val().to_string()) }
+EOF
+CAS_U8="$TMP_DIR/cas_u8"
+mkdir -p "$CAS_U8"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_U8" "$PIONC" build -o "$TMP_DIR/u8_bin1" "$WS_U8/pkg" 2>"$TMP_DIR/u8_1.trace"
+[ "$("$TMP_DIR/u8_bin1")" = "101" ] || fail "Scenario G2 cold expected 101"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_U8" "$PIONC" build -o "$TMP_DIR/u8_bin2" "$WS_U8/pkg" 2>"$TMP_DIR/u8_2.trace"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/u8_2.trace" || fail "Scenario G2 expected warm HIT on UTF-8 path"
+cp -p "$WS_U8/头文件/配置.h" "$TMP_DIR/u8.ref"
+cat > "$WS_U8/头文件/配置.h" <<'EOF'
+#define U8_VAL 202
+EOF
+touch -r "$TMP_DIR/u8.ref" "$WS_U8/头文件/配置.h"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_U8" "$PIONC" build -o "$TMP_DIR/u8_bin3" "$WS_U8/pkg" 2>"$TMP_DIR/u8_3.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/u8_3.trace" || fail "Scenario G2 expected MISS after UTF-8 header edit"
+[ "$("$TMP_DIR/u8_bin3")" = "202" ] || fail "Scenario G2 expected 202 after UTF-8 header edit"
+
+# G3: Racy compile-time header edit must NOT poison .deps manifest permanently
+WS_RACY="$TMP_DIR/ws_racy"
+mkdir -p "$WS_RACY/pkg/src"
+cat > "$WS_RACY/pkg/racy.h" <<'EOF'
+#define RACY_VAL 10
+EOF
+cat > "$WS_RACY/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "racy.h"
+int64_t racy_val(void) { return RACY_VAL; }
+EOF
+cat > "$WS_RACY/pkg/pion.toml" <<'EOF'
+[package]
+name = "racy_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_RACY/pkg/src/main.pion" <<'EOF'
+extern "C" fn racy_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, racy_val().to_string()) }
+EOF
+
+RACY_CC="$TMP_DIR/racy_cc.sh"
+cat > "$RACY_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+"${REAL_CC_BIN}" "$@"
+RC=$?
+if [ "$RC" = "0" ] && [ "${INJECT_RACE:-0}" = "1" ]; then
+  case "$*" in
+    *-c*stub.c*)
+      printf '#define RACY_VAL 20\n' > "${RACY_HDR}"
+      ;;
+  esac
+fi
+exit "$RC"
+EOF
+chmod +x "$RACY_CC"
+
+CAS_RACY="$TMP_DIR/cas_racy"
+mkdir -p "$CAS_RACY"
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_RACE=1 RACY_HDR="$WS_RACY/pkg/racy.h" CC="$RACY_CC" \
+  PION_CACHE_DIR="$CAS_RACY" "$PIONC" build -o "$TMP_DIR/racy_bin1" "$WS_RACY/pkg"
+[ "$("$TMP_DIR/racy_bin1")" = "10" ] || fail "Scenario G3 racy run 1 expected 10"
+# Next run (no race) MUST MISS and pick up 20 because run 1 refused to publish racy .deps!
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_RACE=0 RACY_HDR="$WS_RACY/pkg/racy.h" CC="$RACY_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_RACY" "$PIONC" build -o "$TMP_DIR/racy_bin2" "$WS_RACY/pkg" 2>"$TMP_DIR/racy2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/racy2.trace" || fail "Scenario G3 expected MISS after racy compile"
+[ "$("$TMP_DIR/racy_bin2")" = "20" ] || fail "Scenario G3 expected 20 after racy compile self-healed"
+
+echo "(G) -I shadowing + UTF-8 Chinese path + racy compile-time edit self-heal -> OK"
 echo "PASS: cas_pin_and_cstub_deps"

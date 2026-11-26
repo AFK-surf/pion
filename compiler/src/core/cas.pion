@@ -440,6 +440,49 @@ fn parse_int64_dec(s : String) -> Int64 {
 }
 
 ///|
+/// Whitelist validation for CAS index keys: rejects empty strings, `..`,
+/// path separators (`/`, `\`), NUL, control characters, and whitespace.
+/// After stripping an optional `testbin:` or `wasmbin:` prefix, every byte
+/// must be in `[A-Za-z0-9_.-]`.
+pub fn cas_is_safe_key(ek : String) -> Bool {
+  let n = ek.length()
+  if n == 0 {
+    return false
+  }
+  let start = if n >= 8 &&
+    (slice_str(ek, 0, 8) == "testbin:" || slice_str(ek, 0, 8) == "wasmbin:") {
+    8
+  } else {
+    0
+  }
+  let body_len = n - start
+  if body_len == 0 {
+    return false
+  }
+  if body_len == 1 && str_code_at(ek, start) == 46 {
+    return false
+  }
+  let mut i = start
+  while i < n {
+    let c = str_code_at(ek, i)
+    let ok = (c >= 48 && c <= 57) ||
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      c == 95 ||
+      c == 46 ||
+      c == 45
+    if !ok {
+      return false
+    }
+    if c == 46 && i + 1 < n && str_code_at(ek, i + 1) == 46 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 pub fn cas_parse_index(text : String) -> Array[CasEntry] {
   let out : Array[CasEntry] = []
   let lines = split_lines(text)
@@ -466,13 +509,15 @@ pub fn cas_parse_index(text : String) -> Array[CasEntry] {
     }
     if tab1 > 0 && tab2 > tab1 {
       let key = slice_str(line, 0, tab1)
-      let bytes_s = slice_str(line, tab1 + 1, tab2)
-      let ts_s = slice_str(line, tab2 + 1, line.length())
-      out.push(CasEntry::{
-        key: key,
-        bytes: parse_int64_dec(bytes_s),
-        last_access_ms: parse_int64_dec(ts_s),
-      })
+      if cas_is_safe_key(key) {
+        let bytes_s = slice_str(line, tab1 + 1, tab2)
+        let ts_s = slice_str(line, tab2 + 1, line.length())
+        out.push(CasEntry::{
+          key: key,
+          bytes: parse_int64_dec(bytes_s),
+          last_access_ms: parse_int64_dec(ts_s),
+        })
+      }
     }
     i = i + 1
   }
@@ -699,30 +744,52 @@ pub fn cas_touch_batch_and_evict(
 }
 
 ///|
+/// Post-run CAS budget trim: refreshes `last_access_ms = now_ms` on all entries
+/// in `run_keys ∪ protected_keys`, then if total bytes exceed `max_bytes` evicts
+/// least-recently-used entries NOT in `protected_keys` (active peer process pins
+/// plus returned output `keep_keys`) down to the 80% watermark.
 pub fn cas_evict_post_run(
   entries : Array[CasEntry],
-  run_start_ms : Int64,
+  now_ms : Int64,
   max_bytes : Int64,
   run_keys : Array[String],
+  protected_keys : Array[String],
 ) -> CasEvictResult {
+  let touch_set : Map[String, Bool] = Map([])
+  let prot_set : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < run_keys.length() {
+    touch_set.set(run_keys[i], true)
+    i = i + 1
+  }
+  i = 0
+  while i < protected_keys.length() {
+    let k = protected_keys[i]
+    touch_set.set(k, true)
+    prot_set.set(k, true)
+    i = i + 1
+  }
   let sorted : Array[CasEntry] = []
   let mut total = 0L
-  let mut i = 0
+  i = 0
   while i < entries.length() {
     let e = entries[i]
-    sorted.push(e)
-    total = total + e.bytes
+    let updated_e = if touch_set.contains(e.key) {
+      CasEntry::{
+        key: e.key,
+        bytes: e.bytes,
+        last_access_ms: now_ms,
+      }
+    } else {
+      e
+    }
+    sorted.push(updated_e)
+    total = total + updated_e.bytes
     i = i + 1
   }
   let evicted : Array[String] = []
   if max_bytes <= 0L || total <= max_bytes {
     return CasEvictResult::{ kept: sorted, evicted: evicted }
-  }
-  let run_set : Map[String, Bool] = Map([])
-  i = 0
-  while i < run_keys.length() {
-    run_set.set(run_keys[i], true)
-    i = i + 1
   }
   sort_cas_entries_lru(sorted)
   let watermark = (max_bytes * 80L) / 100L
@@ -730,8 +797,7 @@ pub fn cas_evict_post_run(
   i = 0
   while i < sorted.length() {
     let e = sorted[i]
-    let can_evict = e.last_access_ms < run_start_ms || run_set.contains(e.key)
-    if total > watermark && can_evict {
+    if total > watermark && !prot_set.contains(e.key) {
       total = total - e.bytes
       evicted.push(e.key)
     } else {
@@ -759,37 +825,56 @@ fn cas_sort_strings(arr : Array[String]) -> Unit {
 }
 
 ///|
+/// Parses a GCC/Clang Makefile depfile (`-MD -MF`) into sorted deduplicated
+/// prerequisite paths. Uses contiguous slices to preserve multi-byte UTF-8
+/// paths intact. Fails closed (`None`) on missing target/separator, empty
+/// prerequisite list, or unexpected extra non-comment lines after the rule.
 pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
-  // 1. Normalize CRLF -> LF.
+  // 1. Normalize CRLF -> LF using contiguous slice copies (UTF-8 safe).
   let crlf_sb = StringBuilder()
   let raw_n = txt.length()
+  let mut run_start = 0
   let mut ri = 0
   while ri < raw_n {
-    let ch = str_code_at(txt, ri)
-    if ch == 13 && ri + 1 < raw_n && str_code_at(txt, ri + 1) == 10 {
+    if str_code_at(txt, ri) == 13 &&
+      ri + 1 < raw_n &&
+      str_code_at(txt, ri + 1) == 10 {
+      if ri > run_start {
+        crlf_sb.write_string(slice_str(txt, run_start, ri))
+      }
       crlf_sb.write_char('\n')
       ri = ri + 2
+      run_start = ri
     } else {
-      crlf_sb.write_string(slice_str(txt, ri, ri + 1))
       ri = ri + 1
     }
+  }
+  if raw_n > run_start {
+    crlf_sb.write_string(slice_str(txt, run_start, raw_n))
   }
   let lf_txt = crlf_sb.to_string()
 
   // 2. Collapse backslash-newline continuations into a single space.
   let cont_sb = StringBuilder()
   let lf_n = lf_txt.length()
+  run_start = 0
   let mut ci = 0
   while ci < lf_n {
     if str_code_at(lf_txt, ci) == 92 &&
       ci + 1 < lf_n &&
       str_code_at(lf_txt, ci + 1) == 10 {
+      if ci > run_start {
+        cont_sb.write_string(slice_str(lf_txt, run_start, ci))
+      }
       cont_sb.write_char(' ')
       ci = ci + 2
+      run_start = ci
     } else {
-      cont_sb.write_string(slice_str(lf_txt, ci, ci + 1))
       ci = ci + 1
     }
+  }
+  if lf_n > run_start {
+    cont_sb.write_string(slice_str(lf_txt, run_start, lf_n))
   }
   let norm = cont_sb.to_string()
   let n = norm.length()
@@ -802,10 +887,16 @@ pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
     let ch = str_code_at(norm, i)
     if ch == 10 {
       if has_target {
-        // Line ended before any `:` separator -> malformed depfile.
         return None
       }
       i = i + 1
+      continue
+    }
+    if !has_target && ch == 35 {
+      // Skip leading comment line
+      while i < n && str_code_at(norm, i) != 10 {
+        i = i + 1
+      }
       continue
     }
     if ch == 92 && i + 1 < n {
@@ -839,13 +930,14 @@ pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
   }
 
   // 4. Parse prerequisite paths on the rule line (unescaping `\ `, `\#`, `\:`, `$$`,
-  //    while keeping Windows path backslashes intact).
+  //    using contiguous slice copies for UTF-8 safety and keeping Windows backslashes).
   let deps : Array[String] = []
   let seen : Map[String, Bool] = Map([])
   i = colon_pos + 1
   while i < n {
     let ch0 = str_code_at(norm, i)
     if ch0 == 10 {
+      i = i + 1
       break
     }
     if ch0 == 32 || ch0 == 9 {
@@ -853,6 +945,7 @@ pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
       continue
     }
     let tok = StringBuilder()
+    let mut seg_start = i
     while i < n {
       let ch = str_code_at(norm, i)
       if ch == 32 || ch == 9 || ch == 10 {
@@ -860,31 +953,37 @@ pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
       }
       if ch == 92 && i + 1 < n {
         let nxt = str_code_at(norm, i + 1)
-        if nxt == 32 {
-          tok.write_char(' ')
+        if nxt == 32 || nxt == 35 || nxt == 9 || nxt == 58 {
+          if i > seg_start {
+            tok.write_string(slice_str(norm, seg_start, i))
+          }
+          if nxt == 32 {
+            tok.write_char(' ')
+          } else if nxt == 35 {
+            tok.write_char('#')
+          } else if nxt == 9 {
+            tok.write_char('\t')
+          } else {
+            tok.write_char(':')
+          }
           i = i + 2
-          continue
-        } else if nxt == 35 {
-          tok.write_char('#')
-          i = i + 2
-          continue
-        } else if nxt == 9 {
-          tok.write_char('\t')
-          i = i + 2
-          continue
-        } else if nxt == 58 {
-          tok.write_char(':')
-          i = i + 2
+          seg_start = i
           continue
         }
       }
       if ch == 36 && i + 1 < n && str_code_at(norm, i + 1) == 36 {
+        if i > seg_start {
+          tok.write_string(slice_str(norm, seg_start, i))
+        }
         tok.write_char('$')
         i = i + 2
+        seg_start = i
         continue
       }
-      tok.write_string(slice_str(norm, i, i + 1))
       i = i + 1
+    }
+    if i > seg_start {
+      tok.write_string(slice_str(norm, seg_start, i))
     }
     let dep = tok.to_string()
     if dep.length() > 0 && !seen.contains(dep) {
@@ -892,8 +991,128 @@ pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
       deps.push(dep)
     }
   }
+  if deps.length() == 0 {
+    return None
+  }
+
+  // 5. Reject any unparsed non-blank, non-comment lines after the rule (fail-closed).
+  while i < n {
+    let ch = str_code_at(norm, i)
+    if ch == 32 || ch == 9 || ch == 10 {
+      i = i + 1
+      continue
+    }
+    if ch == 35 {
+      while i < n && str_code_at(norm, i) != 10 {
+        i = i + 1
+      }
+      continue
+    }
+    return None
+  }
+
   cas_sort_strings(deps)
   Some(deps)
+}
+
+///|
+/// Parses MSVC `/sourceDependencies <file>` JSON output, extracting `Data.Source`
+/// and `Data.Includes` into a sorted deduplicated list. Fails closed (`None`)
+/// if the JSON structure is missing or malformed.
+pub fn cas_parse_msvc_source_deps(txt : String) -> Option[Array[String]] {
+  let n = txt.length()
+  // Locate `"Includes"` array key.
+  let needle = "\"Includes\""
+  let nlen = needle.length()
+  let mut pos = -1
+  let mut i = 0
+  while i + nlen <= n {
+    if slice_str(txt, i, i + nlen) == needle {
+      pos = i + nlen
+      break
+    }
+    i = i + 1
+  }
+  if pos < 0 {
+    return None
+  }
+  // Skip whitespace and `:` then whitespace to `[`.
+  while pos < n && (str_code_at(txt, pos) == 32 || str_code_at(txt, pos) == 9 || str_code_at(txt, pos) == 10 || str_code_at(txt, pos) == 13) {
+    pos = pos + 1
+  }
+  if pos >= n || str_code_at(txt, pos) != 58 {
+    return None
+  }
+  pos = pos + 1
+  while pos < n && (str_code_at(txt, pos) == 32 || str_code_at(txt, pos) == 9 || str_code_at(txt, pos) == 10 || str_code_at(txt, pos) == 13) {
+    pos = pos + 1
+  }
+  if pos >= n || str_code_at(txt, pos) != 91 {
+    return None
+  }
+  pos = pos + 1
+  let out : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  while pos < n {
+    while pos < n && (str_code_at(txt, pos) == 32 || str_code_at(txt, pos) == 9 || str_code_at(txt, pos) == 10 || str_code_at(txt, pos) == 13 || str_code_at(txt, pos) == 44) {
+      pos = pos + 1
+    }
+    if pos >= n {
+      return None
+    }
+    if str_code_at(txt, pos) == 93 {
+      cas_sort_strings(out)
+      return Some(out)
+    }
+    if str_code_at(txt, pos) != 34 {
+      return None
+    }
+    pos = pos + 1
+    let sb = StringBuilder()
+    let mut seg = pos
+    let mut closed = false
+    while pos < n {
+      let c = str_code_at(txt, pos)
+      if c == 34 {
+        if pos > seg {
+          sb.write_string(slice_str(txt, seg, pos))
+        }
+        pos = pos + 1
+        closed = true
+        break
+      }
+      if c == 92 && pos + 1 < n {
+        if pos > seg {
+          sb.write_string(slice_str(txt, seg, pos))
+        }
+        let esc = str_code_at(txt, pos + 1)
+        if esc == 92 {
+          sb.write_char('\\')
+        } else if esc == 34 {
+          sb.write_char('"')
+        } else if esc == 47 {
+          sb.write_char('/')
+        } else if esc == 116 {
+          sb.write_char('\t')
+        } else {
+          return None
+        }
+        pos = pos + 2
+        seg = pos
+        continue
+      }
+      pos = pos + 1
+    }
+    if !closed {
+      return None
+    }
+    let p = sb.to_string()
+    if p.length() > 0 && !seen.contains(p) {
+      seen.set(p, true)
+      out.push(p)
+    }
+  }
+  None
 }
 
 ///|
