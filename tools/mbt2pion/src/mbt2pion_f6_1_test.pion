@@ -1,0 +1,664 @@
+///| Wave M2-F6 Track F6-1 unit tests:
+///| 1. Cross-package `pub let` / `pub const` value type ABI export, roundtrip,
+///|    backward compatibility, alias remapping, and struct-update resolution.
+///| 2. Universal MoonBit checked-error lowering (`suberror`, `raise`, `try`, `catch`,
+///|    `noraise`, `try?`, `try!`) positive and fail-closed negative cases.
+
+test "F6-1: ABI v2 values serialization, backward compat & tamper rejection" {
+  // 1. Empty values MUST be omitted from JSON so existing ABI v2 SHA-256 hashes are 100% unchanged
+  let empty_abi = empty_package_abi("plain_pkg")
+  let empty_sha = compute_abi_payload_sha256(empty_abi)
+  let empty_pion = "// abi-sha256: " + empty_sha + "\npub fn f() -> Int { 1 }\n"
+  let empty_json = render_abi_json(empty_abi, [("lib.pion", empty_pion)])
+  assert_true(!str_has(empty_json, "\"values\""), "empty values omitted from ABI v2 JSON")
+  let d_empty : Array[Diag] = []
+  match verify_and_parse_dep_abi("plain_pkg", "/tmp/plain", [("lib.pion", empty_pion)], Some(empty_json), d_empty) {
+    Some(p) => assert_true(p.values.length() == 0 && d_empty.length() == 0, "legacy ABI v2 without values parses as empty")
+    None => assert_true(false, "valid ABI v2 without values must verify")
+  }
+
+  // 2. Non-empty values are sorted deterministically, roundtrip cleanly, and detect tampering
+  let val_abi = PackageAbi::{
+    package_name: "up",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [
+      AbiValueSchema::{ name: "z_const", ty: "Int" },
+      AbiValueSchema::{ name: "default_cfg", ty: "up::Cfg" },
+    ],
+    publishable: true,
+  }
+  let val_sha = compute_abi_payload_sha256(val_abi)
+  let val_pion = "// abi-sha256: " + val_sha + "\npub let default_cfg : Cfg = Cfg::{ x: 0 }\n"
+  let val_json = render_abi_json(val_abi, [("lib.pion", val_pion)])
+  assert_true(str_has(val_json, "\"values\""), "non-empty values included in ABI v2 JSON")
+  let d_ok : Array[Diag] = []
+  match verify_and_parse_dep_abi("up", "/tmp/up", [("lib.pion", val_pion)], Some(val_json), d_ok) {
+    Some(p) => {
+      assert_true(p.values.length() == 2, "2 exported values parsed")
+      assert_true(p.values[0].name == "default_cfg" && p.values[0].ty == "up::Cfg", "sorted first value")
+      assert_true(p.values[1].name == "z_const" && p.values[1].ty == "Int", "sorted second value")
+    }
+    None => assert_true(false, "valid values ABI must verify")
+  }
+  // Tampered value type MUST be rejected
+  let d_bad : Array[Diag] = []
+  match verify_and_parse_dep_abi("up", "/tmp/up", [("lib.pion", val_pion)], Some(str_replace_all(val_json, "\"up::Cfg\"", "\"up::Other\"")), d_bad) {
+    Some(_) => assert_true(false, "tampered values must fail")
+    None => assert_true(d_bad.length() > 0 && d_bad[0].code == "MBT2PION_DEP_ABI_ERROR", "tampered values rejected")
+  }
+}
+
+test "F6-1: cross-package pub let / pub const ABI export resolves downstream struct update" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  // Upstream package `up` defines `pub(all) struct Cfg`, `pub let default_cfg : Cfg`, `pub const MAX_STEP : Int`,
+  // plus private and untyped bindings that must NOT be exported.
+  let up_src = SourceFile::{
+    rel_path: "cfg.mbt",
+    content: "pub(all) struct Cfg {\n  x : Int\n  y : Int\n}\n\npub let default_cfg : Cfg = { x: 1, y: 2 }\npub const MAX_STEP : Int = 8\nlet hidden_cfg : Cfg = { x: 0, y: 0 }\npub let untyped_val = 99\n",
+    is_test: false,
+  }
+  let up_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "up",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let up_res = transpile_package([up_src], empty_api_map(), default_recipes(), [], [], up_opts, [], false, noop_check)
+  assert_true(up_res.blockers == 0, "upstream package transpiles cleanly")
+  assert_true(up_res.abi.values.length() == 2, "only typed pub let/pub const exported")
+  assert_true(up_res.abi.values[0].name == "MAX_STEP" && up_res.abi.values[0].ty == "Int", "pub const Int exported")
+  assert_true(up_res.abi.values[1].name == "default_cfg" && up_res.abi.values[1].ty == "up::Cfg", "pub let Cfg qualified with pkg prefix")
+
+  // Direct symbol table check (including import alias remapping `u` -> `up`)
+  let st = empty_symbol_table()
+  symtab_load_dep_abi(st, "up", up_res.abi)
+  assert_true(st.val_types.get("up::default_cfg") == Some("up::Cfg"), "symtab loads up::default_cfg -> up::Cfg")
+  assert_true(st.val_types.get("up::MAX_STEP") == Some("Int"), "symtab loads up::MAX_STEP -> Int")
+  let st_alias = empty_symbol_table()
+  symtab_load_dep_abi(st_alias, "u", up_res.abi)
+  assert_true(st_alias.val_types.get("u::default_cfg") == Some("u::Cfg"), "aliased dep remaps pkg prefix in val_types")
+
+  // Downstream package uses `{ ..@up.default_cfg, x: 10 }` -> MUST resolve to `up::Cfg::{ ... }` with 0 AMBIGUOUS_STRUCT_UPDATE!
+  let down_src = SourceFile::{
+    rel_path: "use_cfg.mbt",
+    content: "pub fn override_x() -> @up.Cfg {\n  { ..@up.default_cfg, x: 10 }\n}\n",
+    is_test: false,
+  }
+  let down_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "down",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let down_res = transpile_package_with_abis(
+    [down_src],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("up", up_res.abi)],
+    [],
+    down_opts,
+    [],
+    false,
+    noop_check,
+  )
+  let mut has_ambig = false
+  for d in down_res.diagnostics {
+    if str_has(d.code, "AMBIGUOUS_STRUCT_UPDATE") {
+      has_ambig = true
+    }
+  }
+  assert_true(!has_ambig, "downstream struct update on @up.default_cfg has 0 AMBIGUOUS_STRUCT_UPDATE")
+  assert_true(down_res.files.length() > 0 && str_has(down_res.files[0].content, "up::Cfg::{"), "downstream emits up::Cfg::{ ... }")
+}
+
+test "F6-1: lower_error suberror declarations" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "suberror SimpleErr String\npub suberror ApiErr Int\npriv suberror ParseErr {\n  ParseErr(String)\n} derive(Show)\nsuberror MultiErr {\n  BadCode(Int)\n  BadMsg(String)\n} derive(Show, Eq)\nsuberror UnitErr\n"
+  let out = lower_checked_errors_single(src, "errs.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "suberror lowering has 0 diagnostics")
+  assert_true(str_has(out, "enum SimpleErr { SimpleErr(String) }"), "payload suberror lowered")
+  assert_true(str_has(out, "pub enum ApiErr { ApiErr(Int) }"), "pub suberror preserves pub")
+  assert_true(str_has(out, "enum ParseErr {\n  ParseErr(String)\n} derive(Show)"), "braced suberror with derive preserved")
+  assert_true(str_has(out, "enum MultiErr {\n  BadCode(Int)\n  BadMsg(String)\n} derive(Show, Eq)"), "multi-variant suberror lowered")
+  assert_true(str_has(out, "enum UnitErr { UnitErr }"), "unit suberror lowered")
+}
+
+test "F6-1: lower_error local catch, try-catch, noraise, try? and try!" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "priv suberror ParseErr String\nfn parse_num(s : String) -> Int raise ParseErr {\n  if s == \"\" { raise ParseErr(\"empty\") }\n  42\n}\nfn helper(s : String) -> Unit {\n  let a = @json.parse(s) catch { _ => return }\n  let _ = a\n}\nfn loop_catch(xs : Array[String]) -> Int {\n  let mut n = 0\n  for s in xs {\n    let v = @json.parse(s) catch { _ => continue }\n    let _ = v\n    n = n + 1\n  }\n  n\n}\nfn try_some(s : String) -> Option[Json] {\n  try Some(@json.parse(s)) catch { _ => None }\n}\nfn try_noraise(s : String) -> Int {\n  try parse_num(s) catch { ParseErr(_) => -1 } noraise { v => v + 1 }\n}\nfn try_compound(s : String) -> Int {\n  try { let a = parse_num(s); a + 10 } catch { _ => 0 }\n}\nfn try_q(s : String) -> Result[Int, ParseErr] {\n  try? parse_num(s)\n}\nfn try_bang(s : String) -> Int {\n  try! parse_num(s)\n}\n"
+  let out = lower_checked_errors_single(src, "handlers.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "all supported catch/try forms lower with 0 diagnostics")
+  assert_true(str_has(out, "match mbt_compat::mbt_json_parse(s) { Ok(") && str_has(out, "Err(_) => return }"), "postfix catch with return lowered inline")
+  assert_true(str_has(out, "Err(_) => continue }"), "postfix catch with continue lowered inline")
+  assert_true(str_has(out, "=> Some(") && str_has(out, "Err(_) => None }"), "try Some(@json.parse(s)) zero-closure fast path")
+  assert_true(str_has(out, "match parse_num(s) { Ok(v) => v + 1, Err("), "try ... catch ... noraise lowered directly")
+  assert_true(str_has(out, "(fn() { Ok({ let a = (match parse_num(s) { Ok(") && str_has(out, "return Err("), "compound try body lowered via IIFE with match propagation")
+  assert_true(str_has(out, "fn try_q(s : String) -> Result[Int, ParseErr] {\n  parse_num(s)\n}"), "try? on direct call returns Result directly")
+  assert_true(str_has(out, "panic(\"try! failed\")"), "try! panics on Err")
+}
+
+test "F6-1: lower_error raise functions, methods, bare raise & non-try-op mode" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "priv suberror ParseErr String\nstruct Scanner { mut pos : Int }\nfn[T] Scanner::fail(self : Scanner, msg : String) -> T raise ParseErr {\n  raise ParseErr(msg)\n}\nfn Scanner::step(self : Scanner) -> Unit raise ParseErr {\n  if self.pos < 0 { self.fail(\"neg\") }\n  self.pos = self.pos + 1\n}\nfn Scanner::read_int(self : Scanner) -> Int raise ParseErr {\n  self.step()\n  if self.pos == 0 { return 0 }\n  self.pos\n}\nfn bare_raise(x : Int) -> Int raise {\n  if x < 0 { raise \"negative\" }\n  x\n}\n"
+  let out = lower_checked_errors_single(src, "raising.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "raising functions and methods lower cleanly")
+  assert_true(str_has(out, "fn[T] Scanner::fail(self : Scanner, msg : String) -> Result[T, ParseErr] {"), "generic raising method signature lowered")
+  assert_true(!str_has(out, "Ok({ return Err("), "tail raise is not double-wrapped in Ok")
+  assert_true(str_has(out, "self.fail(\"neg\")?"), "raising method call propagated with ?")
+  assert_true(str_has(out, "self.step()?"), "unit raising method call propagated with ?")
+  assert_true(str_has(out, "return Ok(0)"), "early return inside raising fn wrapped in Ok")
+  assert_true(str_has(out, "fn bare_raise(x : Int) -> Result[Int, String]"), "bare raise defaults to Result[T, String]")
+
+  // Verify `use_try_op: false` expands propagation to explicit `match`
+  let cfg_match = ErrorLowerConfig::{
+    known_raising_calls: cfg.known_raising_calls,
+    use_try_op: false,
+    default_err_type: "String",
+  }
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single(src, "raising_match.mbt", cfg_match, d2)
+  assert_true(d2.length() == 0, "match-expansion mode lowers cleanly")
+  assert_true(str_has(out2, "(match self.step() { Ok(") && str_has(out2, "=> return Err("), "match-expansion emits explicit match propagation")
+}
+
+test "F6-1: lower_error fail-closed negative cases" {
+  let cfg = default_error_lower_config()
+  let bad_cases : Array[(String, String)] = [
+    ("hof_raise_param", "suberror E String\nfn run(cb : (Int) -> Int raise E) -> Int { cb(1) }\n"),
+    ("inline_raise_closure", "suberror E String\nfn f() -> Unit { let g = fn(x : Int) -> Int raise E { raise E(\"x\") }; let _ = g }\n"),
+    ("unknown_ext_catch", "fn f(s : String) -> Int { @unknown.parse(s) catch { _ => 0 } }\n"),
+    ("unknown_ext_try", "fn f(s : String) -> Int { try @unknown.parse(s) catch { _ => 0 } }\n"),
+    ("first_class_raise_fn", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Unit { let g = boom; let _ = g }\n"),
+    ("uncaught_raise", "suberror E String\nfn f() -> Int { raise E(\"x\") }\n"),
+    ("uncaught_raising_call", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Int { boom() }\n"),
+    ("unresolved_method_recv", "suberror E String\nstruct S { x : Int }\nfn S::boom(self : S) -> Int raise E { raise E(\"x\") }\nfn get_s() -> S { S::{ x: 1 } }\nfn f() -> Int raise E { get_s().boom() }\n"),
+    ("return_in_compound_try", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Int { try { let a = boom(); return a } catch { _ => 0 } }\n"),
+  ]
+  for bc in bad_cases {
+    let ds : Array[Diag] = []
+    let _ = lower_checked_errors_single(bc.1, bc.0 + ".mbt", cfg, ds)
+    let mut hit = false
+    for d in ds {
+      if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" {
+        hit = true
+      }
+    }
+    assert_true(hit, "fail-closed case `" + bc.0 + "` MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
+}
+
+test "F6-1: R2 regressions (nested raising arg in try/catch, bare try boundary, trailing comment & multiline return, let/for shadow)" {
+  let cfg = default_error_lower_config()
+  // P1-1: nested raising argument inside `try ... catch` and postfix `catch` must NOT escape via `?` to outer RaisingFn
+  let d1 : Array[Diag] = []
+  let src1 = "priv suberror ParseErr String\nfn parse_num(s : String) -> Int raise ParseErr {\n  if s == \"\" { raise ParseErr(\"empty\") }\n  42\n}\nfn outer_try(s : String) -> Int raise ParseErr {\n  try parse_num(parse_num(s).to_string()) catch { _ => 0 }\n}\nfn outer_postfix(s : String) -> Int raise ParseErr {\n  parse_num(parse_num(s).to_string()) catch { _ => 0 }\n}\n"
+  let out1 = lower_checked_errors_single(src1, "p1_1.mbt", cfg, d1)
+  assert_true(d1.length() == 0, "P1-1 nested raising args lower cleanly")
+  assert_true(!str_has(out1, "parse_num(s)?"), "P1-1 inner parse_num(s) must NOT use `?` and bypass try/catch")
+  assert_true(str_has(out1, "match (fn() { Ok({ (match parse_num((match parse_num(s)"), "P1-1 both outer and inner calls lowered inside TryClosure IIFE")
+
+  // P1-2: bare `try` without `catch` must NOT cross `;` or newline to steal a later statement's `catch`
+  let d2a : Array[Diag] = []
+  let _ = lower_checked_errors_single("fn f(s : String) -> Int {\n  try parse_num(s); let x = @json.parse(s) catch { _ => 0 }\n  x\n}\n", "p1_2a.mbt", cfg, d2a)
+  let mut hit2a = false
+  for d in d2a { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit2a = true } }
+  assert_true(hit2a, "P1-2a bare try before `;` fails closed without stealing next catch")
+  let d2b : Array[Diag] = []
+  let _ = lower_checked_errors_single("fn f(s : String) -> Int {\n  try parse_num(s)\n  let x = @json.parse(s) catch { _ => 0 }\n  x\n}\n", "p1_2b.mbt", cfg, d2b)
+  let mut hit2b = false
+  for d in d2b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit2b = true } }
+  assert_true(hit2b, "P1-2b bare try before newline fails closed without stealing next catch")
+
+  // P1-3: trailing line comment inside raising fn body does not swallow `})` and multiline binary return is not truncated
+  let d3 : Array[Diag] = []
+  let src3 = "priv suberror E String\nfn with_comment_and_ml_ret(a : Int, b : Int) -> Int raise E {\n  if a < 0 {\n    return a +\n      b\n  }\n  a + b // trailing comment\n}\n"
+  let out3 = lower_checked_errors_single(src3, "p1_3.mbt", cfg, d3)
+  assert_true(d3.length() == 0, "P1-3 trailing comment & multiline return lower cleanly")
+  assert_true(str_has(out3, "// trailing comment\n}) }"), "P1-3 newline separates trailing comment from closing braces")
+  assert_true(str_has(out3, "return Ok(a +\n      b)"), "P1-3 multiline binary return stays intact inside Ok(...)")
+
+  // P1-4: `let (boom, x) = ...` and `for boom in xs` shadow same-named `pkg_raise_fns`
+  let d4 : Array[Diag] = []
+  let src4 = "priv suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn shadow_test(pair : (Int, Int), xs : Array[Int]) -> Int {\n  let (boom, x) = pair\n  let mut acc = boom + x\n  for boom in xs {\n    acc = acc + boom\n  }\n  acc\n}\n"
+  let out4 = lower_checked_errors_single(src4, "p1_4.mbt", cfg, d4)
+  assert_true(d4.length() == 0, "P1-4 destructuring let and for-in binders shadow raising fn boom")
+  assert_true(str_has(out4, "acc = acc + boom"), "P1-4 shadowed boom preserved verbatim")
+
+  // P1-5: match arm pattern shadowing + unknown Type::fn() return type fails closed
+  let d5a : Array[Diag] = []
+  let src5a = "priv suberror E String\nstruct Scanner { mut pos : Int }\nfn Scanner::step(self : Scanner) -> Unit raise E { raise E(\"x\") }\nfn match_shadow(s : Scanner, opt : Option[Int]) -> Int {\n  let _ = s\n  match opt {\n    Some(s) => s + 1\n    None => 0\n  }\n}\n"
+  let out5a = lower_checked_errors_single(src5a, "p1_5a.mbt", cfg, d5a)
+  assert_true(d5a.length() == 0 && str_has(out5a, "Some(s) => s + 1"), "P1-5a match arm binds s cleanly")
+  let d5b : Array[Diag] = []
+  let src5b = "priv suberror E String\nstruct Scanner { mut pos : Int }\nfn Scanner::step(self : Scanner) -> Unit raise E { raise E(\"x\") }\nfn f(s : Scanner, opt : Option[Other]) -> Unit raise E {\n  let _ = s\n  match opt {\n    Some(s) => s.step()\n    None => ()\n  }\n}\n"
+  let _ = lower_checked_errors_single(src5b, "p1_5b.mbt", cfg, d5b)
+  let mut hit5b = false
+  for d in d5b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit5b = true } }
+  assert_true(hit5b, "P1-5b match-shadowed s.step() must NOT inherit outer Scanner type")
+  let d5c : Array[Diag] = []
+  let src5c = "priv suberror E String\nstruct Scanner { mut pos : Int }\nfn Scanner::step(self : Scanner) -> Unit raise E { raise E(\"x\") }\nfn f() -> Unit raise E {\n  let x = Scanner::unknown_ctor()\n  x.step()\n}\n"
+  let _ = lower_checked_errors_single(src5c, "p1_5c.mbt", cfg, d5c)
+  let mut hit5c = false
+  for d in d5c { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit5c = true } }
+  assert_true(hit5c, "P1-5c unknown Type::fn() return type must NOT guess Scanner")
+
+  // P1-6: `match try? parse_num(s) { ... }` truncates before outer `{`
+  let d6 : Array[Diag] = []
+  let src6 = "priv suberror ParseErr String\nfn parse_num(s : String) -> Int raise ParseErr {\n  if s == \"\" { raise ParseErr(\"empty\") }\n  42\n}\nfn use_match_try_q(s : String) -> Int {\n  match try? parse_num(s) {\n    Ok(v) => v\n    Err(_) => 0\n  }\n}\n"
+  let out6 = lower_checked_errors_single(src6, "p1_6.mbt", cfg, d6)
+  assert_true(d6.length() == 0, "P1-6 match try? lowers cleanly")
+  assert_true(str_has(out6, "match parse_num(s) {\n    Ok(v) => v"), "P1-6 try? stops before match body brace")
+
+  // P1-7: trailing generics `fn id_raise[T](x : T) -> T raise E`
+  let d7 : Array[Diag] = []
+  let src7 = "priv suberror E String\nfn id_raise[T](x : T) -> T raise E {\n  x\n}\nfn call_id(n : Int) -> Int raise E {\n  id_raise(n)\n}\n"
+  let out7 = lower_checked_errors_single(src7, "p1_7.mbt", cfg, d7)
+  assert_true(d7.length() == 0, "P1-7 trailing generic raising fn lowers cleanly")
+  assert_true(str_has(out7, "id_raise(n)?"), "P1-7 trailing generic raising fn call recognized and propagated")
+
+  // P2-1: conflicting canonical `values` across two aliases marks ambiguity and removes ambiguous canon entry
+  let abi_c1 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "Int" }], publishable: true }
+  let abi_c2 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "String" }], publishable: true }
+  let st_amb = empty_symbol_table()
+  symtab_load_dep_abi(st_amb, "a1", abi_c1)
+  symtab_load_dep_abi(st_amb, "a2", abi_c2)
+  assert_true(st_amb.val_types.get("a1::v") == Some("Int") && st_amb.val_types.get("a2::v") == Some("String"), "P2-1 direct alias keys preserved")
+  assert_true(st_amb.val_types.get("shared::v") == None && st_amb.canon_val_types_ambig.contains("shared::v"), "P2-1 conflicting canonical value removed & marked ambiguous")
+
+  // P2-2: top-level `let`/`const` containing `try`/`catch`/`raise` fails closed
+  let d8 : Array[Diag] = []
+  let _ = lower_checked_errors_single("let bad : Int = @json.parse(\"1\") catch { _ => 0 }\n", "p2_2.mbt", cfg, d8)
+  let mut hit8 = false
+  for d in d8 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit8 = true } }
+  assert_true(hit8, "P2-2 residual catch outside top-level fn/test fails closed")
+}
+
+test "F6-1: R3 regressions (unannotated cross-pkg struct update, interp in try/top-level, order-invariant canon_val_types, arrow closures)" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  // P1-1: unannotated `let b = { ..@up.preset, x: 10 }; b.x + b.y` (direct, aliased `@u.preset`, and `pub using` re-export)
+  let up_src = SourceFile::{
+    rel_path: "cfg.mbt",
+    content: "pub(all) struct Cfg {\n  x : Int\n  y : Int\n}\npub let preset : Cfg = { x: 1, y: 3 }\n",
+    is_test: false,
+  }
+  let up_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "up",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let up_res = transpile_package([up_src], empty_api_map(), default_recipes(), [], [], up_opts, [], false, noop_check)
+  assert_true(up_res.blockers == 0, "R3 P1-1 upstream compiles cleanly")
+
+  // Direct `@up.preset` with NO outer type annotation on `let b` or return type
+  let down_direct = SourceFile::{
+    rel_path: "direct.mbt",
+    content: "pub fn run() -> Int {\n  let b = { ..@up.preset, x: 10 }\n  b.x + b.y\n}\n",
+    is_test: false,
+  }
+  let down_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "down",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let res_direct = transpile_package_with_abis([down_direct], empty_api_map(), default_recipes(), [], [], [], [("up", up_res.abi)], [], down_opts, [], false, noop_check)
+  assert_true(res_direct.blockers == 0 && str_has(res_direct.files[0].content, "up::Cfg::{"), "R3 P1-1 unannotated @up.preset struct update resolves to up::Cfg")
+
+  // Aliased `@u.preset` with NO outer type annotation
+  let down_alias = SourceFile::{
+    rel_path: "alias.mbt",
+    content: "pub fn run() -> Int {\n  let b = { ..@u.preset, x: 10 }\n  b.x + b.y\n}\n",
+    is_test: false,
+  }
+  let res_alias = transpile_package_with_abis([down_alias], empty_api_map(), default_recipes(), [], [], [], [("u", up_res.abi)], [], down_opts, [], false, noop_check)
+  assert_true(res_alias.blockers == 0 && str_has(res_alias.files[0].content, "u::Cfg::{"), "R3 P1-1 unannotated @u.preset struct update resolves to u::Cfg")
+
+  // Re-exported `pub using @up { type Cfg, preset }`: remaps `up::Cfg` -> `mid::Cfg` (and alias `m::Cfg`) in `symtab_finalize_dep_reexports`
+  let mid_abi = PackageAbi::{
+    package_name: "mid",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "Cfg", kind: "type", target_pkg: "up", target_name: "Cfg" },
+      AbiReexport::{ name: "preset", kind: "value", target_pkg: "up", target_name: "preset" },
+    ],
+    values: [],
+    publishable: true,
+  }
+  let st_re = empty_symbol_table()
+  symtab_load_dep_abi(st_re, "up", up_res.abi)
+  symtab_load_dep_abi(st_re, "mid", mid_abi)
+  let d_re : Array[Diag] = []
+  symtab_finalize_dep_reexports(st_re, d_re)
+  assert_true(d_re.length() == 0 && st_re.val_types.get("mid::preset") == Some("mid::Cfg"), "R3 P1-1 re-exported value type remaps to mid::Cfg")
+  let st_re_alias = empty_symbol_table()
+  symtab_load_dep_abi(st_re_alias, "up", up_res.abi)
+  symtab_load_dep_abi(st_re_alias, "m", mid_abi)
+  let d_re_a : Array[Diag] = []
+  symtab_finalize_dep_reexports(st_re_alias, d_re_a)
+  assert_true(d_re_a.length() == 0 && st_re_alias.val_types.get("m::preset") == Some("m::Cfg"), "R3 P1-1 aliased re-exported value type remaps to m::Cfg")
+
+  // P1-2: raising call inside string interpolation in `try ... catch` / postfix `catch` + top-level interp residual
+  let cfg = default_error_lower_config()
+  let d_interp : Array[Diag] = []
+  let src_interp = "priv suberror E String\nfn bad() -> Int raise E { raise E(\"boom\") }\nfn take(s : String) -> Int raise E { s.length() }\nfn outer_try() -> Int raise E {\n  try take(\"\\{bad()}\") catch { _ => 7 }\n}\nfn outer_postfix() -> Int raise E {\n  take(\"\\{bad()}\") catch { _ => 7 }\n}\n"
+  let out_interp = lower_checked_errors_single(src_interp, "p1_2_interp.mbt", cfg, d_interp)
+  assert_true(d_interp.length() == 0, "R3 P1-2 interp inside try/catch lowers cleanly")
+  assert_true(!str_has(out_interp, "bad()?"), "R3 P1-2 bad() inside interp must NOT use `?` and escape try/catch")
+  assert_true(str_has(out_interp, "(fn() { Ok({ (match take(\"\\{(match bad()"), "R3 P1-2 interp raising call lowered inside TryClosure IIFE")
+
+  let d_top_interp : Array[Diag] = []
+  let _ = lower_checked_errors_single("let n : String = \"\\{@json.parse(\"1\") catch { _ => 7 }}\"\n", "p1_2_top.mbt", cfg, d_top_interp)
+  let mut hit_top_interp = false
+  for d in d_top_interp { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit_top_interp = true } }
+  assert_true(hit_top_interp, "R3 P1-2 top-level string interpolation with catch fails closed")
+
+  // P2-1: load-order invariance between `(shared, b)` and `(b, shared)` when sharing `package_name = "shared"`
+  let abi_s1 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "Int" }], publishable: true }
+  let abi_s2 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "String" }], publishable: true }
+  let st_ab = empty_symbol_table()
+  symtab_load_dep_abi(st_ab, "shared", abi_s1)
+  symtab_load_dep_abi(st_ab, "b", abi_s2)
+  let st_ba = empty_symbol_table()
+  symtab_load_dep_abi(st_ba, "b", abi_s2)
+  symtab_load_dep_abi(st_ba, "shared", abi_s1)
+  assert_true(st_ab.val_types.get("shared::v") == Some("Int") && st_ba.val_types.get("shared::v") == Some("Int"), "R3 P2-1 direct shared::v order-invariant")
+  assert_true(st_ab.val_types.get("b::v") == Some("String") && st_ba.val_types.get("b::v") == Some("String"), "R3 P2-1 direct b::v order-invariant")
+  assert_true(st_ab.canon_val_types.get("shared::v") == None && st_ba.canon_val_types.get("shared::v") == None, "R3 P2-1 conflicting canon_val_types removed in both orders")
+  assert_true(st_ab.canon_val_types_ambig.contains("shared::v") && st_ba.canon_val_types_ambig.contains("shared::v"), "R3 P2-1 canon_val_types_ambig true in both orders")
+
+  // P2-2: arrow closures isolate `return` from enclosing raising fn and reject `raise` inside arrow closure
+  let d_arr : Array[Diag] = []
+  let src_arr = "priv suberror E String\nfn with_arrows() -> Int raise E {\n  let f = n => { if n > 0 { return 3 }; 2 }\n  let g = (a, b) => { if a > b { return a }; b }\n  f(1) + g(4, 2)\n}\n"
+  let out_arr = lower_checked_errors_single(src_arr, "p2_2_arrow.mbt", cfg, d_arr)
+  assert_true(d_arr.length() == 0, "R3 P2-2 arrow closures inside raising fn lower cleanly")
+  assert_true(str_has(out_arr, "return 3") && str_has(out_arr, "return a"), "R3 P2-2 return inside arrow closure NOT wrapped in Ok")
+  assert_true(!str_has(out_arr, "return Ok(3)") && !str_has(out_arr, "return Ok(a)"), "R3 P2-2 no Ok-wrapping of arrow closure returns")
+
+  let d_arr_bad : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn f() -> Int raise E {\n  let g = n => { if n < 0 { raise E(\"neg\") }; n }\n  g(1)\n}\n", "p2_2_arrow_bad.mbt", cfg, d_arr_bad)
+  let mut hit_arr_bad = false
+  for d in d_arr_bad { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit_arr_bad = true } }
+  assert_true(hit_arr_bad, "R3 P2-2 raise inside arrow closure fails closed")
+}
+
+test "F6-1: R4 regressions (nonlocal control flow in interp, match arm vs inner arrow closure)" {
+  let cfg = default_error_lower_config()
+  // 1. `return` inside string interpolation in `try ... catch` and postfix `catch` fails closed
+  let d1a : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn take(s : String) -> Int raise E { s.length() }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try take(\"\\{if stop { return 42 } else { bad() }}\") catch { _ => 7 }\n  v + 1\n}\n", "r4_1a.mbt", cfg, d1a)
+  let mut hit1a = false
+  for d in d1a { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1a = true } }
+  assert_true(hit1a, "R4 return inside try interp fails closed")
+
+  let d1b : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn take(s : String) -> Int raise E { s.length() }\nfn outer(stop : Bool) -> Int raise E {\n  let v = take(\"\\{if stop { return 42 } else { bad() }}\") catch { _ => 7 }\n  v + 1\n}\n", "r4_1b.mbt", cfg, d1b)
+  let mut hit1b = false
+  for d in d1b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1b = true } }
+  assert_true(hit1b, "R4 return inside postfix catch interp fails closed")
+
+  // 2. `break` inside string interpolation inside `try` within outer loop fails closed
+  let d2 : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn f() -> Int {\n  let mut acc = 0\n  while acc < 10 {\n    acc = acc + (try { let _ = \"\\{break}\"; bad() } catch { _ => 7 })\n  }\n  acc\n}\n", "r4_2.mbt", cfg, d2)
+  let mut hit2 = false
+  for d in d2 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit2 = true } }
+  assert_true(hit2, "R4 break inside try interp fails closed")
+
+  // 3. `match` arm `pat => { return 42 }` inside `try` MUST still fail closed (never mistaken for arrow closure!)
+  let d3 : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn f(stop : Bool) -> Int {\n  try { match stop { true => { return 42 }; false => bad() } } catch { _ => 7 }\n}\n", "r4_3.mbt", cfg, d3)
+  let mut hit3 = false
+  for d in d3 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3 = true } }
+  assert_true(hit3, "R4 match arm return inside try still fails closed")
+
+  // 4. Inner arrow closure `let g = n => { if n > 0 { return n }; 0 }` inside `try` passes cleanly
+  let d4 : Array[Diag] = []
+  let out4 = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn f() -> Int {\n  try { let g = n => { if n > 0 { return n }; 0 }; g(bad()) } catch { _ => 7 }\n}\n", "r4_4.mbt", cfg, d4)
+  assert_true(d4.length() == 0, "R4 inner arrow closure return inside try allowed")
+  assert_true(str_has(out4, "if n > 0 { return n }"), "R4 inner arrow closure return preserved verbatim")
+
+  // 5. Comma-separated `match` arm inside `try` (top-level or nested inside parens) MUST fail closed
+  let d5a : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn f(stop : Bool) -> Int {\n  try { match stop { true => 0, y => { return 42 } } } catch { _ => 7 }\n}\n", "r5_1a.mbt", cfg, d5a)
+  let mut hit5a = false
+  for d in d5a { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit5a = true } }
+  assert_true(hit5a, "R5 comma-separated match arm return inside try fails closed")
+
+  let d5b : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn id(x : Int) -> Int { x }\nfn f(stop : Bool) -> Int {\n  try { id(match stop { true => 0, y => { return 42 } }) + bad() } catch { _ => 7 }\n}\n", "r5_1b.mbt", cfg, d5b)
+  let mut hit5b = false
+  for d in d5b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit5b = true } }
+  assert_true(hit5b, "R5 comma-separated match arm nested inside call parens fails closed")
+
+  // 6. Comma-separated call-argument arrow closure `apply(1, n => { return n })` inside `try` passes cleanly
+  let d6 : Array[Diag] = []
+  let out6 = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn apply(x : Int, f : (Int) -> Int) -> Int { f(x) }\nfn f() -> Int {\n  try { apply(1, n => { if n > 0 { return n }; 0 }) + bad() } catch { _ => 7 }\n}\n", "r5_2.mbt", cfg, d6)
+  assert_true(d6.length() == 0, "R5 call-arg arrow closure after comma inside try allowed")
+  assert_true(str_has(out6, "if n > 0 { return n }"), "R5 call-arg arrow closure return preserved verbatim")
+}
+
+test "F6-1: R6 regressions (interp char/comment boundaries, loop cond block depth, wildcard/if-branch arrow closures)" {
+  let cfg = default_error_lower_config()
+
+  // 1a. `split_interp_string` respects char literals `'}'`, `'"'`, `b'}'`, line comments `// }`, and block comments `/* } */`
+  let sp1 = split_interp_string("\"a\\{if c == '}' { 1 } else { 2 }}b\"", false)
+  assert_true(sp1.length() == 3 && sp1[1].is_expr && sp1[1].text == "if c == '}' { 1 } else { 2 }", "split_interp_string keeps char '}' inside hole")
+  let sp2 = split_interp_string("\"\\{if c == '\"' && b == b'}' { 1 } else { 2 }}\"", false)
+  assert_true(sp2.length() == 1 && sp2[0].is_expr && sp2[0].text == "if c == '\"' && b == b'}' { 1 } else { 2 }", "split_interp_string keeps '\"' and b'}' inside hole")
+  let sp3 = split_interp_string("\"\\{1 /* } /* } */ */ + // }\n2}\"", false)
+  assert_true(sp3.length() == 1 && sp3[0].is_expr && sp3[0].text == "1 /* } /* } */ */ + // }\n2", "split_interp_string skips // } and nested /* } */ comments")
+
+  // 1b. Nonlocal `return` after `c == '}'` inside `try` and postfix `catch` interp fails closed
+  let d1a : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn take(s : String, x : Int) -> Int raise E { s.length() + x }\nfn outer(c : Char) -> Int raise E {\n  let v = try take(\"\\{if c == '}' { return 42 } else { 0 }}\", good(false)) catch { _ => 7 }\n  v + 1\n}\n", "r6_1a.mbt", cfg, d1a)
+  let mut hit1a = false
+  for d in d1a { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1a = true } }
+  assert_true(hit1a, "R6 return after char '}' inside try interp fails closed")
+
+  let d1b : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn take(s : String, x : Int) -> Int raise E { s.length() + x }\nfn outer(c : Char) -> Int raise E {\n  let v = take(\"\\{if c == '}' { return 42 } else { 0 }}\", good(false)) catch { _ => 7 }\n  v + 1\n}\n", "r6_1b.mbt", cfg, d1b)
+  let mut hit1b = false
+  for d in d1b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1b = true } }
+  assert_true(hit1b, "R6 return after char '}' inside postfix catch interp fails closed")
+
+  // 2. Loop with block-containing condition inside `try` keeps loop depth for body `break`
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    while i < (if i == 0 { 2 } else { 3 }) {\n      i = i + 1\n      let _ = \"\\{if i == 2 { break } else { 1 }}\"\n    }\n    i + good(false)\n  } catch { _ => 7 }\n}\n", "r6_2.mbt", cfg, d2)
+  assert_true(d2.length() == 0, "R6 loop with block condition inside try allows body break")
+  assert_true(str_has(out2, "break"), "R6 loop body break preserved")
+
+  // 3. Wildcard `_ => { return 5 }` and `if`-branch tail `n => { return n + 4 }` inside `try` pass cleanly
+  let d3a : Array[Diag] = []
+  let out3a = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn apply(x : Int, f : (Int) -> Int) -> Int { f(x) }\nfn f() -> Int {\n  try { apply(1, _ => { return 5 }) + bad() } catch { _ => 7 }\n}\n", "r6_3a.mbt", cfg, d3a)
+  assert_true(d3a.length() == 0, "R6 wildcard arrow closure inside try allowed")
+  assert_true(str_has(out3a, "_ => { return 5 }"), "R6 wildcard arrow closure return preserved verbatim")
+
+  let d3b : Array[Diag] = []
+  let out3b = lower_checked_errors_single("priv suberror E String\nfn bad() -> Int raise E { raise E(\"b\") }\nfn f(c : Bool) -> Int {\n  try {\n    let g = if c { n => { return n + 4 } } else { _ => { return 5 } }\n    g(bad())\n  } catch { _ => 7 }\n}\n", "r6_3b.mbt", cfg, d3b)
+  assert_true(d3b.length() == 0, "R6 if-branch tail arrow closures inside try allowed")
+  assert_true(str_has(out3b, "return n + 4") && !str_has(out3b, "return Ok(n + 4)"), "R6 if-branch arrow closure return not wrapped in Ok")
+}
+
+test "F6-1: R7 regressions (match empty block scrutinee, bare while condition block, loop arm return lowering)" {
+  let cfg = default_error_lower_config()
+
+  // 1. `match {} { _ => { if stop { return 42 } } }` inside `try` MUST fail closed (empty `{}` is scrutinee, not arm block)
+  let d1 : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try { match {} { _ => { if stop { return 42 } } }; good(false) } catch { _ => 7 }\n  v + 1\n}\n", "r7_1.mbt", cfg, d1)
+  let mut hit1 = false
+  for d in d1 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1 = true } }
+  assert_true(hit1, "R7 match empty block scrutinee arm return inside try fails closed")
+
+  // 2a. Bare condition block `while { i < 2 } { ... break ... }` inside `try` keeps loop depth
+  let d2a : Array[Diag] = []
+  let out2a = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    while { i < 2 } {\n      i = i + 1\n      let _ = \"\\{if i == 2 { break } else { 1 }}\"\n    }\n    i + good(false)\n  } catch { _ => 7 }\n}\n", "r7_2a.mbt", cfg, d2a)
+  assert_true(d2a.length() == 0, "R7 bare while condition block inside try allows body break")
+  assert_true(str_has(out2a, "break"), "R7 bare while condition block break preserved")
+
+  // 2b. Struct-pattern `while h is { count: 1 } && i < 2 { ... break ... }` inside `try` keeps loop depth
+  let d2b : Array[Diag] = []
+  let out2b = lower_checked_errors_single("priv suberror E String\nstruct Holder { count : Int }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f(h : Holder) -> Int {\n  try {\n    let mut i = 0\n    while h is { count: 1 } && i < 2 {\n      i = i + 1\n      let _ = \"\\{if i == 2 { break } else { 1 }}\"\n    }\n    i + good(false)\n  } catch { _ => 7 }\n}\n", "r7_2b.mbt", cfg, d2b)
+  assert_true(d2b.length() == 0, "R7 while is-struct-pattern condition inside try allows body break")
+  assert_true(str_has(out2b, "break"), "R7 while is-struct-pattern break preserved")
+
+  // 3. `loop 1 { _ => { return 42 } }` inside `raise` fn wraps `return 42` as `return Ok(42)` (not PlainFn arrow closure!)
+  let d3 : Array[Diag] = []
+  let out3 = lower_checked_errors_single("priv suberror E String\nfn f() -> Int raise E {\n  loop 1 {\n    _ => { return 42 }\n  }\n}\n", "r7_3.mbt", cfg, d3)
+  assert_true(d3.length() == 0, "R7 loop arm return in raising fn lowers cleanly")
+  assert_true(str_has(out3, "return Ok(42)"), "R7 loop arm return wrapped as Ok(42)")
+}
+
+test "F6-1: R8 regressions (for-in trailing semi, newline block after while, struct literal with arrow in match scrutinee)" {
+  let cfg = default_error_lower_config()
+
+  // 1. `for x in [1, 2] { i = i + x; break }; good(false) + i` inside `try` passes cleanly (0 diag)
+  let d1 : Array[Diag] = []
+  let out1 = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    for x in [1, 2] { i = i + x; break }; good(false) + i\n  } catch { _ => 7 }\n}\n", "r8_1.mbt", cfg, d1)
+  assert_true(d1.length() == 0, "R8 for-in followed by semicolon inside try allows body break")
+  assert_true(str_has(out1, "break"), "R8 for-in body break preserved")
+
+  // 2. `while i < 2 { i = i + 1; break }\n{ good(false) + i }` inside `try` passes cleanly (0 diag)
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single("priv suberror E String\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    while i < 2 { i = i + 1; break }\n    { good(false) + i }\n  } catch { _ => 7 }\n}\n", "r8_2.mbt", cfg, d2)
+  assert_true(d2.length() == 0, "R8 while followed by newline block inside try allows body break")
+  assert_true(str_has(out2, "break"), "R8 while body break preserved")
+
+  // 3. `match H::{ cb: n => { n + 1 } } { _ => { if stop { return 42 } } }` inside `try` MUST fail closed
+  let d3 : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nstruct H { cb : (Int) -> Int }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try { match H::{ cb: n => { n + 1 } } { _ => { if stop { return 42 } } }; good(false) } catch { _ => 7 }\n  v + 1\n}\n", "r8_3.mbt", cfg, d3)
+  let mut hit3 = false
+  for d in d3 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3 = true } }
+  assert_true(hit3, "R8 match struct literal with arrow field scrutinee still fails closed on arm return")
+}
+
+test "F6-1: R9 regressions (match/loop value expressions followed by binary op)" {
+  let cfg = default_error_lower_config()
+
+  // 1. `(match x { _ => { if stop { return 42 }; 0 } }) + good(false)` inside `try` fails closed
+  let d1 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(x : Int, stop : Bool) -> Int raise E {\n  try { (match x { _ => { if stop { return 42 }; 0 } }) + good(false) } catch { _ => 7 }\n}\n", "r9_1.mbt", cfg, d1)
+  let mut hit1 = false
+  for d in d1 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1 = true } }
+  assert_true(hit1, "R9 match value expr followed by + still fails closed on arm return")
+
+  // 2. `fn f(x : Int) -> Int raise E { (match x { _ => { return 42 } }) + 1 }` wraps `return Ok(42)`
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single("suberror E { E(String) }\nfn f(x : Int) -> Int raise E {\n  (match x { _ => { return 42 } }) + 1\n}\n", "r9_2.mbt", cfg, d2)
+  assert_true(d2.length() == 0, "R9 match value expr followed by + in raising fn lowers cleanly")
+  assert_true(str_has(out2, "return Ok(42)"), "R9 match value expr arm return wrapped as Ok(42)")
+
+  // 3. `(loop 0 { _ => { if stop { return 42 }; break 0 } }) + good(false)` inside `try` fails closed
+  let d3 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  try { (loop 0 { _ => { if stop { return 42 }; break 0 } }) + good(false) } catch { _ => 7 }\n}\n", "r9_3.mbt", cfg, d3)
+  let mut hit3 = false
+  for d in d3 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3 = true } }
+  assert_true(hit3, "R9 loop value expr followed by + still fails closed on arm return")
+
+  // 4. `(loop 0 { 0 => break 1; n => continue n - 1 }) + good(false)` inside `try` passes cleanly (0 diag)
+  let d4 : Array[Diag] = []
+  let out4 = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn f() -> Int {\n  try { (loop 0 { 0 => break 1; n => continue n - 1 }) + good(false) } catch { _ => 7 }\n}\n", "r9_4.mbt", cfg, d4)
+  assert_true(d4.length() == 0, "R9 loop value expr followed by + allows local break/continue")
+  assert_true(str_has(out4, "break 1") && str_has(out4, "continue n - 1"), "R9 loop break/continue preserved")
+}
+
+test "F6-1: R10 regressions (LL(1) header/body lbrace grammar across match/loop/while/for)" {
+  let cfg = default_error_lower_config()
+
+  // 1. `match 0 + ({} : Map[Int, Int])\n  .get(1).unwrap_or(3) { _ => { if stop { return 42 } } }` fails closed
+  let d1 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try {\n    match 0 + ({} : Map[Int, Int])\n      .get(1).unwrap_or(3) {\n      _ => { if stop { return 42 } }\n    }\n    good(false)\n  } catch { _ => 7 }\n  v + 1\n}\n", "r10_1.mbt", cfg, d1)
+  let mut hit1 = false
+  for d in d1 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1 = true } }
+  assert_true(hit1, "R10 match with multiline method chain after brace scrutinee fails closed")
+
+  // 1b. Same with bare empty `{}` (`match 0 + {}\n  .get(1).unwrap_or(3)`)
+  let d1b : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try {\n    match 0 + {}\n      .get(1).unwrap_or(3) {\n      _ => { if stop { return 42 } }\n    }\n    good(false)\n  } catch { _ => 7 }\n  v + 1\n}\n", "r10_1b.mbt", cfg, d1b)
+  let mut hit1b = false
+  for d in d1b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1b = true } }
+  assert_true(hit1b, "R10 match with bare {} + multiline .get() scrutinee fails closed")
+
+  // 2. `match 0 + { let g : (Int)->Int = n => { n + 1 }; [g(0)] }[0] { _ => { if stop { return 42 } } }` fails closed
+  let d2 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try {\n    match 0 + { let g : (Int) -> Int = n => { n + 1 }; [g(0)] }[0] {\n      _ => { if stop { return 42 } }\n    }\n    good(false)\n  } catch { _ => 7 }\n  v + 1\n}\n", "r10_2.mbt", cfg, d2)
+  let mut hit2 = false
+  for d in d2 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit2 = true } }
+  assert_true(hit2, "R10 match with block+arrow+index scrutinee fails closed on arm return")
+
+  // 3. `choose(loop 0 { _ => { if stop { return 42 }; break 1 } }, good(false))` fails closed
+  let d3 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn choose(a : Int, b : Int) -> Int { a + b }\nfn outer(stop : Bool) -> Int raise E {\n  let v = try { choose(loop 0 { _ => { if stop { return 42 }; break 1 } }, good(false)) } catch { _ => 7 }\n  v + 1\n}\n", "r10_3.mbt", cfg, d3)
+  let mut hit3 = false
+  for d in d3 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3 = true } }
+  assert_true(hit3, "R10 loop inside call arg before comma fails closed on arm return")
+
+  // 4. `while i < { [2] }[0] { i = i + 1; break }` inside `try` passes cleanly (0 diag)
+  let d4 : Array[Diag] = []
+  let out4 = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    while i < { [2] }[0] { i = i + 1; break }\n    i + good(false)\n  } catch { _ => 7 }\n}\n", "r10_4.mbt", cfg, d4)
+  assert_true(d4.length() == 0, "R10 while with indexed block condition inside try allows body break")
+  assert_true(str_has(out4, "break"), "R10 while indexed block body break preserved")
+
+  // 5. `for x = 0; x < 2 { i = i + x + 1; break }; good(false) + i` inside `try` passes cleanly (0 diag)
+  let d5 : Array[Diag] = []
+  let out5 = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    for x = 0; x < 2 { i = i + x + 1; break }; good(false) + i\n  } catch { _ => 7 }\n}\n", "r10_5.mbt", cfg, d5)
+  assert_true(d5.length() == 0, "R10 2-clause C-style for followed by semicolon inside try allows body break")
+  assert_true(str_has(out5, "break"), "R10 2-clause C-style for body break preserved")
+}
+
+test "F6-1: R11 regressions (prefix bang before block and ident-lexed noraise in header/try scan)" {
+  let cfg = default_error_lower_config()
+
+  // 1. `match !{false} { _ => { if stop { return Ok(42) } } }` inside `try` fails closed
+  let d1 : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Result[Int, E] {\n  let v = try {\n    match !{false} {\n      _ => { if stop { return Ok(42) } }\n    }\n    good(false)\n  } catch { _ => 7 }\n  Ok(v + 1)\n}\n", "r11_1.mbt", cfg, d1)
+  let mut hit1 = false
+  for d in d1 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit1 = true } }
+  assert_true(hit1, "R11 match with prefix !{false} scrutinee fails closed on arm return")
+
+  // 2. `while !{i >= 2} { i = i + 1; break }` inside `try` passes cleanly (0 diag)
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 3 }\nfn f() -> Int {\n  try {\n    let mut i = 0\n    while !{i >= 2} { i = i + 1; break }\n    i + good(false)\n  } catch { _ => 7 }\n}\n", "r11_2.mbt", cfg, d2)
+  assert_true(d2.length() == 0, "R11 while with prefix !{i >= 2} condition inside try allows body break")
+  assert_true(str_has(out2, "break"), "R11 while !{...} body break preserved")
+
+  // 3a. `noraise { _ => { if stop { return Ok(42) }; 0 } }` inside `try` fails closed (`noraise` lexes as Ident)
+  let d3a : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Result[Int, E] {\n  let v = try {\n    let _ = try { good(false) } catch { _ => 0 } noraise { _ => { if stop { return Ok(42) }; 0 } }\n    good(false)\n  } catch { _ => 7 }\n  Ok(v + 1)\n}\n", "r11_3a.mbt", cfg, d3a)
+  let mut hit3a = false
+  for d in d3a { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3a = true } }
+  assert_true(hit3a, "R11 noraise arm return inside outer try fails closed")
+
+  // 3b. `match (try { good(false) } catch { _ => 0 } noraise { v => v }) { _ => { if stop { return Ok(42) } } }` fails closed
+  let d3b : Array[Diag] = []
+  let _ = lower_checked_errors_single("suberror E { E(String) }\nfn good(b : Bool) -> Int raise E { if b { raise E(\"b\") }; 1 }\nfn outer(stop : Bool) -> Result[Int, E] {\n  let v = try {\n    match (try { good(false) } catch { _ => 0 } noraise { v => v }) {\n      _ => { if stop { return Ok(42) } }\n    }\n    good(false)\n  } catch { _ => 7 }\n  Ok(v + 1)\n}\n", "r11_3b.mbt", cfg, d3b)
+  let mut hit3b = false
+  for d in d3b { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit3b = true } }
+  assert_true(hit3b, "R11 match with parenthesized try-catch-noraise scrutinee fails closed on arm return")
+}

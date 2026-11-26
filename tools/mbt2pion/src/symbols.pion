@@ -749,6 +749,8 @@ pub struct SymbolTable {
   fn_param_renames : Map[String, Map[String, String]]
   method_unique_param_renames : Map[String, Map[String, String]]
   val_types : Map[String, String]
+  canon_val_types : Map[String, String]
+  canon_val_types_ambig : Map[String, Bool]
   enum_type_params : Map[String, Array[String]]
   fn_type_params : Map[String, Array[String]]
   fn_labeled_params : Map[String, Map[String, Bool]]
@@ -817,6 +819,8 @@ pub fn empty_symbol_table() -> SymbolTable {
     fn_param_renames: Map(),
     method_unique_param_renames: Map(),
     val_types: Map(),
+    canon_val_types: Map(),
+    canon_val_types_ambig: Map(),
     enum_type_params: Map(),
     fn_type_params: Map(),
     fn_labeled_params: Map(),
@@ -1037,6 +1041,69 @@ pub fn symtab_load_dep_abi(st : SymbolTable, dep_name : String, abi : PackageAbi
       }
     }
   }
+  if abi.values.length() > 0 {
+    let dep_local_types : Map[String, Bool] = Map()
+    for en in abi.enums { dep_local_types[en.name] = true }
+    match abi.structs {
+      Some(sts) => {
+        for s0 in sts { dep_local_types[s0.name] = true }
+      }
+      None => ()
+    }
+    let empty_g : Map[String, Bool] = Map()
+    for v in abi.values {
+      let mut dep_vty = qualify_abi_local_type_names(v.ty, dep_name, dep_local_types, empty_g)
+      if canon_pkg.length() > 0 && canon_pkg != dep_name {
+        dep_vty = remap_abi_pkg_prefix(dep_vty, canon_pkg, dep_name)
+      }
+      st.val_types[dep_name + "::" + v.name] = dep_vty
+      if !skip_canon_reg && canon_pkg.length() > 0 {
+        let ckey = canon_pkg + "::" + v.name
+        let canon_vty = qualify_abi_local_type_names(v.ty, canon_pkg, dep_local_types, empty_g)
+        if !st.canon_val_types_ambig.contains(ckey) {
+          match st.canon_val_types.get(ckey) {
+            Some(prev) =>
+            if prev != canon_vty {
+              st.canon_val_types_ambig[ckey] = true
+              st.canon_val_types.remove(ckey)
+            }
+            None => st.canon_val_types[ckey] = canon_vty
+          }
+        }
+      }
+    }
+  }
+}
+
+fn remap_abi_pkg_prefix(ty : String, from_pkg : String, to_pkg : String) -> String {
+  if from_pkg.length() == 0 || from_pkg == to_pkg || !str_has(ty, from_pkg + "::") {
+    return ty
+  }
+  let sb = StringBuilder()
+  let n = ty.length()
+  let flen = from_pkg.length()
+  let mut i = 0
+  while i < n {
+    let c = ty.code_unit_at(i)
+    if is_alnum(c) {
+      let s = i
+      while i < n && is_alnum(ty.code_unit_at(i)) {
+        i = i + 1
+      }
+      let word = ty.slice(s, i)
+      let qualified_before = s >= 2 && ty.code_unit_at(s - 1) == 58 && ty.code_unit_at(s - 2) == 58
+      let path_after = i + 1 < n && ty.code_unit_at(i) == 58 && ty.code_unit_at(i + 1) == 58
+      if !qualified_before && path_after && word.length() == flen && word == from_pkg {
+        sb.write_string(to_pkg)
+      } else {
+        sb.write_string(word)
+      }
+    } else {
+      sb.write_string(ty.slice(i, i + 1))
+      i = i + 1
+    }
+  }
+  sb.to_string()
 }
 
 ///| Result of querying a foreign struct for external struct-update expansion (`{ ..base, ... }`).
@@ -1162,6 +1229,7 @@ pub fn symtab_resolve_canonical_value(
 ///| aliases re-exported enum/struct/val-rename metadata strictly from canonical origin schemas
 ///| and reports any cyclic or ambiguous re-export chains fail-closed.
 pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> Unit {
+  let reexport_type_by_pkg : Map[String, String] = Map()
   for rkey in sorted_map_keys(st.dep_reexports_type) {
     let cc = rkey.index_of("::")
     if cc <= 0 { continue }
@@ -1174,6 +1242,7 @@ pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> U
       }
       Ok((orig_pkg, orig_name, _)) => {
         let orig_key = orig_pkg + "::" + orig_name
+        reexport_type_by_pkg[pkg + "|" + orig_key] = rkey
         if !st.canon_enum_ambig.contains(orig_key) {
           match st.canon_enum_schemas.get(orig_key) {
             Some(en_schema) => st.enum_schemas[rkey] = en_schema
@@ -1209,7 +1278,31 @@ pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> U
         st.dep_reexport_cycles["value:" + rkey] = msg
         diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", "<dep-abi>", 1, 1, msg))
       }
-      Ok(_) => ()
+      Ok((orig_pkg, orig_name)) => {
+        let orig_key = orig_pkg + "::" + orig_name
+        if !st.val_types.contains(rkey) && !st.canon_val_types_ambig.contains(orig_key) {
+          let vt_opt = match st.canon_val_types.get(orig_key) {
+            Some(vt) => Some(vt)
+            None => st.val_types.get(orig_key)
+          }
+          match vt_opt {
+            Some(vt) => {
+              let vbase = strip_type_args_sym(vt)
+              let mapped_vt = match reexport_type_by_pkg.get(pkg + "|" + vbase) {
+                Some(re_ty) =>
+                if vbase.length() < vt.length() {
+                  re_ty + vt.slice(vbase.length(), vt.length())
+                } else {
+                  re_ty
+                }
+                None => vt
+              }
+              st.val_types[rkey] = mapped_vt
+            }
+            None => ()
+          }
+        }
+      }
     }
   }
 }

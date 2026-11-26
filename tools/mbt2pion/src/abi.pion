@@ -284,6 +284,25 @@ fn sort_abi_structs(xs : Array[AbiStructSchema]) -> Array[AbiStructSchema] {
   out
 }
 
+fn sort_abi_values(xs : Array[AbiValueSchema]) -> Array[AbiValueSchema] {
+  let out : Array[AbiValueSchema] = []
+  for x in xs {
+    out.push(x)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].name, key.name) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
 ///| True iff `s` is complete, externally constructible & updatable, and has zero `priv` fields.
 pub fn abi_struct_is_externally_expandable(s : AbiStructSchema) -> Bool {
   if !s.complete || !s.can_construct || !s.can_update {
@@ -618,6 +637,102 @@ pub fn collect_exported_abi_structs(
   sort_abi_structs(out)
 }
 
+///| Extract exported top-level `pub let name : Ty = ...` and `pub const name : Ty = ...`
+///| value schemas with explicit type annotations from non-test MoonBit sources.
+///| Values without explicit type annotations are skipped (never guessed).
+pub fn collect_exported_abi_values(
+  sources : Array[SourceFile],
+  self_pkg : String,
+  symtab : SymbolTable,
+  recipes : Recipes,
+  target : String,
+) -> Array[AbiValueSchema] {
+  let out : Array[AbiValueSchema] = []
+  let seen_values : Map[String, Bool] = Map()
+  let nominal_local_types : Map[String, Bool] = Map()
+  for lt in symtab.local_types.keys() {
+    if !symtab.type_aliases.contains(lt) {
+      nominal_local_types[lt] = true
+    }
+  }
+  let empty_tparams : Map[String, Bool] = Map()
+  for sf in sources {
+    if sf.is_test {
+      continue
+    }
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    let mut next_cfg_excluded = false
+    while i < n {
+      let t = tokens[i]
+      if t.kind == TokenKind::LBrace {
+        depth = depth + 1
+        i = i + 1
+        continue
+      }
+      if t.kind == TokenKind::RBrace {
+        if depth > 0 { depth = depth - 1 }
+        i = i + 1
+        continue
+      }
+      if depth == 0 && t.kind == TokenKind::Attr {
+        if t.raw.starts_with("#cfg") {
+          match eval_cfg_attr(t.raw, target) {
+            Some(true) => ()
+            _ => next_cfg_excluded = true
+          }
+        }
+        i = i + 1
+        continue
+      }
+      if depth == 0 && next_cfg_excluded {
+        next_cfg_excluded = false
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+      if depth == 0 && t.kind == TokenKind::Keyword && (t.raw == "let" || t.raw == "const") && is_decl_pub(tokens, i) {
+        let mut name_i = i + 1
+        if name_i < n && tokens[name_i].kind == TokenKind::Keyword && tokens[name_i].raw == "mut" {
+          name_i = name_i + 1
+        }
+        if name_i + 2 < n && (tokens[name_i].kind == TokenKind::Ident || tokens[name_i].kind == TokenKind::UpperIdent) &&
+        tokens[name_i + 1].kind == TokenKind::Colon {
+          let vname = tokens[name_i].raw
+          let colon_i = name_i + 1
+          let mut eq_i = colon_i + 1
+          let mut td = 0
+          while eq_i < n {
+            let ek = tokens[eq_i].kind
+            if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace {
+              td = td + 1
+            } else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace {
+              if td > 0 { td = td - 1 } else { break }
+            } else if td == 0 && (ek == TokenKind::Eq || ek == TokenKind::Semi) {
+              break
+            }
+            eq_i = eq_i + 1
+          }
+          if eq_i < n && tokens[eq_i].kind == TokenKind::Eq && eq_i > colon_i + 1 && !seen_values.contains(vname) {
+            let q_toks = qualify_source_type_tokens(tokens, colon_i + 1, eq_i, self_pkg, nominal_local_types, empty_tparams)
+            let lowered = lower_type_tokens(q_toks, 0, q_toks.length() - 1, symtab, recipes).trim()
+            let vty = qualify_abi_local_type_names(lowered, self_pkg, nominal_local_types, empty_tparams)
+            if vty.length() > 0 {
+              seen_values[vname] = true
+              out.push(AbiValueSchema::{ name: vname, ty: vty })
+            }
+          }
+          i = eq_i + 1
+          continue
+        }
+      }
+      i = i + 1
+    }
+  }
+  sort_abi_values(out)
+}
+
 ///| Exact compiler-aligned library source check (`compiler/src/cli/main.pion:188`):
 ///| ONLY literal suffix `_test.pion` is excluded from library compilation; `*_wbtest.pion` IS included!
 pub fn is_abi_library_pion(rel_path : String) -> Bool {
@@ -877,6 +992,7 @@ fn abi_payload_to_json_opts(
   schema_ver : Int,
   include_publishable : Bool,
   include_reexports : Bool,
+  include_values : Bool,
 ) -> json::JsonValue {
   let sorted_enums = sort_abi_enums(abi.enums)
   let enum_arr : Array[json::JsonValue] = []
@@ -980,6 +1096,16 @@ fn abi_payload_to_json_opts(
     }
     fields.push(json_field("reexports", json_arr(re_arr)))
   }
+  if schema_ver >= 2 && (include_values || abi.values.length() > 0) {
+    let val_arr : Array[json::JsonValue] = []
+    for v in sort_abi_values(abi.values) {
+      val_arr.push(json_obj([
+        json_field("name", json_str(v.name)),
+        json_field("ty", json_str(v.ty)),
+      ]))
+    }
+    fields.push(json_field("values", json_arr(val_arr)))
+  }
   if schema_ver >= 2 && include_publishable {
     fields.push(json_field("publishable", json_bool(abi.publishable)))
   }
@@ -987,7 +1113,7 @@ fn abi_payload_to_json_opts(
 }
 
 fn abi_payload_to_json_versioned(abi : PackageAbi, schema_ver : Int) -> json::JsonValue {
-  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0)
+  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0, abi.values.length() > 0)
 }
 
 fn abi_payload_to_json(abi : PackageAbi) -> json::JsonValue {
@@ -1716,6 +1842,35 @@ pub fn verify_and_parse_dep_abi(
     }
   }
 
+  let values : Array[AbiValueSchema] = []
+  let seen_values : Map[String, Bool] = Map()
+  let mut has_values_field = false
+  if sv >= 2 {
+    match json::obj_get(payload_v, "values") {
+      Some(vv) => {
+        has_values_field = true
+        let vitems = match json::as_arr(vv) {
+          Some(a) => a
+          None => {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `values` field in dep `" + dep_name + "`"))
+            return None
+          }
+        }
+        for vit in vitems {
+          let vn = j_str(vit, "name", "")
+          let vt = j_str(vit, "ty", "")
+          if vn.length() == 0 || vt.length() == 0 || seen_values.contains(vn) {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `values` entry `" + vn + "` in dep `" + dep_name + "`"))
+            return None
+          }
+          seen_values[vn] = true
+          values.push(AbiValueSchema::{ name: vn, ty: vt })
+        }
+      }
+      None => ()
+    }
+  }
+
   let has_pub_field = match json::obj_get(payload_v, "publishable") {
     Some(_) => true
     None => false
@@ -1730,10 +1885,11 @@ pub fn verify_and_parse_dep_abi(
     companion_files: companion_files,
     op_impls: op_impls,
     reexports: reexports,
+    values: values,
     publishable: is_publishable,
   }
   // Direction 1: canonical payload SHA-256 MUST equal `abi_sha256`!
-  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field)))
+  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field, has_values_field)))
   if actual_abi_sha != decl_abi_sha {
     diags.push(diag_error(
       "MBT2PION_DEP_ABI_ERROR",
@@ -2097,6 +2253,15 @@ fn build_dep_pub_index_v2(
         }
       }
       None => ()
+    }
+    if abi.values.length() > 0 {
+      let vmap = match pub_values.get(dep_pkg) {
+        Some(m) => m
+        None => { let m : Map[String, Bool] = Map(); pub_values[dep_pkg] = m; m }
+      }
+      for v in abi.values {
+        vmap[v.name] = true
+      }
     }
     if abi.reexports.length() > 0 {
       let rtmap : Map[String, AbiReexport] = Map()
