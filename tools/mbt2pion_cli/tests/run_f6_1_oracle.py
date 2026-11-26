@@ -569,6 +569,76 @@ fn pick_r19_struct_f2(x? : R19S = R19S::{ a: 1, g: 2 }, g~ : Int) -> Int {
   x.a + x.g + g
 }
 
+fn pick_r20_rec_not() -> Int {
+  fn not(n : Int) -> Int {
+    if n == 0 { 1 } else { not(n - 1) }
+  }
+  not(1)
+}
+
+fn pick_r20_rec_or() -> Int {
+  fn or(n : Int) -> Int {
+    if n == 0 { 1 } else { or(n - 1) }
+  }
+  or(1)
+}
+
+fn pick_r20_val_cap_val_(val : (Int) -> Int) -> Int {
+  fn val_(n : Int) -> Int {
+    if n == 0 { 5 } else if n == 1 { val(0) } else { val_(n - 1) }
+  }
+  val_(2)
+}
+
+fn pick_r20_val__cap_val(val_ : (Int) -> Int) -> Int {
+  fn val(n : Int) -> Int {
+    if n == 0 { 5 } else if n == 1 { val_(0) } else { val(n - 1) }
+  }
+  val(2)
+}
+
+fn pick_r20_self_tramp_clash() -> Int {
+  fn val(val_ : Int) -> Int {
+    if val_ == 0 { 1 } else { (val : (Int) -> Int)(val_ - 1) }
+  }
+  val(2)
+}
+
+fn pick_r20_arm_eq_nl() -> Int {
+  fn walk(n : Int) -> Int {
+    match n > 0 {
+      true => if { 1 } ==
+        walk(n - 1) { 1 } else { 0 }
+      false => 1
+    }
+  }
+  walk(2)
+}
+
+fn pick_r20_same_line_semi() -> Int {
+  let mut x = 0; fn walk(n : Int) -> Int { if n == 0 { 1 } else { walk(n - 1) } }; x = walk(1); x
+}
+
+fn pick_r20_shadow_lifted() -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 {
+      1
+    } else {
+      let inner = {
+        let walk = fn(_x : Int) { 9 }
+        walk(0)
+      }
+      inner + walk(n - 1)
+    }
+  }
+  let a = walk(1)
+  let b = {
+    let walk = fn(_x : Int) { 20 }
+    walk(0)
+  }
+  a + b + walk(0)
+}
+
 fn pick_r19_ascribe_rec() -> Int {
   let r17_g = true
   fn walk(n : Int) -> Int {
@@ -925,7 +995,16 @@ fn case_r5_paren_and_guard() -> String {
   let p67 = pick_r19_not_named(g=false)
   let p68 = pick_r19_struct_f1(g=5)
   let p69 = pick_r19_struct_f2(g=5)
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string()
+  // R20: local rec not/or, val/val_ capture & self-trampoline collision, newline after ==, same-line `;`, lifted shadowing
+  let p70 = pick_r20_rec_not()
+  let p71 = pick_r20_rec_or()
+  let p72 = pick_r20_val_cap_val_(fn(_x) { 42 })
+  let p73 = pick_r20_val__cap_val(fn(_x) { 42 })
+  let p74 = pick_r20_self_tramp_clash()
+  let p75 = pick_r20_arm_eq_nl()
+  let p76 = pick_r20_same_line_semi()
+  let p77 = pick_r20_shadow_lifted()
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -1148,7 +1227,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
