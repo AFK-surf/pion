@@ -876,6 +876,126 @@ pub fn f(nm : NestMix, ys : Array[String]) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_str"),
+    "for_in_generic_param_alias": (r'''
+pub fn[T] f(xs : Array[Int], ys : Array[T], a : T, b : T) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      ys.push(a)
+      ys[1] = b
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_generic_struct_field_alias": (r'''
+priv struct GenBox[T] { xs : Array[Int]; ys : Array[T] }
+fn mk_gb[T](xs : Array[Int], ys : Array[T]) -> GenBox[T] { { xs, ys } }
+pub fn[T] f(v : GenBox[T], a : T, b : T) -> Int {
+  let _ = mk_gb
+  let mut s = 0
+  for x in v.xs {
+    if x == 1 {
+      v.ys.push(a)
+      v.ys[1] = b
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_param_shadows_fresh_fn": (r'''
+fn hp(xs : Array[Int]) -> Array[Int] { let _ = xs; [9] }
+pub fn f(xs : Array[Int], hp : (Array[Int]) -> Array[Int]) -> Int {
+  let mut s = 0
+  for x in hp(xs) {
+    if x == 1 {
+      xs.push(4)
+      xs[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_local_closure_shadows_fresh_fn": (r'''
+fn produce(xs : Array[Int]) -> Array[Int] { let _ = xs; [9] }
+pub fn f(xs : Array[Int]) -> Int {
+  let produce = fn(a : Array[Int]) -> Array[Int] { a }
+  let mut s = 0
+  for x in produce(xs) {
+    if x == 1 {
+      xs.push(4)
+      xs[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_deep_if_else_return_truncation": (r'''
+fn deep_ret(b : Bool, xs : Array[Int]) -> Array[Int] {
+  if b { [9] } else { if b { [9] } else { if b { [9] } else { if b { [9] } else { if b { [9] } else { if b { [9] } else { if b { [9] } else { if b { [9] } else { xs } } } } } } } }
+}
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in deep_ret(false, xs) {
+    if x == 1 {
+      xs.push(4)
+      xs[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_priv_nested_inner_alias_write": (r'''
+priv struct NestBox { grid : Array[Array[Int]]; other : Array[Int] }
+fn mk_nb(xs : Array[Int]) -> NestBox { { grid: [xs], other: xs } }
+pub fn f(v : NestBox) -> Int {
+  let _ = mk_nb
+  let mut s = 0
+  for x in v.other {
+    if x == 1 {
+      v.grid[0].push(4)
+      v.grid[0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_priv_nested_iter_sibling_write": (r'''
+priv struct NestBox { grid : Array[Array[Int]]; other : Array[Int] }
+fn mk_nb(xs : Array[Int]) -> NestBox { { grid: [xs], other: xs } }
+pub fn f(v : NestBox) -> Int {
+  let _ = mk_nb
+  let mut s = 0
+  for x in v.grid[0] {
+    if x == 1 {
+      v.other.push(4)
+      v.other[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_pub_nested_inner_alias_write": (r'''
+pub(all) struct NestPub { grid : Array[Array[Int]]; other : Array[Int] }
+pub fn f(v : NestPub) -> Int {
+  let mut s = 0
+  for x in v.other {
+    if x == 1 {
+      v.grid[0].push(4)
+      v.grid[0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
 }
 
 
@@ -968,10 +1088,49 @@ def main():
             )
             assert not os.listdir(out), f"{name}: blocked publish must not write --out"
 
+        # 3b. Cross-package negative: unrelated local `struct Local { items : Array[String] }` must NOT
+        #     pollute foreign `@dep.Holder { items : Array[Int] }` field type or distinctness!
+        dep_src = os.path.join(work, "dep_shadow_src")
+        dep_pkg = os.path.join(work, "dep_shadow_pkg")
+        write(os.path.join(dep_src, "moon.pkg"), "\n")
+        write(os.path.join(dep_src, "dep.mbt"), "pub(all) struct Holder { items : Array[Int] }\n")
+        write(os.path.join(dep_pkg, "pion.toml"),
+              f'[package]\nname = "dep"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        os.makedirs(os.path.join(dep_pkg, "src"))
+        run_cmd([bin_path, "--src", dep_src, "--out", os.path.join(dep_pkg, "src"), "--target", "native",
+                 "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        cons_src = os.path.join(work, "cons_shadow_src")
+        cons_out = os.path.join(work, "cons_shadow_pkg", "src")
+        write(os.path.join(cons_src, "moon.pkg"), 'import { "f41/oracle/dep" }\n')
+        write(os.path.join(cons_src, "cons.mbt"), r'''
+priv struct Local { items : Array[String] }
+fn mk_local() -> Local { { items: [] } }
+pub fn f(v : @dep.Holder, xs : Array[Int]) -> Int {
+  let _ = mk_local
+  let mut s = 0
+  for x in v.items {
+    if x == 1 {
+      xs.push(4)
+      xs[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''')
+        os.makedirs(cons_out)
+        rc_dep, log_dep = run_rc([bin_path, "--src", cons_src, "--out", cons_out, "--target", "native",
+                                  "--mode", "publish", "--dep", f"dep={dep_pkg}",
+                                  "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        assert rc_dep != 0 and "MBT2PION_ARRAY_ITER_MUTATION" in log_dep and "appended to and written" in log_dep, (
+            f"dep_local_field_shadow must block publish with MBT2PION_ARRAY_ITER_MUTATION:\n{log_dep}"
+        )
+        assert not os.listdir(cons_out), "dep_local_field_shadow: blocked publish must not write --out"
+
         print("[f4-1-oracle] PASS: 4-target parity (Moon native == Moon wasm-gc == Pion native == Pion wasm32)!")
         print(moon_pos_native)
         print(f"[f4-1-oracle] PASS: Moon dual-backend counterexamples verified ({expected_ref.replace(chr(10), ' ; ')})")
-        print(f"[f4-1-oracle] PASS: All {len(NEGATIVES)} fail-closed negatives blocked with exact diagnostics!")
+        print(f"[f4-1-oracle] PASS: All {len(NEGATIVES) + 1} fail-closed negatives (incl. cross-package dep field shadow) blocked with exact diagnostics!")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
