@@ -337,7 +337,7 @@ set +e
 SYM_CHK="$("$PIONC" lint --json "$SYM_PKG")"
 "$PIONC" lint --fix --json "$SYM_PKG" >/dev/null
 set -e
-# R2 P2-1: public JSON must strip edits for non-committable symlink targets.
+# Public JSON must strip edits for non-committable symlink targets.
 if printf '%s' "$SYM_CHK" | grep -q '"edits"'; then
   echo "FAIL: public lint --json exposed edits for symlink targets: $SYM_CHK" >&2
   exit 1
@@ -459,7 +459,7 @@ set -e
 [ "$ISO_RC" -ne 0 ] || { echo "FAIL: expected L_UNREACHABLE_CODE in iso_pkg: $ISO_OUT" >&2; exit 1; }
 printf '%s' "$ISO_OUT" | grep -q '"code":"L_UNREACHABLE_CODE"' || { echo "FAIL: test fn panic masked prod L_UNREACHABLE_CODE: $ISO_OUT" >&2; exit 1; }
 
-# 11. P2-6, R2 P2-2, R3 P1-2, R3 P1-4, R3 P2-1, R3 P2-2:
+# 11. CLI guards, commit-lock failure, nested sub-packages, and E_* edit filtering:
 #     CLI edge guards, lock failure fail-closed, nested sub-package isolation,
 #     E_* symlink edit stripping, and all 4 `--fix --json` argument error schemas.
 EMPTY_DIR="$TMP_DIR/empty_dir"
@@ -492,7 +492,7 @@ for ERR_PAIR in "$ARG_RC1|$ARG_ERR1" "$ARG_RC2|$ARG_ERR2" "$ARG_RC3|$ARG_ERR3" "
   printf '%s' "$EJSON" | grep -q '"diagnostics":\[\]' || { echo "FAIL: --fix --json error missing diagnostics:[]: $EJSON" >&2; exit 1; }
 done
 
-# R3 P1-2: Unwritable/file PION_CACHE_DIR must fail closed before writing any source file.
+# Unwritable/file PION_CACHE_DIR must fail closed before writing any source file.
 LOCK_FILE_BLOCKER="$TMP_DIR/not_a_dir"
 printf 'blocker\n' > "$LOCK_FILE_BLOCKER"
 LOCK_SRC="$TMP_DIR/lock_src.pion"
@@ -512,7 +512,7 @@ printf '%s' "$LOCK_OUT" | grep -q '"fixed":0' || { echo "FAIL: lock failure must
 LOCK_HASH_AFTER="$(file_sha256 "$LOCK_SRC")"
 [ "$LOCK_HASH_BEFORE" = "$LOCK_HASH_AFTER" ] || { echo "FAIL: lock failure still modified source file!" >&2; exit 1; }
 
-# R3 P1-4: Nested sub-package (`outer/src/pion.toml`) must NOT be owned/linted by `outer`.
+# Nested sub-package (`outer/src/pion.toml`) must NOT be owned/linted by `outer`.
 OUTER_PKG="$TMP_DIR/outer_pkg"
 mkdir -p "$OUTER_PKG/src"
 cat > "$OUTER_PKG/pion.toml" <<'EOF'
@@ -539,7 +539,7 @@ EOF
 OUTER_OUT="$("$PIONC" lint --json "$OUTER_PKG")"
 [ "$OUTER_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: nested src/pion.toml leaked into outer lint: $OUTER_OUT" >&2; exit 1; }
 
-# R3 P2-1: E_* diagnostics on symlink targets must also strip non-committable edits.
+# E_* diagnostics on symlink targets must also strip non-committable edits.
 SYM_E_REAL="$TMP_DIR/sym_e_real.pion"
 cat > "$SYM_E_REAL" <<'EOF'
 pub fn bad() -> Int {
@@ -561,7 +561,7 @@ if printf '%s' "$SYM_E_OUT" | grep -q '"edits"'; then
   exit 1
 fi
 
-# R4 P1-1 (Opus A): main calling a function defined in an out-of-package symlink must
+# Symlink caller regression: main calling a function defined in an out-of-package symlink must
 # type-check identically to `pionc check` (0 spurious E_*) while not linting the symlink.
 SYM_CALL_OUTSIDE="$TMP_DIR/sym_call_outside.pion"
 cat > "$SYM_CALL_OUTSIDE" <<'EOF'
@@ -585,9 +585,9 @@ pub fn main() -> Int {
 EOF
 "$PIONC" check "$SYM_CALL_PKG" >/dev/null
 SYM_CALL_OUT="$("$PIONC" lint --json "$SYM_CALL_PKG")"
-[ "$SYM_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: Opus A symlink caller regression: $SYM_CALL_OUT" >&2; exit 1; }
+[ "$SYM_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: symlink caller regression: $SYM_CALL_OUT" >&2; exit 1; }
 
-# R4 P1-1 (Opus B): outer/lib.pion calling nested `src/nested.pion` (when `src/pion.toml`
+# Nested sub-package caller regression: outer/lib.pion calling nested `src/nested.pion` (when `src/pion.toml`
 # exists) must type-check identically to `pionc check` (0 spurious E_*) without linting nested.
 OUTER_CALL_PKG="$TMP_DIR/outer_call_pkg"
 mkdir -p "$OUTER_CALL_PKG/src"
@@ -614,9 +614,9 @@ pub fn nested_dirty() -> Int {
 EOF
 "$PIONC" check "$OUTER_CALL_PKG" >/dev/null
 OUTER_CALL_OUT="$("$PIONC" lint --json "$OUTER_CALL_PKG")"
-[ "$OUTER_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: Opus B nested caller regression: $OUTER_CALL_OUT" >&2; exit 1; }
+[ "$OUTER_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: nested caller regression: $OUTER_CALL_OUT" >&2; exit 1; }
 
-# R4 P2-1 (Astra): normal writable package file with E_TYPE_MISMATCH must retain machine edits.
+# Normal writable package file with E_TYPE_MISMATCH must retain machine edits.
 OWN_E_PKG="$TMP_DIR/own_e_pkg"
 mkdir -p "$OWN_E_PKG/src"
 cat > "$OWN_E_PKG/pion.toml" <<'EOF'
@@ -639,7 +639,7 @@ set -e
 printf '%s' "$OWN_E_OUT" | grep -q '"code":"E_TYPE_MISMATCH"' || { echo "FAIL: missing E_TYPE_MISMATCH on own_e_pkg: $OWN_E_OUT" >&2; exit 1; }
 printf '%s' "$OWN_E_OUT" | grep -q '"edits":\[{' || { echo "FAIL: writable package file lost E_* machine edits: $OWN_E_OUT" >&2; exit 1; }
 
-# R4 P1-2 (Astra): All 3 cross-target `[targets]` counterexamples must still pass
+# Cross-target `[targets]` safety: all 3 counterexamples must still pass
 # `pionc check --target wasm32` after host `pionc lint --fix`.
 # Case 1: host-only file (no inactive target file) + shared caller with local `Box::num()`
 #         where wasm dep has conflicting signature.
@@ -790,7 +790,7 @@ printf '%s' "$CT3_OUT" | grep -q '"ok":true' || { echo "FAIL: CT3 cross-target m
 "$PIONC" check "$CT3_DIR/app" >/dev/null
 "$PIONC" check --target wasm32 "$CT3_DIR/app" >/dev/null
 
-# R4 P1-3 (Astra): `pionc lint` and `pionc lint --fix` must NEVER create or modify `pion.lock`.
+# Lockfile read-only guarantee: `pionc lint` and `pionc lint --fix` must NEVER create or modify `pion.lock`.
 GIT_DEP="$TMP_DIR/git_dep_repo"
 mkdir -p "$GIT_DEP/src"
 cat > "$GIT_DEP/pion.toml" <<'EOF'
@@ -841,7 +841,7 @@ if [ -e "$GIT_APP/pion.lock" ]; then
   exit 1
 fi
 
-# R5 P1 (Astra): Nested manifest ownership transition + deterministic lock-synchronized
+# Nested manifest ownership transition + deterministic lock-synchronized
 # concurrent ownership change during `pionc lint --fix`.
 # (a) Two-state ownership comparison: without `outer/src/pion.toml` -> L_UNUSED_MUT + 1 edit;
 #     with `outer/src/pion.toml` added (zero source or `.pion` list change) -> ok:true, diagnostics:[].
