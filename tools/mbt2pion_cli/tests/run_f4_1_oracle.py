@@ -729,6 +729,78 @@ pub fn f(t : Holder, opt : BadEq?) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_ret_field_direct_clear": (r'''
+struct Box { items : Array[Int] }
+fn get_items(b : Box) -> Array[Int] { b.items }
+pub fn f(b : Box) -> Int {
+  let mut s = 0
+  for x in get_items(b) {
+    b.items.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_ret_field_helper_wipe": (r'''
+struct Box { items : Array[Int] }
+fn get_items(b : Box) -> Array[Int] { b.items }
+fn wipe_items(b : Box) -> Unit { b.items.clear() }
+pub fn f(b : Box) -> Int {
+  let mut s = 0
+  for x in get_items(b) {
+    wipe_items(b)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "wipe_items"),
+    "for_in_nested_field_direct_clear": (r'''
+struct Grid { grid : Array[Array[Int]] }
+pub fn f(g : Grid) -> Int {
+  let mut s = 0
+  for x in g.grid[0] {
+    g.grid[0].clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_nested_field_helper_wipe": (r'''
+struct Grid { grid : Array[Array[Int]] }
+fn wipe_grid(g : Grid) -> Unit { g.grid[0].clear() }
+pub fn f(g : Grid) -> Int {
+  let mut s = 0
+  for x in g.grid[0] {
+    wipe_grid(g)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "wipe_grid"),
+    "for_in_pub_pair_sibling_clear": (r'''
+pub(all) struct Pair { a : Array[Int]; b : Array[Int] }
+fn mk_pair() -> Pair { { a: [], b: [] } }
+pub fn f(p : Pair) -> Int {
+  let mut s = 0
+  for x in p.a {
+    p.b.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_priv_nonfresh_sibling_clear": (r'''
+priv struct Pair2 { a : Array[Int]; b : Array[Int] }
+fn mk_pair2(shared : Array[Int]) -> Pair2 { { a: shared, b: shared } }
+pub fn f(p : Pair2) -> Int {
+  let mut s = 0
+  for x in p.a {
+    p.b.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
 }
 
 
