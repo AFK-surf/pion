@@ -1,5 +1,5 @@
 ///| Universal MoonBit checked-error lowering module (`suberror` / `raise` / `try` /
-///| `catch` / `noraise` / `try?` / `try!`) to native Pion `Result` / `match` / `?`.
+///| `catch` / `catch!` / `noraise` / `try?` / `try!`) to native Pion `Result` / `match` / `?`.
 ///|
 ///| Design invariants:
 ///| - Project-agnostic: zero hardcoded domain identifiers.
@@ -8,19 +8,27 @@
 ///|   `try call(...) catch { ... } [noraise { ... }]`, and
 ///|   `try Ctor(call(...)) catch { ... } [noraise { ... }]`, so `return` / `break` /
 ///|   `continue` inside `catch` arms work natively without closure boundaries.
-///| - Strictly fail-closed (`MBT2PION_UNSUPPORTED_SYNTAX`) on higher-order raising
-///|   function parameters, inline raising closures, unknown external raising calls,
-///|   first-class raising function values, unresolved raising method receivers, and
-///|   control-flow statements crossing a compound `try` closure boundary.
+///| - Compound `try` bodies with nonlocal `return` lower via `MbtTryOutcome[R, E]`;
+///|   `break`/`continue` across a compound `try` boundary fail closed.
+///| - Exact MoonBit `catch` exhaustiveness checking: ordinary incomplete `catch`
+///|   fails closed (`MBT2PION_UNSUPPORTED_SYNTAX`) and never auto-rethrows; explicit
+///|   rethrow (`e => raise e`) and `catch!` rethrow only to an enclosing raising
+///|   boundary with identical concrete error type.
+///| - External raising calls resolve via canonical package identity (`moon_import_paths`,
+///|   `pkg_aliases`) and verified dependency ABI (`raising_fns`).
+///| - Strictly fail-closed (`MBT2PION_UNSUPPORTED_SYNTAX`) on bare `raise`, `raise Error`,
+///|   higher-order `raise` parameters, anonymous/escaped raising closures, unknown
+///|   external raising calls, first-class raising function values, and unresolved
+///|   raising method receivers.
 
 ///| Configuration for checked-error lowering.
 pub struct ErrorLowerConfig {
-  /// Map from `<pkg>::<fn>` (e.g. `"json::parse"`) to its Result-returning Pion helper
+  /// Map from `<stdlib_pkg>::<fn>` (e.g. `"json::parse"`) to its Result-returning Pion helper
   /// (e.g. `"mbt_compat::mbt_json_parse"`).
   known_raising_calls : Map[String, String]
   /// Emit postfix `?` for error propagation when true; expand to explicit `match` when false.
   use_try_op : Bool
-  /// Default error type for bare `raise` without an explicit error type (default `"String"`).
+  /// Unused legacy default error type (bare `raise` outside Category A fails closed).
   default_err_type : String
 }
 
@@ -41,27 +49,164 @@ pub fn default_error_lower_config() -> ErrorLowerConfig {
   }
 }
 
+///| External package & ABI context for canonical cross-package error resolution.
+pub struct ExternalErrorEnv {
+  pkg_aliases : Map[String, String]
+  moon_import_paths : Map[String, String]
+  dep_pkg_names : Map[String, Bool]
+  dep_raising_fns : Map[String, String]
+  dep_error_ctors : Map[String, Array[(String, Int)]]
+  dep_ctor_to_err : Map[String, String]
+  cat_a_rewritten : Map[String, Bool]
+}
+
+pub fn empty_external_error_env() -> ExternalErrorEnv {
+  ExternalErrorEnv::{
+    pkg_aliases: Map(),
+    moon_import_paths: Map(),
+    dep_pkg_names: Map(),
+    dep_raising_fns: Map(),
+    dep_error_ctors: Map(),
+    dep_ctor_to_err: Map(),
+    cat_a_rewritten: Map(),
+  }
+}
+
+fn le_add_dep_ctor(
+  dep_error_ctors : Map[String, Array[(String, Int)]],
+  dep_ctor_to_err : Map[String, String],
+  pkg : String,
+  enum_name : String,
+  ctor_name : String,
+  arity : Int,
+) -> Unit {
+  if pkg.length() == 0 || enum_name.length() == 0 || ctor_name.length() == 0 {
+    return
+  }
+  let ek = pkg + "::" + enum_name
+  let list = match dep_error_ctors.get(ek) {
+    Some(xs) => xs
+    None => {
+      let xs : Array[(String, Int)] = []
+      dep_error_ctors[ek] = xs
+      xs
+    }
+  }
+  for existing in list {
+    if existing.0 == ctor_name {
+      return
+    }
+  }
+  list.push((ctor_name, arity))
+  dep_ctor_to_err[pkg + "::" + ctor_name] = ek
+}
+
+///| Build `ExternalErrorEnv` from the loaded `SymbolTable`, verified `dep_abis`,
+///| and the set of Category A test helper functions already rewritten in pass 1.
+pub fn build_external_error_env(
+  symtab : SymbolTable,
+  dep_abis : Array[(String, PackageAbi)],
+  cat_a_rewritten : Map[String, Bool],
+) -> ExternalErrorEnv {
+  let pkg_aliases : Map[String, String] = Map()
+  for k in symtab.pkg_aliases.keys() {
+    match symtab.pkg_aliases.get(k) {
+      Some(v) => pkg_aliases[k] = v
+      None => ()
+    }
+  }
+  let moon_import_paths : Map[String, String] = Map()
+  for k in symtab.moon_import_paths.keys() {
+    match symtab.moon_import_paths.get(k) {
+      Some(v) => moon_import_paths[k] = v
+      None => ()
+    }
+  }
+  let dep_pkg_names : Map[String, Bool] = Map()
+  for k in symtab.dep_pkg_names.keys() {
+    dep_pkg_names[k] = true
+  }
+  let dep_raising_fns : Map[String, String] = Map()
+  let dep_error_ctors : Map[String, Array[(String, Int)]] = Map()
+  let dep_ctor_to_err : Map[String, String] = Map()
+  for pair in dep_abis {
+    let dep_alias = pair.0
+    let abi = pair.1
+    if dep_alias.length() > 0 { dep_pkg_names[dep_alias] = true }
+    if abi.package_name.length() > 0 { dep_pkg_names[abi.package_name] = true }
+    for rf in abi.raising_fns {
+      if abi.package_name.length() > 0 {
+        dep_raising_fns[abi.package_name + "::" + rf.name] = rf.err_ty
+      }
+      if dep_alias.length() > 0 {
+        dep_raising_fns[dep_alias + "::" + rf.name] = rf.err_ty
+      }
+    }
+    for en in abi.enums {
+      for v in en.variants {
+        if abi.package_name.length() > 0 {
+          le_add_dep_ctor(dep_error_ctors, dep_ctor_to_err, abi.package_name, en.name, v.name, v.fields.length())
+        }
+        if dep_alias.length() > 0 && dep_alias != abi.package_name {
+          le_add_dep_ctor(dep_error_ctors, dep_ctor_to_err, dep_alias, en.name, v.name, v.fields.length())
+        }
+      }
+    }
+  }
+  for cname in symtab.ctors.keys() {
+    match symtab.ctors.get(cname) {
+      Some(targets) => {
+        for ct in targets {
+          if !ct.is_local && ct.pkg.length() > 0 && ct.enum_name.length() > 0 {
+            le_add_dep_ctor(dep_error_ctors, dep_ctor_to_err, ct.pkg, ct.enum_name, ct.ctor_name, ct.arity)
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  ExternalErrorEnv::{
+    pkg_aliases: pkg_aliases,
+    moon_import_paths: moon_import_paths,
+    dep_pkg_names: dep_pkg_names,
+    dep_raising_fns: dep_raising_fns,
+    dep_error_ctors: dep_error_ctors,
+    dep_ctor_to_err: dep_ctor_to_err,
+    cat_a_rewritten: cat_a_rewritten,
+  }
+}
+
 enum LeFrame {
   PlainFn(String)
   RaisingFn(String, String)
-  TryClosure
+  TryBlk(String, Bool)
 }
 
 struct LeState {
   file : String
+  is_test : Bool
   cfg : ErrorLowerConfig
+  env : ExternalErrorEnv
   suberror_names : Map[String, Bool]
   suberror_ctors : Map[String, String]
+  suberror_variants : Map[String, Array[String]]
   pkg_raise_fns : Map[String, String]
   pkg_raise_methods : Map[String, String]
   pkg_non_raise_methods : Map[String, Bool]
   pkg_raise_method_names : Map[String, Bool]
   pkg_fn_ret_types : Map[String, String]
+  pkg_all_fns : Map[String, Bool]
   pkg_concrete_types : Map[String, Bool]
+  failure_enum : String
+  outcome_enum : String
   used_idents : Map[String, Bool]
   frames : Array[LeFrame]
   lex_var_types : Array[Map[String, String]]
+  lex_raise_closures : Array[Map[String, String]]
+  lex_err_vars : Array[Map[String, String]]
   diags : Array[Diag]
+  mut need_failure : Bool
+  mut need_outcome : Bool
   mut tmp_seq : Int
 }
 
@@ -81,6 +226,17 @@ fn le_step_depth(k : TokenKind, d : Int) -> Int {
 
 fn le_unsup(st : LeState, line : Int, col : Int, msg : String) -> Unit {
   st.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", st.file, line, col, msg))
+}
+
+fn le_alloc_unique(used : Map[String, Bool], base : String) -> String {
+  let mut nm = base
+  let mut k = 1
+  while used.contains(nm) {
+    nm = base + "_" + k.to_string()
+    k = k + 1
+  }
+  used[nm] = true
+  nm
 }
 
 fn le_fresh_ident(st : LeState, prefix : String) -> String {
@@ -117,10 +273,123 @@ fn le_base_type_ident(ty : String) -> String {
   s.slice(0, i)
 }
 
+fn le_resolve_dep_pkg(env : ExternalErrorEnv, raw_pkg : String) -> String {
+  match env.pkg_aliases.get(raw_pkg) {
+    Some(p) => return p
+    None => ()
+  }
+  match env.moon_import_paths.get(raw_pkg) {
+    Some(fp) => {
+      let d = moon_import_default_alias(fp)
+      if d.length() > 0 { return d }
+    }
+    None => ()
+  }
+  raw_pkg
+}
+
+fn le_canon_err_ty(st : LeState, raw_et : String) -> String {
+  let s = raw_et.trim()
+  if s == "Failure" || s == st.failure_enum {
+    st.need_failure = true
+    return st.failure_enum
+  }
+  if s.starts_with("@") {
+    let dot = s.index_of(".")
+    if dot > 1 {
+      let rp = s.slice(1, dot)
+      let tn = s.slice(dot + 1, s.length()).trim()
+      return le_resolve_dep_pkg(st.env, rp) + "::" + tn
+    }
+  }
+  s
+}
+
+fn le_emit_err_ty(st : LeState, canon_et : String) -> String {
+  if canon_et == "Failure" || canon_et == st.failure_enum {
+    st.need_failure = true
+    return st.failure_enum
+  }
+  if canon_et == "__stdlib_err__" {
+    return "String"
+  }
+  canon_et
+}
+
+///| Resolve `@raw_pkg.fn_name` using canonical package identity (`moon_import_paths`, `pkg_aliases`)
+///| and verified dependency ABI (`dep_raising_fns`).
+///| Returns `Some((lowered_callee, canon_err_ty))` if raising, `None` if non-raising/unknown.
+fn le_resolve_external_call(st : LeState, raw_pkg : String, fn_name : String) -> Option[(String, String)] {
+  match st.env.moon_import_paths.get(raw_pkg) {
+    Some(full_path) => {
+      let std_key = if full_path == "moonbitlang/core/json" {
+        "json::" + fn_name
+      } else if full_path == "moonbitlang/core/encoding/utf8" {
+        "encoding/utf8::" + fn_name
+      } else if full_path == "moonbitlang/core/strconv" {
+        "strconv::" + fn_name
+      } else if full_path == "moonbitlang/core/string" {
+        "string::" + fn_name
+      } else {
+        ""
+      }
+      if std_key.length() > 0 {
+        match st.cfg.known_raising_calls.get(std_key) {
+          Some(target_fn) => return Some((target_fn, "__stdlib_err__"))
+          None => return None
+        }
+      }
+      // User dependency with explicit import path: NEVER match stdlib `known_raising_calls`!
+      let canon_pkg = le_resolve_dep_pkg(st.env, raw_pkg)
+      match st.env.dep_raising_fns.get(canon_pkg + "::" + fn_name) {
+        Some(et) => return Some(("@" + raw_pkg + "." + fn_name, le_canon_err_ty(st, et)))
+        None => ()
+      }
+      match st.env.dep_raising_fns.get(raw_pkg + "::" + fn_name) {
+        Some(et) => return Some(("@" + raw_pkg + "." + fn_name, le_canon_err_ty(st, et)))
+        None => ()
+      }
+      return None
+    }
+    None => ()
+  }
+  match st.env.pkg_aliases.get(raw_pkg) {
+    Some(mp) => {
+      match st.env.dep_raising_fns.get(mp + "::" + fn_name) {
+        Some(et) => return Some(("@" + raw_pkg + "." + fn_name, le_canon_err_ty(st, et)))
+        None => ()
+      }
+      if mp != raw_pkg && !mp.starts_with("moonbitlang/core/") {
+        return None
+      }
+    }
+    None => ()
+  }
+  match st.env.dep_raising_fns.get(raw_pkg + "::" + fn_name) {
+    Some(et) => return Some(("@" + raw_pkg + "." + fn_name, le_canon_err_ty(st, et)))
+    None => ()
+  }
+  if st.env.dep_pkg_names.contains(raw_pkg) {
+    return None
+  }
+  match st.cfg.known_raising_calls.get(raw_pkg + "::" + fn_name) {
+    Some(target_fn) => Some((target_fn, "__stdlib_err__"))
+    None => None
+  }
+}
+
+fn le_is_known_dep_pkg(st : LeState, raw_pkg : String) -> Bool {
+  if st.env.dep_pkg_names.contains(raw_pkg) {
+    return true
+  }
+  let canon = le_resolve_dep_pkg(st.env, raw_pkg)
+  st.env.dep_pkg_names.contains(canon)
+}
+
 fn le_is_lex_bound(st : LeState, name : String) -> Bool {
   let mut i = st.lex_var_types.length() - 1
   while i >= 0 {
-    if st.lex_var_types[i].contains(name) {
+    if st.lex_var_types[i].contains(name) || st.lex_raise_closures[i].contains(name) {
       return true
     }
     i = i - 1
@@ -140,32 +409,128 @@ fn le_lookup_var_type(st : LeState, name : String) -> String {
   ""
 }
 
-fn le_in_raising_context(st : LeState) -> Bool {
+fn le_lookup_raise_fn(st : LeState, name : String) -> Option[String] {
+  let mut i = st.lex_raise_closures.length() - 1
+  while i >= 0 {
+    match st.lex_raise_closures[i].get(name) {
+      Some(v) => return if v.length() > 0 { Some(v) } else { None }
+      None => ()
+    }
+    i = i - 1
+  }
+  if le_is_lex_bound(st, name) {
+    return None
+  }
+  st.pkg_raise_fns.get(name)
+}
+
+fn le_lookup_err_var(st : LeState, name : String) -> Option[String] {
+  let mut i = st.lex_err_vars.length() - 1
+  while i >= 0 {
+    match st.lex_err_vars[i].get(name) {
+      Some(v) => return if v.length() > 0 { Some(v) } else { None }
+      None => ()
+    }
+    i = i - 1
+  }
+  None
+}
+
+fn le_is_builtin_fail(st : LeState, tokens : Array[Token], i : Int, start : Int, end : Int) -> Bool {
+  tokens[i].kind == TokenKind::Ident && tokens[i].raw == "fail" && i + 1 < end &&
+  tokens[i + 1].kind == TokenKind::LParen &&
+  !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
+  !st.pkg_all_fns.contains("fail") && !le_is_lex_bound(st, "fail")
+}
+
+fn le_active_err_ty(st : LeState) -> Option[String] {
   if st.frames.length() == 0 {
-    return false
+    return None
   }
   match st.frames[st.frames.length() - 1] {
-    LeFrame::RaisingFn(_, _) => true
-    LeFrame::TryClosure => true
-    LeFrame::PlainFn(_) => false
+    LeFrame::RaisingFn(_, et) => Some(et)
+    LeFrame::TryBlk(et, _) => Some(et)
+    LeFrame::PlainFn(_) => None
   }
 }
 
-fn le_propagate_call(st : LeState, call_expr : String, line : Int, col : Int) -> String {
-  if !le_in_raising_context(st) {
-    le_unsup(st, line, col, "uncaught raising call outside raising function or `try`/`catch`")
-    return call_expr
+fn le_in_raising_context(st : LeState) -> Bool {
+  match le_active_err_ty(st) {
+    Some(_) => true
+    None => false
   }
-  let in_try_closure = match st.frames[st.frames.length() - 1] {
-    LeFrame::TryClosure => true
-    _ => false
+}
+
+fn le_enclosing_source_ret_ty(frames : Array[LeFrame]) -> String {
+  let mut i = frames.length() - 1
+  while i >= 0 {
+    match frames[i] {
+      LeFrame::PlainFn(rty) => return rty
+      LeFrame::RaisingFn(rty, _) => return rty
+      LeFrame::TryBlk(_, _) => ()
+    }
+    i = i - 1
   }
-  if st.cfg.use_try_op && !in_try_closure {
-    call_expr + "?"
-  } else {
-    let ok_v = le_fresh_ident(st, "__mbt_ok_")
-    let err_v = le_fresh_ident(st, "__mbt_err_")
-    "(match " + call_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(" + err_v + ") => return Err(" + err_v + ") })"
+  "Unit"
+}
+
+fn le_enclosing_ret_stmt(frames : Array[LeFrame], val_expr : String) -> String {
+  if frames.length() == 0 {
+    return "return " + val_expr
+  }
+  match frames[frames.length() - 1] {
+    LeFrame::PlainFn(_) => "return " + val_expr
+    LeFrame::RaisingFn(_, _) => "return Ok(" + val_expr + ")"
+    LeFrame::TryBlk(_, _) => "return MbtTryRet(" + val_expr + ")"
+  }
+}
+
+fn le_active_raise_stmt(st : LeState, err_expr : String, line : Int, col : Int) -> String {
+  if st.frames.length() > 0 {
+    match st.frames[st.frames.length() - 1] {
+      LeFrame::TryBlk(_, true) => return "return MbtTryErr(" + err_expr + ")"
+      LeFrame::TryBlk(_, false) => return "return Err(" + err_expr + ")"
+      LeFrame::RaisingFn(_, _) => return "return Err(" + err_expr + ")"
+      LeFrame::PlainFn(_) => ()
+    }
+  }
+  le_unsup(st, line, col, "uncaught `raise` outside raising function or `try`")
+  "return Err(" + err_expr + ")"
+}
+
+fn le_propagate_call(st : LeState, call_expr : String, call_err_ty : String, line : Int, col : Int) -> String {
+  match le_active_err_ty(st) {
+    None => {
+      le_unsup(st, line, col, "uncaught raising call outside raising function or `try`/`catch`")
+      return call_expr
+    }
+    Some(outer_et) => {
+      if call_err_ty.length() > 0 && call_err_ty != "__stdlib_err__" && outer_et.length() > 0 &&
+      outer_et != "__stdlib_err__" && call_err_ty != outer_et {
+        le_unsup(st, line, col, "cannot propagate error type `" + call_err_ty + "` into boundary expecting `" + outer_et + "`")
+      }
+      match st.frames[st.frames.length() - 1] {
+        LeFrame::TryBlk(_, true) => {
+          let ok_v = le_fresh_ident(st, "__mbt_ok_")
+          let err_v = le_fresh_ident(st, "__mbt_err_")
+          "(match " + call_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(" + err_v + ") => return MbtTryErr(" + err_v + ") })"
+        }
+        LeFrame::TryBlk(_, false) => {
+          let ok_v = le_fresh_ident(st, "__mbt_ok_")
+          let err_v = le_fresh_ident(st, "__mbt_err_")
+          "(match " + call_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(" + err_v + ") => return Err(" + err_v + ") })"
+        }
+        LeFrame::RaisingFn(_, _) =>
+        if st.cfg.use_try_op {
+          call_expr + "?"
+        } else {
+          let ok_v = le_fresh_ident(st, "__mbt_ok_")
+          let err_v = le_fresh_ident(st, "__mbt_err_")
+          "(match " + call_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(" + err_v + ") => return Err(" + err_v + ") })"
+        }
+        LeFrame::PlainFn(_) => call_expr
+      }
+    }
   }
 }
 
@@ -316,6 +681,7 @@ fn le_seed_params(
   close_p : Int,
   fn_name : String,
   vmap : Map[String, String],
+  cmap : Map[String, String],
 ) -> Unit {
   let cc = fn_name.index_of("::")
   if cc > 0 {
@@ -327,6 +693,7 @@ fn le_seed_params(
     if d == 0 && (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) {
       let pn = tokens[k].raw
       if pn != "mut" {
+        cmap[pn] = ""
         let mut ti = k + 1
         if ti < close_p && (tokens[ti].kind == TokenKind::Tilde || tokens[ti].kind == TokenKind::Question) {
           ti = ti + 1
@@ -346,7 +713,13 @@ fn le_seed_params(
   }
 }
 
-fn le_shadow_pat_idents(tokens : Array[Token], s : Int, e : Int, vmap : Map[String, String]) -> Unit {
+fn le_shadow_pat_idents(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  vmap : Map[String, String],
+  cmap : Map[String, String],
+) -> Unit {
   let mut k = s
   while k < e {
     let tk = tokens[k]
@@ -354,6 +727,7 @@ fn le_shadow_pat_idents(tokens : Array[Token], s : Int, e : Int, vmap : Map[Stri
     !(k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) &&
     !(k + 1 < e && tokens[k + 1].kind == TokenKind::Colon) {
       vmap[tk.raw] = ""
+      cmap[tk.raw] = ""
     }
     k = k + 1
   }
@@ -391,8 +765,7 @@ fn le_can_end_expr(t : Token) -> Bool {
   (t.kind == TokenKind::Keyword && (t.raw == "true" || t.raw == "false" || t.raw == "self"))
 }
 
-///| Check whether the token immediately following a `{ ... }` block continues an expression
-///| (used only for the few ambiguous header-leading `{` cases such as `for { ... }` / `for x = 0; { ... }`).
+///| Check whether the token immediately following a `{ ... }` block continues an expression.
 fn le_is_expr_cont_after_brace(t : Token) -> Bool {
   (t.kind == TokenKind::LBrace && !t.newline_before) ||
   (t.kind == TokenKind::Minus && !t.newline_before) ||
@@ -525,20 +898,20 @@ fn le_find_header_body_lbrace(tokens : Array[Token], kw_idx : Int, e : Int) -> I
   -1
 }
 
-///| Locate the opening `{` of a `match` or `loop` expression's arm block starting at `match_idx`.
 fn le_find_match_lbrace(tokens : Array[Token], match_idx : Int, e : Int) -> Int {
   le_find_header_body_lbrace(tokens, match_idx, e)
 }
 
-///| Locate the opening `{` of a `while` / `for` / `loop` body.
 fn le_find_loop_body_lbrace(tokens : Array[Token], kw_idx : Int, e : Int) -> Int {
   le_find_header_body_lbrace(tokens, kw_idx, e)
 }
 
-///| Scan a `try` body range `[s, e)` for control-flow statements (`return`, `break`, `continue`)
-///| that would cross a closure boundary, including inside string interpolation `\{...}` holes.
-///| Skips inner `fn` and arrow closures while never skipping `match`/`catch`/`noraise`/`loop` arms.
-fn le_scan_try_control_flow_depth(tokens : Array[Token], s : Int, e : Int, init_ld : Int) -> Bool {
+///| Scan a `try` body range `[s, e)` for control-flow statements crossing the `try` boundary.
+///| Returns `(has_return, has_break_or_continue)`.
+///| Skips inner `fn` and arrow closures while never skipping `match`/`catch`/`catch!`/`noraise`/`loop` arms.
+fn le_scan_try_control_flow_depth(tokens : Array[Token], s : Int, e : Int, init_ld : Int) -> (Bool, Bool) {
+  let mut has_ret = false
+  let mut has_bc = false
   let mut ld = init_ld
   let loop_depths : Array[Int] = []
   let loop_body_lbraces : Map[Int, Bool] = Map()
@@ -568,6 +941,8 @@ fn le_scan_try_control_flow_depth(tokens : Array[Token], s : Int, e : Int, init_
     } else if (t.kind == TokenKind::Keyword && t.raw == "catch") || le_is_kw(t, "noraise") {
       if i + 1 < e && tokens[i + 1].kind == TokenKind::LBrace {
         arm_block_lbraces[i + 1] = true
+      } else if i + 2 < e && tokens[i + 1].kind == TokenKind::Bang && tokens[i + 2].kind == TokenKind::LBrace {
+        arm_block_lbraces[i + 2] = true
       }
     }
     let in_arm_block = in_arm_block_stack.length() > 0 && in_arm_block_stack[in_arm_block_stack.length() - 1]
@@ -589,9 +964,9 @@ fn le_scan_try_control_flow_depth(tokens : Array[Token], s : Int, e : Int, init_
       for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) {
         if p.is_expr {
           let ht = lex_moonbit(p.text)
-          if le_scan_try_control_flow_depth(ht, 0, ht.length() - 1, ld) {
-            return true
-          }
+          let (hr, hbc) = le_scan_try_control_flow_depth(ht, 0, ht.length() - 1, ld)
+          if hr { has_ret = true }
+          if hbc { has_bc = true }
         }
       }
       i = i + 1
@@ -626,35 +1001,202 @@ fn le_scan_try_control_flow_depth(tokens : Array[Token], s : Int, e : Int, init_
         if ld > 0 { ld = ld - 1 }
       }
     } else if t.kind == TokenKind::Keyword && t.raw == "return" {
-      return true
+      has_ret = true
     } else if t.kind == TokenKind::Keyword && (t.raw == "break" || t.raw == "continue") && ld == 0 {
-      return true
+      has_bc = true
     }
     i = i + 1
   }
-  false
+  (has_ret, has_bc)
 }
 
-fn le_scan_try_control_flow(tokens : Array[Token], s : Int, e : Int) -> Bool {
+fn le_scan_try_control_flow(tokens : Array[Token], s : Int, e : Int) -> (Bool, Bool) {
   le_scan_try_control_flow_depth(tokens, s, e, 0)
 }
 
-///| Check whether `[s, e)` contains at least one statically known raising construct
-///| (a `raise`, a same-package raising call/method, or a configured external raising call).
-///| Returns `(has_known_raising, has_unknown_ext_call)`.
-fn le_analyze_try_body(st : LeState, tokens : Array[Token], s : Int, e : Int) -> (Bool, Bool) {
+///| Locate `catch` or `catch!` after a `try` expression starting at `try_i`.
+///| Returns `(body_s, body_e, catch_i, is_catch_bang, catch_lb, catch_rb)`.
+fn le_find_try_parts(tokens : Array[Token], try_i : Int, end : Int) -> (Int, Int, Int, Bool, Int, Int) {
+  let mut body_s = try_i + 1
+  let mut body_e = try_i + 1
+  let mut catch_i = -1
+  if try_i + 1 < end && tokens[try_i + 1].kind == TokenKind::LBrace {
+    let tb = find_matching_delim(tokens, try_i + 1)
+    body_s = try_i + 2
+    body_e = tb
+    if tb + 1 < end && le_is_kw(tokens[tb + 1], "catch") {
+      catch_i = tb + 1
+    }
+  } else {
+    let mut sc = try_i + 1
+    let mut sd = 0
+    while sc < end {
+      if sd == 0 {
+        if le_is_kw(tokens[sc], "catch") {
+          catch_i = sc
+          break
+        }
+        if tokens[sc].kind == TokenKind::Semi || tokens[sc].kind == TokenKind::RBrace ||
+        tokens[sc].kind == TokenKind::RParen || tokens[sc].kind == TokenKind::RBracket ||
+        (sc > try_i + 1 && tokens[sc].newline_before) {
+          break
+        }
+      }
+      sd = le_step_depth(tokens[sc].kind, sd)
+      sc = sc + 1
+    }
+    body_e = catch_i
+  }
+  if catch_i < 0 {
+    return (body_s, body_e, -1, false, -1, -1)
+  }
+  if catch_i + 2 < end && tokens[catch_i + 1].kind == TokenKind::Bang && tokens[catch_i + 2].kind == TokenKind::LBrace {
+    let clb = catch_i + 2
+    let crb = find_matching_delim(tokens, clb)
+    return (body_s, body_e, catch_i, true, clb, crb)
+  }
+  if catch_i + 1 < end && tokens[catch_i + 1].kind == TokenKind::LBrace {
+    let clb = catch_i + 1
+    let crb = find_matching_delim(tokens, clb)
+    return (body_s, body_e, catch_i, false, clb, crb)
+  }
+  (body_s, body_e, catch_i, false, -1, -1)
+}
+
+///| Check if postfix `catch { ... }` or `catch! { ... }` immediately follows token index `rp`.
+///| Returns `Some((is_catch_bang, catch_lb, catch_rb))`.
+fn le_match_postfix_catch(tokens : Array[Token], rp : Int, end : Int) -> Option[(Bool, Int, Int)] {
+  if rp + 1 >= end || !le_is_kw(tokens[rp + 1], "catch") {
+    return None
+  }
+  if rp + 3 < end && tokens[rp + 2].kind == TokenKind::Bang && tokens[rp + 3].kind == TokenKind::LBrace {
+    let clb = rp + 3
+    return Some((true, clb, find_matching_delim(tokens, clb)))
+  }
+  if rp + 2 < end && tokens[rp + 2].kind == TokenKind::LBrace {
+    let clb = rp + 2
+    return Some((false, clb, find_matching_delim(tokens, clb)))
+  }
+  None
+}
+
+///| Infer the concrete error type raised inside `[s, e)`.
+///| Returns `(has_known, has_unknown_ext, err_ty, is_mixed)`.
+fn le_analyze_try_body_sh(
+  st : LeState,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  init_fail_sh : Bool,
+) -> (Bool, Bool, String, Bool) {
   let mut has_known = false
   let mut has_unknown_ext = false
+  let mut found_et = ""
+  let mut mixed_et = false
+  let shadow_fail : Array[Bool] = [init_fail_sh]
   let mut i = s
   while i < e {
     let t = tokens[i]
+    let mut cand_et = ""
+    if t.kind == TokenKind::LBrace {
+      shadow_fail.push(false)
+      i = i + 1
+      continue
+    }
+    if t.kind == TokenKind::RBrace {
+      if shadow_fail.length() > 1 { let _ = shadow_fail.pop() }
+      i = i + 1
+      continue
+    }
+    if t.kind == TokenKind::Keyword && t.raw == "let" {
+      let ni = if i + 1 < e && tokens[i + 1].kind == TokenKind::Keyword && tokens[i + 1].raw == "mut" { i + 2 } else { i + 1 }
+      if ni < e && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == "fail" {
+        shadow_fail[shadow_fail.length() - 1] = true
+      }
+    }
+    // Skip inner `fn` and arrow closures (their internal raises belong to the closure, not this `try`)
+    if t.kind == TokenKind::Keyword && t.raw == "fn" {
+      let mut j = i + 1
+      while j < e && tokens[j].kind != TokenKind::LBrace {
+        j = if tokens[j].kind == TokenKind::LParen || tokens[j].kind == TokenKind::LBracket {
+          find_matching_delim(tokens, j) + 1
+        } else {
+          j + 1
+        }
+      }
+      if j < e && tokens[j].kind == TokenKind::LBrace {
+        i = find_matching_delim(tokens, j) + 1
+        continue
+      }
+    }
+    // Inner `try`: its body's errors are caught by its own `catch`, EXCEPT if its `catch` rethrows (`catch!` or `raise`)!
+    if le_is_kw(t, "try") {
+      if i + 1 < e && (tokens[i + 1].kind == TokenKind::Question || tokens[i + 1].kind == TokenKind::Bang) {
+        let es = i + 2
+        let ee = if es < e && tokens[es].kind == TokenKind::LBrace {
+          find_matching_delim(tokens, es) + 1
+        } else {
+          le_find_try_expr_end(tokens, es, e)
+        }
+        i = ee
+        continue
+      }
+      let (ibs, ibe, _, is_cb, clb, crb) = le_find_try_parts(tokens, i, e)
+      if clb >= 0 && crb >= clb {
+        let mut fail_sh = false
+        for sfv in shadow_fail { if sfv { fail_sh = true } }
+        let (ihk, ihu, iet, imix) = le_analyze_try_body_sh(st, tokens, ibs, ibe, fail_sh)
+        // Check if inner `catch` rethrows (via `catch!` or explicit `raise` inside `catch` arms)
+        let (chk, chu, cet, cmix) = le_analyze_try_body_sh(st, tokens, clb + 1, crb, fail_sh)
+        if chk {
+          has_known = true
+          if cmix { mixed_et = true }
+          let eff_cet = if cet.length() > 0 { cet } else { iet }
+          if eff_cet.length() > 0 {
+            if found_et.length() == 0 { found_et = eff_cet } else if found_et != eff_cet { mixed_et = true }
+          }
+        }
+        if chu { has_unknown_ext = true }
+        if is_cb && ihk {
+          has_known = true
+          if imix { mixed_et = true }
+          if ihu { has_unknown_ext = true }
+          if iet.length() > 0 {
+            if found_et.length() == 0 { found_et = iet } else if found_et != iet { mixed_et = true }
+          }
+        }
+        let mut after_inner = crb + 1
+        if crb + 2 < e && le_is_kw(tokens[crb + 1], "noraise") && tokens[crb + 2].kind == TokenKind::LBrace {
+          let nlb = crb + 2
+          let nrb = find_matching_delim(tokens, nlb)
+          let (nhk, nhu, net, nmix) = le_analyze_try_body_sh(st, tokens, nlb + 1, nrb, fail_sh)
+          if nhk {
+            has_known = true
+            if nmix { mixed_et = true }
+            if net.length() > 0 {
+              if found_et.length() == 0 { found_et = net } else if found_et != net { mixed_et = true }
+            }
+          }
+          if nhu { has_unknown_ext = true }
+          after_inner = nrb + 1
+        }
+        i = after_inner
+        continue
+      }
+    }
+    let mut fail_sh = false
+    for sfv in shadow_fail { if sfv { fail_sh = true } }
     if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
       for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) {
         if p.is_expr {
           let ht = lex_moonbit(p.text)
-          let (hk, hu) = le_analyze_try_body(st, ht, 0, ht.length() - 1)
+          let (hk, hu, het, hmix) = le_analyze_try_body_sh(st, ht, 0, ht.length() - 1, fail_sh)
           if hk { has_known = true }
           if hu { has_unknown_ext = true }
+          if hmix { mixed_et = true }
+          if het.length() > 0 {
+            if found_et.length() == 0 { found_et = het } else if found_et != het { mixed_et = true }
+          }
         }
       }
       i = i + 1
@@ -662,45 +1204,414 @@ fn le_analyze_try_body(st : LeState, tokens : Array[Token], s : Int, e : Int) ->
     }
     if le_is_kw(t, "raise") {
       has_known = true
+      if i + 1 < e {
+        let nt = tokens[i + 1]
+        if nt.kind == TokenKind::UpperIdent {
+          if nt.raw == "Failure" {
+            cand_et = st.failure_enum
+          } else {
+            match st.suberror_ctors.get(nt.raw) {
+              Some(en) => cand_et = en
+              None =>
+              if i + 3 < e && tokens[i + 2].kind == TokenKind::ColonColon && tokens[i + 3].kind == TokenKind::UpperIdent {
+                match st.suberror_ctors.get(tokens[i + 3].raw) {
+                  Some(en2) => cand_et = en2
+                  None => if st.suberror_names.contains(nt.raw) { cand_et = nt.raw }
+                }
+              }
+            }
+          }
+        } else if nt.kind == TokenKind::PkgRef && i + 3 < e && tokens[i + 2].kind == TokenKind::Dot && tokens[i + 3].kind == TokenKind::UpperIdent {
+          let rp = nt.raw.slice(1, nt.raw.length())
+          let cp = le_resolve_dep_pkg(st.env, rp)
+          match st.env.dep_ctor_to_err.get(cp + "::" + tokens[i + 3].raw) {
+            Some(ek) => cand_et = ek
+            None => ()
+          }
+        } else if nt.kind == TokenKind::Ident {
+          match le_lookup_err_var(st, nt.raw) {
+            Some(vet) => cand_et = vet
+            None => ()
+          }
+        }
+      }
+    } else if !fail_sh && le_is_builtin_fail(st, tokens, i, s, e) {
+      has_known = true
+      st.need_failure = true
+      cand_et = st.failure_enum
     } else if t.kind == TokenKind::PkgRef && i + 3 < e &&
     tokens[i + 1].kind == TokenKind::Dot && tokens[i + 3].kind == TokenKind::LParen {
-      let pkg = t.raw.slice(1, t.raw.length())
-      let key = pkg + "::" + tokens[i + 2].raw
-      if st.cfg.known_raising_calls.contains(key) {
-        has_known = true
-      } else {
-        has_unknown_ext = true
+      let rp = find_matching_delim(tokens, i + 3)
+      let raw_pkg = t.raw.slice(1, t.raw.length())
+      let fn_name = tokens[i + 2].raw
+      match le_resolve_external_call(st, raw_pkg, fn_name) {
+        Some((_, et)) => {
+          match le_match_postfix_catch(tokens, rp, e) {
+            Some((is_cb, clb, crb)) => {
+              if is_cb {
+                has_known = true
+                cand_et = et
+              }
+              let (chk, chu, cet, cmix) = le_analyze_try_body_sh(st, tokens, clb + 1, crb, fail_sh)
+              if chk {
+                has_known = true
+                if cmix { mixed_et = true }
+                let eff = if cet.length() > 0 { cet } else { et }
+                if eff.length() > 0 {
+                  if found_et.length() == 0 { found_et = eff } else if found_et != eff { mixed_et = true }
+                }
+              }
+              if chu { has_unknown_ext = true }
+              i = crb + 1
+              continue
+            }
+            None => {
+              has_known = true
+              cand_et = et
+            }
+          }
+        }
+        None =>
+        if !le_is_known_dep_pkg(st, raw_pkg) {
+          has_unknown_ext = true
+        }
       }
     } else if t.kind == TokenKind::UpperIdent && i + 3 < e &&
     tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident &&
     tokens[i + 3].kind == TokenKind::LParen {
       let qk = t.raw + "::" + tokens[i + 2].raw
-      if st.pkg_raise_methods.contains(qk) {
-        has_known = true
+      let rp = find_matching_delim(tokens, i + 3)
+      match st.pkg_raise_methods.get(qk) {
+        Some(et) =>
+        match le_match_postfix_catch(tokens, rp, e) {
+          Some((is_cb, clb, crb)) => {
+            if is_cb { has_known = true; cand_et = et }
+            let (chk, chu, cet, cmix) = le_analyze_try_body_sh(st, tokens, clb + 1, crb, fail_sh)
+            if chk {
+              has_known = true
+              if cmix { mixed_et = true }
+              let eff = if cet.length() > 0 { cet } else { et }
+              if eff.length() > 0 {
+                if found_et.length() == 0 { found_et = eff } else if found_et != eff { mixed_et = true }
+              }
+            }
+            if chu { has_unknown_ext = true }
+            i = crb + 1
+            continue
+          }
+          None => { has_known = true; cand_et = et }
+        }
+        None =>
+        if rp + 3 < e && tokens[rp + 1].kind == TokenKind::Dot && tokens[rp + 2].kind == TokenKind::Ident && tokens[rp + 3].kind == TokenKind::LParen {
+          match st.pkg_fn_ret_types.get(qk) {
+            Some(rt) =>
+            match st.pkg_raise_methods.get(rt + "::" + tokens[rp + 2].raw) {
+              Some(et) => { has_known = true; cand_et = et }
+              None => ()
+            }
+            None => ()
+          }
+        }
       }
     } else if t.kind == TokenKind::Ident && i + 3 < e &&
     tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident &&
-    tokens[i + 3].kind == TokenKind::LParen {
+    tokens[i + 3].kind == TokenKind::LParen &&
+    !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
       let mn = tokens[i + 2].raw
+      let rp = find_matching_delim(tokens, i + 3)
       if st.pkg_raise_method_names.contains(mn) {
         let rty = le_lookup_var_type(st, t.raw)
-        if rty.length() > 0 && st.pkg_raise_methods.contains(rty + "::" + mn) {
-          has_known = true
+        if rty.length() > 0 {
+          match st.pkg_raise_methods.get(rty + "::" + mn) {
+            Some(et) =>
+            match le_match_postfix_catch(tokens, rp, e) {
+              Some((is_cb, clb, crb)) => {
+                if is_cb { has_known = true; cand_et = et }
+                let (chk, chu, cet, cmix) = le_analyze_try_body_sh(st, tokens, clb + 1, crb, fail_sh)
+                if chk {
+                  has_known = true
+                  if cmix { mixed_et = true }
+                  let eff = if cet.length() > 0 { cet } else { et }
+                  if eff.length() > 0 {
+                    if found_et.length() == 0 { found_et = eff } else if found_et != eff { mixed_et = true }
+                  }
+                }
+                if chu { has_unknown_ext = true }
+                i = crb + 1
+                continue
+              }
+              None => { has_known = true; cand_et = et }
+            }
+            None => ()
+          }
         }
       }
     } else if t.kind == TokenKind::Ident && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen &&
     !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
-      if !le_is_lex_bound(st, t.raw) && st.pkg_raise_fns.contains(t.raw) {
-        has_known = true
+      let rp = find_matching_delim(tokens, i + 1)
+      match le_lookup_raise_fn(st, t.raw) {
+        Some(et) =>
+        match le_match_postfix_catch(tokens, rp, e) {
+          Some((is_cb, clb, crb)) => {
+            if is_cb { has_known = true; cand_et = et }
+            let (chk, chu, cet, cmix) = le_analyze_try_body_sh(st, tokens, clb + 1, crb, fail_sh)
+            if chk {
+              has_known = true
+              if cmix { mixed_et = true }
+              let eff = if cet.length() > 0 { cet } else { et }
+              if eff.length() > 0 {
+                if found_et.length() == 0 { found_et = eff } else if found_et != eff { mixed_et = true }
+              }
+            }
+            if chu { has_unknown_ext = true }
+            i = crb + 1
+            continue
+          }
+          None => { has_known = true; cand_et = et }
+        }
+        None =>
+        if !le_is_lex_bound(st, t.raw) && rp + 3 < e && tokens[rp + 1].kind == TokenKind::Dot &&
+        tokens[rp + 2].kind == TokenKind::Ident && tokens[rp + 3].kind == TokenKind::LParen {
+          match st.pkg_fn_ret_types.get(t.raw) {
+            Some(rt) =>
+            match st.pkg_raise_methods.get(rt + "::" + tokens[rp + 2].raw) {
+              Some(et) => { has_known = true; cand_et = et }
+              None => ()
+            }
+            None => ()
+          }
+        }
+      }
+    }
+    if cand_et.length() > 0 {
+      if found_et.length() == 0 {
+        found_et = cand_et
+      } else if found_et != cand_et {
+        mixed_et = true
       }
     }
     i = i + 1
   }
-  (has_known, has_unknown_ext)
+  (has_known, has_unknown_ext, found_et, mixed_et)
+}
+
+fn le_analyze_try_body(st : LeState, tokens : Array[Token], s : Int, e : Int) -> (Bool, Bool) {
+  let (hk, hu, _, _) = le_analyze_try_body_sh(st, tokens, s, e, false)
+  (hk, hu)
+}
+
+///| Check whether a constructor pattern's argument list `( ... )` is fully irrefutable.
+fn le_is_irrefutable_ctor_args(tokens : Array[Token], lp : Int, rp : Int) -> Bool {
+  let mut k = lp + 1
+  while k < rp {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Comma {
+      k = k + 1
+      continue
+    }
+    // `..` rest pattern
+    if tk.raw == ".." {
+      k = k + 1
+      continue
+    }
+    // `_` wildcard
+    if tk.kind == TokenKind::Underscore || (tk.kind == TokenKind::Ident && tk.raw == "_") {
+      k = k + 1
+      continue
+    }
+    // Plain variable binding `x`, labeled pun `x~`, or labeled irrefutable `x: _` / `x: y`
+    if tk.kind == TokenKind::Ident {
+      if k + 1 < rp && tokens[k + 1].kind == TokenKind::Tilde {
+        k = k + 2
+        continue
+      }
+      if k + 2 < rp && tokens[k + 1].kind == TokenKind::Colon {
+        let vt = tokens[k + 2]
+        if vt.kind == TokenKind::Underscore || vt.kind == TokenKind::Ident {
+          if k + 3 == rp || tokens[k + 3].kind == TokenKind::Comma {
+            k = k + 3
+            continue
+          }
+        }
+        return false
+      }
+      if k + 1 == rp || tokens[k + 1].kind == TokenKind::Comma {
+        k = k + 1
+        continue
+      }
+      return false
+    }
+    return false
+  }
+  true
+}
+
+///| Check whether a single unguarded pattern slice `[ps0, pe0)` covers all errors or a specific constructor.
+///| Returns `(covers_all, covered_ctor_name)`.
+fn le_check_single_pat(tokens : Array[Token], ps0 : Int, pe0 : Int) -> (Bool, String) {
+  let mut ps = ps0
+  let mut pe = pe0
+  while ps < pe && tokens[ps].kind == TokenKind::LParen && find_matching_delim(tokens, ps) + 1 == pe {
+    ps = ps + 1
+    pe = pe - 1
+  }
+  if ps >= pe {
+    return (false, "")
+  }
+  // Wildcard `_` or plain variable binding `e`
+  if ps + 1 == pe {
+    if tokens[ps].kind == TokenKind::Underscore || tokens[ps].kind == TokenKind::Ident {
+      return (true, "")
+    }
+    if tokens[ps].kind == TokenKind::UpperIdent {
+      return (false, tokens[ps].raw)
+    }
+    return (false, "")
+  }
+  // Skip optional `@pkg.` and `Enum::` prefixes to find the constructor `UpperIdent`
+  let mut k = ps
+  if k + 2 <= pe && tokens[k].kind == TokenKind::PkgRef && tokens[k + 1].kind == TokenKind::Dot {
+    k = k + 2
+  }
+  while k + 2 < pe && tokens[k].kind == TokenKind::UpperIdent && tokens[k + 1].kind == TokenKind::ColonColon {
+    k = k + 2
+  }
+  if k >= pe || tokens[k].kind != TokenKind::UpperIdent {
+    return (false, "")
+  }
+  let cname = tokens[k].raw
+  if k + 1 == pe {
+    return (false, cname)
+  }
+  if k + 1 < pe && tokens[k + 1].kind == TokenKind::LParen {
+    let rp = find_matching_delim(tokens, k + 1)
+    if rp + 1 == pe && le_is_irrefutable_ctor_args(tokens, k + 1, rp) {
+      return (false, cname)
+    }
+  }
+  (false, "")
+}
+
+///| Validate `Failure` catch arms (forbid binding `Failure(m)` payload or bare variable)
+///| and check MoonBit exhaustiveness of `catch { ... }` for error type `canon_et`.
+///| Returns `true` iff the `catch` arms are provably exhaustive.
+fn le_validate_and_check_catch(
+  st : LeState,
+  tokens : Array[Token],
+  lb : Int,
+  rb : Int,
+  canon_et : String,
+) -> Bool {
+  let is_failure = canon_et == st.failure_enum || canon_et == "Failure"
+  let mut covers_all = false
+  let covered_ctors : Map[String, Bool] = Map()
+  let mut k = lb + 1
+  let mut d = 0
+  let mut arm_s = k
+  let mut cur_fa = -1
+  while k <= rb {
+    if k < rb && d == 0 && cur_fa < 0 && tokens[k].kind == TokenKind::FatArrow {
+      cur_fa = k
+    }
+    let is_end = k == rb || (d == 0 && (tokens[k].kind == TokenKind::Semi ||
+      (cur_fa >= 0 && tokens[k].kind == TokenKind::Comma) ||
+      (cur_fa >= 0 && k > cur_fa + 1 && tokens[k].newline_before)))
+    if is_end {
+      if cur_fa >= arm_s && cur_fa < k {
+        // Find optional guard `if ...` at depth 0
+        let mut gi = -1
+        let mut gd = 0
+        let mut p = arm_s
+        while p < cur_fa {
+          if gd == 0 && tokens[p].kind == TokenKind::Keyword && tokens[p].raw == "if" {
+            gi = p
+            break
+          }
+          gd = le_step_depth(tokens[p].kind, gd)
+          p = p + 1
+        }
+        let pat_e = if gi >= 0 { gi } else { cur_fa }
+        // Check `Failure` and opaque stdlib error payload/variable binding restrictions
+        if is_failure || canon_et == "__stdlib_err__" {
+          let mut fp = arm_s
+          while fp < pat_e {
+            let pt = tokens[fp]
+            if is_failure && pt.kind == TokenKind::UpperIdent && pt.raw == "Failure" && fp + 1 < pat_e && tokens[fp + 1].kind == TokenKind::LParen {
+              let cp = find_matching_delim(tokens, fp + 1)
+              let mut pi = fp + 2
+              while pi < cp {
+                if tokens[pi].kind != TokenKind::Underscore && tokens[pi].kind != TokenKind::Comma && tokens[pi].raw != ".." {
+                  le_unsup(st, pt.line, pt.col, "binding `Failure(...)` payload is unsupported")
+                  break
+                }
+                pi = pi + 1
+              }
+              fp = cp + 1
+              continue
+            }
+            if pt.kind == TokenKind::Ident && pt.raw != "_" && fp == arm_s && pat_e == arm_s + 1 {
+              le_unsup(st, pt.line, pt.col, "binding error value `" + pt.raw + "` for opaque/stdlib error is unsupported")
+            }
+            fp = fp + 1
+          }
+        }
+        // Exhaustiveness contribution: guarded arms NEVER count
+        if gi < 0 {
+          let mut seg_s = arm_s
+          let mut sd = 0
+          let mut sp = arm_s
+          while sp <= pat_e {
+            if sp == pat_e || (sd == 0 && tokens[sp].kind == TokenKind::Pipe) {
+              let (ca, cn) = le_check_single_pat(tokens, seg_s, sp)
+              if ca { covers_all = true }
+              if cn.length() > 0 { covered_ctors[cn] = true }
+              seg_s = sp + 1
+            }
+            if sp < pat_e { sd = le_step_depth(tokens[sp].kind, sd) }
+            sp = sp + 1
+          }
+        }
+      }
+      if k < rb && (tokens[k].kind == TokenKind::Semi || (cur_fa >= 0 && tokens[k].kind == TokenKind::Comma)) {
+        arm_s = k + 1
+      } else {
+        arm_s = k
+      }
+      cur_fa = -1
+    }
+    if k < rb { d = le_step_depth(tokens[k].kind, d) }
+    k = k + 1
+  }
+  if covers_all {
+    return true
+  }
+  if is_failure {
+    return covered_ctors.contains("Failure")
+  }
+  match st.suberror_variants.get(canon_et) {
+    Some(variants) => {
+      if variants.length() == 0 { return false }
+      for v in variants {
+        if !covered_ctors.contains(v) { return false }
+      }
+      return true
+    }
+    None => ()
+  }
+  match st.env.dep_error_ctors.get(canon_et) {
+    Some(dep_vars) => {
+      if dep_vars.length() == 0 { return false }
+      for dv in dep_vars {
+        if !covered_ctors.contains(dv.0) { return false }
+      }
+      return true
+    }
+    None => ()
+  }
+  false
 }
 
 ///| Check if `{ ... }` arms represent a single wildcard arm `_ => <body>`.
-///| Returns `Some((body_start, body_end))` if so.
 fn le_match_single_wildcard_arm(tokens : Array[Token], lb : Int, rb : Int) -> Option[(Int, Int)] {
   let mut s = lb + 1
   while s < rb && (tokens[s].kind == TokenKind::Semi || tokens[s].kind == TokenKind::Comma) {
@@ -717,7 +1628,6 @@ fn le_match_single_wildcard_arm(tokens : Array[Token], lb : Int, rb : Int) -> Op
   if !is_wild || tokens[s + 1].kind != TokenKind::FatArrow {
     return None
   }
-  // Ensure there is no second top-level `=>` inside `[s + 2, e)`.
   let mut k = s + 2
   let mut d = 0
   while k < e {
@@ -731,7 +1641,6 @@ fn le_match_single_wildcard_arm(tokens : Array[Token], lb : Int, rb : Int) -> Op
 }
 
 ///| Check if `{ ... }` arms represent a single simple variable binding arm `v => <body>`.
-///| Returns `Some((var_name, body_start, body_end))` if so.
 fn le_match_single_var_arm(tokens : Array[Token], lb : Int, rb : Int) -> Option[(String, Int, Int)] {
   let mut s = lb + 1
   while s < rb && (tokens[s].kind == TokenKind::Semi || tokens[s].kind == TokenKind::Comma) {
@@ -759,12 +1668,13 @@ fn le_match_single_var_arm(tokens : Array[Token], lb : Int, rb : Int) -> Option[
   Some((tokens[s].raw, s + 2, e))
 }
 
-fn le_lower_match_arms(
+fn le_lower_match_arms_with_err_ty(
   st : LeState,
   src : String,
   tokens : Array[Token],
   lb : Int,
   rb : Int,
+  catch_err_ty : String,
 ) -> String {
   let sb = StringBuilder()
   let mut k = lb + 1
@@ -776,6 +1686,7 @@ fn le_lower_match_arms(
       cur_fa = k
     }
     let is_end = k == rb || (d == 0 && (tokens[k].kind == TokenKind::Semi ||
+      (cur_fa >= 0 && tokens[k].kind == TokenKind::Comma) ||
       (cur_fa >= 0 && k > cur_fa + 1 && tokens[k].newline_before)))
     if is_end {
       if cur_fa >= arm_s && cur_fa < k {
@@ -792,8 +1703,15 @@ fn le_lower_match_arms(
         }
         let pat_e = if gi >= 0 { gi } else { cur_fa }
         let vm : Map[String, String] = Map()
-        le_shadow_pat_idents(tokens, arm_s, pat_e, vm)
+        let cm : Map[String, String] = Map()
+        let evm : Map[String, String] = Map()
+        le_shadow_pat_idents(tokens, arm_s, pat_e, vm, cm)
+        if catch_err_ty.length() > 0 && pat_e == arm_s + 1 && tokens[arm_s].kind == TokenKind::Ident && tokens[arm_s].raw != "_" {
+          evm[tokens[arm_s].raw] = catch_err_ty
+        }
         st.lex_var_types.push(vm)
+        st.lex_raise_closures.push(cm)
+        st.lex_err_vars.push(evm)
         let mut pk = arm_s
         while pk < pat_e {
           sb.write_string(tokens[pk].leading_trivia + tokens[pk].raw)
@@ -804,11 +1722,13 @@ fn le_lower_match_arms(
         }
         sb.write_string(tokens[cur_fa].leading_trivia + tokens[cur_fa].raw)
         sb.write_string(le_lower_range(st, src, tokens, cur_fa + 1, k))
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
         let _ = st.lex_var_types.pop()
       } else {
         sb.write_string(le_lower_range(st, src, tokens, arm_s, k))
       }
-      if k < rb && tokens[k].kind == TokenKind::Semi {
+      if k < rb && (tokens[k].kind == TokenKind::Semi || (cur_fa >= 0 && tokens[k].kind == TokenKind::Comma)) {
         sb.write_string(tokens[k].leading_trivia + tokens[k].raw)
         arm_s = k + 1
       } else {
@@ -824,25 +1744,73 @@ fn le_lower_match_arms(
   sb.to_string()
 }
 
-///| Render the `Err(...) => ...` arm for a `catch { ... }` block.
+fn le_lower_match_arms(
+  st : LeState,
+  src : String,
+  tokens : Array[Token],
+  lb : Int,
+  rb : Int,
+) -> String {
+  le_lower_match_arms_with_err_ty(st, src, tokens, lb, rb, "")
+}
+
+///| Render the error handling body for a `catch` / `catch!` block (enforcing exact MoonBit exhaustiveness).
+fn le_render_catch_body(
+  st : LeState,
+  src : String,
+  tokens : Array[Token],
+  catch_lb : Int,
+  catch_rb : Int,
+  canon_et : String,
+  is_catch_bang : Bool,
+  catch_line : Int,
+  catch_col : Int,
+) -> (String, String) {
+  let is_exh = le_validate_and_check_catch(st, tokens, catch_lb, catch_rb, canon_et)
+  let mut rethrow_arm = ""
+  if !is_exh {
+    if !is_catch_bang {
+      le_unsup(st, catch_line, catch_col, "non-exhaustive `catch` for error type `" + canon_et + "` is unsupported")
+    } else {
+      match le_active_err_ty(st) {
+        Some(outer_et) =>
+        if outer_et.length() > 0 && outer_et != "Error" && outer_et != "__stdlib_err__" && outer_et == canon_et {
+          let rt_v = le_fresh_ident(st, "__mbt_rethrow_")
+          rethrow_arm = ", " + rt_v + " => " + le_active_raise_stmt(st, rt_v, catch_line, catch_col)
+        } else {
+          le_unsup(st, catch_line, catch_col, "`catch!` rethrow requires an enclosing raising boundary with identical error type `" + canon_et + "`")
+        }
+        None => le_unsup(st, catch_line, catch_col, "`catch!` rethrow outside a raising boundary is unsupported")
+      }
+    }
+  }
+  if rethrow_arm.length() == 0 {
+    match le_match_single_wildcard_arm(tokens, catch_lb, catch_rb) {
+      Some((bs, be)) => {
+        let body = le_lower_range(st, src, tokens, bs, be).trim()
+        return ("_", body)
+      }
+      None => ()
+    }
+  }
+  let err_v = le_fresh_ident(st, "__mbt_err_")
+  let arms = le_lower_match_arms_with_err_ty(st, src, tokens, catch_lb, catch_rb, canon_et).trim()
+  (err_v, "match " + err_v + " { " + arms + rethrow_arm + " }")
+}
+
 fn le_render_catch_err_arm(
   st : LeState,
   src : String,
   tokens : Array[Token],
   catch_lb : Int,
   catch_rb : Int,
+  canon_et : String,
+  is_catch_bang : Bool,
+  catch_line : Int,
+  catch_col : Int,
 ) -> String {
-  match le_match_single_wildcard_arm(tokens, catch_lb, catch_rb) {
-    Some((bs, be)) => {
-      let body = le_lower_range(st, src, tokens, bs, be).trim()
-      "Err(_) => " + body
-    }
-    None => {
-      let err_v = le_fresh_ident(st, "__mbt_err_")
-      let arms = le_lower_match_arms(st, src, tokens, catch_lb, catch_rb).trim()
-      "Err(" + err_v + ") => match " + err_v + " { " + arms + " }"
-    }
-  }
+  let (pat, body) = le_render_catch_body(st, src, tokens, catch_lb, catch_rb, canon_et, is_catch_bang, catch_line, catch_col)
+  "Err(" + pat + ") => " + body
 }
 
 ///| Render the `Ok(...) => ...` arm for optional `noraise { ... }` and optional `wrap_ctor`.
@@ -863,9 +1831,15 @@ fn le_render_ok_arm(
     match le_match_single_var_arm(tokens, noraise_lb, noraise_rb) {
       Some((vname, bs, be)) => {
         let vm : Map[String, String] = Map()
+        let cm : Map[String, String] = Map()
         vm[vname] = ""
+        cm[vname] = ""
         st.lex_var_types.push(vm)
+        st.lex_raise_closures.push(cm)
+        st.lex_err_vars.push(Map())
         let body = le_lower_range(st, src, tokens, bs, be).trim()
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
         let _ = st.lex_var_types.pop()
         return "Ok(" + vname + ") => " + body
       }
@@ -876,16 +1850,16 @@ fn le_render_ok_arm(
   "Ok(" + ok_v + ") => match " + val_expr + " { " + ok_arms + " }"
 }
 
-///| Attempt to recognize `[s, e)` as a single known raising call (optionally wrapped in
+///| Attempt to recognize `[s0, e0)` as a single known raising call (optionally wrapped in
 ///| a single constructor `Ctor(call)`).
-///| Returns `Some((wrap_ctor, lowered_result_call))` when matched without emitting `?`.
+///| Returns `Some((wrap_ctor, lowered_result_call, canon_err_ty))` when matched without emitting `?`.
 fn le_try_lower_direct_result_call(
   st : LeState,
   src : String,
   tokens : Array[Token],
   s0 : Int,
   e0 : Int,
-) -> Option[(String, String)] {
+) -> Option[(String, String, String)] {
   let mut s = s0
   let mut e = e0
   if s < e && tokens[s].kind == TokenKind::LBrace && find_matching_delim(tokens, s) + 1 == e {
@@ -912,14 +1886,13 @@ fn le_try_lower_direct_result_call(
   tokens[s + 1].kind == TokenKind::Dot && tokens[s + 3].kind == TokenKind::LParen {
     let rp = find_matching_delim(tokens, s + 3)
     if rp + 1 == e {
-      let pkg = tokens[s].raw.slice(1, tokens[s].raw.length())
-      let key = pkg + "::" + tokens[s + 2].raw
-      match st.cfg.known_raising_calls.get(key) {
-        Some(target_fn) => {
+      let raw_pkg = tokens[s].raw.slice(1, tokens[s].raw.length())
+      match le_resolve_external_call(st, raw_pkg, tokens[s + 2].raw) {
+        Some((target_fn, err_ty)) => {
           let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 4, rp)
           if arg_k || arg_u { return None }
           let args = le_lower_range(st, src, tokens, s + 4, rp)
-          return Some((wrap_ctor, target_fn + "(" + args + ")"))
+          return Some((wrap_ctor, target_fn + "(" + args + ")", err_ty))
         }
         None => return None
       }
@@ -932,11 +1905,14 @@ fn le_try_lower_direct_result_call(
     let rp = find_matching_delim(tokens, s + 3)
     if rp + 1 == e {
       let qk = tokens[s].raw + "::" + tokens[s + 2].raw
-      if st.pkg_raise_methods.contains(qk) {
-        let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 4, rp)
-        if arg_k || arg_u { return None }
-        let args = le_lower_range(st, src, tokens, s + 4, rp)
-        return Some((wrap_ctor, qk + "(" + args + ")"))
+      match st.pkg_raise_methods.get(qk) {
+        Some(err_ty) => {
+          let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 4, rp)
+          if arg_k || arg_u { return None }
+          let args = le_lower_range(st, src, tokens, s + 4, rp)
+          return Some((wrap_ctor, qk + "(" + args + ")", err_ty))
+        }
+        None => ()
       }
     }
   }
@@ -948,51 +1924,133 @@ fn le_try_lower_direct_result_call(
     if rp + 1 == e {
       let mn = tokens[s + 2].raw
       let rty = le_lookup_var_type(st, tokens[s].raw)
-      if rty.length() > 0 && st.pkg_raise_methods.contains(rty + "::" + mn) {
-        let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 4, rp)
-        if arg_k || arg_u { return None }
-        let args = le_lower_range(st, src, tokens, s + 4, rp)
-        return Some((wrap_ctor, tokens[s].raw + "." + mn + "(" + args + ")"))
+      if rty.length() > 0 {
+        match st.pkg_raise_methods.get(rty + "::" + mn) {
+          Some(err_ty) => {
+            let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 4, rp)
+            if arg_k || arg_u { return None }
+            let args = le_lower_range(st, src, tokens, s + 4, rp)
+            return Some((wrap_ctor, tokens[s].raw + "." + mn + "(" + args + ")", err_ty))
+          }
+          None => ()
+        }
       }
     }
   }
-  // 4. `fn_name(args)`
+  // 4. `fn_name(args)` or local raising closure `closure(args)`
   if s + 1 < e && tokens[s].kind == TokenKind::Ident && tokens[s + 1].kind == TokenKind::LParen {
     let rp = find_matching_delim(tokens, s + 1)
-    if rp + 1 == e && !le_is_lex_bound(st, tokens[s].raw) && st.pkg_raise_fns.contains(tokens[s].raw) {
-      let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 2, rp)
-      if arg_k || arg_u { return None }
-      let args = le_lower_range(st, src, tokens, s + 2, rp)
-      return Some((wrap_ctor, tokens[s].raw + "(" + args + ")"))
+    if rp + 1 == e {
+      match le_lookup_raise_fn(st, tokens[s].raw) {
+        Some(err_ty) => {
+          let (arg_k, arg_u) = le_analyze_try_body(st, tokens, s + 2, rp)
+          if arg_k || arg_u { return None }
+          let args = le_lower_range(st, src, tokens, s + 2, rp)
+          return Some((wrap_ctor, tokens[s].raw + "(" + args + ")", err_ty))
+        }
+        None => ()
+      }
     }
   }
   None
 }
 
-fn le_lower_try_body_as_iife(
+///| Lower a compound `try` body into either a Result IIFE (no nonlocal `return`)
+///| or a `MbtTryOutcome[R, E]` IIFE (when nonlocal `return` crosses the `try` boundary).
+///| Returns `Some((is_outcome, lowered_try_expr, canon_err_ty))`.
+fn le_lower_compound_try(
   st : LeState,
   src : String,
   tokens : Array[Token],
   body_s : Int,
   body_e : Int,
+  catch_lb : Int,
+  catch_rb : Int,
+  is_catch_bang : Bool,
+  noraise_lb : Int,
+  noraise_rb : Int,
+  mode : String,
   line : Int,
   col : Int,
 ) -> Option[String] {
-  if le_scan_try_control_flow(tokens, body_s, body_e) {
-    le_unsup(st, line, col, "`return`/`break`/`continue` across compound `try` boundary is unsupported")
+  let (has_ret, has_bc) = le_scan_try_control_flow(tokens, body_s, body_e)
+  if has_bc {
+    le_unsup(st, line, col, "`break`/`continue` across compound `try` boundary is unsupported")
     return None
   }
-  let (has_known, has_unknown_ext) = le_analyze_try_body(st, tokens, body_s, body_e)
+  let (has_known, has_unknown_ext, body_et, mixed_et) = le_analyze_try_body_sh(st, tokens, body_s, body_e, false)
+  if mixed_et {
+    le_unsup(st, line, col, "polymorphic or mixed error types inside `try` expression are unsupported")
+    return None
+  }
   if !has_known || has_unknown_ext {
     le_unsup(st, line, col, "cannot statically prove raising calls inside `try` expression")
     return None
   }
-  st.frames.push(LeFrame::TryClosure)
+  let canon_et = body_et
+  if has_ret {
+    if canon_et.length() == 0 {
+      le_unsup(st, line, col, "cannot infer concrete error type for compound `try` with `return`")
+      return None
+    }
+    st.need_outcome = true
+    let emit_et = le_emit_err_ty(st, canon_et)
+    let src_ret = le_enclosing_source_ret_ty(st.frames)
+    let fn_v = le_fresh_ident(st, "__mbt_try_")
+    let val_v = le_fresh_ident(st, "__mbt_tval_")
+    let vv = le_fresh_ident(st, "__mbt_tv_")
+    let rv = le_fresh_ident(st, "__mbt_tr_")
+    st.frames.push(LeFrame::TryBlk(canon_et, true))
+    st.lex_var_types.push(Map())
+    st.lex_raise_closures.push(Map())
+    st.lex_err_vars.push(Map())
+    let lowered_body = le_lower_range(st, src, tokens, body_s, body_e).trim()
+    let _ = st.lex_err_vars.pop()
+    let _ = st.lex_raise_closures.pop()
+    let _ = st.lex_var_types.pop()
+    let _ = st.frames.pop()
+    let ok_branch = if mode == "try_q" {
+      "match " + val_v + " { Some(" + vv + ") => Ok(" + vv + "); None => abort(\"unreachable\") }"
+    } else if mode == "try_bang" {
+      "match " + val_v + " { Some(" + vv + ") => " + vv + "; None => abort(\"unreachable\") }"
+    } else if noraise_lb < 0 {
+      "match " + val_v + " { Some(" + vv + ") => " + vv + "; None => abort(\"unreachable\") }"
+    } else {
+      let ok_arms = le_lower_match_arms(st, src, tokens, noraise_lb, noraise_rb).trim()
+      "match " + val_v + " { Some(" + vv + ") => match " + vv + " { " + ok_arms + " }; None => abort(\"unreachable\") }"
+    }
+    let err_branch = if mode == "try_q" {
+      let ev = le_fresh_ident(st, "__mbt_te_")
+      "MbtTryErr(" + ev + ") => Err(" + ev + ")"
+    } else if mode == "try_bang" {
+      "MbtTryErr(_) => panic(\"try! failed\")"
+    } else {
+      let (epat, ebody) = le_render_catch_body(st, src, tokens, catch_lb, catch_rb, canon_et, is_catch_bang, line, col)
+      "MbtTryErr(" + epat + ") => " + ebody
+    }
+    let ret_arm = "MbtTryRet(" + rv + ") => " + le_enclosing_ret_stmt(st.frames, rv)
+    return Some("{ let mut " + val_v + " = None; let " + fn_v + " = fn() -> " + st.outcome_enum + "[" + src_ret + ", " + emit_et + "] { " + val_v + " = Some({ " + lowered_body + "\n}); MbtTryOk }; match " + fn_v + "() { MbtTryOk => " + ok_branch + "; " + ret_arm + "; " + err_branch + " } }")
+  }
+  st.frames.push(LeFrame::TryBlk(canon_et, false))
   st.lex_var_types.push(Map())
+  st.lex_raise_closures.push(Map())
+  st.lex_err_vars.push(Map())
   let lowered = le_lower_range(st, src, tokens, body_s, body_e).trim()
+  let _ = st.lex_err_vars.pop()
+  let _ = st.lex_raise_closures.pop()
   let _ = st.lex_var_types.pop()
   let _ = st.frames.pop()
-  Some("(fn() { Ok({ " + lowered + "\n}) })()")
+  let iife_expr = "(fn() { Ok({ " + lowered + "\n}) })()"
+  if mode == "try_q" {
+    return Some(iife_expr)
+  }
+  if mode == "try_bang" {
+    let ok_v = le_fresh_ident(st, "__mbt_ok_")
+    return Some("match " + iife_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(_) => panic(\"try! failed\") }")
+  }
+  let ok_arm = le_render_ok_arm(st, src, tokens, "", noraise_lb, noraise_rb)
+  let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb, canon_et, is_catch_bang, line, col)
+  Some("match " + iife_expr + " { " + ok_arm + ", " + err_arm + " }")
 }
 
 fn le_emit_postfix_catch(
@@ -1003,6 +2061,8 @@ fn le_emit_postfix_catch(
   arg_s : Int,
   rp : Int,
   callee_prefix : String,
+  canon_et : String,
+  is_catch_bang : Bool,
   catch_lb : Int,
   catch_rb : Int,
   line : Int,
@@ -1010,19 +2070,15 @@ fn le_emit_postfix_catch(
 ) -> String {
   let (arg_k, arg_u) = le_analyze_try_body(st, tokens, arg_s, rp)
   if arg_k || arg_u {
-    match le_lower_try_body_as_iife(st, src, tokens, call_s, rp + 1, line, col) {
-      Some(iife_expr) => {
-        let ok_arm = le_render_ok_arm(st, src, tokens, "", -1, -1)
-        let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb)
-        return "match " + iife_expr + " { " + ok_arm + ", " + err_arm + " }"
-      }
+    match le_lower_compound_try(st, src, tokens, call_s, rp + 1, catch_lb, catch_rb, is_catch_bang, -1, -1, "catch", line, col) {
+      Some(expr) => return expr
       None => return src.slice(tokens[call_s].start_byte, tokens[catch_rb].end_byte)
     }
   }
   let args = le_lower_range(st, src, tokens, arg_s, rp)
   let call_s_str = callee_prefix + "(" + args + ")"
   let ok_arm = le_render_ok_arm(st, src, tokens, "", -1, -1)
-  let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb)
+  let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb, canon_et, is_catch_bang, line, col)
   "match " + call_s_str + " { " + ok_arm + ", " + err_arm + " }"
 }
 
@@ -1033,6 +2089,22 @@ fn le_lower_range(
   start : Int,
   end : Int,
 ) -> String {
+  // Hoist local named `fn foo(...)` declarations so they shadow package-level raising fns
+  let mut hi = start
+  let mut hd = 0
+  while hi < end {
+    let ht = tokens[hi]
+    if hd == 0 && ht.kind == TokenKind::Keyword && ht.raw == "fn" {
+      let mut ni = hi + 1
+      if ni < end && tokens[ni].kind == TokenKind::LBracket { ni = find_matching_delim(tokens, ni) + 1 }
+      if ni + 1 < end && tokens[ni].kind == TokenKind::Ident && tokens[ni + 1].kind == TokenKind::LParen {
+        st.lex_var_types[st.lex_var_types.length() - 1][tokens[ni].raw] = ""
+        st.lex_raise_closures[st.lex_raise_closures.length() - 1][tokens[ni].raw] = ""
+      }
+    }
+    hd = le_step_depth(ht.kind, hd)
+    hi = hi + 1
+  }
   let sb = StringBuilder()
   let mut i = start
   while i < end {
@@ -1041,12 +2113,16 @@ fn le_lower_range(
     if t.kind == TokenKind::LBrace {
       let rb = find_matching_delim(tokens, i)
       st.lex_var_types.push(Map())
+      st.lex_raise_closures.push(Map())
+      st.lex_err_vars.push(Map())
       sb.write_string(t.leading_trivia + "{" + le_lower_range(st, src, tokens, i + 1, rb) + tokens[rb].leading_trivia + "}")
+      let _ = st.lex_err_vars.pop()
+      let _ = st.lex_raise_closures.pop()
       let _ = st.lex_var_types.pop()
       i = rb + 1
       continue
     }
-    // `let [mut] x [: Ty] = ...` tracking local var types + rejecting raising closures
+    // `let [mut] x [: Ty] = ...` tracking local var types + controlled local raising closures
     if t.kind == TokenKind::Keyword && t.raw == "let" && i + 1 < end {
       let ni = if tokens[i + 1].kind == TokenKind::Keyword && tokens[i + 1].raw == "mut" { i + 2 } else { i + 1 }
       if ni < end && tokens[ni].kind == TokenKind::Ident {
@@ -1064,6 +2140,52 @@ fn le_lower_range(
           }
         }
         if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Eq {
+          // Local raising closure `let ok = fn(...) -> T raise E { ... }` (E2-2 parity)
+          if tokens[eq_i + 1].kind == TokenKind::Keyword && tokens[eq_i + 1].raw == "fn" {
+            match le_parse_fn_header(src, tokens, eq_i + 1, end) {
+              Some((_, op, cp, rty, has_r, ety, has_rp, clb)) =>
+              if has_r || has_rp {
+                let crb = find_matching_delim(tokens, clb)
+                let valid_et = ety.length() > 0 && ety != "Error" &&
+                (ety == "Failure" || st.suberror_names.contains(ety) || ety.starts_with("@") || str_has(ety, "::"))
+                if has_rp || !valid_et {
+                  le_unsup(st, tokens[eq_i + 1].line, tokens[eq_i + 1].col, "unsupported `raise` in local closure `" + vname + "`")
+                  sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[crb].end_byte))
+                  i = crb + 1
+                  continue
+                }
+                let canon_et = le_canon_err_ty(st, ety)
+                let emit_et = if ety == "Failure" { st.failure_enum } else { ety }
+                st.lex_raise_closures[st.lex_raise_closures.length() - 1][vname] = canon_et
+                st.lex_var_types[st.lex_var_types.length() - 1][vname] = ""
+                let pm : Map[String, String] = Map()
+                let cm : Map[String, String] = Map()
+                le_seed_params(tokens, op, cp, "", pm, cm)
+                st.lex_var_types.push(pm)
+                st.lex_raise_closures.push(cm)
+                st.lex_err_vars.push(Map())
+                st.frames.push(LeFrame::RaisingFn(rty, canon_et))
+                let bt = le_lower_range(st, src, tokens, clb + 1, crb)
+                let _ = st.frames.pop()
+                let _ = st.lex_err_vars.pop()
+                let _ = st.lex_raise_closures.pop()
+                let _ = st.lex_var_types.pop()
+                let tail_triv = tokens[crb].leading_trivia
+                let tail_nl = if tail_triv.ends_with("\n") { "" } else { "\n" }
+                let wrapped = if le_body_always_exits(tokens, clb, crb) {
+                  "{" + bt + tail_triv + "}"
+                } else if rty == "Unit" {
+                  "{" + bt + tail_triv + tail_nl + "  Ok(())\n}"
+                } else {
+                  "{ Ok({" + bt + tail_triv + tail_nl + "}) }"
+                }
+                sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + " fn" + src.slice(tokens[op].start_byte, tokens[cp].end_byte) + " -> Result[" + rty + ", " + emit_et + "] " + wrapped)
+                i = crb + 1
+                continue
+              }
+              None => ()
+            }
+          }
           let rhs_end = le_find_stmt_expr_end(tokens, eq_i + 1, end)
           sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + le_lower_range(st, src, tokens, eq_i + 1, rhs_end))
           let mut rhs_ce = rhs_end
@@ -1078,8 +2200,14 @@ fn le_lower_range(
               }
             } else if r1.kind == TokenKind::Ident && eq_i + 2 < rhs_ce && tokens[eq_i + 2].kind == TokenKind::LParen && find_matching_delim(tokens, eq_i + 2) + 1 == rhs_ce && !le_is_lex_bound(st, r1.raw) {
               match st.pkg_fn_ret_types.get(r1.raw) { Some(rt) => ann_ty = rt, None => () }
+            } else if r1.kind == TokenKind::Ident && eq_i + 4 < rhs_ce && tokens[eq_i + 2].kind == TokenKind::Dot && tokens[eq_i + 3].kind == TokenKind::Ident && tokens[eq_i + 4].kind == TokenKind::LParen && find_matching_delim(tokens, eq_i + 4) + 1 == rhs_ce {
+              let xr = le_lookup_var_type(st, r1.raw)
+              if xr.length() > 0 {
+                match st.pkg_fn_ret_types.get(xr + "::" + tokens[eq_i + 3].raw) { Some(rt) => ann_ty = rt, None => () }
+              }
             }
           }
+          st.lex_raise_closures[st.lex_raise_closures.length() - 1][vname] = ""
           st.lex_var_types[st.lex_var_types.length() - 1][vname] = ann_ty
           i = rhs_end
           continue
@@ -1094,10 +2222,48 @@ fn le_lower_range(
         if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Eq {
           let rhs_end = le_find_stmt_expr_end(tokens, eq_i + 1, end)
           sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + le_lower_range(st, src, tokens, eq_i + 1, rhs_end))
-          le_shadow_pat_idents(tokens, ni, eq_i, st.lex_var_types[st.lex_var_types.length() - 1])
+          le_shadow_pat_idents(tokens, ni, eq_i, st.lex_var_types[st.lex_var_types.length() - 1], st.lex_raise_closures[st.lex_raise_closures.length() - 1])
           i = rhs_end
           continue
         }
+      }
+    }
+    // `if` / `while` push lexical scope so `is <pat>` binders don't leak past the `if`/`while`
+    if t.kind == TokenKind::Keyword && (t.raw == "if" || t.raw == "while") {
+      let tlb = le_find_header_body_lbrace(tokens, i, end)
+      if tlb >= 0 {
+        let trb = find_matching_delim(tokens, tlb)
+        st.lex_var_types.push(Map())
+        st.lex_raise_closures.push(Map())
+        st.lex_err_vars.push(Map())
+        sb.write_string(t.leading_trivia + t.raw + le_lower_range(st, src, tokens, i + 1, tlb) + tokens[tlb].leading_trivia + "{" + le_lower_range(st, src, tokens, tlb + 1, trb) + tokens[trb].leading_trivia + "}")
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
+        let _ = st.lex_var_types.pop()
+        i = trb + 1
+        continue
+      }
+    }
+    // `is <pat>` shadows pattern identifiers inside the current `if`/`while` scope
+    if le_is_kw(t, "is") && i + 1 < end {
+      let mut pe = i + 1
+      let mut pd = 0
+      while pe < end {
+        let pt = tokens[pe]
+        if pd == 0 && (pt.raw == "&&" || pt.raw == "||" || pt.kind == TokenKind::LBrace ||
+          pt.kind == TokenKind::RParen || pt.kind == TokenKind::Semi ||
+          (pt.kind == TokenKind::Keyword && pt.raw == "else") ||
+          (pe > i + 1 && pt.newline_before)) {
+          break
+        }
+        pd = le_step_depth(pt.kind, pd)
+        pe = pe + 1
+      }
+      if pe > i + 1 {
+        le_shadow_pat_idents(tokens, i + 1, pe, st.lex_var_types[st.lex_var_types.length() - 1], st.lex_raise_closures[st.lex_raise_closures.length() - 1])
+        sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[pe - 1].end_byte))
+        i = pe
+        continue
       }
     }
     // `for <pat> in <iter> { ... }` and C-style `for` shadowing loop binders
@@ -1106,6 +2272,7 @@ fn le_lower_range(
       if flb >= 0 {
         let frb = find_matching_delim(tokens, flb)
         let vm : Map[String, String] = Map()
+        let cm : Map[String, String] = Map()
         let mut in_i = -1
         let mut sc = i + 1
         let mut sd = 0
@@ -1118,7 +2285,7 @@ fn le_lower_range(
           sc = sc + 1
         }
         let header_str = if in_i > i {
-          le_shadow_pat_idents(tokens, i + 1, in_i, vm)
+          le_shadow_pat_idents(tokens, i + 1, in_i, vm, cm)
           src.slice(tokens[i].end_byte, tokens[in_i].end_byte) + le_lower_range(st, src, tokens, in_i + 1, flb)
         } else {
           let mut fk = i + 1
@@ -1126,6 +2293,7 @@ fn le_lower_range(
           while fk < flb && !(fkd == 0 && tokens[fk].kind == TokenKind::Semi) {
             if fkd == 0 && tokens[fk].kind == TokenKind::Ident && fk + 1 < flb && tokens[fk + 1].kind == TokenKind::Eq {
               vm[tokens[fk].raw] = ""
+              cm[tokens[fk].raw] = ""
             }
             fkd = le_step_depth(tokens[fk].kind, fkd)
             fk = fk + 1
@@ -1133,7 +2301,11 @@ fn le_lower_range(
           le_lower_range(st, src, tokens, i + 1, flb)
         }
         st.lex_var_types.push(vm)
+        st.lex_raise_closures.push(cm)
+        st.lex_err_vars.push(Map())
         sb.write_string(t.leading_trivia + "for" + header_str + tokens[flb].leading_trivia + "{" + le_lower_range(st, src, tokens, flb + 1, frb) + tokens[frb].leading_trivia + "}")
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
         let _ = st.lex_var_types.pop()
         i = frb + 1
         continue
@@ -1154,11 +2326,16 @@ fn le_lower_range(
     tokens[i + 1].kind == TokenKind::FatArrow && tokens[i + 2].kind == TokenKind::LBrace {
       let crb = find_matching_delim(tokens, i + 2)
       let pm : Map[String, String] = Map()
-      if t.kind == TokenKind::Ident { pm[t.raw] = "" }
+      let cm : Map[String, String] = Map()
+      if t.kind == TokenKind::Ident { pm[t.raw] = ""; cm[t.raw] = "" }
       st.lex_var_types.push(pm)
+      st.lex_raise_closures.push(cm)
+      st.lex_err_vars.push(Map())
       st.frames.push(LeFrame::PlainFn(""))
       sb.write_string(t.leading_trivia + t.raw + tokens[i + 1].leading_trivia + "=>" + tokens[i + 2].leading_trivia + "{" + le_lower_range(st, src, tokens, i + 3, crb) + tokens[crb].leading_trivia + "}")
       let _ = st.frames.pop()
+      let _ = st.lex_err_vars.pop()
+      let _ = st.lex_raise_closures.pop()
       let _ = st.lex_var_types.pop()
       i = crb + 1
       continue
@@ -1168,11 +2345,16 @@ fn le_lower_range(
       if cp + 2 < end && tokens[cp + 1].kind == TokenKind::FatArrow && tokens[cp + 2].kind == TokenKind::LBrace {
         let crb = find_matching_delim(tokens, cp + 2)
         let pm : Map[String, String] = Map()
-        le_seed_params(tokens, i, cp, "", pm)
+        let cm : Map[String, String] = Map()
+        le_seed_params(tokens, i, cp, "", pm, cm)
         st.lex_var_types.push(pm)
+        st.lex_raise_closures.push(cm)
+        st.lex_err_vars.push(Map())
         st.frames.push(LeFrame::PlainFn(""))
         sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[cp + 2].end_byte) + le_lower_range(st, src, tokens, cp + 3, crb) + tokens[crb].leading_trivia + "}")
         let _ = st.frames.pop()
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
         let _ = st.lex_var_types.pop()
         i = crb + 1
         continue
@@ -1184,17 +2366,23 @@ fn le_lower_range(
         Some((lfn, op, cp, rty, has_r, _, has_rp, clb)) => {
           if lfn.length() > 0 {
             st.lex_var_types[st.lex_var_types.length() - 1][lfn] = ""
+            st.lex_raise_closures[st.lex_raise_closures.length() - 1][lfn] = ""
           }
           let crb = find_matching_delim(tokens, clb)
           if has_r || has_rp {
             le_unsup(st, t.line, t.col, "unsupported raising inline closure or higher-order `raise` parameter")
           }
           let pm : Map[String, String] = Map()
-          le_seed_params(tokens, op, cp, "", pm)
+          let cm : Map[String, String] = Map()
+          le_seed_params(tokens, op, cp, "", pm, cm)
           st.lex_var_types.push(pm)
+          st.lex_raise_closures.push(cm)
+          st.lex_err_vars.push(Map())
           st.frames.push(LeFrame::PlainFn(rty))
           sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[clb].end_byte) + le_lower_range(st, src, tokens, clb + 1, crb) + tokens[crb].leading_trivia + "}")
           let _ = st.frames.pop()
+          let _ = st.lex_err_vars.pop()
+          let _ = st.lex_raise_closures.pop()
           let _ = st.lex_var_types.pop()
           i = crb + 1
           continue
@@ -1202,7 +2390,7 @@ fn le_lower_range(
         None => ()
       }
     }
-    // `try?`, `try!`, and `try <body> catch { ... } [noraise { ... }]`
+    // `try?`, `try!`, and `try <body> catch[!] { ... } [noraise { ... }]`
     if le_is_kw(t, "try") {
       // 1. `try? <expr>` and `try! <expr>`
       if i + 1 < end && (tokens[i + 1].kind == TokenKind::Question || tokens[i + 1].kind == TokenKind::Bang) {
@@ -1213,14 +2401,21 @@ fn le_lower_range(
         } else {
           le_find_try_expr_end(tokens, expr_s, end)
         }
-        let res_opt : Option[String] = match le_try_lower_direct_result_call(st, src, tokens, expr_s, expr_e) {
-          Some((wrap_ctor, res_call)) =>
-          if wrap_ctor.length() == 0 {
-            Some(res_call)
-          } else {
-            let ok_v = le_fresh_ident(st, "__mbt_ok_")
-            let err_v = le_fresh_ident(st, "__mbt_err_")
-            Some("match " + res_call + " { Ok(" + ok_v + ") => Ok(" + wrap_ctor + "(" + ok_v + ")), Err(" + err_v + ") => Err(" + err_v + ") }")
+        match le_try_lower_direct_result_call(st, src, tokens, expr_s, expr_e) {
+          Some((wrap_ctor, res_call, _)) => {
+            let res_expr = if wrap_ctor.length() == 0 {
+              res_call
+            } else {
+              let ok_v = le_fresh_ident(st, "__mbt_ok_")
+              let err_v = le_fresh_ident(st, "__mbt_err_")
+              "match " + res_call + " { Ok(" + ok_v + ") => Ok(" + wrap_ctor + "(" + ok_v + ")), Err(" + err_v + ") => Err(" + err_v + ") }"
+            }
+            if is_bang {
+              let ok_v = le_fresh_ident(st, "__mbt_ok_")
+              sb.write_string(t.leading_trivia + "match " + res_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(_) => panic(\"try! failed\") }")
+            } else {
+              sb.write_string(t.leading_trivia + res_expr)
+            }
           }
           None => {
             let (bs, be) = if expr_s < expr_e && tokens[expr_s].kind == TokenKind::LBrace && find_matching_delim(tokens, expr_s) + 1 == expr_e {
@@ -1228,61 +2423,24 @@ fn le_lower_range(
             } else {
               (expr_s, expr_e)
             }
-            le_lower_try_body_as_iife(st, src, tokens, bs, be, t.line, t.col)
+            let mode = if is_bang { "try_bang" } else { "try_q" }
+            match le_lower_compound_try(st, src, tokens, bs, be, -1, -1, false, -1, -1, mode, t.line, t.col) {
+              Some(expr) => sb.write_string(t.leading_trivia + expr)
+              None => sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[expr_e - 1].end_byte))
+            }
           }
-        }
-        match res_opt {
-          Some(res_expr) =>
-          if is_bang {
-            let ok_v = le_fresh_ident(st, "__mbt_ok_")
-            sb.write_string(t.leading_trivia + "match " + res_expr + " { Ok(" + ok_v + ") => " + ok_v + ", Err(_) => panic(\"try! failed\") }")
-          } else {
-            sb.write_string(t.leading_trivia + res_expr)
-          }
-          None => sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[expr_e - 1].end_byte))
         }
         i = expr_e
         continue
       }
-      // 2. `try <body> catch { ... } [noraise { ... }]`
-      let mut body_s = i + 1
-      let mut body_e = i + 1
-      let mut catch_i = -1
-      if i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace {
-        let tb = find_matching_delim(tokens, i + 1)
-        body_s = i + 2
-        body_e = tb
-        if tb + 1 < end && le_is_kw(tokens[tb + 1], "catch") {
-          catch_i = tb + 1
-        }
-      } else {
-        let mut sc = i + 1
-        let mut sd = 0
-        while sc < end {
-          if sd == 0 {
-            if le_is_kw(tokens[sc], "catch") {
-              catch_i = sc
-              break
-            }
-            if tokens[sc].kind == TokenKind::Semi || tokens[sc].kind == TokenKind::RBrace ||
-            tokens[sc].kind == TokenKind::RParen || tokens[sc].kind == TokenKind::RBracket ||
-            (sc > i + 1 && tokens[sc].newline_before) {
-              break
-            }
-          }
-          sd = le_step_depth(tokens[sc].kind, sd)
-          sc = sc + 1
-        }
-        body_e = catch_i
-      }
-      if catch_i < 0 || catch_i + 1 >= end || tokens[catch_i + 1].kind != TokenKind::LBrace {
+      // 2. `try <body> catch[!] { ... } [noraise { ... }]`
+      let (body_s, body_e, catch_i, is_catch_bang, catch_lb, catch_rb) = le_find_try_parts(tokens, i, end)
+      if catch_i < 0 || catch_lb < 0 {
         le_unsup(st, t.line, t.col, "unsupported `try` without `catch { ... }`")
         sb.write_string(t.leading_trivia + t.raw)
         i = i + 1
         continue
       }
-      let catch_lb = catch_i + 1
-      let catch_rb = find_matching_delim(tokens, catch_lb)
       let mut noraise_lb = -1
       let mut noraise_rb = -1
       let mut after_try = catch_rb + 1
@@ -1293,22 +2451,18 @@ fn le_lower_range(
       }
       // Fast path A & B: single raising call or `Ctor(raising_call)` -> zero-closure direct `match`
       match le_try_lower_direct_result_call(st, src, tokens, body_s, body_e) {
-        Some((wrap_ctor, res_call)) => {
+        Some((wrap_ctor, res_call, canon_et)) => {
           let ok_arm = le_render_ok_arm(st, src, tokens, wrap_ctor, noraise_lb, noraise_rb)
-          let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb)
+          let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb, canon_et, is_catch_bang, tokens[catch_i].line, tokens[catch_i].col)
           sb.write_string(t.leading_trivia + "match " + res_call + " { " + ok_arm + ", " + err_arm + " }")
           i = after_try
           continue
         }
         None => ()
       }
-      // General path C: compound/multi-statement `try` body -> IIFE closure returning `Result`
-      match le_lower_try_body_as_iife(st, src, tokens, body_s, body_e, t.line, t.col) {
-        Some(iife_expr) => {
-          let ok_arm = le_render_ok_arm(st, src, tokens, "", noraise_lb, noraise_rb)
-          let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb)
-          sb.write_string(t.leading_trivia + "match " + iife_expr + " { " + ok_arm + ", " + err_arm + " }")
-        }
+      // General path C: compound/multi-statement `try` body -> Result or MbtTryOutcome IIFE
+      match le_lower_compound_try(st, src, tokens, body_s, body_e, catch_lb, catch_rb, is_catch_bang, noraise_lb, noraise_rb, "catch", tokens[catch_i].line, tokens[catch_i].col) {
+        Some(expr) => sb.write_string(t.leading_trivia + expr)
         None => sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[after_try - 1].end_byte))
       }
       i = after_try
@@ -1318,93 +2472,194 @@ fn le_lower_range(
     if le_is_kw(t, "raise") {
       let ee = le_find_stmt_expr_end(tokens, i + 1, end)
       let err_expr = le_lower_range(st, src, tokens, i + 1, ee).trim()
-      if !le_in_raising_context(st) {
-        le_unsup(st, t.line, t.col, "uncaught `raise` outside raising function or `try`")
+      // Verify error type matches enclosing raising boundary (exact type equality, no `Error`)
+      match le_active_err_ty(st) {
+        Some(outer_et) => {
+          if outer_et == "Error" || outer_et.length() == 0 {
+            le_unsup(st, t.line, t.col, "cannot `raise` into polymorphic or untyped error boundary")
+          } else if i + 1 < ee {
+            let mut raised_et = ""
+            let nt = tokens[i + 1]
+            if i + 2 == ee && nt.kind == TokenKind::Ident {
+              match le_lookup_err_var(st, nt.raw) {
+                Some(vet) => raised_et = vet
+                None => ()
+              }
+            } else if nt.kind == TokenKind::UpperIdent {
+              if nt.raw == "Failure" {
+                raised_et = st.failure_enum
+              } else {
+                match st.suberror_ctors.get(nt.raw) {
+                  Some(en) => raised_et = en
+                  None =>
+                  if i + 3 < ee && tokens[i + 2].kind == TokenKind::ColonColon && tokens[i + 3].kind == TokenKind::UpperIdent {
+                    match st.suberror_ctors.get(tokens[i + 3].raw) {
+                      Some(en2) => raised_et = en2
+                      None => if st.suberror_names.contains(nt.raw) { raised_et = nt.raw }
+                    }
+                  }
+                }
+              }
+            } else if nt.kind == TokenKind::PkgRef && i + 3 < ee && tokens[i + 2].kind == TokenKind::Dot && tokens[i + 3].kind == TokenKind::UpperIdent {
+              let rp = nt.raw.slice(1, nt.raw.length())
+              let cp = le_resolve_dep_pkg(st.env, rp)
+              match st.env.dep_ctor_to_err.get(cp + "::" + tokens[i + 3].raw) {
+                Some(ek) => raised_et = ek
+                None => ()
+              }
+            }
+            if raised_et.length() > 0 && raised_et != outer_et {
+              le_unsup(st, t.line, t.col, "cannot `raise` error type `" + raised_et + "` inside boundary expecting `" + outer_et + "`")
+            }
+          }
+        }
+        None => ()
       }
-      sb.write_string(t.leading_trivia + "return Err(" + err_expr + ")")
+      sb.write_string(t.leading_trivia + le_active_raise_stmt(st, err_expr, t.line, t.col))
       i = ee
       continue
     }
-    // `return [expr]` inside a `RaisingFn` -> `return Ok(expr)` / `return Ok(())`
+    // `return [expr]` inside a `RaisingFn` or `TryBlk(_, true)`
     if t.kind == TokenKind::Keyword && t.raw == "return" && st.frames.length() > 0 {
-      let in_raising_fn = match st.frames[st.frames.length() - 1] {
+      let need_rw = match st.frames[st.frames.length() - 1] {
         LeFrame::RaisingFn(_, _) => true
+        LeFrame::TryBlk(_, true) => true
         _ => false
       }
-      if in_raising_fn {
+      if need_rw {
         let is_bare = i + 1 >= end || tokens[i + 1].kind == TokenKind::Semi ||
         tokens[i + 1].kind == TokenKind::RBrace || tokens[i + 1].kind == TokenKind::Comma ||
         tokens[i + 1].kind == TokenKind::RParen || tokens[i + 1].kind == TokenKind::RBracket ||
         tokens[i + 1].newline_before
         if is_bare {
-          sb.write_string(t.leading_trivia + "return Ok(())")
+          sb.write_string(t.leading_trivia + le_enclosing_ret_stmt(st.frames, "()"))
           i = i + 1
           continue
         }
         let ee = le_find_stmt_expr_end(tokens, i + 1, end)
         let val_s = le_lower_range(st, src, tokens, i + 1, ee).trim()
-        sb.write_string(t.leading_trivia + "return Ok(" + val_s + ")")
+        sb.write_string(t.leading_trivia + le_enclosing_ret_stmt(st.frames, val_s))
         i = ee
         continue
       }
     }
-    // External call `@pkg.fn(args)` (with optional postfix `catch { ... }`)
+    // Builtin `fail(msg)` inside a `Failure` raising boundary
+    if le_is_builtin_fail(st, tokens, i, start, end) && st.frames.length() > 0 {
+      let active_et = match le_active_err_ty(st) { Some(et) => et, None => "" }
+      if active_et == st.failure_enum {
+        let cp = find_matching_delim(tokens, i + 1)
+        st.need_failure = true
+        sb.write_string(t.leading_trivia + le_active_raise_stmt(st, "Failure(" + le_lower_range(st, src, tokens, i + 2, cp) + ")", t.line, t.col))
+        i = cp + 1
+        continue
+      }
+    }
+    // External call `@pkg.fn(args)` (with optional postfix `catch[!] { ... }`)
     if t.kind == TokenKind::PkgRef && i + 3 < end &&
     tokens[i + 1].kind == TokenKind::Dot && tokens[i + 3].kind == TokenKind::LParen {
       let rp = find_matching_delim(tokens, i + 3)
-      let pkg = t.raw.slice(1, t.raw.length())
-      let key = pkg + "::" + tokens[i + 2].raw
-      let has_catch = rp + 2 < end && le_is_kw(tokens[rp + 1], "catch") && tokens[rp + 2].kind == TokenKind::LBrace
-      match st.cfg.known_raising_calls.get(key) {
-        Some(target_fn) => {
-          if has_catch {
-            let catch_lb = rp + 2
-            let catch_rb = find_matching_delim(tokens, catch_lb)
-            sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, target_fn, catch_lb, catch_rb, t.line, t.col))
-            i = catch_rb + 1
-            continue
+      let raw_pkg = t.raw.slice(1, t.raw.length())
+      let fn_name = tokens[i + 2].raw
+      let catch_opt = le_match_postfix_catch(tokens, rp, end)
+      match le_resolve_external_call(st, raw_pkg, fn_name) {
+        Some((target_fn, err_ty)) => {
+          match catch_opt {
+            Some((is_cb, catch_lb, catch_rb)) => {
+              sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, target_fn, err_ty, is_cb, catch_lb, catch_rb, t.line, t.col))
+              i = catch_rb + 1
+              continue
+            }
+            None => ()
           }
           let args = le_lower_range(st, src, tokens, i + 4, rp)
           let call_s = target_fn + "(" + args + ")"
-          sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, t.line, t.col))
+          sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
           i = rp + 1
           continue
         }
         None =>
-        if has_catch {
-          let catch_lb = rp + 2
-          let catch_rb = find_matching_delim(tokens, catch_lb)
-          le_unsup(st, t.line, t.col, "unknown external raising function `@" + pkg + "." + tokens[i + 2].raw + "` in `catch`")
-          sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte))
-          i = catch_rb + 1
-          continue
-        }
-      }
-    }
-    // Qualified method `Type::method(args)` (with optional postfix `catch { ... }`)
-    if t.kind == TokenKind::UpperIdent && i + 2 < end &&
-    tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident {
-      let qk = t.raw + "::" + tokens[i + 2].raw
-      if st.pkg_raise_methods.contains(qk) {
-        if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
-          let rp = find_matching_delim(tokens, i + 3)
-          if rp + 2 < end && le_is_kw(tokens[rp + 1], "catch") && tokens[rp + 2].kind == TokenKind::LBrace {
-            let catch_lb = rp + 2
-            let catch_rb = find_matching_delim(tokens, catch_lb)
-            sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, qk, catch_lb, catch_rb, t.line, t.col))
+        match catch_opt {
+          Some((_, _, catch_rb)) => {
+            le_unsup(st, t.line, t.col, "unknown or non-raising external function `@" + raw_pkg + "." + fn_name + "` in `catch`")
+            sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte))
             i = catch_rb + 1
             continue
           }
-          let args = le_lower_range(st, src, tokens, i + 4, rp)
-          let call_s = qk + "(" + args + ")"
-          sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, t.line, t.col))
-          i = rp + 1
-          continue
+          None => ()
         }
-        le_unsup(st, t.line, t.col, "raising method `" + qk + "` cannot be used as a first-class value")
       }
     }
-    // Receiver method call `recv.method(args)` (with optional postfix `catch { ... }`)
+    // Postfix `Ctor(raising_call) catch[!] { ... }` (e.g. `Some(@utf8.decode(b)) catch { _ => None }`)
+    if t.kind == TokenKind::UpperIdent && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, i + 1)
+      match le_match_postfix_catch(tokens, rp, end) {
+        Some((is_cb, catch_lb, catch_rb)) => {
+          match le_try_lower_direct_result_call(st, src, tokens, i, rp + 1) {
+            Some((wrap_ctor, res_call, canon_et)) => {
+              let ok_arm = le_render_ok_arm(st, src, tokens, wrap_ctor, -1, -1)
+              let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb, canon_et, is_cb, t.line, t.col)
+              sb.write_string(t.leading_trivia + "match " + res_call + " { " + ok_arm + ", " + err_arm + " }")
+            }
+            None =>
+            match le_lower_compound_try(st, src, tokens, i, rp + 1, catch_lb, catch_rb, is_cb, -1, -1, "catch", t.line, t.col) {
+              Some(expr) => sb.write_string(t.leading_trivia + expr)
+              None => sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte))
+            }
+          }
+          i = catch_rb + 1
+          continue
+        }
+        None => ()
+      }
+    }
+    // Qualified method `Type::method(args)` (with optional postfix `catch[!] { ... }` or chained `.method()`)
+    if t.kind == TokenKind::UpperIdent && i + 2 < end &&
+    tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident {
+      let qk = t.raw + "::" + tokens[i + 2].raw
+      match st.pkg_raise_methods.get(qk) {
+        Some(err_ty) => {
+          if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
+            let rp = find_matching_delim(tokens, i + 3)
+            match le_match_postfix_catch(tokens, rp, end) {
+              Some((is_cb, catch_lb, catch_rb)) => {
+                sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, qk, err_ty, is_cb, catch_lb, catch_rb, t.line, t.col))
+                i = catch_rb + 1
+                continue
+              }
+              None => ()
+            }
+            let args = le_lower_range(st, src, tokens, i + 4, rp)
+            let call_s = qk + "(" + args + ")"
+            sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
+            i = rp + 1
+            continue
+          }
+          le_unsup(st, t.line, t.col, "raising method `" + qk + "` cannot be used as a first-class value")
+        }
+        None =>
+        if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
+          let cp = find_matching_delim(tokens, i + 3)
+          if cp + 3 < end && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].kind == TokenKind::Ident &&
+          tokens[cp + 3].kind == TokenKind::LParen && st.pkg_raise_method_names.contains(tokens[cp + 2].raw) {
+            let mn = tokens[cp + 2].raw
+            let cp2 = find_matching_delim(tokens, cp + 3)
+            let rt = match st.pkg_fn_ret_types.get(qk) { Some(v) => v, None => "" }
+            if st.pkg_concrete_types.contains(rt) &&
+            (st.pkg_raise_methods.contains(rt + "::" + mn) || st.pkg_non_raise_methods.contains(rt + "::" + mn)) {
+              let call_s = qk + "(" + le_lower_range(st, src, tokens, i + 4, cp) + ")." + mn + "(" + le_lower_range(st, src, tokens, cp + 4, cp2) + ")"
+              match st.pkg_raise_methods.get(rt + "::" + mn) {
+                Some(err_ty) => sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
+                None => sb.write_string(t.leading_trivia + call_s)
+              }
+              i = cp2 + 1
+              continue
+            }
+            le_unsup(st, tokens[cp + 2].line, tokens[cp + 2].col, "cannot statically resolve receiver type for potentially raising method `." + mn + "()`")
+          }
+        }
+      }
+    }
+    // Receiver method call `recv.method(args)` (with optional postfix `catch[!] { ... }`)
     if t.kind == TokenKind::Ident && i + 3 < end &&
     tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident &&
     tokens[i + 3].kind == TokenKind::LParen &&
@@ -1415,21 +2670,25 @@ fn le_lower_range(
         let rp = find_matching_delim(tokens, i + 3)
         if st.pkg_concrete_types.contains(rty) &&
         (st.pkg_raise_methods.contains(rty + "::" + mn) || st.pkg_non_raise_methods.contains(rty + "::" + mn)) {
-          if st.pkg_raise_methods.contains(rty + "::" + mn) {
-            if rp + 2 < end && le_is_kw(tokens[rp + 1], "catch") && tokens[rp + 2].kind == TokenKind::LBrace {
-              let catch_lb = rp + 2
-              let catch_rb = find_matching_delim(tokens, catch_lb)
-              sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, t.raw + "." + mn, catch_lb, catch_rb, t.line, t.col))
-              i = catch_rb + 1
-              continue
+          match st.pkg_raise_methods.get(rty + "::" + mn) {
+            Some(err_ty) => {
+              match le_match_postfix_catch(tokens, rp, end) {
+                Some((is_cb, catch_lb, catch_rb)) => {
+                  sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 4, rp, t.raw + "." + mn, err_ty, is_cb, catch_lb, catch_rb, t.line, t.col))
+                  i = catch_rb + 1
+                  continue
+                }
+                None => ()
+              }
+              let args = le_lower_range(st, src, tokens, i + 4, rp)
+              let call_s = t.raw + "." + mn + "(" + args + ")"
+              sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
             }
-            let args = le_lower_range(st, src, tokens, i + 4, rp)
-            let call_s = t.raw + "." + mn + "(" + args + ")"
-            sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, t.line, t.col))
-          } else {
-            let args = le_lower_range(st, src, tokens, i + 4, rp)
-            let call_s = t.raw + "." + mn + "(" + args + ")"
-            sb.write_string(t.leading_trivia + call_s)
+            None => {
+              let args = le_lower_range(st, src, tokens, i + 4, rp)
+              let call_s = t.raw + "." + mn + "(" + args + ")"
+              sb.write_string(t.leading_trivia + call_s)
+            }
           }
           i = rp + 1
           continue
@@ -1437,27 +2696,56 @@ fn le_lower_range(
         le_unsup(st, tokens[i + 2].line, tokens[i + 2].col, "cannot statically resolve receiver type for potentially raising method `." + mn + "()`")
       }
     }
-    // Same-package raising function call `fn_name(args)` (with optional postfix `catch { ... }`)
+    // Same-package raising function or local raising closure `fn_name(args)` (or chained `fn().method()`)
     if t.kind == TokenKind::Ident &&
     !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
-    !(i + 1 < end && (tokens[i + 1].kind == TokenKind::Colon || tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::Tilde)) &&
-    !le_is_lex_bound(st, t.raw) && st.pkg_raise_fns.contains(t.raw) {
-      if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
-        let rp = find_matching_delim(tokens, i + 1)
-        if rp + 2 < end && le_is_kw(tokens[rp + 1], "catch") && tokens[rp + 2].kind == TokenKind::LBrace {
-          let catch_lb = rp + 2
-          let catch_rb = find_matching_delim(tokens, catch_lb)
-          sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 2, rp, t.raw, catch_lb, catch_rb, t.line, t.col))
-          i = catch_rb + 1
-          continue
+    !(i + 1 < end && (tokens[i + 1].kind == TokenKind::Colon || tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::Tilde)) {
+      match le_lookup_raise_fn(st, t.raw) {
+        Some(err_ty) => {
+          if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+            let rp = find_matching_delim(tokens, i + 1)
+            match le_match_postfix_catch(tokens, rp, end) {
+              Some((is_cb, catch_lb, catch_rb)) => {
+                sb.write_string(t.leading_trivia + le_emit_postfix_catch(st, src, tokens, i, i + 2, rp, t.raw, err_ty, is_cb, catch_lb, catch_rb, t.line, t.col))
+                i = catch_rb + 1
+                continue
+              }
+              None => ()
+            }
+            let args = le_lower_range(st, src, tokens, i + 2, rp)
+            let call_s = t.raw + "(" + args + ")"
+            sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
+            i = rp + 1
+            continue
+          }
+          le_unsup(st, t.line, t.col, "raising function `" + t.raw + "` cannot be used as a first-class value")
         }
-        let args = le_lower_range(st, src, tokens, i + 2, rp)
-        let call_s = t.raw + "(" + args + ")"
-        sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, t.line, t.col))
-        i = rp + 1
-        continue
+        None =>
+        if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+          let cp = find_matching_delim(tokens, i + 1)
+          if cp + 3 < end && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].kind == TokenKind::Ident &&
+          tokens[cp + 3].kind == TokenKind::LParen && st.pkg_raise_method_names.contains(tokens[cp + 2].raw) {
+            let mn = tokens[cp + 2].raw
+            let cp2 = find_matching_delim(tokens, cp + 3)
+            let rt = if !le_is_lex_bound(st, t.raw) {
+              match st.pkg_fn_ret_types.get(t.raw) { Some(v) => v, None => "" }
+            } else {
+              ""
+            }
+            if st.pkg_concrete_types.contains(rt) &&
+            (st.pkg_raise_methods.contains(rt + "::" + mn) || st.pkg_non_raise_methods.contains(rt + "::" + mn)) {
+              let call_s = t.raw + "(" + le_lower_range(st, src, tokens, i + 2, cp) + ")." + mn + "(" + le_lower_range(st, src, tokens, cp + 4, cp2) + ")"
+              match st.pkg_raise_methods.get(rt + "::" + mn) {
+                Some(err_ty) => sb.write_string(t.leading_trivia + le_propagate_call(st, call_s, err_ty, t.line, t.col))
+                None => sb.write_string(t.leading_trivia + call_s)
+              }
+              i = cp2 + 1
+              continue
+            }
+            le_unsup(st, tokens[cp + 2].line, tokens[cp + 2].col, "cannot statically resolve receiver type for potentially raising method `." + mn + "()`")
+          }
+        }
       }
-      le_unsup(st, t.line, t.col, "raising function `" + t.raw + "` cannot be used as a first-class value")
     }
     // Unresolved `.method()` whose name matches a raising method in this package
     if t.kind == TokenKind::Dot && i + 2 < end &&
@@ -1465,8 +2753,9 @@ fn le_lower_range(
     st.pkg_raise_method_names.contains(tokens[i + 1].raw) {
       le_unsup(st, tokens[i + 1].line, tokens[i + 1].col, "cannot statically resolve receiver type for potentially raising method `." + tokens[i + 1].raw + "()`")
     }
-    // Unexpected standalone `catch { ... }` on an unrecognized LHS expression -> fail-closed
-    if le_is_kw(t, "catch") && i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace {
+    // Unexpected standalone `catch { ... }` or `catch! { ... }` on an unrecognized LHS expression -> fail-closed
+    if le_is_kw(t, "catch") && ((i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace) ||
+      (i + 2 < end && tokens[i + 1].kind == TokenKind::Bang && tokens[i + 2].kind == TokenKind::LBrace)) {
       le_unsup(st, t.line, t.col, "unsupported `catch` attached to non-raising or unknown expression")
     }
     // Interpolated string holes `\{...}`
@@ -1494,10 +2783,12 @@ fn le_lower_range(
 }
 
 ///| Lower MoonBit checked-error declarations and expressions (`suberror`, `raise`, `try`,
-///| `catch`, `noraise`, `try?`, `try!`) across a package's source files into Pion `Result`/`match`/`?`.
-pub fn lower_checked_errors(
+///| `catch`, `catch!`, `noraise`, `try?`, `try!`) across a package's source files into Pion
+///| `Result`/`match`/`?`, resolving cross-package raising calls via `ExternalErrorEnv`.
+pub fn lower_checked_errors_with_env(
   sources : Array[SourceFile],
   cfg : ErrorLowerConfig,
+  env : ExternalErrorEnv,
   diags : Array[Diag],
 ) -> Array[SourceFile] {
   let all_toks : Array[Array[Token]] = []
@@ -1522,24 +2813,28 @@ pub fn lower_checked_errors(
     }
     all_toks.push(toks)
   }
-  if !any_err_kw {
+  if !any_err_kw && env.dep_raising_fns.length() == 0 {
     return sources
   }
 
+  let failure_enum = le_alloc_unique(used_idents, "MbtFailure")
+  let outcome_enum = le_alloc_unique(used_idents, "MbtTryOutcome")
   let suberror_names : Map[String, Bool] = Map()
   let suberror_ctors : Map[String, String] = Map()
+  let suberror_variants : Map[String, Array[String]] = Map()
   let pkg_raise_fns : Map[String, String] = Map()
   let pkg_raise_methods : Map[String, String] = Map()
   let pkg_non_raise_methods : Map[String, Bool] = Map()
   let pkg_raise_method_names : Map[String, Bool] = Map()
   let pkg_fn_ret_types : Map[String, String] = Map()
+  let pkg_all_fns : Map[String, Bool] = Map()
   let pkg_concrete_types : Map[String, Bool] = Map()
   let rejected_fns : Map[String, Bool] = Map()
   for bt in ["Int", "Int64", "UInt", "UInt64", "Double", "Float", "Bool", "Char", "Byte", "String", "Bytes", "Unit", "Array", "FixedArray", "Map", "Option", "Result", "StringBuilder"] {
     pkg_concrete_types[bt] = true
   }
 
-  // Pass 0a: collect concrete types and `suberror` declarations
+  // Pass 0a: collect concrete types and `suberror` declarations + full variant lists
   let mut fi = 0
   while fi < sources.length() {
     let toks = all_toks[fi]
@@ -1557,22 +2852,27 @@ pub fn lower_checked_errors(
       if depth == 0 && le_is_kw(t, "suberror") && i + 1 < n && toks[i + 1].kind == TokenKind::UpperIdent {
         let en = toks[i + 1].raw
         suberror_names[en] = true
-        suberror_ctors[en] = en
         pkg_concrete_types[en] = true
         if i + 2 < n && toks[i + 2].kind == TokenKind::LBrace {
           let rb = find_matching_delim(toks, i + 2)
+          let vars : Array[String] = []
           let mut k = i + 3
           let mut bd = 0
           while k < rb {
             if bd == 0 && toks[k].kind == TokenKind::UpperIdent &&
             (k == i + 3 || toks[k].newline_before || toks[k - 1].kind == TokenKind::Semi) {
               suberror_ctors[toks[k].raw] = en
+              vars.push(toks[k].raw)
             }
             bd = le_step_depth(toks[k].kind, bd)
             k = k + 1
           }
+          suberror_variants[en] = vars
           i = rb + 1
           continue
+        } else {
+          suberror_ctors[en] = en
+          suberror_variants[en] = [en]
         }
       }
       i = i + 1
@@ -1597,8 +2897,18 @@ pub fn lower_checked_errors(
           Some((fname, _, _, rty, has_r, ety, has_rp, lb)) => {
             let rb = find_matching_delim(toks, lb)
             if fname.length() > 0 {
+              pkg_all_fns[fname] = true
               let rt = le_base_type_ident(rty)
-              if rt.length() > 0 && pkg_concrete_types.contains(rt) {
+              let mut is_tp = false
+              if i + 1 < n && toks[i + 1].kind == TokenKind::LBracket {
+                let cb = find_matching_delim(toks, i + 1)
+                let mut tk = i + 2
+                while tk < cb {
+                  if toks[tk].kind == TokenKind::UpperIdent && toks[tk].raw == rt { is_tp = true; break }
+                  tk = tk + 1
+                }
+              }
+              if rt.length() > 0 && pkg_concrete_types.contains(rt) && !is_tp {
                 pkg_fn_ret_types[fname] = rt
               }
             }
@@ -1612,13 +2922,38 @@ pub fn lower_checked_errors(
               ))
               rejected_fns[fname] = true
             } else if has_r {
-              let eff_et = if ety.length() > 0 { ety } else { cfg.default_err_type }
-              let cc = fname.index_of("::")
-              if cc > 0 {
-                pkg_raise_methods[fname] = eff_et
-                pkg_raise_method_names[fname.slice(cc + 2, fname.length())] = true
+              // Bare `raise` (outside already-rewritten Category A test helpers) or `raise Error` MUST fail closed!
+              if ety.length() == 0 || ety == "Error" {
+                diags.push(diag_error(
+                  "MBT2PION_UNSUPPORTED_SYNTAX",
+                  sf.rel_path,
+                  t.line,
+                  t.col,
+                  "bare `raise` or polymorphic `raise Error` on `" + fname + "` is unsupported; specify a concrete `suberror` type",
+                ))
+                rejected_fns[fname] = true
               } else {
-                pkg_raise_fns[fname] = eff_et
+                let canon_et = if ety == "Failure" {
+                  failure_enum
+                } else if ety.starts_with("@") {
+                  let dot = ety.index_of(".")
+                  if dot > 1 {
+                    let rp = ety.slice(1, dot)
+                    let tn = ety.slice(dot + 1, ety.length()).trim()
+                    le_resolve_dep_pkg(env, rp) + "::" + tn
+                  } else {
+                    ety
+                  }
+                } else {
+                  ety
+                }
+                let cc = fname.index_of("::")
+                if cc > 0 {
+                  pkg_raise_methods[fname] = canon_et
+                  pkg_raise_method_names[fname.slice(cc + 2, fname.length())] = true
+                } else {
+                  pkg_raise_fns[fname] = canon_et
+                }
               }
             } else if str_has(fname, "::") {
               pkg_non_raise_methods[fname] = true
@@ -1636,6 +2971,8 @@ pub fn lower_checked_errors(
 
   // Pass 1: lower every file
   let out_sources : Array[SourceFile] = []
+  let mut any_fail = false
+  let mut any_out = false
   fi = 0
   while fi < sources.length() {
     let sf = sources[fi]
@@ -1644,19 +2981,29 @@ pub fn lower_checked_errors(
     let n = toks.length() - 1
     let st = LeState::{
       file: sf.rel_path,
+      is_test: sf.is_test,
       cfg: cfg,
+      env: env,
       suberror_names: suberror_names,
       suberror_ctors: suberror_ctors,
+      suberror_variants: suberror_variants,
       pkg_raise_fns: pkg_raise_fns,
       pkg_raise_methods: pkg_raise_methods,
       pkg_non_raise_methods: pkg_non_raise_methods,
       pkg_raise_method_names: pkg_raise_method_names,
       pkg_fn_ret_types: pkg_fn_ret_types,
+      pkg_all_fns: pkg_all_fns,
       pkg_concrete_types: pkg_concrete_types,
+      failure_enum: failure_enum,
+      outcome_enum: outcome_enum,
       used_idents: used_idents,
       frames: [],
       lex_var_types: [Map()],
+      lex_raise_closures: [Map()],
+      lex_err_vars: [Map()],
       diags: diags,
+      need_failure: false,
+      need_outcome: false,
       tmp_seq: 0,
     }
     let edits : Array[(Int, Int, String)] = []
@@ -1683,20 +3030,17 @@ pub fn lower_checked_errors(
           vis_prefix = "pub "
         }
         if i + 2 < n && toks[i + 2].kind == TokenKind::LBrace {
-          // `suberror E { A(Int); B(String) } [derive(...)]`
           edits.push((start_b, t.end_byte, vis_prefix + "enum"))
           i = i + 2
           continue
         }
         if i + 2 < n && toks[i + 2].kind == TokenKind::LParen {
-          // `suberror E(String) [derive(...)]`
           let cp = find_matching_delim(toks, i + 2)
           let payload = src.slice(toks[i + 2].start_byte, toks[cp].end_byte)
           edits.push((start_b, toks[cp].end_byte, vis_prefix + "enum " + ename + " { " + ename + payload + " }"))
           i = cp + 1
           continue
         }
-        // Check `suberror E PayloadTy [derive(...)]` on the same line (not followed by `derive` or newline)
         if i + 2 < n && !toks[i + 2].newline_before && !le_is_kw(toks[i + 2], "derive") &&
         toks[i + 2].kind != TokenKind::Semi {
           let mut pe = i + 2
@@ -1713,7 +3057,6 @@ pub fn lower_checked_errors(
           i = pe
           continue
         }
-        // Unit `suberror E`
         edits.push((start_b, toks[i + 1].end_byte, vis_prefix + "enum " + ename + " { " + ename + " }"))
         i = i + 2
         continue
@@ -1724,16 +3067,28 @@ pub fn lower_checked_errors(
         match le_parse_fn_header(src, toks, i, n) {
           Some((fname, op, cp, rty, has_r, ety, _, lb)) => {
             let rb = find_matching_delim(toks, lb)
+            // Never double-process a Category A function already rewritten by `preprocess_test_helper_raises`
+            if env.cat_a_rewritten.contains(fname) {
+              if has_r {
+                le_unsup(st, t.line, t.col, "internal invariant violation: Category A helper `" + fname + "` still contains `raise`")
+              }
+              i = rb + 1
+              continue
+            }
             if rejected_fns.contains(fname) {
               i = rb + 1
               continue
             }
             let pm : Map[String, String] = Map()
-            le_seed_params(toks, op, cp, fname, pm)
+            let cm : Map[String, String] = Map()
+            le_seed_params(toks, op, cp, fname, pm, cm)
             st.lex_var_types.push(pm)
+            st.lex_raise_closures.push(cm)
+            st.lex_err_vars.push(Map())
             if has_r {
-              let eff_et = if ety.length() > 0 { ety } else { cfg.default_err_type }
-              st.frames.push(LeFrame::RaisingFn(rty, eff_et))
+              let canon_et = le_canon_err_ty(st, ety)
+              let emit_et = if ety == "Failure" { st.failure_enum } else { ety }
+              st.frames.push(LeFrame::RaisingFn(rty, canon_et))
               let bt = le_lower_range(st, src, toks, lb + 1, rb)
               let _ = st.frames.pop()
               let tail_triv = toks[rb].leading_trivia
@@ -1748,7 +3103,7 @@ pub fn lower_checked_errors(
               edits.push((
                 t.start_byte,
                 toks[rb].end_byte,
-                src.slice(t.start_byte, toks[cp].end_byte) + " -> Result[" + rty + ", " + eff_et + "] " + wrapped,
+                src.slice(t.start_byte, toks[cp].end_byte) + " -> Result[" + rty + ", " + emit_et + "] " + wrapped,
               ))
             } else {
               st.frames.push(LeFrame::PlainFn(rty))
@@ -1758,6 +3113,8 @@ pub fn lower_checked_errors(
                 edits.push((toks[lb].end_byte, toks[rb].start_byte, nb))
               }
             }
+            let _ = st.lex_err_vars.pop()
+            let _ = st.lex_raise_closures.pop()
             let _ = st.lex_var_types.pop()
             i = rb + 1
             continue
@@ -1773,9 +3130,13 @@ pub fn lower_checked_errors(
         if lb < n && toks[lb].kind == TokenKind::LBrace {
           let rb = find_matching_delim(toks, lb)
           st.lex_var_types.push(Map())
+          st.lex_raise_closures.push(Map())
+          st.lex_err_vars.push(Map())
           st.frames.push(LeFrame::PlainFn("Unit"))
           let nb = le_lower_range(st, src, toks, lb + 1, rb) + toks[rb].leading_trivia
           let _ = st.frames.pop()
+          let _ = st.lex_err_vars.pop()
+          let _ = st.lex_raise_closures.pop()
           let _ = st.lex_var_types.pop()
           if nb != src.slice(toks[lb].end_byte, toks[rb].start_byte) {
             edits.push((toks[lb].end_byte, toks[rb].start_byte, nb))
@@ -1785,7 +3146,32 @@ pub fn lower_checked_errors(
         }
       }
 
-      // 4. Fail-closed on residual `raise` / `try` / `catch` outside top-level `fn` / `test` (e.g. top-level `let`/`const`/`impl`)
+      // Skip `struct` / `enum` / `type` / `trait` declarations (Stage A handles `raise` in type definitions + dispositions)
+      if depth == 0 && (le_is_kw(t, "struct") || le_is_kw(t, "enum") || le_is_kw(t, "type") || le_is_kw(t, "trait")) {
+        let mut sk = i + 1
+        while sk < n && toks[sk].kind != TokenKind::LBrace && toks[sk].kind != TokenKind::Semi && !toks[sk].newline_before {
+          sk = sk + 1
+        }
+        if sk < n && toks[sk].kind == TokenKind::LBrace {
+          i = find_matching_delim(toks, sk) + 1
+          continue
+        }
+      }
+      // Skip type annotations on top-level `let`/`const` (Stage A reports `raise` in type annotations + dispositions)
+      if depth == 0 && t.kind == TokenKind::Keyword && (t.raw == "let" || t.raw == "const") {
+        let mut eq_i = i + 1
+        let mut td = 0
+        while eq_i < n && !(td == 0 && (toks[eq_i].kind == TokenKind::Eq || toks[eq_i].kind == TokenKind::Semi)) {
+          td = le_step_depth(toks[eq_i].kind, td)
+          eq_i = eq_i + 1
+        }
+        if eq_i < n && toks[eq_i].kind == TokenKind::Eq {
+          i = eq_i + 1
+          continue
+        }
+      }
+
+      // 4. Fail-closed on residual `raise` / `try` / `catch` outside top-level `fn` / `test`
       if le_is_kw(t, "raise") || le_is_kw(t, "try") || le_is_kw(t, "catch") {
         le_unsup(st, t.line, t.col, "unsupported `" + t.raw + "` outside top-level `fn`/`test`")
       } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
@@ -1794,6 +3180,8 @@ pub fn lower_checked_errors(
 
       i = i + 1
     }
+    if st.need_failure { any_fail = true }
+    if st.need_outcome { any_out = true }
     out_sources.push(if edits.length() > 0 {
       SourceFile::{ rel_path: sf.rel_path, content: apply_byte_edits(src, edits), is_test: sf.is_test }
     } else {
@@ -1801,7 +3189,27 @@ pub fn lower_checked_errors(
     })
     fi = fi + 1
   }
+  if (any_fail || any_out) && out_sources.length() > 0 {
+    let h = (if any_fail { "enum " + failure_enum + " {\n  Failure(String)\n}\n\n" } else { "" }) +
+    (if any_out { "enum " + outcome_enum + "[R, E] {\n  MbtTryOk\n  MbtTryRet(R)\n  MbtTryErr(E)\n}\n\n" } else { "" })
+    let mut ti = 0
+    let mut k = 0
+    while k < out_sources.length() {
+      if !out_sources[k].is_test { ti = k; break }
+      k = k + 1
+    }
+    out_sources[ti] = SourceFile::{ rel_path: out_sources[ti].rel_path, content: h + out_sources[ti].content, is_test: out_sources[ti].is_test }
+  }
   out_sources
+}
+
+///| Lower MoonBit checked-error declarations and expressions with empty external ABI env.
+pub fn lower_checked_errors(
+  sources : Array[SourceFile],
+  cfg : ErrorLowerConfig,
+  diags : Array[Diag],
+) -> Array[SourceFile] {
+  lower_checked_errors_with_env(sources, cfg, empty_external_error_env(), diags)
 }
 
 ///| Return true iff a string interpolation token contains `suberror`/`raise`/`try`/`catch` in any `\{...}` hole.
