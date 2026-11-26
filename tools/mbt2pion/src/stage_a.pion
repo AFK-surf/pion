@@ -12977,6 +12977,170 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
   let bb_priv_decls : Array[String] = []
   let bb_all_idents : Map[String, Bool] = Map()
   let method_seen_count : Map[String, Int] = Map()
+  // Pre-pass 0: collect all local_types, raw_type_aliases, and using_types across all files
+  // (respecting #cfg exclusions) before the main prescan loop so struct_field_types,
+  // exported_abi_enums, fn_param_types, fn_ret_types, and recursive #derive(Eq) detection all
+  // observe the same converged, single-lowered `ctx.symtab.type_aliases`.
+  let raw_type_aliases : Map[String, String] = Map()
+  let pending_using_types : Array[(String, String)] = []
+  for sf in files {
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut pi = 0
+    let mut p_cfg_excluded = false
+    while pi < n {
+      let pt = tokens[pi]
+      if pt.kind == TokenKind::Attr {
+        if pt.raw.starts_with("#cfg") {
+          match eval_cfg_attr(pt.raw, ctx.opts.target) {
+            Some(false) => p_cfg_excluded = true
+            None => p_cfg_excluded = true
+            Some(true) => ()
+          }
+        }
+        pi = pi + 1
+        continue
+      }
+      if p_cfg_excluded {
+        p_cfg_excluded = false
+        pi = skip_top_level_decl(tokens, pi, n)
+        continue
+      }
+      if pt.kind == TokenKind::Keyword &&
+      (pt.raw == "struct" || pt.raw == "enum" || pt.raw == "type" || pt.raw == "suberror" || pt.raw == "trait") &&
+      pi + 1 < n && tokens[pi + 1].kind == TokenKind::UpperIdent {
+        ctx.symtab.local_types[tokens[pi + 1].raw] = true
+      }
+      if pt.kind == TokenKind::Keyword && pt.raw == "type" && pi + 3 < n &&
+      tokens[pi + 1].kind == TokenKind::UpperIdent && tokens[pi + 2].kind == TokenKind::Eq {
+        let aname = tokens[pi + 1].raw
+        let rhs_end = find_top_level_let_expr_end(tokens, pi + 3, n)
+        if rhs_end > pi + 3 {
+          let raw_rhs = sf.content.slice(tokens[pi + 3].start_byte, tokens[rhs_end - 1].end_byte).trim()
+          if raw_rhs.length() > 0 {
+            raw_type_aliases[aname] = raw_rhs
+          }
+        }
+        pi = rhs_end
+        continue
+      }
+      if (pt.kind == TokenKind::Keyword || pt.kind == TokenKind::Ident) && pt.raw == "using" &&
+      pi + 2 < n && tokens[pi + 1].kind == TokenKind::PkgRef && tokens[pi + 2].kind == TokenKind::LBrace {
+        let raw_pkg = tokens[pi + 1].raw.slice(1, tokens[pi + 1].raw.length())
+        let target_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
+          Some(p) => p
+          None => raw_pkg
+        }
+        let rb = find_matching_delim(tokens, pi + 2)
+        let mut uk = pi + 3
+        while uk < rb {
+          let ut = tokens[uk]
+          if ut.kind == TokenKind::Comma || ut.kind == TokenKind::Semi {
+            uk = uk + 1
+            continue
+          }
+          if (ut.kind == TokenKind::Keyword || ut.kind == TokenKind::Ident) &&
+          (ut.raw == "type" || ut.raw == "trait") && uk + 1 < rb &&
+          (tokens[uk + 1].kind == TokenKind::UpperIdent || tokens[uk + 1].kind == TokenKind::Ident) {
+            let tname = tokens[uk + 1].raw
+            pending_using_types.push((tname, target_pkg + "::" + tname))
+            uk = uk + 2
+            continue
+          }
+          uk = uk + 1
+        }
+        pi = rb + 1
+        continue
+      }
+      if pt.kind == TokenKind::LBrace {
+        pi = find_matching_delim(tokens, pi) + 1
+        continue
+      }
+      pi = pi + 1
+    }
+  }
+  for ut in pending_using_types {
+    if !ctx.symtab.local_types.contains(ut.0) {
+      ctx.symtab.using_types[ut.0] = ut.1
+    }
+  }
+  // Step A: fixed-point expand type alias chains on raw MoonBit source text (bounded to 16 iterations)
+  // so MoonBit types (e.g. `ReadOnlyArray[Int]`) are never prematurely lowered and re-aliased.
+  let mut ta_iter = 0
+  while ta_iter < 16 {
+    let mut ta_changed = false
+    for aname in raw_type_aliases.keys() {
+      match raw_type_aliases.get(aname) {
+        Some(cur_raw) => {
+          let rtoks = lex_moonbit(cur_raw)
+          let rn = rtoks.length() - 1
+          let sb = StringBuilder()
+          let mut pos = 0
+          let mut did_sub = false
+          let mut k = 0
+          while k < rn {
+            let tk = rtoks[k]
+            if tk.kind == TokenKind::UpperIdent &&
+            !(k > 0 && rtoks[k - 1].kind == TokenKind::Dot) &&
+            tk.raw != aname &&
+            !(k + 1 < rn && rtoks[k + 1].kind == TokenKind::LBracket) {
+              match raw_type_aliases.get(tk.raw) {
+                Some(aliased) => {
+                  sb.write_string(cur_raw.slice(pos, tk.start_byte))
+                  let needs_parens = k + 1 < rn && rtoks[k + 1].kind == TokenKind::Question && eq_is_fn_type(aliased)
+                  if needs_parens {
+                    sb.write_string("(" + aliased + ")")
+                  } else {
+                    sb.write_string(aliased)
+                  }
+                  pos = tk.end_byte
+                  did_sub = true
+                }
+                None => ()
+              }
+            }
+            k = k + 1
+          }
+          if did_sub {
+            sb.write_string(cur_raw.slice(pos, cur_raw.length()))
+            let next_raw = sb.to_string().trim()
+            if next_raw != cur_raw && next_raw.length() > 0 {
+              raw_type_aliases[aname] = next_raw
+              ta_changed = true
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    if !ta_changed {
+      break
+    }
+    ta_iter = ta_iter + 1
+  }
+  // Step B: lower each fully expanded MoonBit alias RHS exactly once with an empty `type_aliases` map.
+  for old_k in ctx.symtab.type_aliases.keys() {
+    ctx.symtab.type_aliases.remove(old_k)
+  }
+  let lowered_aliases : Map[String, String] = Map()
+  for aname in raw_type_aliases.keys() {
+    match raw_type_aliases.get(aname) {
+      Some(exp_raw) => {
+        let rtoks = lex_moonbit(exp_raw)
+        let rty = lower_type_tokens(rtoks, 0, rtoks.length() - 1, ctx.symtab, ctx.recipes).trim()
+        if rty.length() > 0 {
+          lowered_aliases[aname] = rty
+        }
+      }
+      None => ()
+    }
+  }
+  for aname in lowered_aliases.keys() {
+    match lowered_aliases.get(aname) {
+      Some(rty) => ctx.symtab.type_aliases[aname] = rty
+      None => ()
+    }
+  }
   for sf in files {
     ctx.all_source_texts.push(sf.content)
     let is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
@@ -13161,23 +13325,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           if has_hash_derive {
             ctx.symtab.hashable_types[sname] = true
           }
-          if has_eq_derive {
-            let mut all_prim = true
-            match ctx.symtab.struct_field_types.get(sname) {
-              Some(fm) => {
-                for fk in fm.keys() {
-                  match fm.get(fk) {
-                    Some(ft) => if !is_primitive_type(ft) { all_prim = false }
-                    None => ()
-                  }
-                }
-              }
-              None => ()
-            }
-            if !all_prim {
-              ctx.symtab.custom_eq_types[sname] = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(sname)
-            }
-          }
+          let _ = has_eq_derive
           i = rb + 1
           continue
         } else if lb < n && tokens[lb].kind == TokenKind::LParen {
@@ -13521,12 +13669,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if t.kind == TokenKind::Keyword && t.raw == "type" && i + 3 < n &&
       tokens[i + 1].kind == TokenKind::UpperIdent && tokens[i + 2].kind == TokenKind::Eq {
         next_autofill = false
-        let aname = tokens[i + 1].raw
         let rhs_end = find_top_level_let_expr_end(tokens, i + 3, n)
-        let rty = lower_type_tokens(tokens, i + 3, rhs_end, ctx.symtab, ctx.recipes).trim()
-        if rty.length() > 0 {
-          ctx.symtab.type_aliases[aname] = rty
-        }
         i = rhs_end
         continue
       }
@@ -13794,6 +13937,17 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           ctx.symtab.show_impl_types[tokens[i + 3].raw] = true
         }
       }
+      if t.kind == TokenKind::Keyword && t.raw == "impl" && i + 5 < n && tokens[i + 1].raw == "Eq" &&
+      tokens[i + 2].raw == "for" && tokens[i + 3].kind == TokenKind::UpperIdent &&
+      tokens[i + 4].raw == "with" {
+        let mut eq_mi = i + 5
+        if eq_mi < n && tokens[eq_mi].kind == TokenKind::Keyword && tokens[eq_mi].raw == "fn" {
+          eq_mi = eq_mi + 1
+        }
+        if eq_mi < n && tokens[eq_mi].raw == "equal" {
+          ctx.symtab.custom_impl_eq_types[tokens[i + 3].raw] = true
+        }
+      }
       if t.kind == TokenKind::Keyword && t.raw == "trait" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
         next_autofill = false
         let tname = tokens[i + 1].raw
@@ -13907,6 +14061,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
     }
   }
+  prescan_recursive_derive_eq_types(ctx, files)
 }
 
 ///| Lower a single `.mbt` file through Stage A, emitting declaration anchors,
@@ -13998,7 +14153,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let tn = lower_type_tokens(tokens, ci_scan + 1, f_i, ctx.symtab, ctx.recipes).trim()
         let st = lower_type_tokens(tokens, f_i + 1, w_i, ctx.symtab, ctx.recipes).trim()
         let mn = if w_i + 1 < lb_s { rename_keyword_ident(tokens[w_i + 1].raw) } else { "" }
-        if !(tn == "Show" && mn == "output") && tn.length() > 0 && st.length() > 0 {
+        if !(tn == "Show" && mn == "output") && !(tn == "Eq" && !ctx.symtab.local_types.contains("Eq")) && tn.length() > 0 && st.length() > 0 {
           let ikey = tn + "|" + st
           let prev_c = match impl_counts.get(ikey) { Some(v) => v, None => 0 }
           impl_counts[ikey] = prev_c + 1
@@ -14394,7 +14549,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let rb = find_matching_delim(tokens, lb)
         let mut decl_end = rb + 1
         // Check trailing `derive(...)`
-        if decl_end < n && tokens[decl_end].kind == TokenKind::Keyword && tokens[decl_end].raw == "derive" &&
+        if decl_end < n && (tokens[decl_end].kind == TokenKind::Keyword || tokens[decl_end].kind == TokenKind::Ident) && tokens[decl_end].raw == "derive" &&
         decl_end + 1 < n && tokens[decl_end + 1].kind == TokenKind::LParen {
           let dp = find_matching_delim(tokens, decl_end + 1)
           let mut di = decl_end + 2
@@ -14541,6 +14696,40 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
         }
 
+        let generics = if lb > i + 2 {
+          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
+        } else {
+          ""
+        }
+        let type_vis = if kind_kw == "struct" {
+          if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
+        } else {
+          // §6 Enum visibility:
+          // - `pub(all)` / `pub(open)` -> `pub enum` (`can_match: true, can_construct: true` in ABI)
+          // - `pub enum` (readonly externally) -> `pub enum` (`can_match: true, can_construct: false` in ABI)
+          // - bare `enum` / `priv enum` -> private; fails closed (`MBT2PION_UNSUPPORTED_VISIBILITY`) if exposed in `pub` sig.
+          if pub_fields || vis.length() > 0 {
+            "pub "
+          } else if explicit_priv {
+            ""
+          } else if ctx.symtab.pub_sig_referenced_types.contains(tname) {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_VISIBILITY",
+              sf.rel_path,
+              decl_line,
+              decl_col,
+              "abstract/read-only enum `" + tname + "` is referenced in a public signature, but Pion `pub enum` cannot hide constructors (use `pub(all)` or overlay)",
+            ))
+            ""
+          } else {
+            ""
+          }
+        }
+        let use_native_derive_eq = if kind_kw == "struct" {
+          should_use_native_derive_eq_struct(tname, field_types, ctx.symtab.recursive_derive_eq_types)
+        } else {
+          should_use_native_derive_eq_enum(tname, enum_variants, ctx.symtab.recursive_derive_eq_types)
+        }
         for d in pending_derives {
           if d == "Debug" {
             continue
@@ -14576,18 +14765,11 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               "unrecognized `#derive(" + d + ")` on `" + tname + "` (not in strict allowlist or recipes)",
             ))
           } else {
-            if d == "Eq" && all_fields_primitive {
+            if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              // Synthesize recursive structural equality function for non-primitive struct or enum
-              let eq_fn_name = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname)
-              ctx.symtab.custom_eq_types[tname] = eq_fn_name
-              let eq_body = if kind_kw == "struct" {
-                gen_struct_eq_body("a", "b", field_types, ctx.symtab.custom_eq_types)
-              } else {
-                gen_enum_eq_body("a", "b", enum_variants, ctx.symtab.custom_eq_types)
-              }
-              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  " + eq_body + "\n}\n")
+              // Direct `Bytes` or recursive `#derive(Eq)` type: synthesize native Pion `[pub] impl[T : Eq, ...] Eq`
+              recipe_impls_sb.write_string(gen_explicit_derive_eq_impl(type_vis, tname, type_added_generics, kind_kw == "struct", field_types, enum_variants))
             } else if d == "Hash" {
               let mut all_hashable = true
               if kind_kw == "struct" {
@@ -14618,18 +14800,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 }
                 recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
-                // §5: When both `Eq` and `Hash` are derived, also emit `impl mbt_compat::MapKey`!
+                // §5: When `Hash` is derived alongside `#derive(Eq)` or built-in `impl Eq`, emit `impl mbt_compat::MapKey`!
                 let mut also_has_eq = false
                 for pd in pending_derives {
                   if pd == "Eq" { also_has_eq = true }
                 }
-                if also_has_eq {
-                  let mk_eq_body = if all_fields_primitive {
-                    "self == other"
-                  } else {
-                    ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname) + "(self, other)"
-                  }
-                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    " + mk_eq_body + "\n  }\n}\n")
+                if also_has_eq || (!ctx.symtab.local_types.contains("Eq") && ctx.symtab.custom_impl_eq_types.contains(tname)) {
+                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    self == other\n  }\n}\n")
                 }
               }
             }
@@ -14659,39 +14836,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
         }
 
-        let generics = if lb > i + 2 {
-          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
-        } else {
-          ""
-        }
         let derive_prefix = if pion_derives.length() > 0 {
           "#derive(" + join_comma(pion_derives) + ")\n"
         } else {
           ""
-        }
-        let type_vis = if kind_kw == "struct" {
-          if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
-        } else {
-          // §6 Enum visibility:
-          // - `pub(all)` / `pub(open)` -> `pub enum` (`can_match: true, can_construct: true` in ABI)
-          // - `pub enum` (readonly externally) -> `pub enum` (`can_match: true, can_construct: false` in ABI)
-          // - bare `enum` / `priv enum` -> private; fails closed (`MBT2PION_UNSUPPORTED_VISIBILITY`) if exposed in `pub` sig.
-          if pub_fields || vis.length() > 0 {
-            "pub "
-          } else if explicit_priv {
-            ""
-          } else if ctx.symtab.pub_sig_referenced_types.contains(tname) {
-            ctx.diags.push(diag_error(
-              "MBT2PION_UNSUPPORTED_VISIBILITY",
-              sf.rel_path,
-              decl_line,
-              decl_col,
-              "abstract/read-only enum `" + tname + "` is referenced in a public signature, but Pion `pub enum` cannot hide constructors (use `pub(all)` or overlay)",
-            ))
-            ""
-          } else {
-            ""
-          }
         }
         let decl_code = derive_prefix + type_vis + kind_kw + " " + tname + generics + " {\n" + body_sb.to_string() + "}" + recipe_impls_sb.to_string()
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[decl_end - 1].end_byte)
@@ -14799,8 +14947,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
           fi = f_end + 1
         }
+        let generics = if lb > i + 2 {
+          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
+        } else {
+          ""
+        }
+        let type_vis = if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
         let mut pion_derives : Array[String] = []
         let mut recipe_impls_sb = StringBuilder()
+        let use_native_derive_eq = should_use_native_derive_eq_struct(tname, field_types, ctx.symtab.recursive_derive_eq_types)
         for d in pending_derives {
           if d == "Debug" {
             continue
@@ -14828,13 +14983,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               "unrecognized `#derive(" + d + ")` on `" + tname + "` (not in strict allowlist or recipes)",
             ))
           } else {
-            if d == "Eq" && all_fields_primitive {
+            if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              let eq_fn_name = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname)
-              ctx.symtab.custom_eq_types[tname] = eq_fn_name
-              let eq_body = gen_struct_eq_body("a", "b", field_types, ctx.symtab.custom_eq_types)
-              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  " + eq_body + "\n}\n")
+              recipe_impls_sb.write_string(gen_explicit_derive_eq_impl(type_vis, tname, type_added_generics, true, field_types, []))
             } else if d == "Hash" {
               let mut all_hashable = true
               for ft in field_types {
@@ -14853,18 +15005,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 let hc_body = gen_struct_hash_combine_body("self", "hasher", field_types)
                 recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
-                // §5: When both `Eq` and `Hash` are derived, also emit `impl mbt_compat::MapKey`!
+                // §5: When `Hash` is derived alongside `#derive(Eq)` or built-in `impl Eq`, emit `impl mbt_compat::MapKey`!
                 let mut also_has_eq = false
                 for pd in pending_derives {
                   if pd == "Eq" { also_has_eq = true }
                 }
-                if also_has_eq {
-                  let mk_eq_body = if all_fields_primitive {
-                    "self == other"
-                  } else {
-                    ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname) + "(self, other)"
-                  }
-                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    " + mk_eq_body + "\n  }\n}\n")
+                if also_has_eq || (!ctx.symtab.local_types.contains("Eq") && ctx.symtab.custom_impl_eq_types.contains(tname)) {
+                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    self == other\n  }\n}\n")
                 }
               }
             }
@@ -14884,17 +15031,11 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             }
           }
         }
-        let generics = if lb > i + 2 {
-          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
-        } else {
-          ""
-        }
         let derive_prefix = if pion_derives.length() > 0 {
           "#derive(" + join_comma(pion_derives) + ")\n"
         } else {
           ""
         }
-        let type_vis = if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
         let decl_code = derive_prefix + type_vis + "struct " + tname + generics + " {\n" + body_sb.to_string() + "}" + recipe_impls_sb.to_string()
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[decl_end - 1].end_byte)
         out_sb.write_string(attrs_trivia.to_string() + kept_attrs.to_string() + vis_trivia)
@@ -14967,6 +15108,27 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
 
     // --- 4. `impl Trait for Type with method(self, ...) -> R { ... }` ---
     if kw.kind == TokenKind::Keyword && kw.raw == "impl" {
+      let (handled_eq_impl, next_eq_i) = try_lower_builtin_eq_impl(
+        ctx,
+        sf,
+        tokens,
+        n,
+        decl_start,
+        i,
+        vis,
+        attrs_trivia.to_string(),
+        kept_attrs.to_string(),
+        vis_trivia,
+        decl_line,
+        decl_col,
+        decl_err_before,
+        out_sb,
+        anchors,
+      )
+      if handled_eq_impl {
+        i = next_eq_i
+        continue
+      }
       // pionc 0.1.0 does not support generic `impl[T : ...]` -> fail loud!
       if i + 1 < n && tokens[i + 1].kind == TokenKind::LBracket {
         ctx.diags.push(diag_error(
@@ -15773,7 +15935,12 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
     None => ()
   }
   if t == "Bytes" {
-    return "mbt_compat::bytes_eq(" + a + ", " + b + ")"
+    let ba = "__ba_" + depth.to_string()
+    let bb = "__bb_" + depth.to_string()
+    let bl = "__bl_" + depth.to_string()
+    let bi = "__bi_" + depth.to_string()
+    let beq = "__beq_" + depth.to_string()
+    return "{ let " + ba + " = " + a + "; let " + bb + " = " + b + "; let " + bl + " = " + ba + ".length(); let mut " + beq + " = " + bl + " == " + bb + ".length(); if " + beq + " { let mut " + bi + " = 0; while " + bi + " < " + bl + " { if " + ba + "[" + bi + "] != " + bb + "[" + bi + "] { " + beq + " = false; break }; " + bi + " = " + bi + " + 1 } }; " + beq + " }"
   }
   if t == "MbtJson" || t == "mbt_compat::MbtJson" {
     return "mbt_compat::mbt_json_eq(" + a + ", " + b + ")"
@@ -15784,15 +15951,19 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
   if t.starts_with("(") && t.ends_with(")") {
     let elems = split_tuple_types(t.slice(1, t.length() - 1))
     if elems.length() >= 2 {
+      let ta = "__ta_" + depth.to_string()
+      let tb = "__tb_" + depth.to_string()
       let sb = StringBuilder()
+      sb.write_string("{ let " + ta + " = " + a + "; let " + tb + " = " + b + "; ")
       let mut k = 0
       while k < elems.length() {
         if k > 0 { sb.write_string(" && ") }
-        let ak = "(" + a + ")." + k.to_string()
-        let bk = "(" + b + ")." + k.to_string()
+        let ak = ta + "." + k.to_string()
+        let bk = tb + "." + k.to_string()
         sb.write_string("(" + gen_eq_expr(ak, bk, elems[k], depth * 10 + k + 1, custom_eq) + ")")
         k = k + 1
       }
+      sb.write_string(" }")
       return sb.to_string()
     }
   }
@@ -15803,12 +15974,28 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
     let inner_eq = gen_eq_expr(ax, bx, inner, depth + 1, custom_eq)
     return "match (" + a + ", " + b + ") { (Some(" + ax + "), Some(" + bx + ")) => " + inner_eq + ", (None, None) => true, _ => false }"
   }
-  if t.starts_with("Array[") && t.ends_with("]") {
-    let inner = t.slice(6, t.length() - 1).trim()
+  if t.starts_with("Result[") && t.ends_with("]") {
+    let args = split_tuple_types(t.slice(7, t.length() - 1))
+    if args.length() == 2 {
+      let ok_a = "__ra_" + depth.to_string()
+      let ok_b = "__rb_" + depth.to_string()
+      let err_a = "__ea_" + depth.to_string()
+      let err_b = "__eb_" + depth.to_string()
+      let ok_eq = gen_eq_expr(ok_a, ok_b, args[0], depth * 2 + 1, custom_eq)
+      let err_eq = gen_eq_expr(err_a, err_b, args[1], depth * 2 + 2, custom_eq)
+      return "match (" + a + ", " + b + ") { (Ok(" + ok_a + "), Ok(" + ok_b + ")) => " + ok_eq + ", (Err(" + err_a + "), Err(" + err_b + ")) => " + err_eq + ", _ => false }"
+    }
+  }
+  if (t.starts_with("Array[") || t.starts_with("FixedArray[") || t.starts_with("ImmArray[")) && t.ends_with("]") {
+    let open_idx = t.index_of("[")
+    let inner = t.slice(open_idx + 1, t.length() - 1).trim()
+    let aa = "__aa_" + depth.to_string()
+    let ab = "__ab_" + depth.to_string()
+    let al = "__al_" + depth.to_string()
     let idx = "__ai_" + depth.to_string()
     let eqv = "__aeq_" + depth.to_string()
-    let elem_eq = gen_eq_expr(a + "[" + idx + "]", b + "[" + idx + "]", inner, depth + 1, custom_eq)
-    return "{ let mut " + eqv + " = " + a + ".length() == " + b + ".length(); if " + eqv + " { let mut " + idx + " = 0; while " + idx + " < " + a + ".length() { if !(" + elem_eq + ") { " + eqv + " = false; break }; " + idx + " = " + idx + " + 1 } }; " + eqv + " }"
+    let elem_eq = gen_eq_expr(aa + "[" + idx + "]", ab + "[" + idx + "]", inner, depth + 1, custom_eq)
+    return "{ let " + aa + " = " + a + "; let " + ab + " = " + b + "; let " + al + " = " + aa + ".length(); let mut " + eqv + " = " + al + " == " + ab + ".length(); if " + eqv + " { let mut " + idx + " = 0; while " + idx + " < " + al + " { if !(" + elem_eq + ") { " + eqv + " = false; break }; " + idx + " = " + idx + " + 1 } }; " + eqv + " }"
   }
   a + " == " + b
 }
