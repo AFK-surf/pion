@@ -272,13 +272,31 @@ pub impl Eq for FnEqKey with fn equal(a, b) {
   a.code == b.code
 }
 
-// 8. R4: Single-file alias-mediated recursive #derive(Eq) (cross-file mutual recursion in alias_a.mbt / alias_b.mbt)
+// 8. R4/R5: Single-file, forward/reverse chained, & cross-file alias-mediated recursive #derive(Eq)
 type AliasKids = Array[AliasTree]
 
 #derive(Eq)
 priv enum AliasTree {
   ALeaf(Int)
   ABranch(AliasKids)
+}
+
+type FwdKids = FwdMid
+type FwdMid = Array[FwdAliasTree]
+
+#derive(Eq)
+priv enum FwdAliasTree {
+  FLeaf(Int)
+  FBranch(FwdKids)
+}
+
+type RevMid = Array[RevAliasTree]
+type RevKids = RevMid
+
+#derive(Eq)
+priv enum RevAliasTree {
+  RLeaf(Int)
+  RBranch(RevKids)
 }
 
 pub fn run_all() -> String {
@@ -395,14 +413,18 @@ pub fn run_all() -> String {
   let fn_v = mfn.get({ code: 7 }).unwrap_or(-1)
   let line7 = "F3d1b-7:\{md1 == md2},\{md1 == md3},\{tr1 == tr2},\{tr1 == tr3},\{mw_eq},\{fn_v}"
 
-  // Case 8: R4 single-file & cross-file type-alias recursive #derive(Eq)
+  // Case 8: R4/R5 single-file, forward/reverse chained, & cross-file type-alias recursive #derive(Eq)
   let at1 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(2)])])
   let at2 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(2)])])
   let at3 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(9)])])
+  let ft1 : FwdAliasTree = FBranch([FLeaf(1)])
+  let ft2 : FwdAliasTree = FBranch([FLeaf(2)])
+  let rt1 : RevAliasTree = RBranch([RLeaf(3)])
+  let rt2 : RevAliasTree = RBranch([RLeaf(3)])
   let xa1 : CrossA = CrossA::More([{ a: CrossA::Done }])
   let xa2 : CrossA = CrossA::More([{ a: CrossA::Done }])
   let xa3 : CrossA = CrossA::Done
-  let line8 = "F3d1b-8:\{at1 == at2},\{at1 == at3},\{xa1 == xa2},\{xa1 == xa3}"
+  let line8 = "F3d1b-8:\{at1 == at2},\{at1 == at3},\{ft1 != ft2},\{rt1 == rt2},\{xa1 == xa2},\{xa1 == xa3}"
 
   line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6 + "\n" + line7 + "\n" + line8
 }
@@ -555,7 +577,7 @@ def main():
             "F3d1b-5:100,ok\n"
             "F3d1b-6:true,true,true,true,true,true,42,true\n"
             "F3d1b-7:true,false,true,false,true,42\n"
-            "F3d1b-8:true,false,true,false"
+            "F3d1b-8:true,false,true,true,true,false"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
