@@ -2845,8 +2845,8 @@ pub fn main(w : World) -> Int {
     let r1 = Rec::{ opt: Some(5), arr: [1, 2] }
     let r2 = Rec::{ opt: Some(5), arr: [1, 2] }
     let r3 = Rec::{ opt: Some(5), arr: [1, 3] }
-    let eq12 = __mbt_eq_rec(r1, r2)
-    let eq13 = __mbt_eq_rec(r1, r3)
+    let eq12 = r1 == r2
+    let eq13 = r1 == r3
     trace(w, "eq", eq12.to_string() + "," + eq13.to_string())
     check(w, "derive.eq", eq12 && !eq13)
   } else if kase == "source_loc" {

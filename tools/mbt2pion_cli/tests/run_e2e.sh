@@ -200,8 +200,8 @@ pub fn main(_w : World) -> Int {
   let r1 = Rec::{ opt: Some(5), arr: [1, 2] }
   let r2 = Rec::{ opt: Some(5), arr: [1, 2] }
   let r3 = Rec::{ opt: Some(5), arr: [1, 3] }
-  if !__mbt_eq_rec(r1, r2) { panic("structural eq true") }
-  if __mbt_eq_rec(r1, r3) { panic("structural eq false") }
+  if !(r1 == r2) { panic("structural eq true") }
+  if r1 == r3 { panic("structural eq false") }
   let h = Holder::{ text: "abc", items: [10] }
   let out_items = cascade_demo(h, 5)
   if out_items.length() != 3 { panic("chained cascade") }
