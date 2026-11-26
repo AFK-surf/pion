@@ -1041,6 +1041,52 @@ pub fn qualified_some() -> Int {
   a[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "match_shadow": (r'''
+priv struct Hook {
+  items : Array[Int]
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.items.push(7)
+  0
+}
+
+fn sortit(xs : Array[Int], src : Hook) -> Unit {
+  let h = [0]
+  match src {
+    h => xs.sort_by_key(fn(x) { x + h.length() })
+  }
+}
+
+pub fn match_shadow() -> Int {
+  let a = [2, 1]
+  sortit(a, { items: a })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "later_let_shadow": (r'''
+priv struct Hook {
+  items : Array[Int]
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.items.push(7)
+  0
+}
+
+let h : Hook = { items: [2, 1] }
+
+fn sortit(xs : Array[Int]) -> Unit {
+  xs.sort_by_key(fn(x) { x + h.length() })
+  let h = [0]
+  ignore(h)
+}
+
+pub fn later_let_shadow() -> Int {
+  sortit(h.items)
+  h.items[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]

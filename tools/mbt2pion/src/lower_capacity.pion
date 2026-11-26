@@ -1330,6 +1330,9 @@ fn is_fresh_array_rhs(tokens : Array[Token], s : Int, e : Int) -> Bool {
 
 ///| No `{ .. }` around `k` closes before `before` (`k`'s block is still open there).
 fn block_open_through(tokens : Array[Token], k : Int, before : Int) -> Bool {
+  if k >= before {
+    return false
+  }
   let mut d = 0
   let mut j = k
   while j < before {
@@ -1546,7 +1549,7 @@ fn callable_locals(tokens : Array[Token], body_open : Int) -> Map[String, Bool] 
     // where it is called -- only for an immutable binding whose name nothing else in the function binds.
     if tk.kind == TokenKind::Ident && (tokens[k - 1].raw == "let" || tokens[k - 1].raw == "mut") &&
     !(tokens[k - 1].raw == "let" && k + 2 < body_close && tokens[k + 1].kind == TokenKind::Eq &&
-      tokens[k + 2].raw == "fn" && name_binding_count(tokens, body_open, tk.raw) == 1) {
+      tokens[k + 2].raw == "fn" && possible_binding_count(tokens, body_open, tk.raw) == 1) {
       out[tk.raw] = true
     }
     // A local `fn name(..)`: called by name, out of sight.
@@ -1939,7 +1942,7 @@ fn sort_key_purity_rec(
       }
       if pk.kind == TokenKind::Ident && k >= 3 && tokens[k - 2].kind == TokenKind::Dot &&
       !((pk.raw == "v" || pk.raw == "val") && tokens[k - 3].kind == TokenKind::Ident &&
-        is_ref_cell(tokens, tokens[k - 3].raw, body_open, open)) {
+        is_ref_cell(tokens, tokens[k - 3].raw, body_open, k - 3)) {
         return "the callback writes the field `" + pk.raw + "`"
       }
     }
@@ -1954,20 +1957,130 @@ fn sort_key_purity_rec(
   ""
 }
 
-///| `name` is bound by `let name = mbt_compat::ref_new(..)` (a Stage A cell for a captured `let mut`).
-fn is_ref_cell(tokens : Array[Token], name : String, body_open : Int, before : Int) -> Bool {
-  if body_open < 0 {
+///| The `fn` keyword of the function whose body opens at `body_open` (depth 0 before it), or -1.
+fn fn_start_of(tokens : Array[Token], body_open : Int) -> Int {
+  let mut d = 0
+  let mut f = body_open - 1
+  while f >= 0 {
+    let fk = tokens[f].kind
+    if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace {
+      d = d + 1
+    } else if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace {
+      if d == 0 {
+        return -1
+      }
+      d = d - 1
+    } else if d == 0 && tokens[f].raw == "fn" {
+      return f
+    }
+    f = f - 1
+  }
+  -1
+}
+
+///| The occurrence of a name at `j` certainly does not bind it: a path suffix (`.h`, `::h`), a receiver (`h.m`,
+///| `h[i]`), a direct call (`h(..)`), or a whole argument of a lowercase function or method call (`f(a, h)`, not
+///| `fn f(h)`). Anything else -- a pattern (`h =>`, `Some(h)`, `(h, _)`, `[h, ..]`, `{ h }`), `for h in`, a
+///| parameter, an assignment -- may.
+fn is_definitely_non_binding_use(tokens : Array[Token], j : Int, fn_start : Int, limit : Int) -> Bool {
+  if j <= 0 || j + 1 >= tokens.length() {
     return false
   }
-  let mut k = body_open + 1
-  while k + 5 < before {
-    if tokens[k].raw == "let" && tokens[k + 1].raw == name && tokens[k + 2].kind == TokenKind::Eq &&
-    tokens[k + 3].raw == "mbt_compat" && tokens[k + 4].kind == TokenKind::ColonColon && tokens[k + 5].raw == "ref_new" {
-      return true
+  let pk = tokens[j - 1]
+  let nx = tokens[j + 1]
+  if pk.kind == TokenKind::Dot || pk.kind == TokenKind::ColonColon {
+    return true
+  }
+  if (nx.kind == TokenKind::Dot || nx.kind == TokenKind::LBracket) && pk.raw != "fn" {
+    return true
+  }
+  if nx.kind == TokenKind::LParen && !nx.newline_before && pk.raw != "fn" {
+    return true
+  }
+  if (pk.kind == TokenKind::LParen || pk.kind == TokenKind::Comma) &&
+  (nx.kind == TokenKind::RParen || nx.kind == TokenKind::Comma) && j + 1 < limit {
+    // The innermost open bracket around `j` must be a call's `(`.
+    let mut d = 0
+    let mut o = j - 1
+    while o > fn_start {
+      let ok = tokens[o].kind
+      if ok == TokenKind::RParen || ok == TokenKind::RBracket || ok == TokenKind::RBrace {
+        d = d + 1
+      } else if ok == TokenKind::LParen || ok == TokenKind::LBracket || ok == TokenKind::LBrace {
+        if d == 0 {
+          break
+        }
+        d = d - 1
+      }
+      o = o - 1
     }
-    k = k + 1
+    if o <= fn_start || tokens[o].kind != TokenKind::LParen || o < 1 {
+      return false
+    }
+    let callee = tokens[o - 1]
+    if callee.kind != TokenKind::Ident || is_call_keyword(callee.raw) {
+      return false
+    }
+    // Not the parameter list of a function (`fn f(h)`, `fn[T] f(h)`, `fn T::f(h)`).
+    let mut b = o - 2
+    while b > fn_start {
+      let bk = tokens[b].kind
+      if bk == TokenKind::RBracket {
+        let ob = find_open_before(tokens, b, fn_start)
+        if ob <= fn_start {
+          return false
+        }
+        b = ob - 1
+        continue
+      }
+      if bk == TokenKind::Ident || bk == TokenKind::UpperIdent || bk == TokenKind::ColonColon {
+        b = b - 1
+        continue
+      }
+      break
+    }
+    return !(b >= 0 && tokens[b].raw == "fn")
   }
   false
+}
+
+///| Occurrences of `name` in `(fn_start, limit)` that may bind it (`is_definitely_non_binding_use` is false).
+fn possible_binding_sites(tokens : Array[Token], name : String, fn_start : Int, limit : Int) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut j = fn_start + 1
+  while j < limit {
+    if tokens[j].kind == TokenKind::Ident && tokens[j].raw == name && !is_definitely_non_binding_use(tokens, j, fn_start, limit) {
+      out.push(j)
+    }
+    j = j + 1
+  }
+  out
+}
+
+///| How many occurrences of `name` in the whole function may bind it (`possible_binding_sites`).
+fn possible_binding_count(tokens : Array[Token], body_open : Int, name : String) -> Int {
+  let fs = fn_start_of(tokens, body_open)
+  possible_binding_sites(tokens, name, if fs >= 0 { fs } else { body_open }, find_matching_delim(tokens, body_open)).length()
+}
+
+///| The only possible binding of `name` in its function before `before` (the function body opening at `body_open`),
+///| or -1 when there is none or more than one.
+fn sole_binding_before(tokens : Array[Token], name : String, body_open : Int, before : Int) -> Int {
+  if body_open < 0 {
+    return -1
+  }
+  let fs = fn_start_of(tokens, body_open)
+  let sites = possible_binding_sites(tokens, name, if fs >= 0 { fs } else { body_open }, before)
+  if sites.length() == 1 { sites[0] } else { -1 }
+}
+
+///| `name` is bound (only) by `let name = mbt_compat::ref_new(..)` (a Stage A cell for a captured `let mut`), in a
+///| block still open at `before`.
+fn is_ref_cell(tokens : Array[Token], name : String, body_open : Int, before : Int) -> Bool {
+  let k = sole_binding_before(tokens, name, body_open, before)
+  k > body_open && k + 4 < before && tokens[k - 1].raw == "let" && tokens[k + 1].kind == TokenKind::Eq &&
+  tokens[k + 2].raw == "mbt_compat" && tokens[k + 3].kind == TokenKind::ColonColon && tokens[k + 4].raw == "ref_new" &&
+  block_open_through(tokens, k, before)
 }
 
 ///| The call whose callee ends at `k` (`tokens[k + 1]` is its `(`) inside a sort key: why it is not allowed, or "".
@@ -2075,7 +2188,7 @@ fn receiver_is_builtin(tokens : Array[Token], e : Int, body_open : Int, before :
     return false
   }
   if kk == TokenKind::Ident && !(e > 0 && (tokens[e - 1].kind == TokenKind::Dot || tokens[e - 1].kind == TokenKind::ColonColon)) {
-    return declared_builtin(tokens, tk.raw, body_open, before, env)
+    return declared_builtin(tokens, tk.raw, body_open, e, env)
   }
   false
 }
@@ -2089,56 +2202,51 @@ fn is_builtin_type_start(t : String) -> Bool {
 ///| `name` is declared in the function around `before` with a built-in type (parameter or `let` annotation, or a
 ///| `let` of an array literal / `mbt_compat::ordered_map_..` / `mbt_compat::OrderedMap`) and bound nowhere else.
 fn declared_builtin(tokens : Array[Token], name : String, body_open : Int, before : Int, env : SortKeyEnv) -> Bool {
-  if body_open < 0 || name_binding_count(tokens, body_open, name) != 1 {
+  // The one place that may bind it before its use at `before` (a pattern, a later or inner `let` count too).
+  let k = sole_binding_before(tokens, name, body_open, before)
+  if k < 0 {
     return false
   }
-  let mut f = body_open - 1
-  while f > 0 && tokens[f].raw != "fn" {
-    f = f - 1
-  }
   let body_close = find_matching_delim(tokens, body_open)
-  let mut k = f + 1
-  while k + 2 < body_close {
-    if tokens[k].kind == TokenKind::Ident && tokens[k].raw == name &&
-    !(tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon) {
-      let decl = k < body_open && (tokens[k - 1].kind == TokenKind::LParen || tokens[k - 1].kind == TokenKind::Comma) ||
-      tokens[k - 1].raw == "let" || tokens[k - 1].raw == "mut"
-      if decl {
-        if k > body_open && !block_open_through(tokens, k, before) {
-          return false
-        }
-        if tokens[k + 1].kind == TokenKind::Colon {
-          // An unqualified built-in type no user type shadows, or `mbt_compat::OrderedMap`.
-          let t = tokens[k + 2]
-          let qualified = k + 3 < body_close && tokens[k + 3].kind == TokenKind::ColonColon
-          return is_builtin_type_start(t.raw) && !qualified && !env.methods.contains(" type:" + t.raw) ||
-          t.raw == "mbt_compat" && k + 4 < body_close && tokens[k + 4].raw == "OrderedMap"
-        }
-        if tokens[k + 1].kind == TokenKind::Eq && k + 2 < body_close {
-          // The whole initializer: one literal, one array literal, one `mbt_compat::ordered_map_..(..)` call.
-          let r = tokens[k + 2]
-          let re = statement_end(tokens, k + 2, body_close)
-          if r.kind == TokenKind::LBracket {
-            return find_matching_delim(tokens, k + 2) == re - 1
-          }
-          if r.kind == TokenKind::IntLit || r.kind == TokenKind::FloatLit || r.kind == TokenKind::StringLit ||
-          r.kind == TokenKind::CharLit {
-            return k + 3 == re
-          }
-          return r.raw == "mbt_compat" && k + 5 < re && tokens[k + 4].raw.starts_with("ordered_map_") &&
-          tokens[k + 5].kind == TokenKind::LParen && find_matching_delim(tokens, k + 5) == re - 1
-        }
-        return false
-      }
+  if k + 2 >= before {
+    return false
+  }
+  let decl = k < body_open && (tokens[k - 1].kind == TokenKind::LParen || tokens[k - 1].kind == TokenKind::Comma) ||
+  k > body_open && (tokens[k - 1].raw == "let" || tokens[k - 1].raw == "mut")
+  if !decl {
+    return false
+  }
+  if k > body_open && !block_open_through(tokens, k, before) {
+    return false
+  }
+  if tokens[k + 1].kind == TokenKind::Colon {
+    // An unqualified built-in type no user type shadows, or `mbt_compat::OrderedMap`.
+    let t = tokens[k + 2]
+    let qualified = k + 3 < body_close && tokens[k + 3].kind == TokenKind::ColonColon
+    return is_builtin_type_start(t.raw) && !qualified && !env.methods.contains(" type:" + t.raw) ||
+    t.raw == "mbt_compat" && k + 4 < body_close && tokens[k + 4].raw == "OrderedMap"
+  }
+  if tokens[k + 1].kind == TokenKind::Eq && k + 2 < body_close {
+    // The whole initializer: one literal, one array literal, one `mbt_compat::ordered_map_..(..)` call.
+    let r = tokens[k + 2]
+    let re = statement_end(tokens, k + 2, body_close)
+    if r.kind == TokenKind::LBracket {
+      return find_matching_delim(tokens, k + 2) == re - 1
     }
-    k = k + 1
+    if r.kind == TokenKind::IntLit || r.kind == TokenKind::FloatLit || r.kind == TokenKind::StringLit ||
+    r.kind == TokenKind::CharLit {
+      return k + 3 == re
+    }
+    return r.raw == "mbt_compat" && k + 5 < re && tokens[k + 4].raw.starts_with("ordered_map_") &&
+    tokens[k + 5].kind == TokenKind::LParen && find_matching_delim(tokens, k + 5) == re - 1
   }
   false
 }
 
 ///| `name` is an array this function allocated, has not handed out before `open`, and is not the sorted one.
 fn private_trace(tokens : Array[Token], name : String, body_open : Int, open : Int, sorted : Map[String, Bool]) -> Bool {
-  body_open >= 0 && !sorted.contains(name) && fresh_local_binding(tokens, name, body_open, open, true)
+  body_open >= 0 && !sorted.contains(name) && fresh_local_binding(tokens, name, body_open, open, true) &&
+  sole_binding_before(tokens, name, body_open, open) >= 0
 }
 
 fn opaque_call_desc(tokens : Array[Token], t : Int) -> String {
@@ -2206,7 +2314,7 @@ fn local_closure_body(tokens : Array[Token], idx : Int, name : String) -> Int {
   if body_open < 0 {
     return -1
   }
-  if name_binding_count(tokens, body_open, name) != 1 {
+  if possible_binding_count(tokens, body_open, name) != 1 {
     return -1
   }
   let body_close = find_matching_delim(tokens, body_open)
