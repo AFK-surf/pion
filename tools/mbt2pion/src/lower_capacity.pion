@@ -1192,10 +1192,12 @@ fn kept_iter_mutations(
   body_open : Int,
   head : String,
   callables : Map[String, Bool],
+  user_methods : Map[String, Bool],
   flags : Array[Bool],
 ) -> String {
   // `flags`: [appended, written in place] so far, shared by every part that runs while it is kept (interpolation
   // holes, closures defined before it, the region): only both together are a hazard (`appends_and_writes`).
+  let sort_env_local = SortKeyEnv::{ methods: user_methods }
   let mut t = s
   while t < e {
     let tk = tokens[t]
@@ -1203,7 +1205,7 @@ fn kept_iter_mutations(
     // `"\{xs.pop()}"`: the holes of an interpolation run code too.
     if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline || tk.kind == TokenKind::StringLit {
       for sub in interp_holes(tk.raw) {
-        let why = kept_iter_mutations(sub, names, computed, 0, sub.length() - 1, 0, head, callables, flags)
+        let why = kept_iter_mutations(sub, names, computed, 0, sub.length() - 1, 0, head, callables, user_methods, flags)
         if why.length() > 0 {
           return why + " (in a string interpolation)"
         }
@@ -1213,13 +1215,19 @@ fn kept_iter_mutations(
       if tk.kind == TokenKind::Dot && t + 2 < e && tokens[t + 1].kind == TokenKind::Ident &&
       tokens[t + 2].kind == TokenKind::LParen {
         let m = tokens[t + 1].raw
-        if is_cap_arr_growth_method(m) {
+        let recv_r = receiver_root(tokens, t - 1)
+        let recv_is_builtin = (recv_r.length() > 0 && fresh_local_binding(tokens, recv_r, body_open, t, false)) ||
+        receiver_is_builtin(tokens, t - 1, body_open, t, sort_env_local)
+        if m != "iter" && (is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit") {
+          return "`." + m + "(..)` runs while an iterator of a computed array is kept"
+        } else if !recv_is_builtin && user_methods.contains(m) &&
+        (is_cap_arr_growth_method(m) || is_cap_arr_write_method(m)) {
+          return "`." + m + "(..)` may invoke a user/dependency method while an iterator of a non-local array is kept"
+        } else if is_cap_arr_growth_method(m) {
           flags[0] = true
         } else if is_cap_arr_write_method(m) {
           flags[1] = true
-        } else if m != "iter" && (is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit") {
-          return "`." + m + "(..)` runs while an iterator of a computed array is kept"
-        } else if !is_read_only_array_method(m) && head.length() > 0 && receiver_root(tokens, t - 1) == head {
+        } else if !is_read_only_array_method(m) && head.length() > 0 && recv_r == head {
           return "`." + m + "(..)` on `" + head + "` may change the array of a kept iterator over a non-local array"
         }
       } else if tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
@@ -1310,6 +1318,11 @@ fn appends_and_writes(flags : Array[Bool]) -> String {
 ///| aliases of the root; an iterator consumed in its expression is checked for changes made by its own callbacks.
 ///| Why the iterator could observe a difference, or "".
 pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
+  let env = sort_key_env_of_with_deps([tokens], Map())
+  kept_iter_hazard_with_env(tokens, dot_i, env)
+}
+
+pub fn kept_iter_hazard_with_env(tokens : Array[Token], dot_i : Int, env : SortKeyEnv) -> String {
   let close_p = find_matching_delim(tokens, dot_i + 2)
   if close_p < 0 {
     return "unbalanced `.iter(`"
@@ -1349,11 +1362,11 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
     if cb.length() > 0 {
       return cb
     }
-    let pre = pre_closure_mutations(tokens, names, computed, body_open, close_p, root, callables, close_p + 1, c + 1, true, flags)
+    let pre = pre_closure_mutations(tokens, names, computed, body_open, close_p, root, callables, env.methods, close_p + 1, c + 1, true, flags)
     if pre.length() > 0 {
       return pre
     }
-    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables, flags)
+    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables, env.methods, flags)
     if why.length() > 0 {
       return why + " (inside the iterator chain's callbacks)"
     }
@@ -1365,11 +1378,11 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
   }
   let start = kept_iter_region_start(tokens, dot_i, body_open)
   // Closures defined before the iterator may run after it: their bodies count too.
-  let pre = pre_closure_mutations(tokens, names, computed, body_open, start, root, callables, start, body_close, false, flags)
+  let pre = pre_closure_mutations(tokens, names, computed, body_open, start, root, callables, env.methods, start, body_close, false, flags)
   if pre.length() > 0 {
     return pre
   }
-  let why = kept_iter_mutations(tokens, names, computed, start, body_close, body_open, root, callables, flags)
+  let why = kept_iter_mutations(tokens, names, computed, start, body_close, body_open, root, callables, env.methods, flags)
   if why.length() > 0 {
     return why
   }
@@ -1723,6 +1736,7 @@ fn pre_closure_mutations(
   before : Int,
   root : String,
   callables : Map[String, Bool],
+  user_methods : Map[String, Bool],
   span_s : Int,
   span_e : Int,
   consumed : Bool,
@@ -1844,7 +1858,7 @@ fn pre_closure_mutations(
   for i, o in opens {
     if level[i] > 0 {
       let cs = if level[i] == 1 { light_callables } else { callables }
-      let why = kept_iter_mutations(tokens, names, computed, o + 1, find_matching_delim(tokens, o), body_open, root, cs, flags)
+      let why = kept_iter_mutations(tokens, names, computed, o + 1, find_matching_delim(tokens, o), body_open, root, cs, user_methods, flags)
       if why.length() > 0 {
         return why + " (in a closure defined before the iterator)"
       }
@@ -1900,22 +1914,13 @@ pub struct SortKeyEnv {
   methods : Map[String, Bool]
 }
 
-///| Dependencies' part of `SortKeyEnv` (set from the symbol table before Stage B runs).
-let sort_key_dep_methods : Map[String, Bool] = Map()
-
-pub fn sort_key_set_dep_methods(names : Map[String, Bool]) -> Unit {
-  sort_key_dep_methods.clear()
-  for k in names.keys() {
-    sort_key_dep_methods[k] = true
-  }
-}
-
-///| `SortKeyEnv` of generated sources (`fn T::m(`, methods of `impl .. for T { .. }`, `impl Eq`) plus dependencies'.
+///| `SortKeyEnv` of generated sources (`fn T::m(`, methods of `impl .. for T { .. }`, `impl Eq`) with no dep methods.
+///| Callers with dependency context should call `sort_key_env_of_with_deps` directly.
 pub fn sort_key_env_of(files : Array[Array[Token]]) -> SortKeyEnv {
-  sort_key_env_of_with_deps(files, sort_key_dep_methods)
+  sort_key_env_of_with_deps(files, Map())
 }
 
-///| Explicit-context `SortKeyEnv` builder (avoids reading global `sort_key_dep_methods` once `pipeline.pion` hands off).
+///| Explicit-context `SortKeyEnv` builder combining package-local and dependency method names.
 pub fn sort_key_env_of_with_deps(files : Array[Array[Token]], dep_methods : Map[String, Bool]) -> SortKeyEnv {
   let methods : Map[String, Bool] = Map()
   for k in dep_methods.keys() {
@@ -3045,6 +3050,18 @@ pub struct CapPkgSummary {
   has_custom_eq : Bool
   // True iff a type declared IN THIS PACKAGE defines `impl Eq`.
   local_has_custom_eq : Bool
+  // Local types whose `impl Eq` is NOT proven free of array/opaque hazards (or "*" if unattributed).
+  impure_eq_types : Map[String, Bool]
+  // Local types whose `impl Eq` IS proven free of array/opaque hazards.
+  pure_eq_types : Map[String, Bool]
+  // Struct field name -> unambiguous type string ("Int", "Array:Int", "Node", or "" if ambiguous).
+  field_types : Map[String, String]
+  // Struct field name -> true iff EVERY struct declaration of this field has a built-in scalar or Option[built-in] type.
+  field_all_builtin : Map[String, Bool]
+  // Struct `Array[Elem]` field name -> unambiguous `Elem` type across all `Array[..]` declarations of that field.
+  array_elem_types : Map[String, String]
+  // Struct `Array[Elem]` field name -> true iff EVERY `Array[..]` declaration of this field has a built-in scalar `Elem`.
+  array_elem_all_builtin : Map[String, Bool]
   // Struct closure fields `(e.f)()` proven safe: struct is non-pub or field is `priv`, and every
   // construction/assignment in the package assigns a pure closure literal.
   safe_closure_fields : Map[String, Bool]
@@ -3062,10 +3079,109 @@ pub fn CapPkgSummary::empty() -> CapPkgSummary {
     dep_methods: Map(),
     has_custom_eq: false,
     local_has_custom_eq: false,
+    impure_eq_types: Map(),
+    pure_eq_types: Map(),
+    field_types: Map(),
+    field_all_builtin: Map(),
+    array_elem_types: Map(),
+    array_elem_all_builtin: Map(),
     safe_closure_fields: Map(),
     array_fields: Map(),
     pkg_globals: Map(),
   }
+}
+
+fn is_type_ident_tok(k : TokenKind) -> Bool {
+  k == TokenKind::Ident || k == TokenKind::UpperIdent
+}
+
+fn is_builtin_eq_type_name(t : String) -> Bool {
+  t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" || t == "Double" ||
+  t == "Float" || t == "Bool" || t == "Char" || t == "Byte" || t == "String" || t == "Unit"
+}
+
+fn is_pure_eq_type_name(t : String, summary : CapPkgSummary) -> Bool {
+  is_builtin_eq_type_name(t) || summary.pure_eq_types.contains(t)
+}
+
+///| Collect unambiguous struct field types across the package:
+///| - `field_types`: scalar/named type `f : Int` -> `"Int"`, `f : Array[Int]` -> `"Array:Int"`, conflict -> `""`.
+///| - `array_elem_types`: across `Array[Elem]` field declarations only (ignoring non-Array fields of the same name),
+///|   records unambiguous `Elem` (e.g. `kids : Array[Int]` even if another struct has `kids : Bool`).
+fn collect_struct_field_types_from_tokens(all_tokens : Array[Array[Token]]) -> (Map[String, String], Map[String, Bool], Map[String, String], Map[String, Bool]) {
+  let out : Map[String, String] = Map()
+  let field_bi : Map[String, Bool] = Map()
+  let arr_elems : Map[String, String] = Map()
+  let arr_bi : Map[String, Bool] = Map()
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    while i < n {
+      if ts[i].raw == "struct" && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident) {
+        let mut o = i + 1
+        while o < n && ts[o].kind != TokenKind::LBrace && ts[o].kind != TokenKind::LParen && ts[o].kind != TokenKind::Eof {
+          o = o + 1
+        }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          let mut k = o + 1
+          let mut d = 0
+          while k > 0 && k < close {
+            let kk = ts[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+              d = d + 1
+            } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+              d = d - 1
+            } else if d == 0 && kk == TokenKind::Ident && k + 2 < close && ts[k + 1].kind == TokenKind::Colon &&
+            (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].raw == "priv" || ts[k - 1].kind == TokenKind::Comma) {
+              let fname = ts[k].raw
+              let is_plain_arr = ts[k + 2].raw == "Array" && k + 5 < close && ts[k + 3].kind == TokenKind::LBracket &&
+              is_type_ident_tok(ts[k + 4].kind) && ts[k + 5].kind == TokenKind::RBracket &&
+              !(k + 6 < close && ts[k + 6].raw == "?")
+              let is_plain_opt = ts[k + 2].raw == "Option" && k + 5 < close && ts[k + 3].kind == TokenKind::LBracket &&
+              is_type_ident_tok(ts[k + 4].kind) && ts[k + 5].kind == TokenKind::RBracket
+              let ty_str = if is_plain_arr {
+                "Array:" + ts[k + 4].raw
+              } else if is_plain_opt {
+                ts[k + 4].raw
+              } else if is_type_ident_tok(ts[k + 2].kind) &&
+              !(k + 3 < close && (ts[k + 3].kind == TokenKind::LBracket || ts[k + 3].kind == TokenKind::ColonColon)) {
+                ts[k + 2].raw
+              } else {
+                ""
+              }
+              match out.get(fname) {
+                Some(prev) => if prev != ty_str { out[fname] = "" }
+                None => out[fname] = ty_str
+              }
+              let this_bi = is_builtin_eq_type_name(ty_str)
+              let prev_bi = match field_bi.get(fname) { Some(v) => v, None => true }
+              field_bi[fname] = prev_bi && this_bi
+              if is_plain_arr {
+                let elem = ts[k + 4].raw
+                match arr_elems.get(fname) {
+                  Some(prev) => if prev != elem { arr_elems[fname] = "" }
+                  None => arr_elems[fname] = elem
+                }
+                let prev_abi = match arr_bi.get(fname) { Some(v) => v, None => true }
+                arr_bi[fname] = prev_abi && is_builtin_eq_type_name(elem)
+              } else if ts[k + 2].raw == "Array" && k + 3 < close && ts[k + 3].kind == TokenKind::LBracket &&
+              !(k + 5 < close && ts[k + 5].kind == TokenKind::RBracket && k + 6 < close && ts[k + 6].raw == "?") {
+                // Complex `Array[...]` element type -> mark ambiguous
+                arr_elems[fname] = ""
+                arr_bi[fname] = false
+              }
+            }
+            k = k + 1
+          }
+          i = if close > i { close } else { i + 1 }
+          continue
+        }
+      }
+      i = i + 1
+    }
+  }
+  (out, field_bi, arr_elems, arr_bi)
 }
 
 ///| Check whether a bare method or free function name is proven pure read-only across ALL package declarations
@@ -3183,13 +3299,16 @@ pub fn collect_cap_pkg_summary(
     let fs_decl = fn_start_of(ts, body_open)
     if fs_decl >= 0 {
       let mut pk = fs_decl + 1
-      let mut pd = 0
+      let mut paren_d = 0
+      let mut brack_d = 0
       let mut p_ord = 0
       while pk + 1 < body_open {
         let pkk = ts[pk].kind
-        if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
-        else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
-        else if pd == 1 && pkk == TokenKind::Ident && ts[pk + 1].kind == TokenKind::Colon {
+        if pkk == TokenKind::LParen { paren_d = paren_d + 1 }
+        else if pkk == TokenKind::RParen { paren_d = paren_d - 1 }
+        else if pkk == TokenKind::LBracket { brack_d = brack_d + 1 }
+        else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
+        else if paren_d == 1 && brack_d == 0 && (pkk == TokenKind::Ident || ts[pk].raw == "self") && ts[pk + 1].kind == TokenKind::Colon {
           fn_param_idx[ts[pk].raw] = p_ord
           p_ord = p_ord + 1
         }
@@ -3200,7 +3319,7 @@ pub fn collect_cap_pkg_summary(
       let out : Array[Int] = []
       let mut j = as_
       while j < ae_ {
-        if ts[j].kind == TokenKind::Ident &&
+        if (ts[j].kind == TokenKind::Ident || ts[j].raw == "self") &&
         !(j > 0 && (ts[j - 1].kind == TokenKind::Dot || ts[j - 1].kind == TokenKind::ColonColon)) &&
         !(j + 1 < ae_ && ts[j + 1].kind == TokenKind::Dot) {
           match fn_param_idx.get(ts[j].raw) {
@@ -3238,6 +3357,8 @@ pub fn collect_cap_pkg_summary(
         let recv_tail = path_tail(ts, k - 1)
         let recv_is_field = k - 1 >= 2 && ts[k - 2].kind == TokenKind::Dot
         let is_own_fresh = !recv_is_field && recv_r.length() > 0 && local_fresh.contains(recv_r)
+        let is_arr_op = is_cap_arr_shrink_or_shift_method(m) || is_cap_arr_growth_method(m) ||
+        is_cap_arr_write_method(m) || m == "shrink_to_fit"
         if is_cap_arr_shrink_or_shift_method(m) {
           if !is_own_fresh {
             ef.may_shrink_or_shift = true
@@ -3265,6 +3386,12 @@ pub fn collect_cap_pkg_summary(
         } else if is_builtin_first_order_method(m) && (is_own_fresh || receiver_is_builtin(ts, k - 1, body_open, k, sort_env)) {
           ()
         } else if !is_pure_key_method(m) || sort_env.methods.contains(m) {
+          edges.push("M:" + m)
+        }
+        // Astra P1-1: If a user/dep defines a same-name method (e.g. `Hook::push`), also propagate its effects
+        // whenever the receiver is not proven to be a built-in/fresh `Array`!
+        if is_arr_op && !is_own_fresh && sort_env.methods.contains(m) &&
+        !receiver_is_builtin(ts, k - 1, body_open, k, sort_env) {
           edges.push("M:" + m)
         }
       } else if tk.kind == TokenKind::RBracket && k + 1 < body_close &&
@@ -3691,7 +3818,7 @@ pub fn collect_cap_pkg_summary(
                   let dummy_flags = [false, false]
                   let cs = callable_locals(ts, bo)
                   if closure_body_opacity(ts, lb, rb, cs).length() > 0 ||
-                  kept_iter_mutations(ts, Map(), true, lb + 1, rb, bo, "", cs, dummy_flags).length() > 0 ||
+                  kept_iter_mutations(ts, Map(), true, lb + 1, rb, bo, "", cs, sort_env.methods, dummy_flags).length() > 0 ||
                   dummy_flags[0] || dummy_flags[1] {
                     safe_closure_fields.remove(tk.raw)
                   }
@@ -3721,6 +3848,40 @@ pub fn collect_cap_pkg_summary(
     }
   }
 
+  let (field_types, field_all_builtin, array_elem_types, array_elem_all_builtin) = collect_struct_field_types_from_tokens(all_tokens)
+  let impure_eq_types : Map[String, Bool] = Map()
+  let pure_eq_types : Map[String, Bool] = Map()
+  let mut found_local_eq = false
+  for eq_nm in ["op_equal", "eq", "equal"] {
+    match by_name.get(eq_nm) {
+      Some(keys) => {
+        for dk in keys {
+          let sep = dk.index_of("::")
+          if sep > 0 {
+            found_local_eq = true
+            let ty = dk.slice(0, sep)
+            match effects.get(dk) {
+              Some(ef) =>
+              if ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || (ef.may_grow && ef.may_write) {
+                impure_eq_types[ty] = true
+              } else if !impure_eq_types.contains(ty) {
+                pure_eq_types[ty] = true
+              }
+              None => impure_eq_types[ty] = true
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  for ty in impure_eq_types.keys() {
+    pure_eq_types.remove(ty)
+  }
+  if local_has_custom_eq && !found_local_eq {
+    impure_eq_types["*"] = true
+  }
+
   let dep_methods_copy : Map[String, Bool] = Map()
   for dm in dep_methods.keys() {
     match dep_methods.get(dm) {
@@ -3735,10 +3896,425 @@ pub fn collect_cap_pkg_summary(
     dep_methods: dep_methods_copy,
     has_custom_eq: has_custom_eq,
     local_has_custom_eq: local_has_custom_eq,
+    impure_eq_types: impure_eq_types,
+    pure_eq_types: pure_eq_types,
+    field_types: field_types,
+    field_all_builtin: field_all_builtin,
+    array_elem_types: array_elem_types,
+    array_elem_all_builtin: array_elem_all_builtin,
     safe_closure_fields: safe_closure_fields,
     array_fields: array_fields,
     pkg_globals: pkg_globals,
   }
+}
+
+///| Find the body `{` of the innermost enclosing named `fn` containing `pos` (handles `impl T { fn m(..) { .. } }`,
+///| where `outermost_body_open` returns `impl T`'s `{` instead of the method's `{`).
+fn innermost_fn_body_open(tokens : Array[Token], pos : Int, fallback : Int) -> Int {
+  let mut b = pos
+  while b > 0 {
+    let o = enclosing_open(tokens, b, 0, TokenKind::LBrace)
+    if o < 0 {
+      break
+    }
+    let fs = fn_start_of(tokens, o)
+    if fs >= 0 && !(fs + 1 < o && tokens[fs + 1].kind == TokenKind::LParen) {
+      return o
+    }
+    b = o
+  }
+  fallback
+}
+
+///| Resolve the declared type string of identifier `nm` in the enclosing function (`body_open`, `site_i`):
+///| checks enclosing `fn(...)` params, local `let [mut] nm : Ty`, enclosing `for` binders (index = `"Int"`,
+///| range = `"Int"`, element of `Array[Elem]` = `Elem`), and enclosing closure params `fn(nm : Ty)`.
+///| Returns `""` if unknown or generic.
+fn resolve_local_type_name(
+  tokens : Array[Token],
+  nm : String,
+  body_open : Int,
+  site_i : Int,
+  summary : CapPkgSummary,
+) -> String {
+  if body_open < 0 || nm.length() == 0 {
+    return ""
+  }
+  let fn_bo = innermost_fn_body_open(tokens, site_i, body_open)
+  // 1. Enclosing `for` loops between `site_i` and `fn_bo`
+  let mut b = site_i
+  while b > fn_bo {
+    let o = enclosing_open(tokens, b, fn_bo, TokenKind::LBrace)
+    if o <= fn_bo {
+      break
+    }
+    // Check if `{` at `o` is a `for ... in <iter> {`
+    let mut fi = o - 1
+    let mut hd = 0
+    let mut in_i = -1
+    let mut for_i = -1
+    let mut is_range = false
+    while fi > fn_bo {
+      let fk = tokens[fi].kind
+      if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { hd = hd + 1 }
+      else if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace {
+        if hd == 0 { break }
+        hd = hd - 1
+      } else if hd == 0 {
+        if tokens[fi].raw == "in" && in_i < 0 { in_i = fi }
+        else if in_i < 0 && (tokens[fi].raw == "..<" || tokens[fi].raw == "..=") { is_range = true }
+        else if tokens[fi].raw == "for" { for_i = fi; break }
+        else if fk == TokenKind::Semi { break }
+      }
+      fi = fi - 1
+    }
+    if for_i >= 0 && in_i > for_i {
+      // `for idx, elem in iter {` vs `for elem in iter {`
+      if for_i + 2 < in_i && tokens[for_i + 1].raw == nm && tokens[for_i + 2].kind == TokenKind::Comma {
+        return "Int"
+      }
+      let elem_i = if for_i + 3 < in_i && tokens[for_i + 2].kind == TokenKind::Comma { for_i + 3 } else { for_i + 1 }
+      if elem_i < in_i && tokens[elem_i].raw == nm {
+        if is_range {
+          return "Int"
+        }
+        // Strip outer parens on iterable
+        let mut is_ = in_i + 1
+        let mut ie_ = o - 1
+        while is_ < ie_ && tokens[is_].kind == TokenKind::LParen && find_matching_delim(tokens, is_) == ie_ {
+          is_ = is_ + 1
+          ie_ = ie_ - 1
+        }
+        if ie_ >= is_ + 2 && tokens[ie_ - 1].kind == TokenKind::Dot && tokens[ie_].kind == TokenKind::Ident {
+          if summary.array_elem_all_builtin.get(tokens[ie_].raw) == Some(true) {
+            return "Int"
+          }
+          match summary.array_elem_types.get(tokens[ie_].raw) {
+            Some(elem) => if elem.length() > 0 { return elem }
+            None => ()
+          }
+          match summary.field_types.get(tokens[ie_].raw) {
+            Some(ft) => if ft.starts_with("Array:") { return ft.slice(6, ft.length()) }
+            None => ()
+          }
+        } else if ie_ == is_ && tokens[ie_].kind == TokenKind::Ident {
+          let arr_ty = resolve_local_type_name(tokens, tokens[ie_].raw, fn_bo, for_i, summary)
+          if arr_ty.starts_with("Array:") {
+            return arr_ty.slice(6, arr_ty.length())
+          }
+        }
+        return ""
+      }
+    }
+    // Check if `{` at `o` is a closure `fn(a : T, ...) {`
+    let mut ci = o - 1
+    while ci > fn_bo && tokens[ci].kind != TokenKind::RParen && tokens[ci].kind != TokenKind::Semi &&
+    tokens[ci].kind != TokenKind::LBrace {
+      ci = ci - 1
+    }
+    if ci > fn_bo && tokens[ci].kind == TokenKind::RParen {
+      let lp = find_open_before(tokens, ci, fn_bo)
+      if lp > fn_bo && tokens[lp - 1].raw == "fn" {
+        let mut pk = lp + 1
+        let mut pd = 0
+        while pk + 2 < ci {
+          let pkk = tokens[pk].kind
+          if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
+          else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
+          else if pd == 0 && pkk == TokenKind::Ident && tokens[pk].raw == nm && tokens[pk + 1].kind == TokenKind::Colon {
+            if tokens[pk + 2].raw == "Array" && pk + 5 < ci && tokens[pk + 3].kind == TokenKind::LBracket &&
+            is_type_ident_tok(tokens[pk + 4].kind) && tokens[pk + 5].kind == TokenKind::RBracket {
+              return "Array:" + tokens[pk + 4].raw
+            }
+            return tokens[pk + 2].raw
+          }
+          pk = pk + 1
+        }
+      }
+    }
+    b = o
+  }
+  // 2. Local `let [mut] nm : Ty = ...` or `let [mut] nm = <lit / ident / field>` before `site_i`
+  let mut li = site_i - 1
+  while li > fn_bo {
+    if tokens[li].raw == "let" {
+      let mut ni = li + 1
+      if ni < site_i && tokens[ni].raw == "mut" { ni = ni + 1 }
+      if ni + 2 < site_i && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == nm {
+        if tokens[ni + 1].kind == TokenKind::Colon {
+          if tokens[ni + 2].raw == "Array" && ni + 5 < site_i && tokens[ni + 3].kind == TokenKind::LBracket &&
+          is_type_ident_tok(tokens[ni + 4].kind) && tokens[ni + 5].kind == TokenKind::RBracket {
+            return "Array:" + tokens[ni + 4].raw
+          }
+          return tokens[ni + 2].raw
+        } else if tokens[ni + 1].kind == TokenKind::Eq {
+          let rhs = ni + 2
+          let rk = tokens[rhs].kind
+          if rk == TokenKind::IntLit || (tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::IntLit) {
+            return "Int"
+          }
+          if rk == TokenKind::FloatLit || (tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::FloatLit) {
+            return "Double"
+          }
+          if rk == TokenKind::StringLit { return "String" }
+          if rk == TokenKind::CharLit { return "Char" }
+          if tokens[rhs].raw == "true" || tokens[rhs].raw == "false" { return "Bool" }
+          if rk == TokenKind::Ident && tokens[rhs].raw != nm {
+            // `Array::make(n, <lit>)` or `mbt_compat::arr_make(n, <lit>)`
+            if (tokens[rhs].raw == "Array" || tokens[rhs].raw == "mbt_compat") && rhs + 4 < site_i &&
+            tokens[rhs + 1].kind == TokenKind::ColonColon && (tokens[rhs + 2].raw == "make" || tokens[rhs + 2].raw == "arr_make") &&
+            tokens[rhs + 3].kind == TokenKind::LParen {
+              let cp = find_matching_delim(tokens, rhs + 3)
+              if cp > rhs + 3 && cp < site_i {
+                let last_arg = cp - 1
+                if tokens[last_arg].kind == TokenKind::IntLit { return "Array:Int" }
+                if tokens[last_arg].kind == TokenKind::FloatLit { return "Array:Double" }
+                if tokens[last_arg].kind == TokenKind::StringLit { return "Array:String" }
+                if tokens[last_arg].raw == "true" || tokens[last_arg].raw == "false" { return "Array:Bool" }
+              }
+            }
+            // Bare ident initializer `let mut item = at` or `let x = e.f`
+            if rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::Dot {
+              let mut cur = rhs
+              while cur + 2 < site_i && tokens[cur + 1].kind == TokenKind::Dot && tokens[cur + 2].kind == TokenKind::Ident {
+                cur = cur + 2
+                if cur + 1 < site_i && tokens[cur + 1].kind == TokenKind::LBracket {
+                  let rb = find_matching_delim(tokens, cur + 1)
+                  if rb > cur + 1 && rb + 2 < site_i && tokens[rb + 1].kind == TokenKind::Dot && tokens[rb + 2].kind == TokenKind::Ident {
+                    cur = rb + 2
+                  } else {
+                    break
+                  }
+                }
+              }
+              if !(cur + 1 < site_i && tokens[cur + 1].kind == TokenKind::LParen) {
+                match summary.field_types.get(tokens[cur].raw) {
+                  Some(ft) => if ft.length() > 0 { return ft }
+                  None => ()
+                }
+              }
+            } else if !(rhs + 1 < site_i && (tokens[rhs + 1].kind == TokenKind::LParen || tokens[rhs + 1].kind == TokenKind::ColonColon || tokens[rhs + 1].kind == TokenKind::LBracket)) {
+              let inner_ty = resolve_local_type_name(tokens, tokens[rhs].raw, fn_bo, li, summary)
+              if inner_ty.length() > 0 { return inner_ty }
+            }
+          }
+        }
+      }
+    }
+    li = li - 1
+  }
+  // 3. Function parameter signature `fn f[..](..., nm : Ty, ...) {`
+  let fs = fn_start_of(tokens, fn_bo)
+  if fs >= 0 {
+    let mut pk = fs + 1
+    let mut paren_d = 0
+    let mut brack_d = 0
+    while pk + 2 < fn_bo {
+      let pkk = tokens[pk].kind
+      if pkk == TokenKind::LParen { paren_d = paren_d + 1 }
+      else if pkk == TokenKind::RParen { paren_d = paren_d - 1 }
+      else if pkk == TokenKind::LBracket { brack_d = brack_d + 1 }
+      else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
+      else if paren_d == 1 && brack_d == 0 && pkk == TokenKind::Ident && tokens[pk].raw == nm &&
+      tokens[pk + 1].kind == TokenKind::Colon {
+        if tokens[pk + 2].raw == "Array" && pk + 5 < fn_bo && tokens[pk + 3].kind == TokenKind::LBracket {
+          if is_type_ident_tok(tokens[pk + 4].kind) && tokens[pk + 5].kind == TokenKind::RBracket {
+            return "Array:" + tokens[pk + 4].raw
+          }
+          if tokens[pk + 4].kind == TokenKind::LParen {
+            return "Array:("
+          }
+        }
+        if is_type_ident_tok(tokens[pk + 2].kind) &&
+        !(pk + 3 < fn_bo && (tokens[pk + 3].kind == TokenKind::LBracket || tokens[pk + 3].kind == TokenKind::ColonColon)) {
+          return tokens[pk + 2].raw
+        }
+        return ""
+      }
+      pk = pk + 1
+    }
+  }
+  ""
+}
+
+///| True iff the operand ending at `idx` (`is_lhs == true`) or starting at `idx` (`is_lhs == false`)
+///| of `==`/`!=` is proven to have a built-in or pure-`Eq` type (Opus P1 Scheme A).
+fn eq_operand_is_pure(
+  tokens : Array[Token],
+  idx : Int,
+  body_open : Int,
+  site_i : Int,
+  summary : CapPkgSummary,
+  is_lhs : Bool,
+) -> Bool {
+  let n = tokens.length()
+  if idx < 0 || idx >= n {
+    return false
+  }
+  let mut p = idx
+  // Strip outer parens on the operand side, or handle `()` Unit literal
+  if is_lhs {
+    if tokens[p].kind == TokenKind::RParen && p > 0 && tokens[p - 1].kind == TokenKind::LParen {
+      // Either `()` unit literal or `expr.m()` call
+      if p >= 2 && tokens[p - 2].kind == TokenKind::Ident && p >= 3 && tokens[p - 3].kind == TokenKind::Dot {
+        if is_builtin_result_method(tokens[p - 2].raw) {
+          return true
+        }
+      } else if !(p >= 2 && tokens[p - 2].kind == TokenKind::Ident) {
+        return true
+      }
+    }
+    if tokens[p].kind == TokenKind::RParen && p > 0 {
+      let lp = find_open_before(tokens, p, if body_open >= 0 { body_open } else { 0 })
+      if lp > 0 && tokens[lp - 1].kind == TokenKind::Ident && lp >= 2 && tokens[lp - 2].kind == TokenKind::Dot &&
+      is_builtin_result_method(tokens[lp - 1].raw) {
+        return true
+      }
+      if lp >= 0 && !(lp > 0 && tokens[lp - 1].kind == TokenKind::Ident) && p - 1 > lp {
+        p = p - 1
+      }
+    }
+  } else {
+    if tokens[p].kind == TokenKind::LParen && p + 1 < n && tokens[p + 1].kind == TokenKind::RParen {
+      return true
+    }
+    while p + 1 < n && tokens[p].kind == TokenKind::LParen {
+      p = p + 1
+    }
+    if tokens[p].raw == "-" && p + 1 < n &&
+    (tokens[p + 1].kind == TokenKind::IntLit || tokens[p + 1].kind == TokenKind::FloatLit) {
+      return true
+    }
+  }
+  let tk = tokens[p]
+  let kk = tk.kind
+  if kk == TokenKind::IntLit || kk == TokenKind::FloatLit || kk == TokenKind::StringLit ||
+  kk == TokenKind::CharLit || tk.raw == "true" || tk.raw == "false" || tk.raw == "None" {
+    return true
+  }
+  // Builtin receiver / call / expression
+  if body_open >= 0 && receiver_is_builtin(tokens, p, body_open, site_i, summary.sort_env) {
+    return true
+  }
+  if is_lhs {
+    // Field access `e.f`
+    if kk == TokenKind::Ident && p >= 1 && tokens[p - 1].kind == TokenKind::Dot {
+      if summary.field_all_builtin.get(tk.raw) == Some(true) {
+        return true
+      }
+      match summary.field_types.get(tk.raw) {
+        Some(ft) => if is_pure_eq_type_name(ft, summary) { return true }
+        None => ()
+      }
+      return false
+    }
+    // Index access `e[i]` where `e` is `Array[Pure]`
+    if kk == TokenKind::RBracket && p > 0 {
+      let lb = find_open_before(tokens, p, if body_open >= 0 { body_open } else { 0 })
+      if lb > 0 && tokens[lb - 1].kind == TokenKind::Ident {
+        if lb >= 2 && tokens[lb - 2].kind == TokenKind::Dot {
+          if summary.array_elem_all_builtin.get(tokens[lb - 1].raw) == Some(true) {
+            return true
+          }
+          match summary.array_elem_types.get(tokens[lb - 1].raw) {
+            Some(ae) => if ae.length() > 0 && is_pure_eq_type_name(ae, summary) { return true }
+            None => ()
+          }
+          match summary.field_types.get(tokens[lb - 1].raw) {
+            Some(ft) => if ft.starts_with("Array:") && is_pure_eq_type_name(ft.slice(6, ft.length()), summary) { return true }
+            None => ()
+          }
+        } else {
+          let arr_ty = resolve_local_type_name(tokens, tokens[lb - 1].raw, body_open, site_i, summary)
+          if arr_ty.starts_with("Array:") && is_pure_eq_type_name(arr_ty.slice(6, arr_ty.length()), summary) {
+            return true
+          }
+        }
+      }
+      return false
+    }
+    // Bare identifier `x`
+    if kk == TokenKind::Ident && !(p >= 1 && tokens[p - 1].kind == TokenKind::ColonColon) {
+      let ty = resolve_local_type_name(tokens, tk.raw, body_open, site_i, summary)
+      if ty.length() > 0 && is_pure_eq_type_name(ty, summary) {
+        return true
+      }
+    }
+  } else {
+    // Walk forward through `a.b[i].c` on RHS to find the terminal segment
+    if kk == TokenKind::Ident {
+      let mut cur = p
+      let mut is_call = false
+      let mut is_idx = false
+      while cur + 1 < n {
+        if tokens[cur + 1].kind == TokenKind::Dot && cur + 2 < n && tokens[cur + 2].kind == TokenKind::Ident {
+          cur = cur + 2
+          is_idx = false
+        } else if tokens[cur + 1].kind == TokenKind::LBracket {
+          let rb = find_matching_delim(tokens, cur + 1)
+          if rb > cur + 1 {
+            if rb + 2 < n && tokens[rb + 1].kind == TokenKind::Dot && tokens[rb + 2].kind == TokenKind::Ident {
+              cur = rb + 2
+              is_idx = false
+            } else {
+              is_idx = true
+              break
+            }
+          } else {
+            break
+          }
+        } else if tokens[cur + 1].kind == TokenKind::LParen && !tokens[cur + 1].newline_before {
+          is_call = true
+          break
+        } else {
+          break
+        }
+      }
+      if is_call {
+        if cur >= 1 && tokens[cur - 1].kind == TokenKind::Dot && is_builtin_result_method(tokens[cur].raw) {
+          return true
+        }
+        return false
+      }
+      if is_idx {
+        if cur >= 1 && tokens[cur - 1].kind == TokenKind::Dot {
+          if summary.array_elem_all_builtin.get(tokens[cur].raw) == Some(true) {
+            return true
+          }
+          match summary.array_elem_types.get(tokens[cur].raw) {
+            Some(ae) => if ae.length() > 0 && is_pure_eq_type_name(ae, summary) { return true }
+            None => ()
+          }
+          match summary.field_types.get(tokens[cur].raw) {
+            Some(ft) => if ft.starts_with("Array:") && is_pure_eq_type_name(ft.slice(6, ft.length()), summary) { return true }
+            None => ()
+          }
+        } else {
+          let arr_ty = resolve_local_type_name(tokens, tokens[cur].raw, body_open, site_i, summary)
+          if arr_ty.starts_with("Array:") && is_pure_eq_type_name(arr_ty.slice(6, arr_ty.length()), summary) {
+            return true
+          }
+        }
+        return false
+      }
+      if cur > p && tokens[cur - 1].kind == TokenKind::Dot {
+        if summary.field_all_builtin.get(tokens[cur].raw) == Some(true) {
+          return true
+        }
+        match summary.field_types.get(tokens[cur].raw) {
+          Some(ft) => if is_pure_eq_type_name(ft, summary) { return true }
+          None => ()
+        }
+        return false
+      }
+      // Bare identifier `x`
+      let ty = resolve_local_type_name(tokens, tk.raw, body_open, site_i, summary)
+      if ty.length() > 0 && is_pure_eq_type_name(ty, summary) {
+        return true
+      }
+    }
+  }
+  false
 }
 
 ///| Sound `Array::search_by(pred)` hazard checker enforcing MoonBit's `(buf, init_len)` slot-stability invariant.
@@ -3834,16 +4410,9 @@ fn search_by_body_hazard(
       return "the callback uses `|>` pipe"
     }
     if (kk == TokenKind::EqEq || tk.raw == "!=") && summary.has_custom_eq {
-      // Allow `==`/`!=` on literals (`""`, `0`, `true`, `false`, `'a'`), or when one side is a literal/builtin.
-      let lhs_lit = k > s && (tokens[k - 1].kind == TokenKind::IntLit || tokens[k - 1].kind == TokenKind::FloatLit ||
-        tokens[k - 1].kind == TokenKind::StringLit || tokens[k - 1].kind == TokenKind::CharLit ||
-        tokens[k - 1].raw == "true" || tokens[k - 1].raw == "false")
-      let rhs_lit = k + 1 < e && (tokens[k + 1].kind == TokenKind::IntLit || tokens[k + 1].kind == TokenKind::FloatLit ||
-        tokens[k + 1].kind == TokenKind::StringLit || tokens[k + 1].kind == TokenKind::CharLit ||
-        tokens[k + 1].raw == "true" || tokens[k + 1].raw == "false")
-      let lhs_bi = lhs_lit || (k > s && receiver_is_builtin(tokens, k - 1, body_open, site_i, summary.sort_env))
-      let rhs_bi = rhs_lit || (k + 1 < e && receiver_is_builtin(tokens, k + 1, body_open, site_i, summary.sort_env))
-      if !(lhs_bi || rhs_bi) {
+      let lhs_pure = k > s && eq_operand_is_pure(tokens, k - 1, body_open, k, summary, true)
+      let rhs_pure = k + 1 < e && eq_operand_is_pure(tokens, k + 1, body_open, k, summary, false)
+      if !(lhs_pure || rhs_pure) {
         return "the callback compares with `" + tk.raw + "` while a user type has an `impl Eq`"
       }
     }
@@ -3879,6 +4448,13 @@ fn search_by_body_hazard(
       let m = tokens[k + 1].raw
       let recv_r = receiver_root(tokens, k - 1)
       let is_disjoint = !computed && recv_r.length() > 0 && !names.contains(recv_r)
+      let recv_is_builtin_arr = (recv_r.length() > 0 && fresh_local_binding(tokens, recv_r, body_open, site_i, false)) ||
+      receiver_is_builtin(tokens, k - 1, body_open, site_i, summary.sort_env)
+      let shadowed_user_arr_op = !recv_is_builtin_arr && (summary.by_name.contains(m) || summary.dep_methods.contains(m)) &&
+      (is_cap_arr_shrink_or_shift_method(m) || is_cap_arr_growth_method(m) || is_cap_arr_write_method(m) || m == "shrink_to_fit")
+      if shadowed_user_arr_op && !summary_fn_is_pure_read_only(summary, m, true) {
+        return "the callback calls `." + m + "(..)`, which may invoke a user/dependency method that mutates arrays"
+      }
       if is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit" {
         if !is_disjoint {
           return "`." + m + "(..)` mutates the array during `search_by`"
@@ -4061,6 +4637,17 @@ fn stmt_immediately_exits_loop(tokens : Array[Token], stmt_i : Int, loop_open : 
   let exits_outer = fn(r : String) -> Bool {
     r == "return" || (!in_inner_loop && r == "break")
   }
+  let span_clean = fn(from : Int, to : Int) -> Bool {
+    let mut ti = from
+    while ti < to {
+      let tr = tokens[ti].raw
+      if tr == "continue" || tr == "for" || tr == "while" {
+        return false
+      }
+      ti = ti + 1
+    }
+    true
+  }
   // Walk to end of current statement, then check the next statement in the same block.
   let se = statement_end(tokens, stmt_i, block_close)
   let mut k = se
@@ -4071,7 +4658,7 @@ fn stmt_immediately_exits_loop(tokens : Array[Token], stmt_i : Int, loop_open : 
     return false
   }
   if exits_outer(tokens[k].raw) {
-    return true
+    return span_clean(stmt_i, k)
   }
   // Allow up to 3 simple non-looping statements before `break`/`return` as long as none of them contain
   // a nested loop or branch that could skip the exit.
@@ -4080,7 +4667,7 @@ fn stmt_immediately_exits_loop(tokens : Array[Token], stmt_i : Int, loop_open : 
   while cur < block_close && steps < 4 {
     let r = tokens[cur].raw
     if exits_outer(r) {
-      return true
+      return span_clean(stmt_i, cur)
     }
     if r == "if" || r == "while" || r == "for" || r == "match" || r == "continue" || r == "break" {
       return false
@@ -4153,8 +4740,19 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
   if loop_close <= loop_open {
     return ""
   }
+  // Strip any balanced outer parentheses around the iterable expression `(xs)` / `((b.items))`.
+  let mut iter_s = in_i + 1
+  let mut iter_e = loop_open - 1
+  while iter_s < iter_e && tokens[iter_s].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, iter_s) == iter_e {
+    iter_s = iter_s + 1
+    iter_e = iter_e - 1
+  }
+  if iter_e < iter_s {
+    return ""
+  }
   // Array literal `for x in [1, 2, 3]` or private copy `for x in copy`: cannot be mutated through any name.
-  if is_array_literal_end(tokens, loop_open - 1) {
+  if is_array_literal_end(tokens, iter_e) {
     return ""
   }
   let body_open = outermost_body_open(tokens, for_i)
@@ -4165,14 +4763,37 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
   if loop_iterable_private_copy(tokens, body_open, body_close, in_i, loop_open, summary.array_fields) == 1 {
     return ""
   }
-  let root = receiver_root(tokens, loop_open - 1)
-  let tail = path_tail(tokens, loop_open - 1)
-  let is_field_iter = loop_open - 1 >= 2 && tokens[loop_open - 2].kind == TokenKind::Dot
+  let root = receiver_root(tokens, iter_e)
+  let tail = path_tail(tokens, iter_e)
+  let is_field_iter = iter_e >= 2 && tokens[iter_e - 1].kind == TokenKind::Dot
   let fresh_root = !is_field_iter && root.length() > 0 &&
   fresh_local_binding(tokens, root, body_open, for_i, true) &&
   !name_handed_out(tokens, root, body_open, for_i)
   let names : Map[String, Bool] = if !is_field_iter && root.length() > 0 {
     array_aliases(tokens, root, body_open, body_close)
+  } else if is_field_iter && tail.length() > 0 {
+    // Collect local aliases of the iterated field (`let ys = b.items`) and their transitive aliases.
+    let fa : Map[String, Bool] = Map()
+    let mut ai = body_open + 1
+    while ai + 3 < body_close {
+      if tokens[ai].raw == "let" {
+        let mut ni = ai + 1
+        if ni < body_close && tokens[ni].raw == "mut" { ni = ni + 1 }
+        if ni + 2 < body_close && tokens[ni].kind == TokenKind::Ident && tokens[ni + 1].kind == TokenKind::Eq {
+          let se = statement_end(tokens, ni + 2, body_close)
+          let last = se - 1
+          if last >= ni + 4 && tokens[last].kind == TokenKind::Ident && tokens[last].raw == tail &&
+          tokens[last - 1].kind == TokenKind::Dot {
+            let alias_nm = tokens[ni].raw
+            for an in array_aliases(tokens, alias_nm, body_open, body_close).keys() {
+              fa[an] = true
+            }
+          }
+        }
+      }
+      ai = ai + 1
+    }
+    fa
   } else {
     Map()
   }
@@ -4181,12 +4802,15 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
   let fs = fn_start_of(tokens, body_open)
   if fs >= 0 {
     let mut pk = fs + 1
-    let mut pd = 0
+    let mut paren_d = 0
+    let mut brack_d = 0
     while pk + 2 < body_open {
       let pkk = tokens[pk].kind
-      if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
-      else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
-      else if pd == 1 && pkk == TokenKind::Ident && tokens[pk + 1].kind == TokenKind::Colon {
+      if pkk == TokenKind::LParen { paren_d = paren_d + 1 }
+      else if pkk == TokenKind::RParen { paren_d = paren_d - 1 }
+      else if pkk == TokenKind::LBracket { brack_d = brack_d + 1 }
+      else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
+      else if paren_d == 1 && brack_d == 0 && pkk == TokenKind::Ident && tokens[pk + 1].kind == TokenKind::Colon {
         if tokens[pk + 2].raw == "Array" {
           arr_params[tokens[pk].raw] = true
         }
@@ -4241,10 +4865,45 @@ fn for_in_body_hazard(
   // iterated array or its owner (e.g. `for k in keys { (self.same)(was, v) }` or `for x in xs { key(x) }`)
   // are left unblocked here to preserve existing package compatibility until compiler-level `(buf, init_len)`
   // snapshots are introduced.
-  let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, arg_open : Int, arg_close : Int, pos : Int, label : String) -> String {
+  let is_local_fresh_recv = fn(r : String, r_is_field : Bool, pos : Int) -> Bool {
+    !r_is_field && r.length() > 0 && body_open >= 0 && fresh_local_binding(tokens, r, body_open, pos, true)
+  }
+  let iter_elem_ty = if !is_field_iter && root.length() > 0 && body_open >= 0 {
+    let rty = resolve_local_type_name(tokens, root, body_open, loop_open, summary)
+    if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
+  } else {
+    ""
+  }
+  let may_alias_target = fn(r : String, r_tail : String, r_is_field : Bool, pos : Int) -> Bool {
+    if fresh_root {
+      !r_is_field && names.contains(r)
+    } else if is_local_fresh_recv(r, r_is_field, pos) {
+      false
+    } else if is_field_iter {
+      (r_is_field && r_tail == tail) || (!r_is_field && names.contains(r))
+    } else {
+      let field_can_alias = if r_is_field {
+        if r_tail == tail {
+          true
+        } else if arr_params.contains(root) && r != "self" && summary.array_fields.get(r_tail) == Some(true) {
+          // Statically distinct element types (e.g. `Array[(Int, Int)]` vs `Array[Int]`) cannot alias.
+          match summary.array_elem_types.get(r_tail) {
+            Some(fe) => !(iter_elem_ty.length() > 0 && fe.length() > 0 && fe != iter_elem_ty)
+            None => true
+          }
+        } else {
+          false
+        }
+      } else {
+        false
+      }
+      (!r_is_field && (names.contains(r) || (arr_params.contains(r) && !fresh_before.contains(r)))) || field_can_alias
+    }
+  }
+  let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, arg_open : Int, arg_close : Int, is_method_call : Bool, recv_is_root : Bool, pos : Int, label : String) -> String {
     // pass_kind: 2 = iterated Array itself passed/received; 1 = owner struct of `root.tail` passed/received; 0 = neither
     if pass_kind == 2 {
-      if (ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque) && !can_exit(pos) {
+      if (ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || ef.may_pass_param_to_dep) && !can_exit(pos) {
         return label + " may mutate the array during `for .. in`"
       }
       if ef.may_grow { flags[0] = true }
@@ -4253,24 +4912,29 @@ fn for_in_body_hazard(
       if is_field_iter && tail.length() > 0 {
         // Check if `root` is passed at a parameter position that `ef` passes to a cross-package `dep::f(param)`.
         let mut root_escapes_to_dep = false
-        if ef.may_pass_param_to_dep && arg_open >= 0 && arg_close > arg_open {
-          let mut ai = arg_open + 1
-          let mut ad = 0
-          let mut arg_ord = 0
-          while ai < arg_close {
-            let ak = tokens[ai].kind
-            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
-            else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
-            else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
-            else if ad == 0 && ak == TokenKind::Ident && tokens[ai].raw == root &&
-            !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
-            !(ai + 1 < arg_close && tokens[ai + 1].kind == TokenKind::Dot) {
-              if ef.dep_escaped_params.contains(arg_ord) {
-                root_escapes_to_dep = true
-                break
+        if ef.may_pass_param_to_dep {
+          if is_method_call && recv_is_root && ef.dep_escaped_params.contains(0) {
+            root_escapes_to_dep = true
+          }
+          if !root_escapes_to_dep && arg_open >= 0 && arg_close > arg_open {
+            let mut ai = arg_open + 1
+            let mut ad = 0
+            let mut arg_ord = if is_method_call { 1 } else { 0 }
+            while ai < arg_close {
+              let ak = tokens[ai].kind
+              if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+              else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+              else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
+              else if ad == 0 && ak == TokenKind::Ident && tokens[ai].raw == root &&
+              !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
+              !(ai + 1 < arg_close && tokens[ai + 1].kind == TokenKind::Dot) {
+                if ef.dep_escaped_params.contains(arg_ord) {
+                  root_escapes_to_dep = true
+                  break
+                }
               }
+              ai = ai + 1
             }
-            ai = ai + 1
           }
         }
         if (ef.mutated_fields.contains(tail) || root_escapes_to_dep) && !can_exit(pos) {
@@ -4318,17 +4982,12 @@ fn for_in_body_hazard(
         }
       }
     }
-    // Custom `impl Eq` on `==` / `!=` for non-local/escaped arrays
-    if !fresh_root && summary.local_has_custom_eq && (kk == TokenKind::EqEq || tk.raw == "!=") {
-      let lhs_lit = k > s && (tokens[k - 1].kind == TokenKind::IntLit || tokens[k - 1].kind == TokenKind::FloatLit ||
-        tokens[k - 1].kind == TokenKind::StringLit || tokens[k - 1].kind == TokenKind::CharLit ||
-        tokens[k - 1].raw == "true" || tokens[k - 1].raw == "false")
-      let rhs_lit = k + 1 < e && (tokens[k + 1].kind == TokenKind::IntLit || tokens[k + 1].kind == TokenKind::FloatLit ||
-        tokens[k + 1].kind == TokenKind::StringLit || tokens[k + 1].kind == TokenKind::CharLit ||
-        tokens[k + 1].raw == "true" || tokens[k + 1].raw == "false")
-      let lhs_bi = lhs_lit || (k > s && body_open >= 0 && receiver_is_builtin(tokens, k - 1, body_open, k, summary.sort_env))
-      let rhs_bi = rhs_lit || (k + 1 < e && body_open >= 0 && receiver_is_builtin(tokens, k + 1, body_open, k, summary.sort_env))
-      if !(lhs_bi || rhs_bi) && !summary_custom_eq_is_pure(summary) && !can_exit(k) {
+    // Custom `impl Eq` on `==` / `!=` for non-local/escaped arrays (Opus P1 Scheme A: per-type impure Eq tracking)
+    if !fresh_root && summary.local_has_custom_eq && summary.impure_eq_types.length() > 0 &&
+    (kk == TokenKind::EqEq || tk.raw == "!=") {
+      let lhs_pure = k > s && eq_operand_is_pure(tokens, k - 1, body_open, k, summary, true)
+      let rhs_pure = k + 1 < e && eq_operand_is_pure(tokens, k + 1, body_open, k, summary, false)
+      if !(lhs_pure || rhs_pure) && !can_exit(k) {
         return "`" + tk.raw + "` may invoke a custom `impl Eq` that mutates the array during `for .. in`"
       }
     }
@@ -4358,14 +5017,7 @@ fn for_in_body_hazard(
       let recv_r = receiver_root(tokens, k - 1)
       let recv_tail = path_tail(tokens, k - 1)
       let recv_is_field = k - 1 >= 2 && tokens[k - 2].kind == TokenKind::Dot
-      let may_alias = if fresh_root {
-        !recv_is_field && names.contains(recv_r)
-      } else if is_field_iter {
-        (recv_is_field && recv_tail == tail) || (!recv_is_field && names.contains(recv_r))
-      } else {
-        (!recv_is_field && (names.contains(recv_r) || (arr_params.contains(recv_r) && !fresh_before.contains(recv_r)))) ||
-        (recv_is_field && recv_tail == tail)
-      }
+      let may_alias = may_alias_target(recv_r, recv_tail, recv_is_field, k)
       if may_alias {
         if is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit" {
           if !can_exit(k) {
@@ -4379,21 +5031,25 @@ fn for_in_body_hazard(
       }
       let cp_m = find_matching_delim(tokens, k + 2)
       let apk = args_pass_kind(k + 3, cp_m)
+      let recv_is_root = !recv_is_field && recv_r == root
       let pass_kind = if may_alias || apk == 2 {
         2
-      } else if (is_field_iter && !recv_is_field && recv_r == root) || apk == 1 {
+      } else if (is_field_iter && recv_is_root) || apk == 1 {
         1
       } else {
         0
       }
-      let recv_proven_disjoint_builtin = !may_alias && is_builtin_first_order_method(m) && apk == 0
+      let recv_is_builtin_arr_or_val = (recv_is_field && summary.array_fields.get(recv_tail) == Some(true)) ||
+      (body_open >= 0 && receiver_is_builtin(tokens, k - 1, body_open, k, summary.sort_env))
+      let recv_proven_disjoint_builtin = !may_alias && is_builtin_first_order_method(m) && apk == 0 &&
+      (!summary.by_name.contains(m) || recv_is_builtin_arr_or_val)
       if !recv_proven_disjoint_builtin {
         match summary.by_name.get(m) {
           Some(keys) => {
             for dk in keys {
               match summary.effects.get(dk) {
                 Some(ef) => {
-                  let why = check_pkg_effect(ef, pass_kind, k + 2, cp_m, k, "`." + m + "(..)`")
+                  let why = check_pkg_effect(ef, pass_kind, k + 2, cp_m, true, recv_is_root, k, "`." + m + "(..)`")
                   if why.length() > 0 { return why }
                 }
                 None => ()
@@ -4420,13 +5076,7 @@ fn for_in_body_hazard(
       let wr_r = if lb > s { receiver_root(tokens, lb - 1) } else { "" }
       let wr_tail = if lb > s { path_tail(tokens, lb - 1) } else { "" }
       let wr_is_field = lb - 1 >= 2 && tokens[lb - 2].kind == TokenKind::Dot
-      let may_alias = if fresh_root {
-        !wr_is_field && names.contains(wr_r)
-      } else if is_field_iter {
-        wr_is_field && wr_tail == tail
-      } else {
-        !wr_is_field && (names.contains(wr_r) || (arr_params.contains(wr_r) && !fresh_before.contains(wr_r)))
-      }
+      let may_alias = may_alias_target(wr_r, wr_tail, wr_is_field, lb)
       if may_alias {
         flags[1] = true
       }
@@ -4437,12 +5087,26 @@ fn for_in_body_hazard(
       let q = tokens[k - 2].raw
       let cp = find_matching_delim(tokens, k + 1)
       if q == "mbt_compat" {
-        let arg0_r = if k + 2 < cp { receiver_root(tokens, k + 2) } else { "" }
-        let may_alias = if fresh_root {
-          names.contains(arg0_r)
-        } else {
-          names.contains(arg0_r) || (arr_params.contains(arg0_r) && !fresh_before.contains(arg0_r))
+        let mut a0_end = k + 2
+        let mut ad = 0
+        while a0_end < cp {
+          let ak = tokens[a0_end].kind
+          if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+          else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+          else if ad == 0 && ak == TokenKind::Comma { break }
+          a0_end = a0_end + 1
         }
+        let mut a0_s = k + 2
+        let mut a0_e = a0_end - 1
+        while a0_s < a0_e && tokens[a0_s].kind == TokenKind::LParen &&
+        find_matching_delim(tokens, a0_s) == a0_e {
+          a0_s = a0_s + 1
+          a0_e = a0_e - 1
+        }
+        let arg0_r = if a0_e >= a0_s { receiver_root(tokens, a0_e) } else { "" }
+        let arg0_tail = if a0_e >= a0_s { path_tail(tokens, a0_e) } else { "" }
+        let arg0_is_field = a0_e >= a0_s + 2 && tokens[a0_e - 1].kind == TokenKind::Dot
+        let may_alias = may_alias_target(arg0_r, arg0_tail, arg0_is_field, k)
         if may_alias {
           if is_cap_compat_shrink_or_shift_fn(tk.raw) || tk.raw == "arr_shrink_to_fit" {
             if !can_exit(k) {
@@ -4465,7 +5129,7 @@ fn for_in_body_hazard(
         } else {
           match summary.effects.get(q + "::" + tk.raw) {
             Some(ef) => {
-              let why = check_pkg_effect(ef, pk, k + 1, cp, k, "call to `" + q + "::" + tk.raw + "(..)`")
+              let why = check_pkg_effect(ef, pk, k + 1, cp, false, false, k, "call to `" + q + "::" + tk.raw + "(..)`")
               if why.length() > 0 { return why }
             }
             None =>
@@ -4497,7 +5161,7 @@ fn for_in_body_hazard(
       } else {
         match summary.effects.get("::" + tk.raw) {
           Some(ef) => {
-            let why = check_pkg_effect(ef, pk, k + 1, cp, k, "call to `" + tk.raw + "(..)`")
+            let why = check_pkg_effect(ef, pk, k + 1, cp, false, false, k, "call to `" + tk.raw + "(..)`")
             if why.length() > 0 { return why }
           }
           None =>

@@ -5,7 +5,7 @@
 ///|    (single-op `insert`/`splice`/`resize`, `for x in f2 { f2.clear() }`, immediate-break `remove; break`)
 ///| 3. Strict package-confined escape analysis, declaration-bound effect summaries (mutual recursion),
 ///|    private struct closure fields `(e.off)()`, and `combobox`-style negative tests
-///| 4. Dep-only dangerous same-name method rejection (`sort_key_set_dep_methods` + `sort_key_env_of_with_deps`)
+///| 4. Dep-only dangerous same-name method rejection (`sort_key_env_of_with_deps`)
 
 fn f4_1_has_diag(ds : Array[Diag], code : String, needle : String) -> Bool {
   for d in ds {
@@ -269,7 +269,7 @@ test "F4-1-3: Strict escape rules, mutual-recursion effect summaries, struct clo
   assert_true(str_has(cb_hit, "a call to `off(..)`"), "combobox-style opaque callback must block: " + cb_hit)
 }
 
-test "F4-1-4: Dep-only dangerous same-name method rejection (sort_key_env_of_with_deps & global handoff)" {
+test "F4-1-4: Dep-only dangerous same-name method rejection (explicit dep_methods context)" {
   let src = "pub fn f(xs : Array[Int], h : dep::Hook, arr : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { h.length() + x })\n  xs.sort_by_key(fn(x) { arr.length() + x })\n}\n"
   let ts = lex_moonbit(src)
   let dep_m : Map[String, Bool] = Map()
@@ -287,18 +287,11 @@ test "F4-1-4: Dep-only dangerous same-name method rejection (sort_key_env_of_wit
   assert_true(str_has(hits_exp[0], "not proven built-in"), "dep-only method `length` must reject h.length(): " + hits_exp[0])
   assert_true(hits_exp[1] == "", "proven built-in Array[Int] arr.length() still allowed: " + hits_exp[1])
 
-  // 2. Backward-compatible global setter (`sort_key_set_dep_methods`)
-  sort_key_set_dep_methods(dep_m)
-  let env_global = sort_key_env_of([ts])
-  let mut hits_glob : Array[String] = []
-  for i, t in ts {
-    if t.raw == "sort_by_key" {
-      hits_glob.push(sort_key_closure_opacity(ts, i + 1, env_global))
-    }
-  }
-  sort_key_set_dep_methods(Map())
-  assert_true(str_has(hits_glob[0], "not proven built-in"), "global dep methods must reject h.length()")
-  assert_true(hits_glob[1] == "", "global dep methods still allow arr.length()")
+  // 2. Post-convergence `stage_b_audit_final_sort_keys_with_deps` threads explicit dep_methods (no global state)
+  let sk_src = "pub fn f(xs : Array[Int], h : dep::Hook) -> Unit {\n  mbt_compat::arr_sort_by_key(xs, fn(x) { h.length() + x })\n}\n"
+  let sk_diags : Array[Diag] = []
+  stage_b_audit_final_sort_keys_with_deps([GeneratedFile::{ rel_path: "sk_dep.pion", content: sk_src, source_file: "sk_dep.mbt", anchors: [] }], dep_m, sk_diags)
+  assert_true(sk_diags.length() == 1 && sk_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "stage_b_audit_final_sort_keys_with_deps must reject dep-only length")
 }
 
 test "F4-1-5: Review & Red-Team R1 soundness regressions" {
@@ -424,4 +417,159 @@ test "F4-1-5: Review & Red-Team R1 soundness regressions" {
   let wd_diags : Array[Diag] = []
   stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "wd.pion", content: wrap_dep_src, source_file: "wd.mbt", anchors: [] }], wd_diags)
   assert_true(wd_diags.length() == 1 && wd_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "wrapper calling dep::mutate(b) in for-in b.items must block")
+}
+
+test "f4_1_astra_r2_soundness_and_cache_regressions" {
+  // 1. Astra P1-1: User method shadowing `Array::push` (`Hook::push`) in search_by, kept_iter, and for-in
+  let hook_sb_src = "struct Hook { xs : Array[Int] }\nfn Hook::push(self : Hook, v : Int) -> Unit { self.xs.clear() }\npub fn f(xs : Array[Int], h : Hook) -> Option[Int] {\n  xs.search_by(fn(x) { h.push(x); x == 2 })\n}\n"
+  let hsb_toks = lex_moonbit(hook_sb_src)
+  let hsb_sum = collect_cap_pkg_summary([hsb_toks], Map())
+  let hsb_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(hsb_toks, hsb_sum, "hsb.pion", 4, 6, hsb_diags), "Hook::push inside search_by must block")
+
+  let hook_iter_src = "struct Hook { xs : Array[Int] }\nfn Hook::push(self : Hook, v : Int) -> Unit { self.xs.clear() }\npub fn f(xs : Array[Int], h : Hook) -> Int {\n  let it = xs.iter()\n  h.push(1)\n  it.count()\n}\n"
+  let hi_toks = lex_moonbit(hook_iter_src)
+  let hi_env = sort_key_env_of([hi_toks])
+  let mut hi_dot = -1
+  for i, t in hi_toks {
+    if t.kind == TokenKind::Dot && i + 1 < hi_toks.length() && hi_toks[i + 1].raw == "iter" { hi_dot = i }
+  }
+  assert_true(kept_iter_hazard_with_env(hi_toks, hi_dot, hi_env).length() > 0, "Hook::push during kept iter must block")
+
+  let hook_for_src = "struct Hook { items : Array[Int] }\nfn Hook::push(self : Hook, v : Int) -> Unit { self.items.clear() }\npub fn f(h : Hook) -> Int {\n  let mut s = 0\n  for x in h.items { h.push(x); s = s + x }\n  s\n}\n"
+  let hf_diags : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "hf.pion", content: hook_for_src, source_file: "hf.mbt", anchors: [] }], hf_diags)
+  assert_true(hf_diags.length() == 1 && hf_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "Hook::push inside for-in h.items must block")
+
+  // 2. Astra P1-2: Same-round version bump on File A must NOT poison File A's tokens when File B scans the package
+  let file_a = "pub fn a(xs : Array[Int]) -> Unit {\n  xs.unsafe_set(0, 1)\n}\n"
+  let file_b = "pub fn b(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { x == 1 })\n}\n"
+  let run_two = fn(cache_on : Bool) -> (String, String, Array[Diag]) {
+    stage_b_set_cache_enabled(cache_on)
+    let files = [
+      GeneratedFile::{ rel_path: "a.pion", content: file_a, source_file: "a.mbt", anchors: [] },
+      GeneratedFile::{ rel_path: "b.pion", content: file_b, source_file: "b.mbt", anchors: [] },
+    ]
+    let diags : Array[Diag] = []
+    let log : Array[DriftEntry] = []
+    let mut call_n = 0
+    let (out, _, _) = run_stage_b_with_ops(files, empty_api_map(), Map(), fn(batch : Array[(String, String)]) -> String {
+      call_n = call_n + 1
+      if call_n == 1 {
+        return "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"a.pion\",\"line\":2,\"col\":6,\"message\":\"unknown method `unsafe_set` on type `Array[Int]`\"},{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"b.pion\",\"line\":2,\"col\":6,\"message\":\"unknown method `search_by` on type `Array[Int]`\"}]}"
+      }
+      if call_n == 2 {
+        // Verify File A was actually rewritten in round 1 AND round 2 sees updated File A (no stale cache)!
+        let mut a_has_unsafe = false
+        for p in batch {
+          if p.0 == "a.pion" && str_has(p.1, "unsafe_set") { a_has_unsafe = true }
+        }
+        assert_true(!a_has_unsafe, "round 2 must see rewritten a.pion")
+      }
+      "{\"diagnostics\":[]}"
+    }, diags, log)
+    stage_b_set_cache_enabled(true)
+    (out[0].content, out[1].content, diags)
+  }
+  let (a_off, b_off, d_off) = run_two(false)
+  let (a_on, b_on, d_on) = run_two(true)
+  assert_true(a_off == a_on && b_off == b_on && d_off.length() == d_on.length(), "same-round A rewrite + B pkg scan must be byte-identical with cache on/off")
+  // Both a.pion and b.pion changed in round 1 (version 0 -> 1) and round 2 had 0 diags, so token_cache must NOT
+  // have poisoned version 1 with round-1 tokens (Astra P1-2).
+  assert_true(stage_b_last_tokens_count() == 0, "stage_b_last_tokens must not publish stale v0 tokens for v1 files")
+  // Also verify Astra P2-6: stage_b_last_tokens populated by post-convergence audit and cleared after stage_b_audit_final_sort_keys
+  let post_files = [
+    GeneratedFile::{ rel_path: "a.pion", content: a_on, source_file: "a.mbt", anchors: [] },
+    GeneratedFile::{ rel_path: "b.pion", content: b_on, source_file: "b.mbt", anchors: [] },
+  ]
+  let post_diags : Array[Diag] = []
+  stage_b_audit_for_in_arrays(post_files, post_diags)
+  assert_true(stage_b_last_tokens_count() == 2, "stage_b_last_tokens populated during post-convergence audit")
+  let sk_diags : Array[Diag] = []
+  stage_b_audit_final_sort_keys(post_files, sk_diags)
+  assert_true(stage_b_last_tokens_count() == 0, "stage_b_last_tokens must be cleared after stage_b_audit_final_sort_keys")
+
+  // 3. Astra P1-3: parenthesized iterable, direct field shift (mbt_compat::arr_insert), field alias, param-field alias
+  let paren_src = "pub fn f(xs : Array[Int]) -> Int {\n  let mut s = 0\n  for x in (xs) { xs.clear(); s = s + x }\n  s\n}\n"
+  let p3a : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p3a.pion", content: paren_src, source_file: "p3a.mbt", anchors: [] }], p3a)
+  assert_true(p3a.length() == 1 && p3a[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "for x in (xs) with clear must block")
+
+  let field_ins_src = "struct Box { items : Array[Int] }\npub fn f(b : Box) -> Int {\n  let mut s = 0\n  for x in b.items { mbt_compat::arr_insert(b.items, 0, 9); s = s + x }\n  s\n}\n"
+  let p3b : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p3b.pion", content: field_ins_src, source_file: "p3b.mbt", anchors: [] }], p3b)
+  assert_true(p3b.length() == 1 && p3b[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "for x in b.items with mbt_compat::arr_insert(b.items, ..) must block")
+
+  let field_alias_src = "struct Box { items : Array[Int] }\npub fn f(b : Box) -> Int {\n  let ys = b.items\n  let mut s = 0\n  for x in b.items { ys.push(4); ys[1] = 9; s = s + x }\n  s\n}\n"
+  let p3c : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p3c.pion", content: field_alias_src, source_file: "p3c.mbt", anchors: [] }], p3c)
+  assert_true(p3c.length() == 1 && p3c[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "field alias ys = b.items with grow+write must block")
+
+  let param_field_src = "struct Box { items : Array[Int] }\npub fn f(xs : Array[Int], b : Box) -> Int {\n  let mut s = 0\n  for x in xs { b.items.push(4); b.items[1] = 9; s = s + x }\n  s\n}\n"
+  let p3d : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p3d.pion", content: param_field_src, source_file: "p3d.mbt", anchors: [] }], p3d)
+  assert_true(p3d.length() == 1 && p3d[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "param xs aliased by b.items with grow+write must block")
+
+  // 4. Astra P1-4: `let _ = if x == 1 { continue } else { 0 }; break` after shift must NOT be treated as immediate exit
+  let cont_src = "pub fn f(xs : Array[Int]) -> Int {\n  let mut s = 0\n  for x in xs {\n    if x == 1 {\n      mbt_compat::arr_insert(xs, 0, 9)\n      let _ = if x == 1 { continue } else { 0 }\n      break\n    }\n    s = s + x\n  }\n  s\n}\n"
+  let p4 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p4.pion", content: cont_src, source_file: "p4.mbt", anchors: [] }], p4)
+  assert_true(p4.length() == 1 && p4[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "continue inside let-init before break must NOT bypass for-in hazard")
+
+  // 5. Astra P1-5: Tab after `for` (`for\tx in xs`) must NOT bypass `stage_b_audit_for_in_arrays`
+  let tab_src = "pub fn f(xs : Array[Int]) -> Int {\n  let mut s = 0\n  for\tx in xs { xs.clear(); s = s + x }\n  s\n}\n"
+  let p5 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "p5.pion", content: tab_src, source_file: "p5.mbt", anchors: [] }], p5)
+  assert_true(p5.length() == 1 && p5[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "for<tab>x in xs must still be audited and blocked")
+
+  // 6. Leader #1: Generic type parameter `[T : Show]` must NOT shift `fn_param_idx`
+  let gen_dep_src = "struct Box { items : Array[Int] }\nfn w[T : Show](b : Box, t : T) -> Unit { dep::mutate(b) }\npub fn run(b : Box) -> Int {\n  let mut s = 0\n  for x in b.items { w(b, x); s = s + x }\n  s\n}\n"
+  let l1 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "l1.pion", content: gen_dep_src, source_file: "l1.mbt", anchors: [] }], l1)
+  assert_true(l1.length() == 1 && l1[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "generic fn w[T : Show](b : Box) calling dep::mutate(b) must block")
+
+  // 7. Leader #2: Method receiver `self` must map to `arg_ord = 0` in `b.w()`
+  let meth_dep_src = "struct Box { items : Array[Int] }\nfn Box::w(self : Box) -> Unit { dep::mutate(self) }\npub fn run(b : Box) -> Int {\n  let mut s = 0\n  for x in b.items { b.w(); s = s + x }\n  s\n}\n"
+  let l2 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "l2.pion", content: meth_dep_src, source_file: "l2.mbt", anchors: [] }], l2)
+  assert_true(l2.length() == 1 && l2[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "method b.w() calling dep::mutate(self) must block")
+
+  // 8. Opus P1 (Scheme A): Per-type impure `impl Eq` allows `Int != Int` in same pkg, blocks `BadEq` & generic `T : Eq`
+  let opus_eq_src = "struct BadEq { same : (BadEq) -> Bool }\n" +
+  "impl Eq for BadEq { fn equal(self : BadEq, other : BadEq) -> Bool { (self.same)(other) } }\n" +
+  "struct Node { kids : Array[Int], picks : Array[BadEq] }\n" +
+  "pub fn ok_int_cmp(self : Node, item : Int) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for k in self.kids { if k != item { s = s + k } }\n" +
+  "  s\n" +
+  "}\n" +
+  "pub fn bad_eq_cmp(self : Node, target : BadEq) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for p in self.picks { if p == target { s = s + 1 } }\n" +
+  "  s\n" +
+  "}\n" +
+  "pub fn bad_generic_cmp[T : Eq](xs : Array[T], t : T) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for x in xs { if x == t { s = s + 1 } }\n" +
+  "  s\n" +
+  "}\n"
+  let op1 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "op1.pion", content: opus_eq_src, source_file: "op1.mbt", anchors: [] }], op1)
+  // Expect exactly 2 diagnostics: bad_eq_cmp (line 11) and bad_generic_cmp (line 16), NOT ok_int_cmp (line 6)!
+  assert_true(op1.length() == 2, "expected 2 diags (BadEq + generic T), got " + op1.length().to_string())
+  assert_true(op1[0].line == 11 && op1[1].line == 16, "ok_int_cmp must pass while BadEq & generic T block")
+
+  // Also verify `let mut item = at` (`at : Int`) + `for k in self.nodes[0].kids` (`kids : Array[Int]`) passes!
+  let along_src = "struct BadEq { same : (BadEq) -> Bool }\n" +
+  "impl Eq for BadEq { fn equal(self : BadEq, other : BadEq) -> Bool { (self.same)(other) } }\n" +
+  "struct Node { mut parent : Int, kids : Array[Int] }\n" +
+  "struct Tree { nodes : Array[Node] }\n" +
+  "pub fn Tree::along_row_at(self : Tree, at : Int) -> Bool {\n" +
+  "  let mut item = at\n" +
+  "  for k in self.nodes[0].kids { if k != item { return true } }\n" +
+  "  false\n" +
+  "}\n"
+  let op2 : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "op2.pion", content: along_src, source_file: "op2.mbt", anchors: [] }], op2)
+  assert_true(op2.length() == 0, "along_row_at Int != Int must pass with 0 diags")
 }

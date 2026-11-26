@@ -392,7 +392,7 @@ pub fn f(xs : Array[Int]) -> Int {
 pub fn f(xs : Array[Int], cb : (Int) -> Bool) -> Int? {
   xs.search_by(fn(x) { [x].iter().any(cb) })
 }
-''', "MBT2PION_ARRAY_ITER_MUTATION", "opaque `cb`"),
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".any(..)"),
     "confined_for_in_reenter_shrink": (r'''
 struct S { items : Array[Int] }
 pub fn iter_cb(s : S, cb : (S) -> Unit) -> Unit {
@@ -405,6 +405,93 @@ pub fn reset(s : S) -> Unit {
   s.items.shrink_to_fit()
 }
 ''', "MBT2PION_ARRAY_SHRINK_ITER", "iterates an array named `items`"),
+    "hook_push_search_by": (r'''
+struct Hook { xs : Array[Int] }
+fn Hook::push(self : Hook, v : Int) -> Unit {
+  let _ = v
+  self.xs.clear()
+}
+pub fn f(xs : Array[Int], h : Hook) -> Int? {
+  xs.search_by(fn(x) { h.push(x); x == 2 })
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "search_by"),
+    "hook_push_kept_iter": (r'''
+struct Hook { xs : Array[Int] }
+fn Hook::push(self : Hook, v : Int) -> Unit {
+  let _ = v
+  self.xs.clear()
+}
+pub fn f(xs : Array[Int], h : Hook) -> Int {
+  let it = xs.iter()
+  h.push(1)
+  it.count()
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".push(..)"),
+    "for_in_parens_clear": (r'''
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in (xs) {
+    xs.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_field_insert": (r'''
+struct Box { items : Array[Int] }
+pub fn f(b : Box) -> Int {
+  let mut s = 0
+  for x in b.items {
+    b.items.insert(0, 9)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "arr_insert(..)"),
+    "for_in_field_alias_grow_write": (r'''
+struct Box { items : Array[Int] }
+pub fn f(b : Box) -> Int {
+  let ys = b.items
+  let mut s = 0
+  for x in b.items {
+    ys.push(4)
+    ys[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_param_field_alias_grow_write": (r'''
+struct Box { items : Array[Int] }
+pub fn f(xs : Array[Int], b : Box) -> Int {
+  let mut s = 0
+  for x in xs {
+    b.items.push(4)
+    b.items[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_continue_in_let_before_break": (r'''
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      xs.insert(0, 9)
+      let _ = if x == 1 { continue } else { 0 }
+      break
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "arr_insert(..)"),
+    "for_in_tab_clear": (
+        "pub fn f(xs : Array[Int]) -> Int {\n  let mut s = 0\n  for\tx in xs {\n    xs.clear()\n    s = s + x\n  }\n  s\n}\n",
+        "MBT2PION_ARRAY_ITER_MUTATION",
+        ".clear(..)",
+    ),
 }
 
 
