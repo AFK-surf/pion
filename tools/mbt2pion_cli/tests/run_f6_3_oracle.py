@@ -499,6 +499,28 @@ pub fn run(xs : Array[Int]) -> Int {
   }
   acc
 }
+pub fn probe(x : Int) -> Int {
+  x + 1
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r7_top_let_labeled_loop",
+        r'''
+let value : Int = outer~: for x in [3] { break outer~ x } nobreak { 4 }
+pub fn get_value() -> Int {
+  value
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r7_interp_labeled_loop",
+        r'''
+pub fn run() -> Int {
+  "\{outer~: for x in [3] { break outer~ x } nobreak { 4 }}".length()
+}
 ''',
         "MBT2PION_UNSUPPORTED_SYNTAX",
     ),
@@ -734,6 +756,7 @@ def main():
             nsrc = os.path.join(nmod, "src")
             nout = os.path.join(tmp, f"{name}_out")
             nrep = os.path.join(tmp, f"{name}_rep.json")
+            nreport = os.path.join(tmp, f"{name}_report.json")
             os.makedirs(nsrc, exist_ok=True)
             with open(os.path.join(nmod, "moon.mod"), "w") as f:
                 f.write(f'name = "neg/{name}"\n')
@@ -753,6 +776,7 @@ def main():
                 "--src", nsrc,
                 "--out", nout,
                 "--drift-ledger", nrep,
+                "--report", nreport,
                 "--pionc", pionc,
                 "--mbt-compat", COMPAT_DIR,
                 "--no-fmt",
@@ -779,6 +803,14 @@ def main():
                 if allow_hits:
                     raise RuntimeError(
                         f"SOUNDNESS FAILURE: negative case `{name}` unexpectedly logged allow categories {allow_hits}"
+                    )
+            if name == "neg_gate_d_labeled_for_slice":
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:run") != "unsupported" or disps.get("fn:probe") != "transpiled":
+                    raise RuntimeError(
+                        f"REPORT DISPOSITION MISMATCH for `{name}`: expected fn:run=unsupported, fn:probe=transpiled; got {disps}"
                     )
             print(f"[NEG PASS] {name}: moon check OK, fail-closed with {expected_diag} (rc={p.returncode})")
 

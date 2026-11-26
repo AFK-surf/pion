@@ -660,6 +660,8 @@ pub struct StageAContext {
   mut val_site_seq : Int
   mut init_order_seq : Int
   mut ufcs_seq : Int
+  orig_labeled_loop_locs : Map[String, Array[(Int, Int)]]
+  orig_labeled_loop_cursor : Map[String, Int]
 }
 
 pub fn stage_a_context_new(
@@ -725,6 +727,8 @@ pub fn stage_a_context_new(
     val_site_seq: 0,
     init_order_seq: 0,
     ufcs_seq: 0,
+    orig_labeled_loop_locs: Map(),
+    orig_labeled_loop_cursor: Map(),
   }
 }
 
@@ -13454,69 +13458,233 @@ pub fn eval_cfg_attr(raw_attr : String, pion_target : String) -> Option[Bool] {
   eval_cfg_expr(s.slice(5, s.length() - 1), pion_target)
 }
 
-///| Scan raw unpreprocessed source files for unsupported labeled loops (`<label>~: for|while|loop`),
-///| honoring top-level `#cfg(...)` exclusions so diagnostics report exact original `.mbt` line:col.
-pub fn check_unsupported_labeled_loops(
+///| Extract interpolation holes `\{...}` from an `InterpString` / `InterpMultiline` raw token,
+///| returning `(hole_source, abs_start_line, abs_start_col)` relative to `(base_line, base_col)`.
+fn extract_interp_holes_with_pos(
+  raw : String,
+  base_line : Int,
+  base_col : Int,
+) -> Array[(String, Int, Int)] {
+  let out : Array[(String, Int, Int)] = []
+  let len = raw.length()
+  let mut line = base_line
+  let mut col = base_col
+  let mut i = 0
+  while i < len {
+    let ch = raw.code_unit_at(i)
+    if ch == 10 {
+      line = line + 1
+      col = 1
+      i = i + 1
+      continue
+    }
+    if ch == 92 && i + 1 < len {
+      let nx = raw.code_unit_at(i + 1)
+      if nx == 123 {
+        // Found `\{` — advance past both characters to start of hole expression
+        let hole_start = i + 2
+        let hole_line = line
+        let hole_col = col + 2
+        i = i + 2
+        col = col + 2
+        let mut bd = 1
+        let mut in_str = false
+        let mut in_chr = false
+        while i < len && bd > 0 {
+          let hc = raw.code_unit_at(i)
+          if hc == 10 {
+            line = line + 1
+            col = 1
+            i = i + 1
+            continue
+          }
+          if in_str {
+            if hc == 92 && i + 1 < len {
+              let ec = raw.code_unit_at(i + 1)
+              if ec == 10 {
+                line = line + 1
+                col = 1
+              } else {
+                col = col + 2
+              }
+              i = i + 2
+              continue
+            }
+            if hc == 34 { in_str = false }
+            col = col + 1
+            i = i + 1
+            continue
+          }
+          if in_chr {
+            if hc == 92 && i + 1 < len {
+              col = col + 2
+              i = i + 2
+              continue
+            }
+            if hc == 39 { in_chr = false }
+            col = col + 1
+            i = i + 1
+            continue
+          }
+          if hc == 34 {
+            in_str = true
+          } else if hc == 39 {
+            in_chr = true
+          } else if hc == 123 {
+            bd = bd + 1
+          } else if hc == 125 {
+            bd = bd - 1
+            if bd == 0 {
+              out.push((raw.slice(hole_start, i), hole_line, hole_col))
+              col = col + 1
+              i = i + 1
+              break
+            }
+          }
+          col = col + 1
+          i = i + 1
+        }
+        continue
+      }
+      // Other escape sequence inside string literal (skip escaped char so `\\{` is not treated as `\{`)
+      if nx == 10 {
+        line = line + 1
+        col = 1
+      } else {
+        col = col + 2
+      }
+      i = i + 2
+      continue
+    }
+    col = col + 1
+    i = i + 1
+  }
+  out
+}
+
+///| Recursively collect all `<Ident> ~ : for|while|loop` hits in `tokens[s..e)`,
+///| including inside `InterpString` / `InterpMultiline` interpolation holes.
+fn collect_labeled_loop_hits_in_tokens(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  base_line : Int,
+  base_col : Int,
+  out : Array[(String, String, Int, Int)],
+) -> Unit {
+  let mut i = s
+  while i < e {
+    let tk = tokens[i]
+    let kk = tk.kind
+    let abs_line = base_line + tk.line - 1
+    let abs_col = if tk.line == 1 { base_col + tk.col - 1 } else { tk.col }
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline {
+      let holes = extract_interp_holes_with_pos(tk.raw, abs_line, abs_col)
+      for h in holes {
+        let htoks = lex_moonbit(h.0)
+        let hn = htoks.length() - 1
+        if hn > 0 {
+          collect_labeled_loop_hits_in_tokens(htoks, 0, hn, h.1, h.2, out)
+        }
+      }
+    } else if kk == TokenKind::Ident &&
+    !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
+    i + 3 < e &&
+    tokens[i + 1].kind == TokenKind::Tilde &&
+    tokens[i + 2].kind == TokenKind::Colon &&
+    tokens[i + 3].kind == TokenKind::Keyword &&
+    (tokens[i + 3].raw == "for" || tokens[i + 3].raw == "while" || tokens[i + 3].raw == "loop") {
+      out.push((tk.raw, tokens[i + 3].raw, abs_line, abs_col))
+      i = i + 3
+      continue
+    }
+    i = i + 1
+  }
+}
+
+///| Pre-pass: record exact original `.mbt` `(line, col)` for every labeled loop in active
+///| top-level declarations (honoring `#cfg(...)` exclusions) before pre-passes compress lines.
+pub fn collect_orig_labeled_loop_locs(
+  ctx : StageAContext,
   sources : Array[SourceFile],
   target : String,
-  diags : Array[Diag],
 ) -> Unit {
   for sf in sources {
     let tokens = lex_moonbit(sf.content)
     let n = tokens.length() - 1
-    let mut depth = 0
     let mut cfg_excluded = false
     let mut i = 0
     while i < n {
       let tk = tokens[i]
-      let kk = tk.kind
-      if depth == 0 {
-        if kk == TokenKind::Attr {
-          if tk.raw.trim().starts_with("#cfg(") {
-            match eval_cfg_attr(tk.raw, target) {
-              Some(false) => cfg_excluded = true
-              None => cfg_excluded = true
-              Some(true) => ()
-            }
+      if tk.kind == TokenKind::Attr {
+        if tk.raw.trim().starts_with("#cfg(") {
+          match eval_cfg_attr(tk.raw, target) {
+            Some(false) => cfg_excluded = true
+            None => cfg_excluded = true
+            Some(true) => ()
           }
-          i = i + 1
-          continue
         }
-        if cfg_excluded {
-          cfg_excluded = false
-          i = skip_top_level_decl(tokens, i, n)
-          continue
-        }
-      }
-      if kk == TokenKind::LBrace || kk == TokenKind::LParen || kk == TokenKind::LBracket {
-        depth = depth + 1
         i = i + 1
         continue
       }
-      if kk == TokenKind::RBrace || kk == TokenKind::RParen || kk == TokenKind::RBracket {
-        if depth > 0 { depth = depth - 1 }
-        i = i + 1
+      if cfg_excluded {
+        cfg_excluded = false
+        i = skip_top_level_decl(tokens, i, n)
         continue
       }
-      if depth > 0 && kk == TokenKind::Ident &&
-      !(i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
-      i + 3 < n &&
-      tokens[i + 1].kind == TokenKind::Tilde &&
-      tokens[i + 2].kind == TokenKind::Colon &&
-      tokens[i + 3].kind == TokenKind::Keyword &&
-      (tokens[i + 3].raw == "for" || tokens[i + 3].raw == "while" || tokens[i + 3].raw == "loop") {
-        diags.push(diag_error(
-          "MBT2PION_UNSUPPORTED_SYNTAX",
-          sf.rel_path,
-          tk.line,
-          tk.col,
-          "labeled loop `" + tk.raw + "~:` is unsupported (fail-closed)",
-        ))
-        i = i + 3
-        continue
+      let decl_end = skip_top_level_decl(tokens, i, n)
+      let next_i = if decl_end > i { decl_end } else { i + 1 }
+      let hits : Array[(String, String, Int, Int)] = []
+      collect_labeled_loop_hits_in_tokens(tokens, i, next_i, 1, 1, hits)
+      for hit in hits {
+        let key = sf.rel_path + "::" + hit.0 + "::" + hit.1
+        let arr = match ctx.orig_labeled_loop_locs.get(key) {
+          Some(a) => a
+          None => []
+        }
+        arr.push((hit.2, hit.3))
+        ctx.orig_labeled_loop_locs[key] = arr
       }
-      i = i + 1
+      i = next_i
     }
+  }
+}
+
+///| Emit `MBT2PION_UNSUPPORTED_SYNTAX` for any labeled loop in `tokens[s..e)` using exact
+///| pre-pass original `(line, col)` coordinates, inside the enclosing declaration's `decl_err_before` window.
+fn scan_and_emit_labeled_loops_in_span(
+  ctx : StageAContext,
+  rel_path : String,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+) -> Unit {
+  let hits : Array[(String, String, Int, Int)] = []
+  collect_labeled_loop_hits_in_tokens(tokens, s, e, 1, 1, hits)
+  for hit in hits {
+    let key = rel_path + "::" + hit.0 + "::" + hit.1
+    let cur = match ctx.orig_labeled_loop_cursor.get(key) {
+      Some(c) => c
+      None => 0
+    }
+    let mut use_line = hit.2
+    let mut use_col = hit.3
+    match ctx.orig_labeled_loop_locs.get(key) {
+      Some(arr) =>
+      if cur < arr.length() {
+        use_line = arr[cur].0
+        use_col = arr[cur].1
+        ctx.orig_labeled_loop_cursor[key] = cur + 1
+      }
+      None => ()
+    }
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      rel_path,
+      use_line,
+      use_col,
+      "labeled loop `" + hit.0 + "~:` is unsupported (fail-closed)",
+    ))
   }
 }
 
@@ -13602,7 +13770,7 @@ fn skip_top_level_decl(tokens : Array[Token], start_i : Int, n : Int) -> Int {
     }
     return k
   }
-  if is_kw && (kw.raw == "fn" || kw.raw == "impl" || kw.raw == "test" || kw.raw == "trait") {
+  if is_kw && (kw.raw == "fn" || kw.raw == "impl" || kw.raw == "test" || kw.raw == "trait" || kw.raw == "init") {
     let mut k = i + 1
     let mut depth = 0
     while k < n {
@@ -15302,6 +15470,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
     }
 
     let decl_err_before = count_error_diags(ctx.diags)
+    let decl_scan_end = skip_top_level_decl(tokens, i, n)
+    if decl_scan_end > i {
+      scan_and_emit_labeled_loops_in_span(ctx, sf.rel_path, tokens, i, decl_scan_end)
+    }
 
     // Parse visibility (`pub`, `pub(all)`, `pub(open)`, `priv`)
     let mut vis = ""
