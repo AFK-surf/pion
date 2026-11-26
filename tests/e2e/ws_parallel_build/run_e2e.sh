@@ -774,13 +774,15 @@ pub fn call_field[T](h : Holder, t : T, x : Int) -> Int {
   (h.f)(x)
 }
 
-pub fn check_escapes[T](t : T, def_s~ : String = "\x1b[0m") -> String {
+pub fn check_escapes[T](t : T, def_s~ : String = "\x1b[0m中文😀") -> String {
   let _ = t
   let c_nl : Char = '\n'
   let b_esc : Byte = b'\x1b'
   let c_sq : Char = '\''
   let c_bs : Char = '\\'
   let s_esc : String = "\x1b[0m"
+  let u_lit : String = "中文😀"
+  let u_interp : String = "前\{def_s}后"
   let b0 = def_s.code_unit_at(0)
   let s0 = s_esc.code_unit_at(0)
   "nl=" + c_nl.to_int().to_string() +
@@ -788,7 +790,9 @@ pub fn check_escapes[T](t : T, def_s~ : String = "\x1b[0m") -> String {
     ",sq=" + c_sq.to_int().to_string() +
     ",bs=" + c_bs.to_int().to_string() +
     ",ds=" + b0.to_string() +
-    ",ss=" + s0.to_string()
+    ",ss=" + s0.to_string() +
+    ",u=" + u_lit +
+    ",ui=" + u_interp
 }
 
 pub fn sum_loops[T](xs : Array[Int], t : T) -> Int {
@@ -872,7 +876,7 @@ printf '\n// hot-stub-rebuild\n' >> "$WS_STUB/app/src/main.pion"
 PION_CACHE_DIR="$CAS_STUB" "$PIONC" build --jobs 1 -o "$TMP_DIR/stub_hot" "$WS_STUB/app"
 STUB_HOT_OUT="$("$TMP_DIR/stub_hot")"
 echo "Contract A.13 hot=$STUB_HOT_OUT"
-test "$STUB_COLD_OUT" = "field=6 nl=10,esc=27,sq=39,bs=92,ds=27,ss=27 loop=57 wrap=86 priv=15"
+test "$STUB_COLD_OUT" = "$(printf 'field=6 nl=10,esc=27,sq=39,bs=92,ds=27,ss=27,u=中文😀,ui=前\033[0m中文😀后 loop=57 wrap=86 priv=15')"
 test "$STUB_COLD_OUT" = "$STUB_HOT_OUT"
 echo "Contract A.13 (cold vs hot .pionstub fidelity: ECall(EField), escapes, SForIn, SLetTuple, generic method & impl): OK"
 
