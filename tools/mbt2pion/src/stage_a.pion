@@ -6687,7 +6687,7 @@ fn lower_one_token_or_form(
         tokens[in_idx + 1].kind == TokenKind::Ident && tokens[in_idx + 2].kind == TokenKind::LBracket &&
         find_matching_delim(tokens, in_idx + 2) == lb - 1 {
           let sl_recv = tokens[in_idx + 1].raw
-          if for_slice_body_is_ro_safe_f42(ctx, tokens, lb + 1, close_b, sl_recv) {
+          if for_slice_body_is_ro_safe_f42(ctx, tokens, lb + 1, close_b, sl_recv, in_idx + 2) {
             let b_idx = iter_s.index_of("mbt_compat::__mbt_slice_borrow(")
             if b_idx >= 0 {
               let mut rp_idx = -1
@@ -10134,12 +10134,11 @@ fn classify_slice_consumer(
   }
   // Read-only `ArrayView[T]` argument slice of a strictly read-only plain-ident array passed directly
   // to a same-file local function whose corresponding parameter is strictly read-only & non-escaping
-  // and which does not mutate any other parameter (e.g. `patch_all(list, ops[i:i+run], o)`).
+  // and whose transitive call graph performs no non-fresh array mutations (e.g. `patch_all(list, ops[i:i+run], o)`).
   if !has_chained_slice && recv_root.length() > 0 {
     let exp_t = current_expected_type(ctx).trim()
-    if (exp_t.starts_with("ArrayView[") || exp_t.starts_with("mbt_compat::ArrayView[")) &&
-    ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, close_br, recv_root, 0) {
-      // Verify receiver is a plain ident (not a call result like `xs.map(...)[1:3]`)
+    if exp_t.starts_with("ArrayView[") || exp_t.starts_with("mbt_compat::ArrayView[") {
+      // Find opening `[` of this slice and verify receiver is a plain ident (not a call result like `xs.map(...)[1:3]`)
       let mut ob_scan = close_br - 1
       let mut br_d = 1
       while ob_scan >= 0 && br_d > 0 {
@@ -10153,7 +10152,8 @@ fn classify_slice_consumer(
       tokens[ob_scan - 1].kind == TokenKind::Ident &&
       tokens[ob_scan - 1].raw == recv_root &&
       !(ob_scan >= 2 && tokens[ob_scan - 2].kind == TokenKind::Dot)
-      if is_plain_ident_recv {
+      if is_plain_ident_recv &&
+      ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, close_br, recv_root, ob_scan, 0) {
         // Verify direct call argument to a same-file local fn whose return type does NOT escape ArrayView
         let mut p_scan = ob_scan - 2
         let mut p_d = 0
@@ -10197,10 +10197,11 @@ fn classify_slice_consumer(
           }
           if !other_arg_refs_recv {
             let callee_name = tokens[enclosing_lp - 1].raw
+            let target_elem_ty = extract_array_view_elem_f42(exp_t)
             match ctx.symtab.fn_ret_types.get(callee_name) {
               Some(ret_ty) =>
               if !str_has(ret_ty, "ArrayView") &&
-              callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, 0) {
+              callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, target_elem_ty, 0) {
                 return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
               }
               None => ()
@@ -11913,7 +11914,8 @@ fn lower_match_arms_with_ty(
     // `Some(Object(_) as v)`, `((A(v) | B(v)) as x)`). Preserves single-eval, guard visibility,
     // failure backtrack, outer shadowing, and never hoists bindings out of the arm.
     if !handled_special && !pattern_contains_struct_pat(tokens, i, pat_end) &&
-    pattern_contains_as_kw_f42(tokens, i, pat_end) {
+    pattern_contains_as_kw_f42(tokens, i, pat_end) &&
+    !pattern_has_array_pat_without_inner_as_f42(tokens, i, pat_end) {
       let (outer_pat, as_obls, bad_or_as) = peel_as_patterns_in_pat(ctx, tokens, i, pat_end, file)
       if bad_or_as || as_obls.length() == 0 {
         ctx.diags.push(diag_error(
@@ -17365,7 +17367,45 @@ fn peel_as_patterns_in_pat(
   (sb.to_string().trim(), obls, false)
 }
 
-///| True iff `m` is shadowed by a user-defined local type method in `ctx.symtab`.
+///| True iff `[s, e)` contains an array pattern `[...]` AND no `as` keyword appears inside any `[...]`,
+///| so patterns like `([_, _] as fs, _)` fall through to Special case C (array-pattern lowering)
+///| while `[A(n) as x, ..]` is still caught fail-closed by Special case A.
+fn pattern_has_array_pat_without_inner_as_f42(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  let mut has_lb = false
+  let mut br_depth = 0
+  let mut k = s
+  while k < e {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LBracket {
+      has_lb = true
+      br_depth = br_depth + 1
+    } else if kk == TokenKind::RBracket {
+      if br_depth > 0 {
+        br_depth = br_depth - 1
+      }
+    } else if br_depth > 0 && kk == TokenKind::Keyword && tokens[k].raw == "as" {
+      return false
+    }
+    k = k + 1
+  }
+  has_lb
+}
+
+///| Extract element type from `ArrayView[T]` / `mbt_compat::ArrayView[T]` (normalizing `mbt_compat::MbtJson` -> `Json`).
+fn extract_array_view_elem_f42(exp_t : String) -> String {
+  let lb = exp_t.index_of("[")
+  if lb < 0 || !exp_t.ends_with("]") {
+    return ""
+  }
+  let inner = exp_t.slice(lb + 1, exp_t.length() - 1).trim()
+  if inner == "mbt_compat::MbtJson" || inner == "MbtJson" {
+    "Json"
+  } else {
+    inner
+  }
+}
+
+///| True iff `m` is shadowed by a method on a local user-defined type in `ctx.symtab.local_types`.
 fn is_method_shadowed_f42(ctx : StageAContext, m : String) -> Bool {
   if ctx.symtab.local_types.contains("Array") || ctx.symtab.local_types.contains("ArrayView") {
     return true
@@ -17379,7 +17419,7 @@ fn is_method_shadowed_f42(ctx : StageAContext, m : String) -> Bool {
   false
 }
 
-///| True iff `m` is a strictly pure read-only method name (and not shadowed by user/dep code).
+///| True iff `m` is a strictly pure read-only method name (and not shadowed by a local type method).
 fn is_pure_ro_method_f42(ctx : StageAContext, m : String) -> Bool {
   if !(m == "length" || m == "is_empty" || m == "get" || m == "contains" || m == "copy" ||
     m == "unwrap_or" || m == "is_some" || m == "is_none") {
@@ -17397,6 +17437,7 @@ fn for_slice_body_is_ro_safe_f42(
   start : Int,
   end : Int,
   recv_ident : String,
+  allowed_slice_lb : Int,
 ) -> Bool {
   let mut k = start
   while k < end {
@@ -17431,7 +17472,7 @@ fn for_slice_body_is_ro_safe_f42(
     }
     k = k + 1
   }
-  ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, start, recv_ident, 0)
+  ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, start, recv_ident, allowed_slice_lb, 0)
 }
 
 ///| Check whether token `i` is a direct argument to a same-file local call `callee(...)`, returning
@@ -17479,6 +17520,7 @@ fn direct_local_call_arg_info_f42(tokens : Array[Token], i : Int, bound_start : 
 
 ///| True iff `tokens[i]` (an ident `name`) is used strictly in a read-only, non-aliasing,
 ///| non-escaping position inside `[fn_open + 1, fn_close)`.
+///| Sub-slice syntax `<name>[lo:hi]` is ONLY allowed when `i + 1 == allowed_slice_lb`.
 fn ident_occ_is_strictly_ro_f42(
   ctx : StageAContext,
   tokens : Array[Token],
@@ -17486,6 +17528,7 @@ fn ident_occ_is_strictly_ro_f42(
   fn_open : Int,
   fn_close : Int,
   allow_let_decl : Bool,
+  allowed_slice_lb : Int,
   depth : Int,
 ) -> Bool {
   // Form A: immutable `let <name> = ...` declaration (rejects `let mut <name>`)
@@ -17502,11 +17545,68 @@ fn ident_occ_is_strictly_ro_f42(
   is_pure_ro_method_f42(ctx, tokens[i + 2].raw) {
     return true
   }
-  // Form D: read-only index or slice `<name>[...]` (not assigned, not followed by mutating method)
+  // Form D: read-only single-element index `<name>[idx]` (or the single authorized slice `allowed_slice_lb`).
+  // Rejects sub-slices `<name>[lo:hi]` everywhere else, index writes, pipes `|>`, and non-pure methods.
   if i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBracket {
     let cb = find_matching_delim(tokens, i + 1)
     if cb > i + 1 && cb < fn_close {
-      if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+      let mut is_slice_syntax = false
+      let mut sk = i + 2
+      let mut sd = 0
+      while sk < cb {
+        let skk = tokens[sk].kind
+        if skk == TokenKind::LParen || skk == TokenKind::LBracket || skk == TokenKind::LBrace { sd = sd + 1 }
+        else if skk == TokenKind::RParen || skk == TokenKind::RBracket || skk == TokenKind::RBrace { if sd > 0 { sd = sd - 1 } }
+        else if sd == 0 && skk == TokenKind::Colon {
+          is_slice_syntax = true
+          break
+        }
+        sk = sk + 1
+      }
+      if is_slice_syntax && i + 1 != allowed_slice_lb {
+        // Also allow immediately consumed pure read-only slices `<name>[lo:hi].contains/length/is_empty(...)`
+        // or another direct call argument to a verified RO non-escaping local fn (never `let sub = ops[0:2]`!).
+        let is_imm_ro_slice = allow_let_decl && cb + 3 < fn_close &&
+        tokens[cb + 1].kind == TokenKind::Dot && tokens[cb + 2].kind == TokenKind::Ident &&
+        tokens[cb + 3].kind == TokenKind::LParen &&
+        (tokens[cb + 2].raw == "contains" || tokens[cb + 2].raw == "length" || tokens[cb + 2].raw == "is_empty") &&
+        !is_method_shadowed_f42(ctx, tokens[cb + 2].raw)
+        let mut is_ro_call_arg_slice = false
+        if !is_imm_ro_slice && allow_let_decl && depth < 1 &&
+        i > fn_open && (tokens[i - 1].kind == TokenKind::LParen || tokens[i - 1].kind == TokenKind::Comma) &&
+        cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::RParen || tokens[cb + 1].kind == TokenKind::Comma) {
+          let mut ps = i - 1
+          let mut pd = 0
+          let mut ap = 0
+          let mut clp = -1
+          while ps >= fn_open {
+            let pk = tokens[ps].kind
+            if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd + 1 }
+            else if pk == TokenKind::LParen {
+              if pd == 0 { clp = ps; break }
+              pd = pd - 1
+            } else if pk == TokenKind::LBracket || pk == TokenKind::LBrace {
+              if pd == 0 { break }
+              pd = pd - 1
+            } else if pd == 0 && pk == TokenKind::Comma {
+              ap = ap + 1
+            }
+            ps = ps - 1
+          }
+          if clp >= 1 && tokens[clp - 1].kind == TokenKind::Ident &&
+          !(clp >= 2 && (tokens[clp - 2].kind == TokenKind::Dot || tokens[clp - 2].kind == TokenKind::ColonColon)) {
+            let cname = tokens[clp - 1].raw
+            if callee_param_is_ro_non_escaping_f42(ctx, tokens, cname, ap, "", depth + 1) {
+              is_ro_call_arg_slice = true
+            }
+          }
+        }
+        if !is_imm_ro_slice && !is_ro_call_arg_slice {
+          return false
+        }
+      }
+      if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp ||
+        tokens[cb + 1].kind == TokenKind::PipeGt) {
         return false
       }
       if cb + 3 < fn_close && tokens[cb + 1].kind == TokenKind::Dot &&
@@ -17522,7 +17622,7 @@ fn ident_occ_is_strictly_ro_f42(
   if depth < 2 {
     match direct_local_call_arg_info_f42(tokens, i, fn_open) {
       Some((callee_name, arg_pos)) =>
-      if callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, depth + 1) {
+      if callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, "", depth + 1) {
         return true
       }
       None => ()
@@ -17532,12 +17632,13 @@ fn ident_occ_is_strictly_ro_f42(
 }
 
 ///| True iff `recv_ident` is strictly read-only, never aliased, never escaped, and never mutated
-///| anywhere in its enclosing top-level `fn`.
+///| anywhere in its enclosing top-level `fn` (supporting `fn name`, `fn Type::method`, and `fn[T] name`).
 fn ident_is_strictly_ro_in_enclosing_fn_f42(
   ctx : StageAContext,
   tokens : Array[Token],
   pos : Int,
   recv_ident : String,
+  allowed_slice_lb : Int,
   depth : Int,
 ) -> Bool {
   let mut fn_open = -1
@@ -17553,7 +17654,8 @@ fn ident_is_strictly_ro_in_enclosing_fn_f42(
         d = d - 1
       }
     } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "fn" && fn_open >= 0 &&
-    k + 1 < tokens.length() && tokens[k + 1].kind == TokenKind::Ident {
+    k + 1 < tokens.length() && (tokens[k + 1].kind == TokenKind::Ident ||
+      tokens[k + 1].kind == TokenKind::UpperIdent || tokens[k + 1].kind == TokenKind::LBracket) {
       break
     }
     k = k - 1
@@ -17570,7 +17672,7 @@ fn ident_is_strictly_ro_in_enclosing_fn_f42(
     let tk = tokens[i]
     if tk.kind == TokenKind::Ident && tk.raw == recv_ident &&
     !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
-      if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, true, depth) {
+      if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, true, allowed_slice_lb, depth) {
         return false
       }
     }
@@ -17579,20 +17681,8 @@ fn ident_is_strictly_ro_in_enclosing_fn_f42(
   true
 }
 
-///| True iff `callee_name` is a same-file top-level `fn` whose `arg_pos`-th parameter is strictly
-///| read-only and non-escaping (zero index writes, zero mutating methods, zero aliasing/return/storage),
-///| and which does not mutate any of its other parameters.
-fn callee_param_is_ro_non_escaping_f42(
-  ctx : StageAContext,
-  tokens : Array[Token],
-  callee_name : String,
-  arg_pos : Int,
-  depth : Int,
-) -> Bool {
-  if arg_pos < 0 || !ctx.symtab.local_fn_names.contains(callee_name) {
-    return false
-  }
-  // Locate top-level `fn <callee_name>(...)` in `tokens`
+///| Locate top-level `fn <fn_name>(...) { ... }` in `tokens`, returning `Some((param_names, fn_open, fn_close))`.
+fn find_top_level_fn_f42(tokens : Array[Token], fn_name : String) -> Option[(Array[String], Int, Int)] {
   let n = tokens.length()
   let mut bd = 0
   let mut fn_lp = -1
@@ -17602,7 +17692,7 @@ fn callee_param_is_ro_non_escaping_f42(
     if kk == TokenKind::LBrace { bd = bd + 1 }
     else if kk == TokenKind::RBrace { if bd > 0 { bd = bd - 1 } }
     else if bd == 0 && kk == TokenKind::Keyword && tokens[k].raw == "fn" {
-      if k + 2 < n && tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == callee_name {
+      if k + 2 < n && tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == fn_name {
         let mut scan = k + 2
         if scan < n && tokens[scan].kind == TokenKind::LBracket {
           scan = find_matching_delim(tokens, scan) + 1
@@ -17616,13 +17706,12 @@ fn callee_param_is_ro_non_escaping_f42(
     k = k + 1
   }
   if fn_lp < 0 {
-    return false
+    return None
   }
   let fn_rp = find_matching_delim(tokens, fn_lp)
   if fn_rp <= fn_lp {
-    return false
+    return None
   }
-  // Extract parameter names from `( ... )`
   let param_names : Array[String] = []
   let mut ps = fn_lp + 1
   while ps < fn_rp {
@@ -17636,7 +17725,6 @@ fn callee_param_is_ro_non_escaping_f42(
       else if pd == 0 && pk == TokenKind::Comma { break }
       pe = pe + 1
     }
-    // Parameter name is first ident (skipping `mut` / `~`)
     let mut pn_idx = ps
     while pn_idx < pe && (tokens[pn_idx].kind == TokenKind::Tilde ||
       (tokens[pn_idx].kind == TokenKind::Keyword && tokens[pn_idx].raw == "mut")) {
@@ -17649,64 +17737,307 @@ fn callee_param_is_ro_non_escaping_f42(
     }
     ps = pe + 1
   }
-  if arg_pos >= param_names.length() || param_names[arg_pos].length() == 0 {
-    return false
-  }
-  let target_param = param_names[arg_pos]
-  // Find body `{ ... }`
   let mut fn_open = fn_rp + 1
   while fn_open < n && tokens[fn_open].kind != TokenKind::LBrace {
     fn_open = fn_open + 1
   }
   if fn_open >= n {
-    return false
+    return None
   }
   let fn_close = find_matching_delim(tokens, fn_open)
   if fn_close <= fn_open {
+    return None
+  }
+  Some((param_names, fn_open, fn_close))
+}
+
+///| True iff `name` is a module-level `let` of type `Array[E]` whose element type `E` is provably
+///| disjoint from `target_elem_ty` (e.g. `keyed_ats : Array[KeyedAt]` vs `Json`).
+fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_ty : String) -> Bool {
+  if target_elem_ty.length() == 0 {
     return false
   }
-  // Scan body: target_param must be strictly RO & non-escaping; other params must not be mutated.
+  match ctx.symtab.val_types.get(name) {
+    Some(vt) => {
+      let t = vt.trim()
+      if t.starts_with("Array[") && t.ends_with("]") {
+        let e = t.slice(6, t.length() - 1).trim()
+        let norm_e = if e == "mbt_compat::MbtJson" || e == "MbtJson" { "Json" } else { e }
+        return norm_e.length() > 0 && norm_e != target_elem_ty && !str_has(norm_e, "Array")
+      }
+      false
+    }
+    None => false
+  }
+}
+
+///| True iff the RHS of `let <x> [: Ty] = <rhs>` allocates a provably fresh local collection.
+fn let_rhs_is_fresh_alloc_f42(tokens : Array[Token], rhs_start : Int, fn_close : Int) -> Bool {
+  if rhs_start >= fn_close {
+    return false
+  }
+  let tk = tokens[rhs_start]
+  if tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+    return true
+  }
+  if (tk.kind == TokenKind::UpperIdent && (tk.raw == "Map" || tk.raw == "StringBuilder")) &&
+  rhs_start + 1 < fn_close && tokens[rhs_start + 1].kind == TokenKind::LParen {
+    return true
+  }
+  if tk.kind == TokenKind::UpperIdent && (tk.raw == "Array" || tk.raw == "Map") &&
+  rhs_start + 3 < fn_close && tokens[rhs_start + 1].kind == TokenKind::ColonColon &&
+  tokens[rhs_start + 2].kind == TokenKind::Ident && tokens[rhs_start + 2].raw == "new" &&
+  tokens[rhs_start + 3].kind == TokenKind::LParen {
+    return true
+  }
+  let mut k = rhs_start
+  let mut d = 0
+  while k < fn_close {
+    if k > rhs_start && d == 0 && (tokens[k].newline_before || tokens[k].kind == TokenKind::Semi || tokens[k].kind == TokenKind::RBrace) {
+      break
+    }
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+    else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+    else if d == 0 && kk == TokenKind::Dot && k + 3 < fn_close &&
+    tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == "copy" &&
+    tokens[k + 2].kind == TokenKind::LParen && tokens[k + 3].kind == TokenKind::RParen {
+      let after = k + 4
+      if after >= fn_close || tokens[after].newline_before || tokens[after].kind == TokenKind::Semi || tokens[after].kind == TokenKind::RBrace {
+        return true
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| True iff `fn_name` and every same-file function transitively reachable from it performs NO
+///| non-fresh array mutations (blocks helper_mut(a), b.items[0]=, alias_a[0]=, global G[0]=, cb()).
+fn fn_has_no_nonfresh_mutation_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  fn_name : String,
+  target_elem_ty : String,
+  inline_closure_params : Map[String, Bool],
+  visited : Map[String, Bool],
+) -> Bool {
+  if visited.contains(fn_name) {
+    return true
+  }
+  visited[fn_name] = true
+  let (param_names, fn_open, fn_close) = match find_top_level_fn_f42(tokens, fn_name) {
+    Some(info) => info
+    None => return false
+  }
+  let _ = param_names
+  let fresh_locals : Map[String, Bool] = Map()
+  let local_closures : Map[String, Bool] = Map()
+  let map_locals : Map[String, Bool] = Map()
+  let reassigned : Map[String, Bool] = Map()
+  let mut p = fn_open + 1
+  while p < fn_close {
+    let tk = tokens[p]
+    if tk.kind == TokenKind::Ident && p + 1 < fn_close &&
+    (tokens[p + 1].kind == TokenKind::Eq || tokens[p + 1].kind == TokenKind::AssignOp) &&
+    !(p > fn_open && tokens[p - 1].kind == TokenKind::Keyword && tokens[p - 1].raw == "let") {
+      reassigned[tk.raw] = true
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "let" && p + 2 < fn_close &&
+    tokens[p + 1].kind == TokenKind::Ident {
+      let vname = tokens[p + 1].raw
+      let mut eq_idx = p + 2
+      let mut ld = 0
+      while eq_idx < fn_close {
+        let ek = tokens[eq_idx].kind
+        if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { ld = ld + 1 }
+        else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if ld > 0 { ld = ld - 1 } }
+        else if ld == 0 && ek == TokenKind::Eq { break }
+        else if ld == 0 && (tokens[eq_idx].newline_before || ek == TokenKind::Semi) { eq_idx = -1; break }
+        eq_idx = eq_idx + 1
+      }
+      if eq_idx > p + 1 && eq_idx + 1 < fn_close {
+        let rhs = eq_idx + 1
+        if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "fn" {
+          local_closures[vname] = true
+        } else if let_rhs_is_fresh_alloc_f42(tokens, rhs, fn_close) {
+          fresh_locals[vname] = true
+        }
+        let mut scan_m = rhs
+        while scan_m < fn_close && !(scan_m > rhs && tokens[scan_m].newline_before) && tokens[scan_m].kind != TokenKind::Semi {
+          if tokens[scan_m].kind == TokenKind::Ident && scan_m + 1 < fn_close && tokens[scan_m + 1].kind == TokenKind::LParen {
+            match ctx.symtab.fn_ret_types.get(tokens[scan_m].raw) {
+              Some(rt) => if str_has(rt, "Map[") || str_has(rt, "OrderedMap[") { map_locals[vname] = true }
+              None => ()
+            }
+          }
+          scan_m = scan_m + 1
+        }
+      }
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "match" && p + 2 < fn_close &&
+    tokens[p + 1].kind == TokenKind::Ident && map_locals.contains(tokens[p + 1].raw) &&
+    tokens[p + 2].kind == TokenKind::LBrace {
+      let mc = find_matching_delim(tokens, p + 2)
+      let mut mp = p + 3
+      while mp + 3 < mc {
+        if tokens[mp].kind == TokenKind::UpperIdent && tokens[mp].raw == "Some" &&
+        tokens[mp + 1].kind == TokenKind::LParen && tokens[mp + 2].kind == TokenKind::Ident &&
+        tokens[mp + 3].kind == TokenKind::RParen {
+          map_locals[tokens[mp + 2].raw] = true
+        }
+        mp = mp + 1
+      }
+    }
+    p = p + 1
+  }
+  for r in reassigned.keys() {
+    if fresh_locals.contains(r) {
+      fresh_locals[r] = false
+    }
+  }
   let mut i = fn_open + 1
   while i < fn_close {
     let tk = tokens[i]
-    if tk.kind == TokenKind::Ident &&
-    !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
-      if tk.raw == target_param {
-        if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, false, depth) {
+    if (tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket) &&
+    i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
+      return false
+    }
+    if tk.kind == TokenKind::PipeGt {
+      if !(i + 1 < fn_close && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 1].raw == "ignore") {
+        return false
+      }
+    }
+    if tk.kind == TokenKind::LBracket {
+      let cb = find_matching_delim(tokens, i)
+      if cb > i && cb + 1 < fn_close &&
+      (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+        if i > fn_open && tokens[i - 1].kind == TokenKind::UpperIdent && tokens[cb + 1].kind == TokenKind::Eq {
+          i = i + 1
+          continue
+        }
+        if !(i > fn_open && tokens[i - 1].kind == TokenKind::Ident &&
+          !(i >= 2 && (tokens[i - 2].kind == TokenKind::Dot || tokens[i - 2].kind == TokenKind::ColonColon))) {
+          return false
+        }
+        let r = tokens[i - 1].raw
+        let is_fresh = match fresh_locals.get(r) { Some(b) => b; None => false }
+        if !(is_fresh || map_locals.contains(r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+          return false
+        }
+      }
+    }
+    if tk.kind == TokenKind::Ident && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
+      if i > fn_open && tokens[i - 1].kind == TokenKind::Dot {
+        let m = tk.raw
+        if is_pure_ro_method_f42(ctx, m) || m == "stringify" || m == "to_string" ||
+        m == "to_int" || m == "to_double" || m == "floor" {
+          ()
+        } else if m == "map" {
+          if !(i + 2 < fn_close && tokens[i + 2].kind == TokenKind::Keyword && tokens[i + 2].raw == "fn") {
+            return false
+          }
+        } else {
+          if !(i >= 2 && tokens[i - 2].kind == TokenKind::Ident &&
+            !(i >= 3 && (tokens[i - 3].kind == TokenKind::Dot || tokens[i - 3].kind == TokenKind::ColonColon))) {
+            return false
+          }
+          let r = tokens[i - 2].raw
+          let is_fresh = match fresh_locals.get(r) { Some(b) => b; None => false }
+          if !(is_fresh || map_locals.contains(r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+            return false
+          }
+        }
+      } else if i >= 2 && tokens[i - 1].kind == TokenKind::ColonColon {
+        let q = tokens[i - 2].raw
+        let m = tk.raw
+        let ok_qual = (q == "Json" && (m == "array" || m == "object" || m == "null" || m == "number" || m == "string" || m == "boolean")) ||
+        ((q == "Array" || q == "Map") && m == "new")
+        if !ok_qual {
           return false
         }
       } else {
-        let mut is_other_param = false
-        for pn in param_names {
-          if pn == tk.raw {
-            is_other_param = true
-            break
-          }
-        }
-        if is_other_param {
-          // Reject reassignment `p = ...`
-          if i + 1 < fn_close && (tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::AssignOp) {
-            return false
-          }
-          // Reject index assignment `p[...] = ...`
-          if i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBracket {
-            let cb = find_matching_delim(tokens, i + 1)
-            if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
-              return false
+        let g = tk.raw
+        if g == "ignore" || g == "physical_equal" || local_closures.contains(g) || inline_closure_params.contains(g) {
+          ()
+        } else if ctx.symtab.local_fn_names.contains(g) {
+          let call_rp = find_matching_delim(tokens, i + 1)
+          let child_inline : Map[String, Bool] = Map()
+          match find_top_level_fn_f42(tokens, g) {
+            Some((g_params, _, _)) => {
+              let mut as_idx = i + 2
+              let mut a_pos = 0
+              while as_idx < call_rp {
+                if tokens[as_idx].kind == TokenKind::Comma { as_idx = as_idx + 1; continue }
+                let mut ae = as_idx
+                let mut ad = 0
+                while ae < call_rp {
+                  let ak = tokens[ae].kind
+                  if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+                  else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+                  else if ad == 0 && ak == TokenKind::Comma { break }
+                  ae = ae + 1
+                }
+                let is_inline_fn = (as_idx < ae && tokens[as_idx].kind == TokenKind::Keyword && tokens[as_idx].raw == "fn") ||
+                (as_idx + 1 == ae && tokens[as_idx].kind == TokenKind::Ident &&
+                  (inline_closure_params.contains(tokens[as_idx].raw) || local_closures.contains(tokens[as_idx].raw)))
+                if is_inline_fn && a_pos < g_params.length() && g_params[a_pos].length() > 0 {
+                  child_inline[g_params[a_pos]] = true
+                }
+                a_pos = a_pos + 1
+                as_idx = ae + 1
+              }
             }
+            None => return false
           }
-          // Reject non-pure method calls `p.<method>(...)`
-          if i + 3 < fn_close && tokens[i + 1].kind == TokenKind::Dot &&
-          tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen &&
-          !is_pure_ro_method_f42(ctx, tokens[i + 2].raw) {
+          if !fn_has_no_nonfresh_mutation_f42(ctx, tokens, g, target_elem_ty, child_inline, visited) {
             return false
           }
+        } else {
+          return false
         }
       }
     }
     i = i + 1
   }
   true
+}
+
+///| True iff `callee_name` is a same-file top-level `fn` whose `arg_pos`-th parameter is strictly
+///| read-only and non-escaping (zero index writes, zero sub-slices, zero mutating methods, zero
+///| aliasing/return/storage), and whose transitive call graph performs no non-fresh array mutations.
+fn callee_param_is_ro_non_escaping_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  callee_name : String,
+  arg_pos : Int,
+  target_elem_ty : String,
+  depth : Int,
+) -> Bool {
+  if arg_pos < 0 || !ctx.symtab.local_fn_names.contains(callee_name) {
+    return false
+  }
+  let (param_names, fn_open, fn_close) = match find_top_level_fn_f42(tokens, callee_name) {
+    Some(info) => info
+    None => return false
+  }
+  if arg_pos >= param_names.length() || param_names[arg_pos].length() == 0 {
+    return false
+  }
+  let target_param = param_names[arg_pos]
+  let mut i = fn_open + 1
+  while i < fn_close {
+    let tk = tokens[i]
+    if tk.kind == TokenKind::Ident && tk.raw == target_param &&
+    !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, false, -1, depth) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  let visited : Map[String, Bool] = Map()
+  fn_has_no_nonfresh_mutation_f42(ctx, tokens, callee_name, target_elem_ty, Map(), visited)
 }
 
 ///| True iff `m` is an `Iter` consumer/combinator method name on MoonBit `Map::keys()`.
@@ -17903,11 +18234,13 @@ fn is_irrefutable_as_inner_pat_f42(ctx : StageAContext, pat : String) -> Bool {
     }
     seen_variants[av] = true
   }
-  // Builtin Option / Result / Bool exhaustiveness
-  if (!has_qual || qual == "Option") && seen_variants.contains("Some") && seen_variants.contains("None") {
+  // Builtin Option / Result / Bool exhaustiveness (guarded against local constructor shadowing)
+  if (!has_qual || qual == "Option") && seen_variants.contains("Some") && seen_variants.contains("None") &&
+  !ctx.symtab.ctors.contains("Some") && !ctx.symtab.ctors.contains("None") {
     return true
   }
-  if (!has_qual || qual == "Result") && seen_variants.contains("Ok") && seen_variants.contains("Err") {
+  if (!has_qual || qual == "Result") && seen_variants.contains("Ok") && seen_variants.contains("Err") &&
+  !ctx.symtab.ctors.contains("Ok") && !ctx.symtab.ctors.contains("Err") {
     return true
   }
   if !has_qual && seen_variants.contains("true") && seen_variants.contains("false") {

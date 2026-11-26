@@ -429,6 +429,18 @@ def main():
             "MBT2PION_UNSUPPORTED_SYNTAX",
         )
 
+        # 3k. Sub-slice escape & transitive non-fresh array mutation MUST fail closed
+        for nm, src in [
+            ("sub_slice_callee", "fn sw(v : ArrayView[Int]) -> Int { let s = v[0:2]; s[0] = 99; v[0] }\npub fn f(ops : Array[Int]) -> Int { sw(ops[0:2]) }\n"),
+            ("sub_slice_caller", "fn uv(v : ArrayView[Int]) -> Int { v[0] }\npub fn f(ops : Array[Int]) -> Int { let s = ops[0:2]; s[0] = 99; uv(ops[0:2]) }\n"),
+            ("helper_mut_param", "fn hm(a : Array[Int]) -> Unit { a[0] = 99 }\nfn rh(a : Array[Int], v : ArrayView[Int]) -> Int { hm(a); v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { rh(a, ops[0:2]) }\n"),
+            ("box_field_mut", "priv struct Box { items : Array[Int] }\nfn rb(b : Box, v : ArrayView[Int]) -> Int { b.items[0] = 99; v[0] }\npub fn f(b : Box, ops : Array[Int]) -> Int { rb(b, ops[0:2]) }\n"),
+            ("callee_alias_mut", "fn am(a : Array[Int], v : ArrayView[Int]) -> Int { let al = a; al[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { am(a, ops[0:2]) }\n"),
+            ("global_same_ty_mut", "let g : Array[Int] = [1, 2, 3]\nfn gm(v : ArrayView[Int]) -> Int { g[0] = 99; v[0] }\npub fn f(ops : Array[Int]) -> Int { gm(ops[0:2]) }\n"),
+            ("callback_mut", "fn cm(cb : () -> Unit, v : ArrayView[Int]) -> Int { cb(); v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { cm(cb, ops[0:2]) }\n"),
+        ]:
+            assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
+
         print("PASS: Wave M2-F4 Track F4-2 4-Target Differential Oracle (Moon native == Moon wasm-gc == Pion native == Pion wasm32 + all negative gates)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
