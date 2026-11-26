@@ -17722,8 +17722,92 @@ test "p134_norm_mono_pkg_and_same_ssa_native_wasm" {
 }
 
 ///|
+fn test_aa1_read_uleb(bin : Bytes, pos : Int) -> (Int, Int) {
+  let mut acc = 0
+  let mut shift = 0
+  let mut i = pos
+  while i < bin.length() {
+    let b = bin[i].to_int()
+    i = i + 1
+    acc = acc | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 {
+      return (acc, i)
+    }
+    shift = shift + 7
+  }
+  (acc, i)
+}
+
+///|
+fn test_aa1_extract_code_bodies(bin : Bytes) -> Array[Array[Int]] {
+  let bodies : Array[Array[Int]] = []
+  let mut pos = 8
+  while pos < bin.length() {
+    let sec_id = bin[pos].to_int()
+    pos = pos + 1
+    let (sec_len, sec_start) = test_aa1_read_uleb(bin, pos)
+    let sec_end = sec_start + sec_len
+    if sec_id == 10 {
+      let (nfuncs, fpos0) = test_aa1_read_uleb(bin, sec_start)
+      let mut fpos = fpos0
+      let mut fi = 0
+      while fi < nfuncs && fpos < sec_end {
+        let (blen, bstart) = test_aa1_read_uleb(bin, fpos)
+        let body : Array[Int] = []
+        let mut bi = 0
+        while bi < blen && bstart + bi < sec_end {
+          body.push(bin[bstart + bi].to_int())
+          bi = bi + 1
+        }
+        bodies.push(body)
+        fpos = bstart + blen
+        fi = fi + 1
+      }
+      return bodies
+    }
+    pos = sec_end
+  }
+  bodies
+}
+
+///|
+fn test_aa1_bytes_contains(hay : Array[Int], needle : Array[Int]) -> Bool {
+  if needle.length() == 0 {
+    return true
+  }
+  if needle.length() > hay.length() {
+    return false
+  }
+  let mut i = 0
+  while i <= hay.length() - needle.length() {
+    let mut ok = true
+    let mut j = 0
+    while j < needle.length() {
+      if hay[i + j] != needle[j] {
+        ok = false
+        break
+      }
+      j = j + 1
+    }
+    if ok {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
 test "wave_aa1_wasm_opt_unit_checks" {
-  // 1. AA1-S1: fast path zero-copy when no collisions, fallback when cross-unit host import collides
+  // 0. Review-fix 1: 64-bit phi_edge_key must not wrap when pred_idx * nb >= 2^32
+  assert_true(
+    wasm_phi_edge_key(0, 7, 131072) != wasm_phi_edge_key(32768, 7, 131072),
+    "64-bit phi edge key must not wrap at 2^32",
+  )
+  assert_eq(wasm_phi_edge_key(32768, 7, 131072), 32768L * 131072L + 7L)
+
+  // 1. AA1-S1: fast path zero-copy when no collisions, exact fallback rename on collision,
+  //    and single-unit (nu == 1) local+export collision disambiguation
   let u1 = "function w $helper_a(w %x) {\n@start\n  ret %x\n}\nexport function w $main() {\n@start\n  %r =w call $helper_a(w 42)\n  ret %r\n}\n"
   let u2 = "function w $helper_b(w %x) {\n@start\n  ret %x\n}\nexport function w $other() {\n@start\n  %r =w call $helper_b(w 7)\n  ret %r\n}\n"
   let fast_res = wasm_disambiguate_unit_locals([u1, u2])
@@ -17733,11 +17817,19 @@ test "wave_aa1_wasm_opt_unit_checks" {
   // Cross-unit host import collision: u_host references $helper_a without defining it
   let u_host = "export function w $use_host() {\n@start\n  %r =w call $helper_a(w 1)\n  ret %r\n}\n"
   let col_res1 = wasm_disambiguate_unit_locals([u1, u_host])
-  assert_true(col_res1[0] != u1, "expected fallback disambiguation [local, host]")
+  assert_true(col_res1[0].contains("function w $helper_a__u0_1("), "expected exact rename helper_a__u0_1 def")
+  assert_true(col_res1[0].contains("call $helper_a__u0_1("), "expected exact rename helper_a__u0_1 call")
   assert_eq(col_res1[1], u_host)
   let col_res2 = wasm_disambiguate_unit_locals([u_host, u1])
   assert_eq(col_res2[0], u_host)
-  assert_true(col_res2[1] != u1, "expected fallback disambiguation [host, local]")
+  assert_true(col_res2[1].contains("function w $helper_a__u1_1("), "expected exact rename helper_a__u1_1 def")
+  assert_true(col_res2[1].contains("call $helper_a__u1_1("), "expected exact rename helper_a__u1_1 call")
+  // Single-unit (nu == 1) local + export collision must also trigger fallback rename
+  let u_single_col = "export data $dup = { w 1 }\nfunction w $dup(w %x) {\n@start\n  ret %x\n}\n"
+  let single_res = wasm_disambiguate_unit_locals([u_single_col])
+  assert_eq(single_res.length(), 1)
+  assert_true(single_res[0].contains("export data $dup"), "export data $dup must remain intact")
+  assert_true(single_res[0].contains("function w $dup__u0_1("), "single-unit local $dup must be renamed")
 
   // 2. AA1-S2: slot_drop_mask rejects duplicate or out-of-order slot drops, accepts strictly increasing
   let ssa_dup_drop =
@@ -17796,44 +17888,117 @@ test "wave_aa1_wasm_opt_unit_checks" {
   }
   assert_true(saw_dis && saw_ol && saw_sm && saw_cf && saw_bi, "missing fine-grained wasm stage labels")
 
-  // 4. AA1-Z2: size-aware const ext fold (-1 extuw must NOT grow to 6B; 42 extsw folds to 2B) + eqz
-  let ssa_z2 =
-    #|export function l $ext_neg1() {
-    #|@start
-    #|  %a =l extuw -1
-    #|  ret %a
-    #|}
-    #|export function l $ext_42() {
-    #|@start
-    #|  %a =l extsw 42
-    #|  ret %a
-    #|}
-    #|export function w $cmp_zero(l %x) {
-    #|@start
-    #|  %c =w ceql %x, 0
-    #|  ret %c
-    #|}
-  let bin_z2 = emit_wasm_from_ssa(ssa_z2)
-  assert_true(bin_z2.length() > 8, "valid wasm binary for Z2")
+  // 4. AA1-Z2: byte-level Code-section assertions
+  let bin_neg1 = emit_wasm_from_ssa("export function l $ext_neg1() {\n@start\n  %a =l extuw -1\n  ret %a\n}\n")
+  let bodies_neg1 = test_aa1_extract_code_bodies(bin_neg1)
+  assert_true(bodies_neg1.length() >= 1, "expected code body for ext_neg1")
+  assert_true(
+    test_aa1_bytes_contains(bodies_neg1[0], [0x41, 0x7F, 0xAD]),
+    "extuw -1 must retain i32.const -1; i64.extend_i32_u",
+  )
 
-  // 5. AA1-Z1 + Z3: expression tree forwarding & irreducible br_table intra-block coloring
+  let bin_ext42 = emit_wasm_from_ssa("export function l $ext_42() {\n@start\n  %a =l extsw 42\n  ret %a\n}\n")
+  let bodies_ext42 = test_aa1_extract_code_bodies(bin_ext42)
+  assert_true(bodies_ext42.length() >= 1, "expected code body for ext_42")
+  assert_true(
+    test_aa1_bytes_contains(bodies_ext42[0], [0x42, 0x2A]),
+    "extsw 42 must fold to i64.const 42",
+  )
+  assert_true(
+    !test_aa1_bytes_contains(bodies_ext42[0], [0xAC]),
+    "extsw 42 must not emit i64.extend_i32_s",
+  )
+
+  let bin_eqz = emit_wasm_from_ssa("export function w $cmp_zero(l %x) {\n@start\n  %c =w ceql %x, 0\n  ret %c\n}\n")
+  let bodies_eqz = test_aa1_extract_code_bodies(bin_eqz)
+  assert_true(bodies_eqz.length() >= 1, "expected code body for cmp_zero")
+  assert_true(
+    test_aa1_bytes_contains(bodies_eqz[0], [0x50]),
+    "ceql %x, 0 must emit i64.eqz (0x50)",
+  )
+  assert_true(
+    !test_aa1_bytes_contains(bodies_eqz[0], [0x42, 0x00, 0x51]),
+    "ceql %x, 0 must not emit i64.const 0; i64.eq",
+  )
+
+  let ssa_tee =
+    #|export function l $tee_promoted(l %x) {
+    #|@start
+    #|  %p =l alloc8 8
+    #|  storel %x, %p
+    #|  %v1 =l loadl %p
+    #|  %v2 =l loadl %p
+    #|  %s =l add %v1, %v2
+    #|  ret %s
+    #|}
+  let bin_tee = emit_wasm_from_ssa(ssa_tee)
+  let bodies_tee = test_aa1_extract_code_bodies(bin_tee)
+  assert_true(bodies_tee.length() >= 1, "expected code body for tee_promoted")
+  assert_true(
+    test_aa1_bytes_contains(bodies_tee[0], [0x22]),
+    "promoted alloc store+load+load must emit local.tee (0x22) preserving write",
+  )
+
+  // 5. AA1-Z1 + Z3: finite terminating irreducible CFG (br_table) with forwarded exprs & colored temps
   let ssa_z1_z3 =
-    #|export function l $irred(w %sel, l %a, l %b) {
+    #|export function l $irred_fin(w %sel, l %n, l %a) {
     #|@start
     #|  %t1 =l add %a, 1
     #|  %t2 =l mul %t1, 3
-    #|  %t3 =l add %t2, %b
     #|  jnz %sel, @l1, @l2
     #|@l1
-    #|  %x1 =l add %t3, 10
+    #|  %c1 =l phi @start %n, @l2 %n2
+    #|  %acc1 =l phi @start %t2, @l2 %acc2
+    #|  %done1 =w cslel %c1, 0
+    #|  jnz %done1, @done, @l1_body
+    #|@l1_body
+    #|  %x1 =l add %acc1, 10
     #|  %x2 =l xor %x1, 5
-    #|  jnz %sel, @l2, @done
+    #|  %n1 =l sub %c1, 1
+    #|  jmp @l2
     #|@l2
-    #|  %y1 =l add %t3, 20
-    #|  jnz %sel, @l1, @done
+    #|  %c2 =l phi @start %n, @l1_body %n1
+    #|  %acc2 =l phi @start %t2, @l1_body %x2
+    #|  %done2 =w cslel %c2, 0
+    #|  jnz %done2, @done, @l2_body
+    #|@l2_body
+    #|  %y1 =l add %acc2, 20
+    #|  %n2 =l sub %c2, 1
+    #|  jmp @l1
     #|@done
-    #|  ret %t3
+    #|  %res =l phi @l1 %acc1, @l2 %acc2
+    #|  ret %res
     #|}
   let bin_z1_z3 = emit_wasm_from_ssa(ssa_z1_z3)
-  assert_true(bin_z1_z3.length() > 8, "valid wasm binary for Z1+Z3")
+  let bodies_z1_z3 = test_aa1_extract_code_bodies(bin_z1_z3)
+  assert_true(bodies_z1_z3.length() >= 1, "valid wasm binary for finite irreducible Z1+Z3")
+
+  // 6. AA1-Z3: >128-local function exercises frequency-based local reordering
+  let sb_big = StringBuilder::new()
+  sb_big.write_string("export function l $many_locals(l %x) {\n@start\n")
+  let mut li = 0
+  while li < 135 {
+    sb_big.write_string("  %v")
+    sb_big.write_string(li.to_string())
+    sb_big.write_string(" =l add %x, ")
+    sb_big.write_string((li + 1).to_string())
+    sb_big.write_string("\n")
+    li = li + 1
+  }
+  sb_big.write_string("  %acc0 =l copy %v0\n")
+  li = 1
+  while li < 135 {
+    sb_big.write_string("  %acc")
+    sb_big.write_string(li.to_string())
+    sb_big.write_string(" =l add %acc")
+    sb_big.write_string((li - 1).to_string())
+    sb_big.write_string(", %v")
+    sb_big.write_string(li.to_string())
+    sb_big.write_string("\n")
+    li = li + 1
+  }
+  sb_big.write_string("  ret %acc134\n}\n")
+  let bin_big = emit_wasm_from_ssa(sb_big.to_string())
+  let bodies_big = test_aa1_extract_code_bodies(bin_big)
+  assert_true(bodies_big.length() >= 1, "valid wasm binary for >128-local reorder")
 }

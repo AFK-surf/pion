@@ -880,11 +880,14 @@ import PionProofs.WaveAA1Wasm
 #print axioms QbeRealWorkloadDataOpts.SparseData.loop_blocks
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget_4096
+#print axioms WaveAA1Wasm.ExtAndEqz.extsw_const_toInt
 #print axioms WaveAA1Wasm.ExtAndEqz.extsw_const
 #print axioms WaveAA1Wasm.ExtAndEqz.extuw_const
 #print axioms WaveAA1Wasm.ExtAndEqz.extsh_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extsh_shift_pair
 #print axioms WaveAA1Wasm.ExtAndEqz.extuh_const
 #print axioms WaveAA1Wasm.ExtAndEqz.extsb_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extsb_shift_pair
 #print axioms WaveAA1Wasm.ExtAndEqz.extub_const
 #print axioms WaveAA1Wasm.ExtAndEqz.trunc32_sext32
 #print axioms WaveAA1Wasm.ExtAndEqz.trunc32_zext32

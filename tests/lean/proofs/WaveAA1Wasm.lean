@@ -25,13 +25,73 @@ namespace WaveAA1Wasm
 
 namespace ExtAndEqz
 
-def eqz32 (x : BitVec 32) : Bool := x == 0#32
-def eqz64 (x : BitVec 64) : Bool := x == 0#64
+inductive CVal where
+  | i32 (v : BitVec 32)
+  | i64 (v : BitVec 64)
+  deriving DecidableEq
+
+inductive CmpOp where
+  | constI32 (v : BitVec 32)
+  | constI64 (v : BitVec 64)
+  | i32Eq
+  | i64Eq
+  | i32Ne
+  | i64Ne
+  | i32Eqz
+  | i64Eqz
+
 def boolToI32 (b : Bool) : BitVec 32 := if b then 1#32 else 0#32
 
+def stepCmp (stk : List CVal) : CmpOp → List CVal
+  | .constI32 v => .i32 v :: stk
+  | .constI64 v => .i64 v :: stk
+  | .i32Eq =>
+    match stk with
+    | .i32 b :: .i32 a :: rest => .i32 (boolToI32 (a == b)) :: rest
+    | _ => stk
+  | .i64Eq =>
+    match stk with
+    | .i64 b :: .i64 a :: rest => .i32 (boolToI32 (a == b)) :: rest
+    | _ => stk
+  | .i32Ne =>
+    match stk with
+    | .i32 b :: .i32 a :: rest => .i32 (boolToI32 (a != b)) :: rest
+    | _ => stk
+  | .i64Ne =>
+    match stk with
+    | .i64 b :: .i64 a :: rest => .i32 (boolToI32 (a != b)) :: rest
+    | _ => stk
+  | .i32Eqz =>
+    match stk with
+    | .i32 a :: rest => .i32 (if a.toNat = 0 then 1#32 else 0#32) :: rest
+    | _ => stk
+  | .i64Eqz =>
+    match stk with
+    | .i64 a :: rest => .i32 (if a.toNat = 0 then 1#32 else 0#32) :: rest
+    | _ => stk
+
+def runCmp (ops : List CmpOp) (stk : List CVal) : List CVal :=
+  ops.foldl stepCmp stk
+
+/-- Constant `extsw v` preserves the signed 32-bit integer value when widening to 64 bits. -/
+theorem extsw_const_toInt (v : BitVec 64) :
+    (BitVec.signExtend 64 (BitVec.truncate 32 v)).toInt =
+      (BitVec.truncate 32 v).toInt := by
+  rw [BitVec.toInt_signExtend]
+  have hlt := (BitVec.truncate 32 v).isLt
+  simp [Int.bmod, BitVec.toInt]
+  omega
+
+/-- Constant `extsw v` equals constructing the 64-bit two's-complement immediate directly
+    from the signed 32-bit value (justifying `i64.const (sext32 v)`). -/
 theorem extsw_const (v : BitVec 64) :
     BitVec.signExtend 64 (BitVec.truncate 32 v) =
-      BitVec.signExtend 64 (BitVec.truncate 32 v) := rfl
+      BitVec.ofInt 64 (BitVec.truncate 32 v).toInt := by
+  apply BitVec.eq_of_toInt_eq
+  rw [extsw_const_toInt, BitVec.toInt_ofInt]
+  have hlt := (BitVec.truncate 32 v).isLt
+  simp [Int.bmod, BitVec.toInt]
+  omega
 
 theorem extuw_const (v : BitVec 64) :
     BitVec.zeroExtend 64 (BitVec.truncate 32 v) = v &&& 0xFFFFFFFF#64 := by
@@ -48,6 +108,23 @@ theorem extsh_const (v : BitVec 64) :
   apply BitVec.eq_of_toInt_eq
   simp [BitVec.toInt_signExtend, Int.bmod]
   omega
+
+/-- Matches `wasm.pion`'s shift-pair constant evaluation `((v32 << 16) >> 16)` for `extsh`. -/
+theorem extsh_shift_pair (v32 : BitVec 32) :
+    (v32 <<< 16).sshiftRight 16 = BitVec.signExtend 32 (BitVec.truncate 16 v32) := by
+  ext i hi
+  simp only [BitVec.getElem_sshiftRight, BitVec.getElem_shiftLeft,
+    BitVec.getElem_signExtend, BitVec.truncate_eq_setWidth]
+  by_cases h : i < 16
+  · have h1 : 16 + i < 32 := by omega
+    have h2 : ¬ (16 + i < 16) := by omega
+    have h3 : 16 + i - 16 = i := by omega
+    simp [h, h1, h2, h3, BitVec.getElem_eq_testBit_toNat]
+    change v32.toNat.testBit i = (v32.toNat % 2 ^ 16).testBit i
+    rw [Nat.testBit_mod_two_pow]
+    simp [h]
+  · have h1 : ¬ (16 + i < 32) := by omega
+    simp [h, h1, BitVec.msb, BitVec.getMsbD]
 
 theorem extuh_const (v : BitVec 64) :
     BitVec.zeroExtend 64 (BitVec.truncate 32 v &&& 0xFFFF#32) =
@@ -67,6 +144,23 @@ theorem extsb_const (v : BitVec 64) :
   apply BitVec.eq_of_toInt_eq
   simp [BitVec.toInt_signExtend, Int.bmod]
   omega
+
+/-- Matches `wasm.pion`'s shift-pair constant evaluation `((v32 << 24) >> 24)` for `extsb`. -/
+theorem extsb_shift_pair (v32 : BitVec 32) :
+    (v32 <<< 24).sshiftRight 24 = BitVec.signExtend 32 (BitVec.truncate 8 v32) := by
+  ext i hi
+  simp only [BitVec.getElem_sshiftRight, BitVec.getElem_shiftLeft,
+    BitVec.getElem_signExtend, BitVec.truncate_eq_setWidth]
+  by_cases h : i < 8
+  · have h1 : 24 + i < 32 := by omega
+    have h2 : ¬ (24 + i < 24) := by omega
+    have h3 : 24 + i - 24 = i := by omega
+    simp [h, h1, h2, h3, BitVec.getElem_eq_testBit_toNat]
+    change v32.toNat.testBit i = (v32.toNat % 2 ^ 8).testBit i
+    rw [Nat.testBit_mod_two_pow]
+    simp [h]
+  · have h1 : ¬ (24 + i < 32) := by omega
+    simp [h, h1, BitVec.msb, BitVec.getMsbD]
 
 theorem extub_const (v : BitVec 64) :
     BitVec.zeroExtend 64 (BitVec.truncate 32 v &&& 0xFF#32) =
@@ -96,53 +190,83 @@ theorem trunc32_zext32 (x : BitVec 32) :
     BitVec.toNat_setWidth, BitVec.toNat_setWidth]
   omega
 
-theorem ceqw_zero_eq_eqz (x : BitVec 32) :
-    (x == 0#32) = eqz32 x ∧ (0#32 == x) = eqz32 x := by
-  constructor
-  · rfl
-  · unfold eqz32
-    cases h : (x == 0#32)
-    · simp only [beq_eq_false_iff_ne] at h
-      simp [beq_eq_false_iff_ne, Ne.symm h]
-    · simp only [beq_iff_eq] at h
-      subst h
-      rfl
-
-theorem ceql_zero_eq_eqz (x : BitVec 64) :
-    (x == 0#64) = eqz64 x ∧ (0#64 == x) = eqz64 x := by
-  constructor
-  · rfl
-  · unfold eqz64
-    cases h : (x == 0#64)
-    · simp only [beq_eq_false_iff_ne] at h
-      simp [beq_eq_false_iff_ne, Ne.symm h]
-    · simp only [beq_iff_eq] at h
-      subst h
-      rfl
-
-theorem cnew_zero_eq_eqz_eqz (x : BitVec 32) :
-    (x != 0#32) = eqz32 (boolToI32 (eqz32 x)) ∧
-    (0#32 != x) = eqz32 (boolToI32 (eqz32 x)) := by
-  unfold bne eqz32 boolToI32
-  cases h : (x == 0#32)
-  · simp only [beq_eq_false_iff_ne] at h
-    have hsym : (0#32 == x) = false := by simp [beq_eq_false_iff_ne, Ne.symm h]
-    simp [hsym]
-  · simp only [beq_iff_eq] at h
-    subst h
+private theorem bv_eq_zero_iff_toNat {n : Nat} (x : BitVec n) :
+    (x == BitVec.ofNat n 0) = decide (x.toNat = 0) := by
+  by_cases h : x.toNat = 0
+  · have hx : x = BitVec.ofNat n 0 := BitVec.eq_of_toNat_eq (by simpa using h)
+    subst hx
     simp
+  · have hne : x ≠ BitVec.ofNat n 0 := by
+      intro heq
+      apply h
+      simp [heq]
+    simp [beq_eq_false_iff_ne.mpr hne, h]
 
-theorem cnel_zero_eq_eqz_eqz (x : BitVec 64) :
-    (x != 0#64) = eqz32 (boolToI32 (eqz64 x)) ∧
-    (0#64 != x) = eqz32 (boolToI32 (eqz64 x)) := by
-  unfold bne eqz64 eqz32 boolToI32
-  cases h : (x == 0#64)
-  · simp only [beq_eq_false_iff_ne] at h
-    have hsym : (0#64 == x) = false := by simp [beq_eq_false_iff_ne, Ne.symm h]
-    simp [hsym]
-  · simp only [beq_iff_eq] at h
-    subst h
-    simp
+theorem ceqw_zero_eq_eqz (x : BitVec 32) (stk : List CVal) :
+    runCmp [.constI32 0#32, .i32Eq] (.i32 x :: stk) = runCmp [.i32Eqz] (.i32 x :: stk) ∧
+    runCmp [.i32Eq] (.i32 x :: .i32 0#32 :: stk) = runCmp [.i32Eqz] (.i32 x :: stk) := by
+  have hz : (x == 0#32) = decide (x.toNat = 0) := bv_eq_zero_iff_toNat x
+  constructor
+  · simp [runCmp, stepCmp, boolToI32, hz]
+  · by_cases h : x.toNat = 0
+    · have hx : x = 0#32 := BitVec.eq_of_toNat_eq (by simpa using h)
+      subst hx
+      simp [runCmp, stepCmp, boolToI32]
+    · have hne : (0#32 : BitVec 32) ≠ x := by
+        intro heq
+        apply h
+        simp [← heq]
+      simp [runCmp, stepCmp, boolToI32, beq_eq_false_iff_ne.mpr hne, h]
+
+theorem ceql_zero_eq_eqz (x : BitVec 64) (stk : List CVal) :
+    runCmp [.constI64 0#64, .i64Eq] (.i64 x :: stk) = runCmp [.i64Eqz] (.i64 x :: stk) ∧
+    runCmp [.i64Eq] (.i64 x :: .i64 0#64 :: stk) = runCmp [.i64Eqz] (.i64 x :: stk) := by
+  have hz : (x == 0#64) = decide (x.toNat = 0) := bv_eq_zero_iff_toNat x
+  constructor
+  · simp [runCmp, stepCmp, boolToI32, hz]
+  · by_cases h : x.toNat = 0
+    · have hx : x = 0#64 := BitVec.eq_of_toNat_eq (by simpa using h)
+      subst hx
+      simp [runCmp, stepCmp, boolToI32]
+    · have hne : (0#64 : BitVec 64) ≠ x := by
+        intro heq
+        apply h
+        simp [← heq]
+      simp [runCmp, stepCmp, boolToI32, beq_eq_false_iff_ne.mpr hne, h]
+
+theorem cnew_zero_eq_eqz_eqz (x : BitVec 32) (stk : List CVal) :
+    runCmp [.constI32 0#32, .i32Ne] (.i32 x :: stk) =
+      runCmp [.i32Eqz, .i32Eqz] (.i32 x :: stk) ∧
+    runCmp [.i32Ne] (.i32 x :: .i32 0#32 :: stk) =
+      runCmp [.i32Eqz, .i32Eqz] (.i32 x :: stk) := by
+  by_cases h : x.toNat = 0
+  · have hx : x = 0#32 := BitVec.eq_of_toNat_eq (by simpa using h)
+    subst hx
+    simp [runCmp, stepCmp, boolToI32]
+  · have hne1 : x ≠ (0#32 : BitVec 32) := by
+      intro heq
+      apply h
+      simp [heq]
+    have hne2 : (0#32 : BitVec 32) ≠ x := hne1.symm
+    simp [runCmp, stepCmp, boolToI32, bne, beq_eq_false_iff_ne.mpr hne1,
+      beq_eq_false_iff_ne.mpr hne2, h]
+
+theorem cnel_zero_eq_eqz_eqz (x : BitVec 64) (stk : List CVal) :
+    runCmp [.constI64 0#64, .i64Ne] (.i64 x :: stk) =
+      runCmp [.i64Eqz, .i32Eqz] (.i64 x :: stk) ∧
+    runCmp [.i64Ne] (.i64 x :: .i64 0#64 :: stk) =
+      runCmp [.i64Eqz, .i32Eqz] (.i64 x :: stk) := by
+  by_cases h : x.toNat = 0
+  · have hx : x = 0#64 := BitVec.eq_of_toNat_eq (by simpa using h)
+    subst hx
+    simp [runCmp, stepCmp, boolToI32]
+  · have hne1 : x ≠ (0#64 : BitVec 64) := by
+      intro heq
+      apply h
+      simp [heq]
+    have hne2 : (0#64 : BitVec 64) ≠ x := hne1.symm
+    simp [runCmp, stepCmp, boolToI32, bne, beq_eq_false_iff_ne.mpr hne1,
+      beq_eq_false_iff_ne.mpr hne2, h]
 
 end ExtAndEqz
 
@@ -229,6 +353,11 @@ theorem emitExpr_stack_prefix {Val : Type} (e : PureExpr Val)
     rw [emitExpr, execOps_append, execOps_append, iha, ihb]
     rfl
 
+/-- Model soundness for AA1-Z1 pure expression forwarding: assuming `hlive`
+    (no intervening write to any leaf between producer `envP` and consumer `envQ`,
+    which the compiler enforces via its same-block intervening-def check in
+    `wasm_build_fwd_exprs`), evaluating the forwarded tree at `envQ` pushes the
+    exact same value as evaluating at `envP`. -/
 theorem forward_single_use_sound {Val : Type} (e : PureExpr Val)
     (envP envQ : Nat → Val) (stk : List Val)
     (hlive : ∀ x, x ∈ e.leaves → envP x = envQ x) :
@@ -310,16 +439,18 @@ end EmitPeephole
 
 namespace LocalColorAndReorder
 
-/-- Disjoint live intervals `[defPos, lastUse]` within a single basic block never
-    clobber each other when assigned the same physical slot, regardless of any
-    initial slot value (arbitrary irreducible CFG / `br_table` entry). -/
+/-- Model soundness for AA1-Z3 intra-block interval coloring: given the interval
+    disjointness precondition `hdisj` (enforced by the compiler's greedy interval
+    colorer in `wasm_assign_intrablock_colored_locals`), two distinct temps sharing
+    a physical slot never clobber each other within `[defPos a, lastUse a]`,
+    regardless of initial slot contents (arbitrary irreducible CFG / `br_table` entry). -/
 theorem intrablock_slot_preserved
     (slotOf : Nat → Nat) (defPos lastUse : Nat → Nat)
     (hwf : ∀ x, defPos x ≤ lastUse x)
     (hdisj : ∀ a b, a ≠ b → slotOf a = slotOf b →
       lastUse a < defPos b ∨ lastUse b < defPos a)
     (a b : Nat) (hab : a ≠ b) (hslot : slotOf a = slotOf b)
-    (u : Nat) (_hu_lo : defPos a < u) (hu_hi : u ≤ lastUse a) :
+    (u : Nat) (hu_hi : u ≤ lastUse a) :
     ¬ (defPos a < defPos b ∧ defPos b ≤ u) := by
   intro ⟨h1, h2⟩
   have hwf_b := hwf b

@@ -2040,7 +2040,7 @@ struct WasmFnCtx {
   // phi_moves[pred_blk][dst_blk] -> Array[(dst_local, dst_ty, src_operand)]
   has_phi : Bool
   num_blocks : Int
-  phi_edge_map : Map[Int, Array[Int]]
+  phi_edge_map : Map[Int64, Array[Int]]
   phi_preds : Array[Int]
   phi_dsts : Array[Int]
   phi_dst_names : Array[String]
@@ -2958,11 +2958,16 @@ fn wasm_emit_addr(
 }
 
 ///|
+fn wasm_phi_edge_key(pred_idx : Int, dst_idx : Int, nb : Int) -> Int64 {
+  pred_idx.to_int64() * nb.to_int64() + dst_idx.to_int64()
+}
+
+///|
 fn wasm_has_phi_edge(fctx : WasmFnCtx, pred_idx : Int, dst_idx : Int) -> Bool {
   if !fctx.has_phi {
     return false
   }
-  fctx.phi_edge_map.contains(pred_idx * fctx.num_blocks + dst_idx)
+  fctx.phi_edge_map.contains(wasm_phi_edge_key(pred_idx, dst_idx, fctx.num_blocks))
 }
 
 ///|
@@ -2979,7 +2984,7 @@ fn wasm_emit_phi_edge(
   if !fctx.has_phi {
     return
   }
-  let matched = match fctx.phi_edge_map.get(pred_idx * fctx.num_blocks + dst_idx) {
+  let matched = match fctx.phi_edge_map.get(wasm_phi_edge_key(pred_idx, dst_idx, fctx.num_blocks)) {
     Some(arr) => arr
     None => return
   }
@@ -4619,22 +4624,25 @@ fn wasm_build_fwd_exprs(
 ) -> Unit {
   let nb = f.blocks.length()
   // Never forward a temp that is used as a base pointer by `addr_off_base`
+  let has_addr_off = addr_off_base.length() > 0
   let addr_off_is_base : Map[String, Bool] = Map([])
   let mut bi = 0
-  while bi < nb {
-    let insts = f.blocks[bi].insts
-    let mut ii = 0
-    while ii < insts.length() {
-      let d = insts[ii].dst
-      if d.length() > 0 {
-        match addr_off_base.get(d) {
-          Some(b) => addr_off_is_base.set(b, true)
-          None => ()
+  if has_addr_off {
+    while bi < nb {
+      let insts = f.blocks[bi].insts
+      let mut ii = 0
+      while ii < insts.length() {
+        let d = insts[ii].dst
+        if d.length() > 0 {
+          match addr_off_base.get(d) {
+            Some(b) => addr_off_is_base.set(b, true)
+            None => ()
+          }
         }
+        ii = ii + 1
       }
-      ii = ii + 1
+      bi = bi + 1
     }
-    bi = bi + 1
   }
 
   let mut blk_pos = 0
@@ -4642,9 +4650,15 @@ fn wasm_build_fwd_exprs(
   while bi < nb {
     let insts = f.blocks[bi].insts
     let ni = insts.length()
-    let cand_def_idx : Map[String, Int] = Map([])
+    if ni < 2 {
+      blk_pos = blk_pos + ni
+      bi = bi + 1
+      continue
+    }
+    // Zero-alloc pre-check: skip blocks that have no single-use pure producer
+    let mut first_cand = -1
     let mut p = 0
-    while p < ni {
+    while p < ni - 1 {
       let inst = insts[p]
       let d = inst.dst
       if d.length() > 0 && inst.dst_ty != WASM_TY_VOID && inst.op != "phi" &&
@@ -4652,7 +4666,31 @@ fn wasm_build_fwd_exprs(
         let dcnt = match def_counts.get(d) { Some(c) => c; None => 0 }
         let ucnt = match use_counts.get(d) { Some(c) => c; None => 0 }
         if dcnt == 1 && ucnt == 1 && !param_set.contains(d) && !const_copies.contains(d) &&
-          !addr_off_base.contains(d) && !addr_off_is_base.contains(d) &&
+          (!has_addr_off || (!addr_off_base.contains(d) && !addr_off_is_base.contains(d))) &&
+          !promoted_alloc_ty.contains(d) && !alloc_offsets.contains(d) {
+          first_cand = p
+          break
+        }
+      }
+      p = p + 1
+    }
+    if first_cand < 0 {
+      blk_pos = blk_pos + ni
+      bi = bi + 1
+      continue
+    }
+
+    let cand_def_idx : Map[String, Int] = Map([])
+    p = first_cand
+    while p < ni - 1 {
+      let inst = insts[p]
+      let d = inst.dst
+      if d.length() > 0 && inst.dst_ty != WASM_TY_VOID && inst.op != "phi" &&
+        wasm_is_z1_pure_op(inst.op, inst.dst_ty) {
+        let dcnt = match def_counts.get(d) { Some(c) => c; None => 0 }
+        let ucnt = match use_counts.get(d) { Some(c) => c; None => 0 }
+        if dcnt == 1 && ucnt == 1 && !param_set.contains(d) && !const_copies.contains(d) &&
+          (!has_addr_off || (!addr_off_base.contains(d) && !addr_off_is_base.contains(d))) &&
           !promoted_alloc_ty.contains(d) && !alloc_offsets.contains(d) {
           cand_def_idx.set(d, p)
         }
@@ -4660,104 +4698,120 @@ fn wasm_build_fwd_exprs(
       p = p + 1
     }
 
-    if cand_def_idx.length() > 0 {
-      let cons_idx : Map[String, Int] = Map([])
-      let mut q = 0
-      while q < ni {
-        let qinst = insts[q]
-        if qinst.op != "phi" && !(qinst.dst.length() > 0 && addr_off_base.contains(qinst.dst)) {
-          let mut ai = 0
-          while ai < qinst.args.length() {
-            let a = wasm_trim(qinst.args[ai])
-            match cand_def_idx.get(a) {
-              Some(pidx) =>
-                if pidx < q {
-                  cons_idx.set(a, q)
-                }
-              None => ()
-            }
-            ai = ai + 1
-          }
-        }
-        q = q + 1
-      }
+    // Flat per-instruction arrays indexed by 0..ni-1 (eliminates 4 Maps per block)
+    let cons_at : Array[Int] = []
+    let depth_at : Array[Int] = []
+    let root_at : Array[Int] = []
+    p = 0
+    while p < ni {
+      cons_at.push(-1)
+      depth_at.push(0)
+      root_at.push(-1)
+      p = p + 1
+    }
 
-      let fwd_depth : Map[String, Int] = Map([])
-      let fwd_cons_local : Map[String, Int] = Map([])
-      let accepted_p : Array[Int] = []
-      p = 0
-      while p < ni {
-        let inst = insts[p]
-        let d = inst.dst
-        if d.length() > 0 {
-          match cons_idx.get(d) {
-            Some(q_pos) => {
-              let mut ok = true
-              let mut max_d = 0
-              let mut ai = 0
-              while ai < inst.args.length() {
-                let a = wasm_trim(inst.args[ai])
-                if a.length() > 0 && str_code_at(a, 0) == 37 {
-                  match fwd_depth.get(a) {
-                    Some(ad) =>
-                      if ad > max_d {
-                        max_d = ad
-                      }
-                    None => {
-                      let adcnt = match def_counts.get(a) { Some(c) => c; None => 0 }
-                      if adcnt != 1 || promoted_alloc_ty.contains(a) {
-                        ok = false
-                        break
-                      }
-                    }
-                  }
-                }
-                ai = ai + 1
-              }
-              if ok && max_d + 1 <= 8 {
-                fwd_expr.set(d, inst)
-                fwd_depth.set(d, max_d + 1)
-                fwd_cons_local.set(d, q_pos)
-                accepted_p.push(p)
-              }
-            }
-            None => ()
-          }
-        }
-        p = p + 1
-      }
-
-      // Compute root consumer global position and extend all transitive leaf live ranges
-      let fwd_root_pos : Map[String, Int] = Map([])
-      let mut ri = accepted_p.length() - 1
-      while ri >= 0 {
-        let ap = accepted_p[ri]
-        let inst = insts[ap]
-        let d = inst.dst
-        let q_pos = match fwd_cons_local.get(d) { Some(v) => v; None => ap }
-        let q_dst = insts[q_pos].dst
-        let root_pos = if q_dst.length() > 0 {
-          match fwd_root_pos.get(q_dst) {
-            Some(rp) => rp
-            None => blk_pos + q_pos
-          }
-        } else {
-          blk_pos + q_pos
-        }
-        fwd_root_pos.set(d, root_pos)
+    let mut q = first_cand + 1
+    while q < ni {
+      let qinst = insts[q]
+      if qinst.op != "phi" &&
+        !(has_addr_off && qinst.dst.length() > 0 && addr_off_base.contains(qinst.dst)) {
+        // Avoid duplicating a forwarded tree across both branches of inline pion_arr_push_owned
+        let is_arr_push_owned = qinst.op == "call" && qinst.dst.length() == 0 &&
+          qinst.args.length() >= 3 && qinst.args[0] == "$pion_arr_push_owned"
         let mut ai = 0
-        while ai < inst.args.length() {
-          let s0 = wasm_trim(inst.args[ai])
-          if s0.length() > 0 && str_code_at(s0, 0) == 37 && !fwd_expr.contains(s0) {
-            let s = match addr_off_base.get(s0) { Some(b) => b; None => s0 }
-            let prev = match fwd_leaf_ext.get(s) { Some(v) => v; None => -1 }
-            if root_pos > prev {
-              fwd_leaf_ext.set(s, root_pos)
+        while ai < qinst.args.length() {
+          if !(is_arr_push_owned && ai == 2) {
+            let a = wasm_trim(qinst.args[ai])
+            if a.length() > 0 && str_code_at(a, 0) == 37 {
+              match cand_def_idx.get(a) {
+                Some(pidx) =>
+                  if pidx < q {
+                    cons_at[pidx] = q
+                  }
+                None => ()
+              }
             }
           }
           ai = ai + 1
         }
-        ri = ri - 1
+      }
+      q = q + 1
+    }
+
+    let mut any_fwd = false
+    p = first_cand
+    while p < ni - 1 {
+      if cons_at[p] >= 0 {
+        let inst = insts[p]
+        let mut ok = true
+        let mut max_d = 0
+        let mut ai = 0
+        while ai < inst.args.length() {
+          let a = wasm_trim(inst.args[ai])
+          if a.length() > 0 && str_code_at(a, 0) == 37 {
+            let ad = match cand_def_idx.get(a) {
+              Some(ap) => depth_at[ap]
+              None => 0
+            }
+            if ad > 0 {
+              if ad > max_d {
+                max_d = ad
+              }
+            } else {
+              let adcnt = match def_counts.get(a) { Some(c) => c; None => 0 }
+              if adcnt != 1 || promoted_alloc_ty.contains(a) {
+                ok = false
+                break
+              }
+            }
+          }
+          ai = ai + 1
+        }
+        if ok && max_d + 1 <= 8 {
+          fwd_expr.set(inst.dst, inst)
+          depth_at[p] = max_d + 1
+          any_fwd = true
+        }
+      }
+      p = p + 1
+    }
+
+    if any_fwd {
+      p = ni - 2
+      while p >= first_cand {
+        if depth_at[p] > 0 {
+          let q_pos = cons_at[p]
+          let rpos = if depth_at[q_pos] > 0 {
+            root_at[q_pos]
+          } else {
+            blk_pos + q_pos
+          }
+          root_at[p] = rpos
+          let inst = insts[p]
+          let mut ai = 0
+          while ai < inst.args.length() {
+            let s0 = wasm_trim(inst.args[ai])
+            if s0.length() > 0 && str_code_at(s0, 0) == 37 {
+              let is_child_fwd = match cand_def_idx.get(s0) {
+                Some(ap) => depth_at[ap] > 0
+                None => false
+              }
+              if !is_child_fwd {
+                let s = if has_addr_off {
+                  match addr_off_base.get(s0) { Some(b) => b; None => s0 }
+                } else {
+                  s0
+                }
+                let prev = match fwd_leaf_ext.get(s) { Some(v) => v; None => -1 }
+                if rpos > prev {
+                  fwd_leaf_ext.set(s, rpos)
+                }
+              }
+            }
+            ai = ai + 1
+          }
+        }
+        p = p - 1
       }
     }
 
@@ -5389,7 +5443,7 @@ fn wasm_compile_func(
   let phi_dst_names : Array[String] = []
   let phi_dst_tys : Array[Int] = []
   let phi_src_ops : Array[String] = []
-  let phi_edge_map : Map[Int, Array[Int]] = Map([])
+  let phi_edge_map : Map[Int64, Array[Int]] = Map([])
 
   // Pass 1: map block labels, local types, def/use counts, and check whether any alloc exists
   // (Local indices are allocated lazily during emission so single-use adjacent temps consume 0 local slots.)
@@ -5492,7 +5546,7 @@ fn wasm_compile_func(
               phi_dst_names.push(inst.dst)
               phi_dst_tys.push(inst.dst_ty)
               phi_src_ops.push(inst.args[pi + 1])
-              let pkey = pidx * nb + bi
+              let pkey = wasm_phi_edge_key(pidx, bi, nb)
               match phi_edge_map.get(pkey) {
                 Some(arr) => arr.push(eidx)
                 None => phi_edge_map.set(pkey, [eidx])
@@ -5788,7 +5842,7 @@ fn wasm_compile_func(
       const_copies, addr_off_base, promoted_alloc_ty, alloc_offsets,
       fwd_expr, fwd_leaf_ext, local_idx, extra_local_tys,
     )
-  } else {
+  } else if multi_blk {
     wasm_assign_intrablock_colored_locals(
       f, n_params, param_set, local_ty, def_counts, use_counts,
       const_copies, addr_off_base, promoted_alloc_ty, alloc_offsets,
@@ -5800,258 +5854,280 @@ fn wasm_compile_func(
   // reorder extra locals so top-frequency locals occupy 1-byte LEB128 slots (< 128),
   // grouped by type within hot/cold partitions to keep local-decl RLE compact.
   let promoted_alloc_lidx : Map[String, Int] = Map([])
-  let mut est_unalloc = 0
-  let unalloc_syms : Array[String] = []
-  let unalloc_seen : Map[String, Bool] = Map([])
-  bi = 0
-  while bi < nb {
-    let insts = f.blocks[bi].insts
-    let mut ii = 0
-    while ii < insts.length() {
-      let d = insts[ii].dst
-      if d.length() > 0 && insts[ii].dst_ty != WASM_TY_VOID && !local_idx.contains(d) &&
-        !unalloc_seen.contains(d) && !const_copies.contains(d) && !addr_off_base.contains(d) &&
-        !promoted_alloc_ty.contains(d) && !fwd_expr.contains(d) {
-        let ucnt = match use_counts.get(d) { Some(c) => c; None => 0 }
-        if ucnt > 0 {
-          unalloc_seen.set(d, true)
-          unalloc_syms.push(d)
-          est_unalloc = est_unalloc + 1
+  if local_ty.length() + cand_names.length() + 4 > 128 {
+    let mut est_unalloc = 0
+    let unalloc_syms : Array[String] = []
+    let unalloc_seen : Map[String, Bool] = Map([])
+    bi = 0
+    while bi < nb {
+      let insts = f.blocks[bi].insts
+      let ni = insts.length()
+      let mut ii = 0
+      while ii < ni {
+        let d = insts[ii].dst
+        if d.length() > 0 && insts[ii].dst_ty != WASM_TY_VOID && !local_idx.contains(d) &&
+          !unalloc_seen.contains(d) && !const_copies.contains(d) && !addr_off_base.contains(d) &&
+          !promoted_alloc_ty.contains(d) && !fwd_expr.contains(d) {
+          let ucnt = match use_counts.get(d) { Some(c) => c; None => 0 }
+          let dcnt = match def_counts.get(d) { Some(c) => c; None => 0 }
+          // Do not pre-allocate single-use temps consumed immediately as first operand of next inst
+          // (they are elided without a local slot by the adjacent set;get peephole).
+          let mut adj_elided = false
+          if ucnt == 1 && dcnt == 1 && ii + 1 < ni {
+            let nx = insts[ii + 1]
+            if nx.op != "phi" && nx.args.length() > 0 {
+              let first_arg = if nx.op == "call" {
+                if nx.args.length() > 1 { wasm_trim(nx.args[1]) } else { "" }
+              } else if wasm_is_mem_store_op(nx.op) {
+                if nx.args.length() > 1 { wasm_trim(nx.args[1]) } else { "" }
+              } else {
+                wasm_trim(nx.args[0])
+              }
+              if first_arg == d {
+                adj_elided = true
+              }
+            }
+          }
+          if ucnt > 0 && !adj_elided {
+            unalloc_seen.set(d, true)
+            unalloc_syms.push(d)
+            est_unalloc = est_unalloc + 1
+          }
         }
+        ii = ii + 1
       }
-      ii = ii + 1
+      bi = bi + 1
     }
-    bi = bi + 1
-  }
-  let mut est_promoted = 0
-  ci = 0
-  while ci < cand_names.length() {
-    match promoted_alloc_ty.get(cand_names[ci]) {
-      Some(sty) =>
-        if sty >= 0 {
-          est_promoted = est_promoted + 1
-        }
-      None => ()
-    }
-    ci = ci + 1
-  }
-  if n_params + extra_local_tys.length() + est_unalloc + est_promoted > 128 {
-    let mut ui = 0
-    while ui < unalloc_syms.length() {
-      let sym = unalloc_syms[ui]
-      if !local_idx.contains(sym) {
-        let ty = match local_ty.get(sym) { Some(t) => t; None => WASM_TY_I64 }
-        let idx = n_params + extra_local_tys.length()
-        extra_local_tys.push(ty)
-        local_idx.set(sym, idx)
-      }
-      ui = ui + 1
-    }
+    let mut est_promoted = 0
     ci = 0
     while ci < cand_names.length() {
-      let cname = cand_names[ci]
-      match promoted_alloc_ty.get(cname) {
+      match promoted_alloc_ty.get(cand_names[ci]) {
         Some(sty) =>
-          if sty >= 0 && !promoted_alloc_lidx.contains(cname) {
-            let idx = n_params + extra_local_tys.length()
-            extra_local_tys.push(sty)
-            promoted_alloc_lidx.set(cname, idx)
+          if sty >= 0 {
+            est_promoted = est_promoted + 1
           }
         None => ()
       }
       ci = ci + 1
     }
-    let n_extra = extra_local_tys.length()
-    if n_params + n_extra > 128 && n_extra > 1 {
-      let freq : Array[Int] = []
-      let mut ei = 0
-      while ei < n_extra {
-        freq.push(0)
-        ei = ei + 1
-      }
-      bi = 0
-      while bi < nb {
-        let insts = f.blocks[bi].insts
-        let mut ii = 0
-        while ii < insts.length() {
-          let inst = insts[ii]
-          if inst.dst.length() > 0 && !fwd_expr.contains(inst.dst) &&
-            !const_copies.contains(inst.dst) && !addr_off_base.contains(inst.dst) {
-            match local_idx.get(inst.dst) {
-              Some(lidx) =>
-                if lidx >= n_params {
-                  freq[lidx - n_params] = freq[lidx - n_params] + 1
-                }
-              None => ()
-            }
-          }
-          if inst.op == "phi" {
-            let mut pi = 0
-            while pi + 1 < inst.args.length() {
-              let s0 = wasm_trim(inst.args[pi + 1])
-              let s = match addr_off_base.get(s0) { Some(b) => b; None => s0 }
-              match local_idx.get(s) {
-                Some(lidx) =>
-                  if lidx >= n_params {
-                    freq[lidx - n_params] = freq[lidx - n_params] + 1
-                  }
-                None => ()
-              }
-              pi = pi + 2
-            }
-          } else {
-            let mut ai = 0
-            while ai < inst.args.length() {
-              let s0 = wasm_trim(inst.args[ai])
-              match promoted_alloc_lidx.get(s0) {
-                Some(plidx) =>
-                  if plidx >= n_params {
-                    freq[plidx - n_params] = freq[plidx - n_params] + 1
-                  }
-                None => ()
-              }
-              let s = match addr_off_base.get(s0) { Some(b) => b; None => s0 }
-              match local_idx.get(s) {
-                Some(lidx) =>
-                  if lidx >= n_params {
-                    freq[lidx - n_params] = freq[lidx - n_params] + 1
-                  }
-                None => ()
-              }
-              ai = ai + 1
-            }
-          }
-          if fp_local >= n_params &&
-            (inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16") &&
-            !promoted_alloc_ty.contains(inst.dst) {
-            freq[fp_local - n_params] = freq[fp_local - n_params] + 1
-          }
-          if pc_local >= n_params &&
-            (inst.op == "jmp" || inst.op == "jnz" || inst.op == "jtbl") {
-            freq[pc_local - n_params] = freq[pc_local - n_params] + 2
-          }
-          ii = ii + 1
+    if n_params + extra_local_tys.length() + est_unalloc + est_promoted > 128 {
+      let mut ui = 0
+      while ui < unalloc_syms.length() {
+        let sym = unalloc_syms[ui]
+        if !local_idx.contains(sym) {
+          let ty = match local_ty.get(sym) { Some(t) => t; None => WASM_TY_I64 }
+          let idx = n_params + extra_local_tys.length()
+          extra_local_tys.push(ty)
+          local_idx.set(sym, idx)
         }
-        bi = bi + 1
-      }
-      // Sort extra slot indices by descending access frequency
-      let order : Array[Int] = []
-      ei = 0
-      while ei < n_extra {
-        order.push(ei)
-        ei = ei + 1
-      }
-      let mut oi = 1
-      while oi < n_extra {
-        let key_slot = order[oi]
-        let key_f = freq[key_slot]
-        let mut oj = oi - 1
-        while oj >= 0 && freq[order[oj]] < key_f {
-          order[oj + 1] = order[oj]
-          oj = oj - 1
-        }
-        order[oj + 1] = key_slot
-        oi = oi + 1
-      }
-      let hot_budget = if n_params < 128 { 128 - n_params } else { 0 }
-      let hot_n = if hot_budget < n_extra { hot_budget } else { n_extra }
-      let new_order : Array[Int] = []
-      let ty_list : Array[Int] = [WASM_TY_I32, WASM_TY_I64, WASM_TY_F32, WASM_TY_F64]
-      let mut ti = 0
-      while ti < ty_list.length() {
-        let t = ty_list[ti]
-        let mut k = 0
-        while k < hot_n {
-          if extra_local_tys[order[k]] == t {
-            new_order.push(order[k])
-          }
-          k = k + 1
-        }
-        ti = ti + 1
-      }
-      ti = 0
-      while ti < ty_list.length() {
-        let t = ty_list[ti]
-        let mut k = hot_n
-        while k < n_extra {
-          if extra_local_tys[order[k]] == t {
-            new_order.push(order[k])
-          }
-          k = k + 1
-        }
-        ti = ti + 1
-      }
-      let remap : Array[Int] = []
-      let new_tys : Array[Int] = []
-      ei = 0
-      while ei < n_extra {
-        remap.push(ei)
-        new_tys.push(extra_local_tys[new_order[ei]])
-        ei = ei + 1
-      }
-      ei = 0
-      while ei < n_extra {
-        remap[new_order[ei]] = ei
-        ei = ei + 1
-      }
-      ei = 0
-      while ei < n_extra {
-        extra_local_tys[ei] = new_tys[ei]
-        ei = ei + 1
-      }
-      if fp_local >= n_params {
-        fp_local = n_params + remap[fp_local - n_params]
-      }
-      if pc_local >= n_params {
-        pc_local = n_params + remap[pc_local - n_params]
+        ui = ui + 1
       }
       ci = 0
       while ci < cand_names.length() {
         let cname = cand_names[ci]
-        match promoted_alloc_lidx.get(cname) {
-          Some(old_lidx) =>
-            if old_lidx >= n_params {
-              promoted_alloc_lidx.set(cname, n_params + remap[old_lidx - n_params])
+        match promoted_alloc_ty.get(cname) {
+          Some(sty) =>
+            if sty >= 0 && !promoted_alloc_lidx.contains(cname) {
+              let idx = n_params + extra_local_tys.length()
+              extra_local_tys.push(sty)
+              promoted_alloc_lidx.set(cname, idx)
             }
           None => ()
         }
         ci = ci + 1
       }
-      let remapped_sym : Map[String, Bool] = Map([])
-      bi = 0
-      while bi < nb {
-        let insts = f.blocks[bi].insts
-        let mut ii = 0
-        while ii < insts.length() {
-          let inst = insts[ii]
-          if inst.dst.length() > 0 && !remapped_sym.contains(inst.dst) {
-            remapped_sym.set(inst.dst, true)
-            match local_idx.get(inst.dst) {
-              Some(old_lidx) =>
-                if old_lidx >= n_params {
-                  local_idx.set(inst.dst, n_params + remap[old_lidx - n_params])
-                }
-              None => ()
-            }
-          }
-          let mut ai = 0
-          while ai < inst.args.length() {
-            let s = wasm_trim(inst.args[ai])
-            if s.length() > 0 && str_code_at(s, 0) == 37 && !remapped_sym.contains(s) {
-              remapped_sym.set(s, true)
-              match local_idx.get(s) {
-                Some(old_lidx) =>
-                  if old_lidx >= n_params {
-                    local_idx.set(s, n_params + remap[old_lidx - n_params])
+      let n_extra = extra_local_tys.length()
+      if n_params + n_extra > 128 && n_extra > 1 {
+        let freq : Array[Int] = []
+        let mut ei = 0
+        while ei < n_extra {
+          freq.push(0)
+          ei = ei + 1
+        }
+        bi = 0
+        while bi < nb {
+          let insts = f.blocks[bi].insts
+          let mut ii = 0
+          while ii < insts.length() {
+            let inst = insts[ii]
+            if inst.dst.length() > 0 && !fwd_expr.contains(inst.dst) &&
+              !const_copies.contains(inst.dst) && !addr_off_base.contains(inst.dst) {
+              match local_idx.get(inst.dst) {
+                Some(lidx) =>
+                  if lidx >= n_params {
+                    freq[lidx - n_params] = freq[lidx - n_params] + 1
                   }
                 None => ()
               }
             }
-            ai = ai + 1
+            if inst.op == "phi" {
+              let mut pi = 0
+              while pi + 1 < inst.args.length() {
+                let s0 = wasm_trim(inst.args[pi + 1])
+                let s = match addr_off_base.get(s0) { Some(b) => b; None => s0 }
+                match local_idx.get(s) {
+                  Some(lidx) =>
+                    if lidx >= n_params {
+                      freq[lidx - n_params] = freq[lidx - n_params] + 1
+                    }
+                  None => ()
+                }
+                pi = pi + 2
+              }
+            } else {
+              let mut ai = 0
+              while ai < inst.args.length() {
+                let s0 = wasm_trim(inst.args[ai])
+                match promoted_alloc_lidx.get(s0) {
+                  Some(plidx) =>
+                    if plidx >= n_params {
+                      freq[plidx - n_params] = freq[plidx - n_params] + 1
+                    }
+                  None => ()
+                }
+                let s = match addr_off_base.get(s0) { Some(b) => b; None => s0 }
+                match local_idx.get(s) {
+                  Some(lidx) =>
+                    if lidx >= n_params {
+                      freq[lidx - n_params] = freq[lidx - n_params] + 1
+                    }
+                  None => ()
+                }
+                ai = ai + 1
+              }
+            }
+            if fp_local >= n_params &&
+              (inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16") &&
+              !promoted_alloc_ty.contains(inst.dst) {
+              freq[fp_local - n_params] = freq[fp_local - n_params] + 1
+            }
+            if pc_local >= n_params &&
+              (inst.op == "jmp" || inst.op == "jnz" || inst.op == "jtbl") {
+              freq[pc_local - n_params] = freq[pc_local - n_params] + 2
+            }
+            ii = ii + 1
           }
-          ii = ii + 1
+          bi = bi + 1
         }
-        bi = bi + 1
+        // Sort extra slot indices by descending access frequency
+        let order : Array[Int] = []
+        ei = 0
+        while ei < n_extra {
+          order.push(ei)
+          ei = ei + 1
+        }
+        let mut oi = 1
+        while oi < n_extra {
+          let key_slot = order[oi]
+          let key_f = freq[key_slot]
+          let mut oj = oi - 1
+          while oj >= 0 && freq[order[oj]] < key_f {
+            order[oj + 1] = order[oj]
+            oj = oj - 1
+          }
+          order[oj + 1] = key_slot
+          oi = oi + 1
+        }
+        let hot_budget = if n_params < 128 { 128 - n_params } else { 0 }
+        let hot_n = if hot_budget < n_extra { hot_budget } else { n_extra }
+        let new_order : Array[Int] = []
+        let ty_list : Array[Int] = [WASM_TY_I32, WASM_TY_I64, WASM_TY_F32, WASM_TY_F64]
+        let mut ti = 0
+        while ti < ty_list.length() {
+          let t = ty_list[ti]
+          let mut k = 0
+          while k < hot_n {
+            if extra_local_tys[order[k]] == t {
+              new_order.push(order[k])
+            }
+            k = k + 1
+          }
+          ti = ti + 1
+        }
+        ti = 0
+        while ti < ty_list.length() {
+          let t = ty_list[ti]
+          let mut k = hot_n
+          while k < n_extra {
+            if extra_local_tys[order[k]] == t {
+              new_order.push(order[k])
+            }
+            k = k + 1
+          }
+          ti = ti + 1
+        }
+        let remap : Array[Int] = []
+        let new_tys : Array[Int] = []
+        ei = 0
+        while ei < n_extra {
+          remap.push(ei)
+          new_tys.push(extra_local_tys[new_order[ei]])
+          ei = ei + 1
+        }
+        ei = 0
+        while ei < n_extra {
+          remap[new_order[ei]] = ei
+          ei = ei + 1
+        }
+        ei = 0
+        while ei < n_extra {
+          extra_local_tys[ei] = new_tys[ei]
+          ei = ei + 1
+        }
+        if fp_local >= n_params {
+          fp_local = n_params + remap[fp_local - n_params]
+        }
+        if pc_local >= n_params {
+          pc_local = n_params + remap[pc_local - n_params]
+        }
+        ci = 0
+        while ci < cand_names.length() {
+          let cname = cand_names[ci]
+          match promoted_alloc_lidx.get(cname) {
+            Some(old_lidx) =>
+              if old_lidx >= n_params {
+                promoted_alloc_lidx.set(cname, n_params + remap[old_lidx - n_params])
+              }
+            None => ()
+          }
+          ci = ci + 1
+        }
+        let remapped_sym : Map[String, Bool] = Map([])
+        bi = 0
+        while bi < nb {
+          let insts = f.blocks[bi].insts
+          let mut ii = 0
+          while ii < insts.length() {
+            let inst = insts[ii]
+            if inst.dst.length() > 0 && !remapped_sym.contains(inst.dst) {
+              remapped_sym.set(inst.dst, true)
+              match local_idx.get(inst.dst) {
+                Some(old_lidx) =>
+                  if old_lidx >= n_params {
+                    local_idx.set(inst.dst, n_params + remap[old_lidx - n_params])
+                  }
+                None => ()
+              }
+            }
+            let mut ai = 0
+            while ai < inst.args.length() {
+              let s = wasm_trim(inst.args[ai])
+              if s.length() > 0 && str_code_at(s, 0) == 37 && !remapped_sym.contains(s) {
+                remapped_sym.set(s, true)
+                match local_idx.get(s) {
+                  Some(old_lidx) =>
+                    if old_lidx >= n_params {
+                      local_idx.set(s, n_params + remap[old_lidx - n_params])
+                    }
+                  None => ()
+                }
+              }
+              ai = ai + 1
+            }
+            ii = ii + 1
+          }
+          bi = bi + 1
+        }
       }
     }
   }
@@ -7186,7 +7262,7 @@ pub fn wasm_namespace_local_ssa(ssa : String, prefix : String) -> String {
 /// Zero-copy when no collision occurs; preserves `pion_drop_*` prefixes by suffixing only.
 fn wasm_disambiguate_unit_locals(units : Array[String]) -> Array[String] {
   let nu = units.length()
-  if nu <= 1 {
+  if nu == 0 {
     return units
   }
   // AA1-S1 lossless fast path:
@@ -7266,7 +7342,7 @@ fn wasm_disambiguate_unit_locals(units : Array[String]) -> Array[String] {
     }
     ui = ui + 1
   }
-  if !fast_conflict && !has_any_local {
+  if !fast_conflict && (!has_any_local || nu == 1) {
     return units
   }
   // Phase B: read-only `$tok` scan with exact same string/comment lexer as `wasm_scan_ssa_all_syms`.
@@ -12857,9 +12933,11 @@ fn wasm_outline_nested_loops_cached(
   // whereas callees only called inside small-const loops (e.g. spectral_norm::mul_av in while r < 10)
   // still need nested-loop outlining to trigger TurboFan tier-up.
   let called_in_loop : Map[String, Bool] = Map([])
+  let existing_names : Map[String, Bool] = Map([])
   let mut pfi = 0
   while pfi < funcs.length() {
     let pf = funcs[pfi]
+    existing_names.set(pf.name, true)
     let pnb = pf.blocks.length()
     if pnb > 1 {
       let pbidx : Map[String, Int] = Map([])
@@ -13456,9 +13534,14 @@ fn wasm_outline_nested_loops_cached(
         continue
       }
 
-      // Build outlined WasmFunc $__pion_ol_<ol_seq>
+      // Build outlined WasmFunc $__pion_ol_<ol_seq> (guaranteed fresh against existing names & cfg_cache)
+      while existing_names.contains("__pion_ol_" + ol_seq.to_string()) {
+        ol_seq = ol_seq + 1
+      }
       let ol_name = "__pion_ol_" + ol_seq.to_string()
       let ol_id_str = ol_seq.to_string()
+      existing_names.set(ol_name, true)
+      cfg_cache.remove(ol_name)
       ol_seq = ol_seq + 1
       any_outlined = true
 
