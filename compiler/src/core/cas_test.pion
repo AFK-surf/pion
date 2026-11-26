@@ -1,0 +1,185 @@
+///| Unit tests for CAS batch pinning, post-run eviction, depfile parsing,
+///  MSVC /showIncludes parsing, and raw-bytes SHA-256.
+
+///|
+test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
+  // Initial index: k_old1 (t=10, 400B), k_old2 (t=20, 400B), k_hit (t=30, 300B)
+  let entries = cas_parse_index("k_old1\t400\t10\nk_old2\t400\t20\nk_hit\t300\t30\n")
+  // Batch adds k_new1 (500B) and k_new2 (500B); total exceeds max_bytes=1000B.
+  // k_hit is pinned as a hot HIT from the same run.
+  let res = cas_touch_batch_and_evict(
+    entries,
+    ["k_new1", "k_new2"],
+    [500L, 500L],
+    500L,
+    1000L,
+    ["k_hit"],
+  )
+  // Both unpinned old entries must be evicted; k_hit, k_new1, k_new2 must all be kept!
+  assert_eq(res.evicted.length(), 2)
+  assert_eq(res.evicted[0], "k_old1")
+  assert_eq(res.evicted[1], "k_old2")
+  assert_eq(res.kept.length(), 3)
+  let mut saw_hit = false
+  let mut saw_new1 = false
+  let mut saw_new2 = false
+  let mut i = 0
+  while i < res.kept.length() {
+    let e = res.kept[i]
+    if e.key == "k_hit" {
+      saw_hit = true
+      assert_eq(e.bytes, 300L)
+      // Hot HIT timestamp must be refreshed to now_ms=500L
+      assert_eq(e.last_access_ms, 500L)
+    } else if e.key == "k_new1" {
+      saw_new1 = true
+      assert_eq(e.bytes, 500L)
+      assert_eq(e.last_access_ms, 500L)
+    } else if e.key == "k_new2" {
+      saw_new2 = true
+      assert_eq(e.bytes, 500L)
+      assert_eq(e.last_access_ms, 500L)
+    }
+    i = i + 1
+  }
+  assert_true(saw_hit, "k_hit kept")
+  assert_true(saw_new1, "k_new1 kept")
+  assert_true(saw_new2, "k_new2 kept")
+}
+
+///|
+test "cas_touch_batch_and_evict_duplicate_key_takes_last_size_and_80pct_watermark" {
+  let entries = cas_parse_index("a\t300\t10\nb\t300\t20\nc\t300\t30\n")
+  // Add d=200 then d=350 (last wins -> 350B). Total = 1250 > 1000 -> watermark = 800.
+  // Evicting a (300) -> 950 > 800; evicting b (300) -> 650 <= 800 -> stops! c stays.
+  let res = cas_touch_batch_and_evict(
+    entries,
+    ["d", "d"],
+    [200L, 350L],
+    100L,
+    1000L,
+    [],
+  )
+  assert_eq(res.evicted.length(), 2)
+  assert_eq(res.evicted[0], "a")
+  assert_eq(res.evicted[1], "b")
+  assert_eq(res.kept.length(), 2)
+  let mut saw_c = false
+  let mut saw_d = false
+  let mut i = 0
+  while i < res.kept.length() {
+    if res.kept[i].key == "c" {
+      saw_c = true
+    } else if res.kept[i].key == "d" {
+      saw_d = true
+      assert_eq(res.kept[i].bytes, 350L)
+    }
+    i = i + 1
+  }
+  assert_true(saw_c, "c kept")
+  assert_true(saw_d, "d kept")
+}
+
+///|
+test "cas_evict_post_run_protects_concurrent_process_entries" {
+  // run_start_ms = 1000.
+  // old_k: t=500 (< 1000) -> evictable
+  // my_k1: t=1050 (in run_keys) -> evictable
+  // peer_k: t=1020 (>= 1000, NOT in run_keys) -> MUST NOT be evicted!
+  // my_k2: t=1100 (in run_keys) -> evictable
+  let entries = cas_parse_index(
+    "old_k\t400\t500\nmy_k1\t400\t1050\npeer_k\t500\t1020\nmy_k2\t400\t1100\n",
+  )
+  // Total = 1700 > max_bytes=1000 (watermark=800).
+  // LRU order: old_k (500), peer_k (1020, protected!), my_k1 (1050), my_k2 (1100).
+  // Evict old_k -> 1300; skip peer_k -> 1300; evict my_k1 -> 900; evict my_k2 -> 500 <= 800.
+  let res = cas_evict_post_run(entries, 1000L, 1000L, ["my_k1", "my_k2"])
+  assert_eq(res.evicted.length(), 3)
+  assert_eq(res.evicted[0], "old_k")
+  assert_eq(res.evicted[1], "my_k1")
+  assert_eq(res.evicted[2], "my_k2")
+  assert_eq(res.kept.length(), 1)
+  assert_eq(res.kept[0].key, "peer_k")
+}
+
+///|
+test "cas_parse_depfile_unix_crlf_continuations_escapes_and_windows_drives" {
+  // 1. Unix multiline with \\\n, escaped space, \#, $$, duplicates
+  let d1 = "/tmp/obj_0.o: /src/a.c \\\n  /inc/my\\ dir/foo\\#1.h \\\n  /inc/cost$$2.h /inc/a.h /inc/a.h\n"
+  match cas_parse_depfile(d1) {
+    Some(deps) => {
+      assert_eq(deps.length(), 4)
+      assert_eq(deps[0], "/inc/a.h")
+      assert_eq(deps[1], "/inc/cost$2.h")
+      assert_eq(deps[2], "/inc/my dir/foo#1.h")
+      assert_eq(deps[3], "/src/a.c")
+    }
+    None => assert_true(false, "expected Some for Unix depfile")
+  }
+
+  // 2. Windows CRLF + drive colons (both C:\ and C:/)
+  let d2 = "C:\\cache\\obj_0.o: C:\\proj\\src\\main.c \\\r\n  C:/sdk/include/win\\ compat.h C:\\proj\\inc\\sub.h\r\n"
+  match cas_parse_depfile(d2) {
+    Some(deps) => {
+      assert_eq(deps.length(), 3)
+      assert_eq(deps[0], "C:/sdk/include/win compat.h")
+      assert_eq(deps[1], "C:\\proj\\inc\\sub.h")
+      assert_eq(deps[2], "C:\\proj\\src\\main.c")
+    }
+    None => assert_true(false, "expected Some for Windows depfile")
+  }
+
+  // 3. Malformed inputs fail closed -> None
+  match cas_parse_depfile("") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for empty depfile")
+  }
+  match cas_parse_depfile("no_colon_here /inc/a.h\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for depfile without colon")
+  }
+  match cas_parse_depfile("   : /inc/a.h\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for depfile with empty target")
+  }
+}
+
+///|
+test "cas_parse_msvc_show_includes_parses_trims_dedups_and_sorts" {
+  let out = "stub.c\r\nNote: including file: C:\\proj\\b.h\r\nNote: including file:   C:\\proj\\a.h  \r\nNote: including file: C:\\proj\\b.h\r\nwarning C4996: ignored\r\n"
+  let deps = cas_parse_msvc_show_includes(out)
+  assert_eq(deps.length(), 2)
+  assert_eq(deps[0], "C:\\proj\\a.h")
+  assert_eq(deps[1], "C:\\proj\\b.h")
+}
+
+///|
+test "cas_sha256_bytes_empty_ascii_and_non_utf8" {
+  // Empty bytes == SHA-256("")
+  assert_eq(
+    cas_sha256_bytes(Bytes::new(0)),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  )
+  // ASCII "abc" == NIST vector
+  let abc = Bytes::new(3)
+  abc[0] = (97).to_byte()
+  abc[1] = (98).to_byte()
+  abc[2] = (99).to_byte()
+  assert_eq(
+    cas_sha256_bytes(abc),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  )
+  // Non-UTF-8 raw bytes 0x80..0xFF (128 bytes): must produce distinct deterministic 64-hex digest
+  let raw = Bytes::new(128)
+  let mut i = 0
+  while i < 128 {
+    raw[i] = (128 + i).to_byte()
+    i = i + 1
+  }
+  let h1 = cas_sha256_bytes(raw)
+  assert_eq(h1.length(), 64)
+  // Mutating one high byte must change the digest
+  raw[64] = (0x00).to_byte()
+  let h2 = cas_sha256_bytes(raw)
+  assert_true(h1 != h2, "mutated byte changes sha256")
+}

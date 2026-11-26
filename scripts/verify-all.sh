@@ -530,6 +530,8 @@ sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC2"
 # PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
 sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC2"
+# CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.
+sh "$ROOT_DIR/tests/e2e/cas_pin_and_cstub_deps/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 E2E
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.

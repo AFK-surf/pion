@@ -151,8 +151,7 @@ pub fn cas_linked_exe_name(windows : Bool, path : String) -> String {
 }
 
 ///|
-pub fn cas_sha256_hex(s : String) -> String {
-  let bytes = str_to_utf8_ints(s)
+fn cas_sha256_ints(bytes : Array[Int]) -> String {
   let msg_len = bytes.length()
   let bit_len = msg_len.to_int64() * 8L
   bytes.push(0x80)
@@ -257,6 +256,23 @@ pub fn cas_sha256_hex(s : String) -> String {
     si = si + 1
   }
   sb.to_string()
+}
+
+///|
+pub fn cas_sha256_hex(s : String) -> String {
+  cas_sha256_ints(str_to_utf8_ints(s))
+}
+
+///|
+pub fn cas_sha256_bytes(data : Bytes) -> String {
+  let bytes : Array[Int] = []
+  let n = data.length()
+  let mut i = 0
+  while i < n {
+    bytes.push(data[i].to_int() & 0xFF)
+    i = i + 1
+  }
+  cas_sha256_ints(bytes)
 }
 
 ///|
@@ -571,4 +587,348 @@ pub fn cas_touch_and_evict(
     i = i + 1
   }
   CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+pub fn cas_touch_batch_and_evict(
+  entries : Array[CasEntry],
+  keys : Array[String],
+  sizes : Array[Int64],
+  now_ms : Int64,
+  max_bytes : Int64,
+  pinned_keys : Array[String],
+) -> CasEvictResult {
+  let pinned : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < pinned_keys.length() {
+    pinned.set(pinned_keys[i], true)
+    i = i + 1
+  }
+  let key_sizes : Map[String, Int64] = Map([])
+  let key_order : Array[String] = []
+  let nk = if keys.length() < sizes.length() {
+    keys.length()
+  } else {
+    sizes.length()
+  }
+  i = 0
+  while i < nk {
+    let k = keys[i]
+    pinned.set(k, true)
+    if !key_sizes.contains(k) {
+      key_order.push(k)
+    }
+    key_sizes.set(k, sizes[i])
+    i = i + 1
+  }
+
+  let updated : Array[CasEntry] = []
+  let seen : Map[String, Bool] = Map([])
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if seen.contains(e.key) {
+      i = i + 1
+      continue
+    }
+    seen.set(e.key, true)
+    match key_sizes.get(e.key) {
+      Some(sz) =>
+        updated.push(CasEntry::{
+          key: e.key,
+          bytes: sz,
+          last_access_ms: now_ms,
+        })
+      None =>
+        if pinned.contains(e.key) {
+          updated.push(CasEntry::{
+            key: e.key,
+            bytes: e.bytes,
+            last_access_ms: now_ms,
+          })
+        } else {
+          updated.push(e)
+        }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < key_order.length() {
+    let k = key_order[i]
+    if !seen.contains(k) {
+      let sz = match key_sizes.get(k) {
+        Some(v) => v
+        None => 0L
+      }
+      updated.push(CasEntry::{
+        key: k,
+        bytes: sz,
+        last_access_ms: now_ms,
+      })
+    }
+    i = i + 1
+  }
+
+  let mut total = 0L
+  i = 0
+  while i < updated.length() {
+    total = total + updated[i].bytes
+    i = i + 1
+  }
+
+  let evicted : Array[String] = []
+  if max_bytes <= 0L || total <= max_bytes {
+    return CasEvictResult::{ kept: updated, evicted: evicted }
+  }
+
+  sort_cas_entries_lru(updated)
+  let watermark = (max_bytes * 80L) / 100L
+  let kept : Array[CasEntry] = []
+  i = 0
+  while i < updated.length() {
+    let e = updated[i]
+    if total > watermark && !pinned.contains(e.key) {
+      total = total - e.bytes
+      evicted.push(e.key)
+    } else {
+      kept.push(e)
+    }
+    i = i + 1
+  }
+  CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+pub fn cas_evict_post_run(
+  entries : Array[CasEntry],
+  run_start_ms : Int64,
+  max_bytes : Int64,
+  run_keys : Array[String],
+) -> CasEvictResult {
+  let sorted : Array[CasEntry] = []
+  let mut total = 0L
+  let mut i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    sorted.push(e)
+    total = total + e.bytes
+    i = i + 1
+  }
+  let evicted : Array[String] = []
+  if max_bytes <= 0L || total <= max_bytes {
+    return CasEvictResult::{ kept: sorted, evicted: evicted }
+  }
+  let run_set : Map[String, Bool] = Map([])
+  i = 0
+  while i < run_keys.length() {
+    run_set.set(run_keys[i], true)
+    i = i + 1
+  }
+  sort_cas_entries_lru(sorted)
+  let watermark = (max_bytes * 80L) / 100L
+  let kept : Array[CasEntry] = []
+  i = 0
+  while i < sorted.length() {
+    let e = sorted[i]
+    let can_evict = e.last_access_ms < run_start_ms || run_set.contains(e.key)
+    if total > watermark && can_evict {
+      total = total - e.bytes
+      evicted.push(e.key)
+    } else {
+      kept.push(e)
+    }
+    i = i + 1
+  }
+  CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+fn cas_sort_strings(arr : Array[String]) -> Unit {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let cur = arr[i]
+    let mut j = i - 1
+    while j >= 0 && cur < arr[j] {
+      arr[j + 1] = arr[j]
+      j = j - 1
+    }
+    arr[j + 1] = cur
+    i = i + 1
+  }
+}
+
+///|
+pub fn cas_parse_depfile(txt : String) -> Option[Array[String]] {
+  // 1. Normalize CRLF -> LF.
+  let crlf_sb = StringBuilder()
+  let raw_n = txt.length()
+  let mut ri = 0
+  while ri < raw_n {
+    let ch = str_code_at(txt, ri)
+    if ch == 13 && ri + 1 < raw_n && str_code_at(txt, ri + 1) == 10 {
+      crlf_sb.write_char('\n')
+      ri = ri + 2
+    } else {
+      crlf_sb.write_string(slice_str(txt, ri, ri + 1))
+      ri = ri + 1
+    }
+  }
+  let lf_txt = crlf_sb.to_string()
+
+  // 2. Collapse backslash-newline continuations into a single space.
+  let cont_sb = StringBuilder()
+  let lf_n = lf_txt.length()
+  let mut ci = 0
+  while ci < lf_n {
+    if str_code_at(lf_txt, ci) == 92 &&
+      ci + 1 < lf_n &&
+      str_code_at(lf_txt, ci + 1) == 10 {
+      cont_sb.write_char(' ')
+      ci = ci + 2
+    } else {
+      cont_sb.write_string(slice_str(lf_txt, ci, ci + 1))
+      ci = ci + 1
+    }
+  }
+  let norm = cont_sb.to_string()
+  let n = norm.length()
+
+  // 3. Locate the true `:` target separator (skipping `\:` and Windows drive colons like `C:\` / `C:/`).
+  let mut colon_pos = -1
+  let mut has_target = false
+  let mut i = 0
+  while i < n {
+    let ch = str_code_at(norm, i)
+    if ch == 10 {
+      if has_target {
+        // Line ended before any `:` separator -> malformed depfile.
+        return None
+      }
+      i = i + 1
+      continue
+    }
+    if ch == 92 && i + 1 < n {
+      let nxt = str_code_at(norm, i + 1)
+      if nxt == 58 || nxt == 32 || nxt == 9 || nxt == 35 {
+        has_target = true
+        i = i + 2
+        continue
+      }
+    }
+    if ch == 58 {
+      let at_sep = i + 1 == n ||
+        str_code_at(norm, i + 1) == 32 ||
+        str_code_at(norm, i + 1) == 9 ||
+        str_code_at(norm, i + 1) == 10
+      if at_sep {
+        colon_pos = i
+        break
+      }
+      has_target = true
+      i = i + 1
+      continue
+    }
+    if ch != 32 && ch != 9 {
+      has_target = true
+    }
+    i = i + 1
+  }
+  if colon_pos < 0 || !has_target {
+    return None
+  }
+
+  // 4. Parse prerequisite paths on the rule line (unescaping `\ `, `\#`, `\:`, `$$`,
+  //    while keeping Windows path backslashes intact).
+  let deps : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  i = colon_pos + 1
+  while i < n {
+    let ch0 = str_code_at(norm, i)
+    if ch0 == 10 {
+      break
+    }
+    if ch0 == 32 || ch0 == 9 {
+      i = i + 1
+      continue
+    }
+    let tok = StringBuilder()
+    while i < n {
+      let ch = str_code_at(norm, i)
+      if ch == 32 || ch == 9 || ch == 10 {
+        break
+      }
+      if ch == 92 && i + 1 < n {
+        let nxt = str_code_at(norm, i + 1)
+        if nxt == 32 {
+          tok.write_char(' ')
+          i = i + 2
+          continue
+        } else if nxt == 35 {
+          tok.write_char('#')
+          i = i + 2
+          continue
+        } else if nxt == 9 {
+          tok.write_char('\t')
+          i = i + 2
+          continue
+        } else if nxt == 58 {
+          tok.write_char(':')
+          i = i + 2
+          continue
+        }
+      }
+      if ch == 36 && i + 1 < n && str_code_at(norm, i + 1) == 36 {
+        tok.write_char('$')
+        i = i + 2
+        continue
+      }
+      tok.write_string(slice_str(norm, i, i + 1))
+      i = i + 1
+    }
+    let dep = tok.to_string()
+    if dep.length() > 0 && !seen.contains(dep) {
+      seen.set(dep, true)
+      deps.push(dep)
+    }
+  }
+  cas_sort_strings(deps)
+  Some(deps)
+}
+
+///|
+pub fn cas_parse_msvc_show_includes(txt : String) -> Array[String] {
+  let prefix = "Note: including file:"
+  let plen = prefix.length()
+  let lines = split_lines(txt)
+  let out : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < lines.length() {
+    let mut line = lines[i]
+    let ln = line.length()
+    if ln > 0 && str_code_at(line, ln - 1) == 13 {
+      line = slice_str(line, 0, ln - 1)
+    }
+    if line.length() >= plen && slice_str(line, 0, plen) == prefix {
+      let mut s = plen
+      let mut e = line.length()
+      while s < e && (str_code_at(line, s) == 32 || str_code_at(line, s) == 9) {
+        s = s + 1
+      }
+      while e > s && (str_code_at(line, e - 1) == 32 || str_code_at(line, e - 1) == 9) {
+        e = e - 1
+      }
+      if e > s {
+        let path = slice_str(line, s, e)
+        if !seen.contains(path) {
+          seen.set(path, true)
+          out.push(path)
+        }
+      }
+    }
+    i = i + 1
+  }
+  cas_sort_strings(out)
+  out
 }
