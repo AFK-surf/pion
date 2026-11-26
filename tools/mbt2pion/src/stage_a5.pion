@@ -936,13 +936,436 @@ pub fn instrument_probes_for_file_with_api_map(
     GeneratedFile::{ rel_path: file, content: content, source_file: file, anchors: [] },
   ])
   let (qvals, qtypes) = collect_qualified_api_names(api_map)
-  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes, Map())
+  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, 0, dvals, dtypes, qvals, qtypes, Map())
 }
 
+fn is_u16_arith_or_bit_raw(r : String) -> Bool {
+  r == "+" || r == "-" || r == "*" || r == "/" || r == "%" ||
+  r == "&" || r == "|" || r == "^" || r == "<<" || r == ">>" || r == "~"
+}
+
+fn is_u16_cmp_raw(r : String) -> Bool {
+  r == "==" || r == "!=" || r == "<" || r == "<=" || r == ">" || r == ">="
+}
+
+fn is_u16_int_lit_0_65535(raw : String) -> Bool {
+  let n = raw.length()
+  if n == 0 { return false }
+  let mut base = 10
+  let mut i = 0
+  if n >= 2 && raw.code_unit_at(0) == 48 {
+    let c1 = raw.code_unit_at(1)
+    if c1 == 120 || c1 == 88 { base = 16; i = 2 }
+    else if c1 == 111 || c1 == 79 { base = 8; i = 2 }
+    else if c1 == 98 || c1 == 66 { base = 2; i = 2 }
+  }
+  let mut acc = 0
+  let mut seen = false
+  while i < n {
+    let c = raw.code_unit_at(i)
+    if c == 95 { i = i + 1; continue }
+    let d = if c >= 48 && c <= 57 { c - 48 }
+    else if c >= 97 && c <= 102 { c - 87 }
+    else if c >= 65 && c <= 70 { c - 55 }
+    else { -1 }
+    if d < 0 || d >= base { return false }
+    seen = true
+    acc = acc * base + d
+    if acc > 65535 { return false }
+    i = i + 1
+  }
+  seen && acc >= 0 && acc <= 65535
+}
+
+fn find_matching_open_delim_back(tokens : Array[Token], close_idx : Int) -> Int {
+  let ck = tokens[close_idx].kind
+  let mut d = 0
+  let mut k = close_idx
+  while k >= 0 {
+    let tk = tokens[k].kind
+    if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+      d = d + 1
+    } else if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+      d = d - 1
+      if d == 0 {
+        if (ck == TokenKind::RParen && tk == TokenKind::LParen) ||
+        (ck == TokenKind::RBracket && tk == TokenKind::LBracket) ||
+        (ck == TokenKind::RBrace && tk == TokenKind::LBrace) {
+          return k
+        }
+        return -1
+      }
+    }
+    k = k - 1
+  }
+  -1
+}
+
+fn find_enclosing_peq_call_span(tokens : Array[Token], recv_start : Int, close_p : Int) -> Option[(Int, Int)] {
+  let n = tokens.length()
+  let mut scan_p = recv_start - 1
+  let mut pd = 0
+  let mut enc_lp = -1
+  while scan_p >= 0 {
+    let tk = tokens[scan_p]
+    if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace {
+      pd = pd + 1
+    } else if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+      if pd == 0 {
+        if tk.kind == TokenKind::LParen { enc_lp = scan_p }
+        break
+      }
+      pd = pd - 1
+    }
+    scan_p = scan_p - 1
+  }
+  if enc_lp < 1 || tokens[enc_lp - 1].raw != "physical_equal" ||
+  (enc_lp >= 2 && (tokens[enc_lp - 2].kind == TokenKind::Dot || tokens[enc_lp - 2].kind == TokenKind::ColonColon)) {
+    return None
+  }
+  let enc_rp = find_matching_delim(tokens, enc_lp)
+  if enc_rp <= close_p || enc_rp >= n {
+    return None
+  }
+  let args : Array[(Int, Int)] = []
+  let mut has_empty_mid = false
+  let mut as_i = enc_lp + 1
+  let mut ad = 0
+  let mut ak = enc_lp + 1
+  while ak <= enc_rp {
+    if ak == enc_rp || (ad == 0 && tokens[ak].kind == TokenKind::Comma) {
+      if ak > as_i {
+        args.push((as_i, ak))
+      } else if ak < enc_rp {
+        has_empty_mid = true
+      }
+      as_i = ak + 1
+    } else {
+      let kk = tokens[ak].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { ad = ad + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+    }
+    ak = ak + 1
+  }
+  if !has_empty_mid && args.length() == 2 {
+    let (a0s, a0e) = args[0]
+    let (a1s, a1e) = args[1]
+    if (recv_start == a0s && close_p + 1 == a0e) || (recv_start == a1s && close_p + 1 == a1e) {
+      return Some((tokens[enc_lp - 1].start_byte, tokens[enc_rp].end_byte))
+    }
+  }
+  None
+}
+
+fn is_safe_u16_peer_expr(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  base_byte : Int,
+  proven_str_u16_spans : Map[String, Bool],
+) -> Bool {
+  if s >= e { return false }
+  if e == s + 1 && tokens[s].kind == TokenKind::IntLit {
+    return is_u16_int_lit_0_65535(tokens[s].raw)
+  }
+  if tokens[e - 1].kind == TokenKind::RParen {
+    let lp = find_matching_open_delim_back(tokens, e - 1)
+    if lp == s + 3 && tokens[s].raw == "mbt_compat" &&
+    tokens[s + 1].kind == TokenKind::ColonColon && tokens[s + 2].raw == "utf16_code_unit_at" {
+      return true
+    }
+  }
+  let span_key = (base_byte + tokens[s].start_byte).to_string() + ":" + (base_byte + tokens[e - 1].end_byte).to_string()
+  proven_str_u16_spans.contains(span_key)
+}
+
+fn is_safe_code_unit_at_context(
+  tokens : Array[Token],
+  recv_start : Int,
+  close_p : Int,
+  file_idx : Int,
+  base_byte : Int,
+  proven_str_u16_spans : Map[String, Bool],
+  proven_builtin_peq_all : Map[String, Bool],
+) -> Bool {
+  let n = tokens.length()
+  // Context A1: immediate safe widening/conversion/compare method chain
+  if close_p + 3 < n && tokens[close_p + 1].kind == TokenKind::Dot &&
+  tokens[close_p + 2].kind == TokenKind::Ident && tokens[close_p + 3].kind == TokenKind::LParen &&
+  !tokens[close_p + 3].newline_before {
+    let m = tokens[close_p + 2].raw
+    if (m == "to_int" || m == "to_uint" || m == "to_int64" || m == "to_uint64" || m == "to_byte" || m == "to_string") &&
+    close_p + 4 < n && tokens[close_p + 4].kind == TokenKind::RParen {
+      return true
+    }
+    if m == "compare" {
+      let cmp_rp = find_matching_delim(tokens, close_p + 3)
+      if cmp_rp > close_p + 4 && cmp_rp < n {
+        let mut arg_count = 0
+        let mut has_empty_mid = false
+        let mut a_s = close_p + 4
+        let mut a_e = -1
+        let mut seg_s = close_p + 4
+        let mut d = 0
+        let mut k = close_p + 4
+        while k <= cmp_rp {
+          if k == cmp_rp || (d == 0 && tokens[k].kind == TokenKind::Comma) {
+            if k > seg_s {
+              arg_count = arg_count + 1
+              if arg_count == 1 {
+                a_s = seg_s
+                a_e = k
+              }
+            } else if k < cmp_rp {
+              has_empty_mid = true
+            }
+            seg_s = k + 1
+          } else {
+            let kk = tokens[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+            else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+          }
+          k = k + 1
+        }
+        if !has_empty_mid && arg_count == 1 && is_safe_u16_peer_expr(tokens, a_s, a_e, base_byte, proven_str_u16_spans) {
+          return true
+        }
+      }
+    }
+  }
+  // Context A2: sole argument of `<peer>.compare(<site>)` with safe peer receiver
+  if recv_start >= 4 && tokens[recv_start - 1].kind == TokenKind::LParen &&
+  !tokens[recv_start - 1].newline_before &&
+  tokens[recv_start - 2].kind == TokenKind::Ident && tokens[recv_start - 2].raw == "compare" &&
+  tokens[recv_start - 3].kind == TokenKind::Dot &&
+  close_p + 1 < n && tokens[close_p + 1].kind == TokenKind::RParen {
+    let cmp_recv_s = find_receiver_start(tokens, recv_start - 4)
+    if cmp_recv_s >= 0 && is_safe_u16_peer_expr(tokens, cmp_recv_s, recv_start - 3, base_byte, proven_str_u16_spans) {
+      return true
+    }
+  }
+  // For Context B/C, the site itself must not be directly adjacent to arithmetic/bitwise/postfix ops
+  if recv_start > 0 && is_u16_arith_or_bit_raw(tokens[recv_start - 1].raw) {
+    return false
+  }
+  if close_p + 1 < n {
+    let nxt = tokens[close_p + 1]
+    if is_u16_arith_or_bit_raw(nxt.raw) || nxt.kind == TokenKind::Dot ||
+    nxt.kind == TokenKind::LBracket || nxt.kind == TokenKind::LParen {
+      return false
+    }
+  }
+  // Context B1: `<site> <cmp> <peer>`
+  if close_p + 2 < n && is_u16_cmp_raw(tokens[close_p + 1].raw) {
+    let ps = close_p + 2
+    let mut pe = ps
+    let mut d = 0
+    while pe < n {
+      let tk = tokens[pe]
+      if tk.kind == TokenKind::Eof { break }
+      if d == 0 {
+        if tk.kind == TokenKind::Comma || tk.kind == TokenKind::RParen ||
+        tk.kind == TokenKind::RBracket || tk.kind == TokenKind::LBrace || tk.kind == TokenKind::RBrace ||
+        tk.kind == TokenKind::Semi || tk.kind == TokenKind::FatArrow ||
+        tk.raw == "&&" || tk.raw == "||" || is_u16_cmp_raw(tk.raw) ||
+        (pe > ps && tk.newline_before && !is_u16_arith_or_bit_raw(tk.raw) && tk.kind != TokenKind::Dot) ||
+        (tk.kind == TokenKind::Keyword && (tk.raw == "else" || tk.raw == "in" || tk.raw == "as")) {
+          break
+        }
+      }
+      if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { d = d + 1 }
+      else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      pe = pe + 1
+    }
+    if is_safe_u16_peer_expr(tokens, ps, pe, base_byte, proven_str_u16_spans) {
+      return true
+    }
+  }
+  // Context B2: `<peer> <cmp> <site>`
+  if recv_start >= 2 && is_u16_cmp_raw(tokens[recv_start - 1].raw) {
+    let pe = recv_start - 1
+    let mut ps = pe
+    let mut d = 0
+    while ps > 0 {
+      let tk = tokens[ps - 1]
+      if d == 0 {
+        if tk.kind == TokenKind::Comma || tk.kind == TokenKind::LParen ||
+        tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace ||
+        tk.kind == TokenKind::Semi || tk.kind == TokenKind::FatArrow ||
+        tk.raw == "&&" || tk.raw == "||" || tk.raw == "=" || is_u16_cmp_raw(tk.raw) ||
+        (tk.kind == TokenKind::Keyword && (tk.raw == "if" || tk.raw == "while" || tk.raw == "return" || tk.raw == "else" || tk.raw == "let")) {
+          break
+        }
+      }
+      if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { d = d + 1 }
+      else if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { if d > 0 { d = d - 1 } }
+      ps = ps - 1
+    }
+    if is_safe_u16_peer_expr(tokens, ps, pe, base_byte, proven_str_u16_spans) {
+      return true
+    }
+  }
+  // Context C: direct argument to unshadowed `physical_equal(arg0, arg1)` or `mbt_compat::int_compare(arg0, arg1)`
+  let mut scan_p = recv_start - 1
+  let mut pd = 0
+  let mut enc_lp = -1
+  while scan_p >= 0 {
+    let tk = tokens[scan_p]
+    if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace {
+      pd = pd + 1
+    } else if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+      if pd == 0 {
+        if tk.kind == TokenKind::LParen { enc_lp = scan_p }
+        break
+      }
+      pd = pd - 1
+    }
+    scan_p = scan_p - 1
+  }
+  let enc_rp_peq = if enc_lp >= 0 { find_matching_delim(tokens, enc_lp) } else { -1 }
+  let peq_span_key = if enc_lp >= 1 && enc_rp_peq > close_p && enc_rp_peq < n {
+    file_idx.to_string() + "_" + (base_byte + tokens[enc_lp - 1].start_byte).to_string() + "_" + (base_byte + tokens[enc_rp_peq].end_byte).to_string()
+  } else {
+    ""
+  }
+  let is_peq_call = enc_lp >= 1 && tokens[enc_lp - 1].raw == "physical_equal" &&
+  !(enc_lp >= 2 && (tokens[enc_lp - 2].kind == TokenKind::Dot || tokens[enc_lp - 2].kind == TokenKind::ColonColon)) &&
+  peq_span_key.length() > 0 && proven_builtin_peq_all.contains(peq_span_key)
+  let is_mbt_int_cmp_call = enc_lp >= 3 && tokens[enc_lp - 1].raw == "int_compare" &&
+  tokens[enc_lp - 2].kind == TokenKind::ColonColon && tokens[enc_lp - 3].raw == "mbt_compat" &&
+  !(enc_lp >= 4 && (tokens[enc_lp - 4].kind == TokenKind::Dot || tokens[enc_lp - 4].kind == TokenKind::ColonColon))
+  if is_peq_call || is_mbt_int_cmp_call {
+    let enc_rp = enc_rp_peq
+    if enc_rp > close_p && enc_rp < n {
+      let args : Array[(Int, Int)] = []
+      let mut has_empty_mid = false
+      let mut as_i = enc_lp + 1
+      let mut ad = 0
+      let mut ak = enc_lp + 1
+      while ak <= enc_rp {
+        if ak == enc_rp || (ad == 0 && tokens[ak].kind == TokenKind::Comma) {
+          if ak > as_i {
+            args.push((as_i, ak))
+          } else if ak < enc_rp {
+            has_empty_mid = true
+          }
+          as_i = ak + 1
+        } else {
+          let kk = tokens[ak].kind
+          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { ad = ad + 1 }
+          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+        }
+        ak = ak + 1
+      }
+      if !has_empty_mid && args.length() == 2 {
+        let (a0s, a0e) = args[0]
+        let (a1s, a1e) = args[1]
+        if recv_start == a0s && close_p + 1 == a0e && is_safe_u16_peer_expr(tokens, a1s, a1e, base_byte, proven_str_u16_spans) {
+          return true
+        }
+        if recv_start == a1s && close_p + 1 == a1e && is_safe_u16_peer_expr(tokens, a0s, a0e, base_byte, proven_str_u16_spans) {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+///| Invariant: `file_idx` is the 0-based index of this file in the current round's `cur_files`;
+///| instrumentation and recovery passes must iterate `cur_files` in identical order.
+fn is_safe_code_unit_at_site_in_file(
+  file_tokens : Array[Token],
+  file_idx : Int,
+  start_byte : Int,
+  end_byte : Int,
+  proven_str_u16_spans : Map[String, Bool],
+  proven_builtin_peq_all : Map[String, Bool],
+) -> Bool {
+  let n = file_tokens.length() - 1
+  let mut recv_start = -1
+  let mut close_p = -1
+  let mut k = 0
+  while k < n {
+    if file_tokens[k].start_byte == start_byte && recv_start < 0 {
+      recv_start = k
+    }
+    if file_tokens[k].end_byte == end_byte {
+      close_p = k
+      break
+    }
+    if file_tokens[k].start_byte > end_byte {
+      break
+    }
+    k = k + 1
+  }
+  if recv_start >= 0 && close_p >= recv_start {
+    return is_safe_code_unit_at_context(
+      file_tokens,
+      recv_start,
+      close_p,
+      file_idx,
+      0,
+      proven_str_u16_spans,
+      proven_builtin_peq_all,
+    )
+  }
+  // Fallback for sites inside an interpolated string `"...\{expr}..."`
+  let mut ti = 0
+  while ti < n {
+    let t = file_tokens[ti]
+    if (t.kind == TokenKind::InterpString || (t.kind == TokenKind::InterpMultiline && t.raw.starts_with("$|"))) &&
+    t.start_byte <= start_byte && end_byte <= t.end_byte {
+      let is_ml = t.kind == TokenKind::InterpMultiline
+      let parts = split_interp_string(t.raw, is_ml)
+      let mut part_off = t.start_byte + (if is_ml { 2 } else { 1 })
+      for p in parts {
+        if !p.is_expr {
+          part_off = part_off + p.text.length()
+        } else {
+          let expr_start = part_off + 2
+          let expr_end = expr_start + p.text.length()
+          if expr_start <= start_byte && end_byte <= expr_end {
+            let inner_toks = lex_moonbit(p.text)
+            let in_n = inner_toks.length() - 1
+            let mut rs = -1
+            let mut cp = -1
+            let mut ik = 0
+            while ik < in_n {
+              if expr_start + inner_toks[ik].start_byte == start_byte && rs < 0 { rs = ik }
+              if expr_start + inner_toks[ik].end_byte == end_byte { cp = ik; break }
+              ik = ik + 1
+            }
+            if rs >= 0 && cp >= rs {
+              return is_safe_code_unit_at_context(
+                inner_toks,
+                rs,
+                cp,
+                file_idx,
+                expr_start,
+                proven_str_u16_spans,
+                proven_builtin_peq_all,
+              )
+            }
+            return false
+          }
+          part_off = expr_end + 1
+        }
+      }
+      return false
+    }
+    ti = ti + 1
+  }
+  false
+}
+
+///| Invariant: `file_idx` is the 0-based index of this file in the current round's `cur_files`;
+///| instrumentation and recovery passes must iterate `cur_files` in identical order.
 fn instrument_probes_for_file_with_safe(
   file : String,
   content : String,
   safe_offsets : Map[Int, Bool],
+  file_idx : Int,
   base_offset : Int,
   declared_values : Map[String, Bool],
   declared_types : Map[String, Bool],
@@ -954,6 +1377,7 @@ fn instrument_probes_for_file_with_safe(
   let n = tokens.length() - 1
   let sites : Array[ProbeSite] = []
   let edits : Array[(Int, Int, String)] = []
+  let peq_wrapped : Map[String, Bool] = Map()
   let mut covered_end = 0
   let mut slice_only_pass = false
   if str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow") ||
@@ -1227,6 +1651,7 @@ fn instrument_probes_for_file_with_safe(
             file,
             arg_txt,
             safe_offsets,
+            file_idx,
             base_offset + asb,
             declared_values,
             declared_types,
@@ -1409,6 +1834,7 @@ fn instrument_probes_for_file_with_safe(
             file,
             p.text,
             safe_offsets,
+            file_idx,
             base_offset + expr_start_byte,
             declared_values,
             declared_types,
@@ -1528,6 +1954,90 @@ fn instrument_probes_for_file_with_safe(
         edits.push((start_b, end_b, recv_expr + ".mbt_len_probe()"))
         covered_end = end_b
         i = i + 4
+        continue
+      }
+    }
+
+    // 1b. `<recv>.code_unit_at(<idx>)` -> `<recv>.mbt_code_unit_at_probe(<idx>)`
+    //     Routes `String::code_unit_at(i)` to `mbt_compat::utf16_code_unit_at_u16(s, i)`
+    //     while leaving non-`String` receivers (e.g. `Bytes`) intact.
+    if t.kind == TokenKind::Dot && i + 3 < n &&
+    tokens[i + 1].raw == "code_unit_at" &&
+    tokens[i + 2].kind == TokenKind::LParen {
+      let op_b = base_offset + tokens[i + 1].start_byte
+      let close_p = find_matching_delim(tokens, i + 2)
+      let recv_start = find_receiver_start(tokens, i - 1)
+      let mut arg_count = 0
+      let mut has_empty_mid = false
+      let mut arg_s = i + 3
+      let mut arg_e = -1
+      if close_p > i + 3 {
+        let mut seg_s = i + 3
+        let mut d = 0
+        let mut k = i + 3
+        while k <= close_p {
+          if k == close_p || (d == 0 && tokens[k].kind == TokenKind::Comma) {
+            if k > seg_s {
+              arg_count = arg_count + 1
+              if arg_count == 1 {
+                arg_s = seg_s
+                arg_e = k
+              }
+            } else if k < close_p {
+              has_empty_mid = true
+            }
+            seg_s = k + 1
+          } else {
+            let kk = tokens[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+              d = d + 1
+            } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+              if d > 0 { d = d - 1 }
+            }
+          }
+          k = k + 1
+        }
+      }
+      if !safe_offsets.contains(op_b) && !has_empty_mid && arg_count == 1 && arg_e > arg_s &&
+      recv_start >= 0 && tokens[recv_start].start_byte >= covered_end &&
+      !is_non_expr_receiver(tokens, recv_start) {
+        let start_b = tokens[recv_start].start_byte
+        let end_b = tokens[close_p].end_byte
+        let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        let arg_expr = content.slice(tokens[arg_s].start_byte, tokens[arg_e - 1].end_byte).trim()
+        sites.push(ProbeSite::{
+          probe_id: "",
+          file: file,
+          probe_kind: "mbt_code_unit_at_probe",
+          start_byte: start_b,
+          end_byte: end_b,
+          op_byte: op_b,
+          line: tokens[i + 1].line,
+          col: tokens[i + 1].col,
+          lhs_expr: recv_expr,
+          rhs_expr: arg_expr,
+          assign_op: "",
+          slice_hi: "",
+          divisor_is_zero: false,
+          rhs_has_lit: false,
+          rhs_is_neg: false,
+          rhs_u64: 0UL,
+          rhs_overflow: false,
+        })
+        edits.push((start_b, end_b, recv_expr + ".mbt_code_unit_at_probe(" + arg_expr + ")"))
+        match find_enclosing_peq_call_span(tokens, recv_start, close_p) {
+          Some((peq_s, peq_e)) => {
+            let peq_key = file_idx.to_string() + "_" + (base_offset + peq_s).to_string() + "_" + (base_offset + peq_e).to_string()
+            if !peq_wrapped.contains(peq_key) {
+              peq_wrapped[peq_key] = true
+              edits.push((peq_s, peq_s, "({ let _ = physical_equal(mbt_peq_probe__" + peq_key + "=0, 0); "))
+              edits.push((peq_e, peq_e, " })"))
+            }
+          }
+          None => ()
+        }
+        covered_end = end_b
+        i = close_p + 1
         continue
       }
     }
@@ -2092,6 +2602,43 @@ fn rewrite_for_probe_hygienic(
     if resolved_type.starts_with("ArrayView[") || resolved_type.starts_with("mbt_compat::ArrayView[") ||
     resolved_type.starts_with("ArrayBuf[") || resolved_type.starts_with("mbt_compat::ArrayBuf[") {
       return Some(site.lhs_expr + ".get(" + site.rhs_expr + ")")
+    }
+    return None
+  }
+
+  if site.probe_kind == "mbt_code_unit_at_probe" {
+    if resolved_type == "String" {
+      if site.assign_op != "safe_u16" {
+        diags.push(diag_error(
+          "MBT2PION_UINT16_ESCAPE",
+          site.file,
+          site.line,
+          site.col,
+          "String::code_unit_at(i) in unchecked UInt16 context (arithmetic/binding/escape) is not supported (fail-closed)",
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: "string_utf16_code_unit_at",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: site.lhs_expr + ".code_unit_at(" + site.rhs_expr + ")",
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "String.code_unit_at(i) outside safe UInt16 context",
+        })
+        return None
+      }
+      drift_ledger.push(DriftEntry::{
+        category: "string_utf16_code_unit_at",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: site.lhs_expr + ".code_unit_at(" + site.rhs_expr + ")",
+        resolution: "mbt_compat::utf16_code_unit_at",
+        status: "resolved",
+        detail: "String.code_unit_at(i) routed to UTF-16 code unit access",
+      })
+      return Some("mbt_compat::utf16_code_unit_at(" + site.lhs_expr + ", " + site.rhs_expr + ")")
     }
     return None
   }
@@ -2907,6 +3454,7 @@ pub fn has_probe_residual(content : String) -> Bool {
     if t.kind == TokenKind::Ident {
       let r = t.raw
       if r.starts_with("mbt_len_probe") ||
+      r.starts_with("mbt_code_unit_at_probe") ||
       r.starts_with("mbt_idx_probe") ||
       r.starts_with("mbt_div_probe") ||
       r.starts_with("mbt_mod_probe") ||
@@ -3101,6 +3649,58 @@ fn audit_undisposed_raw_tokens(
           status: "unresolved",
           detail: "undisposed probe candidate after Stage A.5 (raw-token audit)",
         })
+      }
+    } else if t.kind == TokenKind::Dot && i + 3 < n &&
+    toks[i + 1].raw == "code_unit_at" &&
+    toks[i + 2].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(toks, i + 2)
+      let mut arg_count = 0
+      let mut has_empty_mid = false
+      if close_p > i + 3 {
+        let mut seg_s = i + 3
+        let mut d = 0
+        let mut k = i + 3
+        while k <= close_p {
+          if k == close_p || (d == 0 && toks[k].kind == TokenKind::Comma) {
+            if k > seg_s {
+              arg_count = arg_count + 1
+            } else if k < close_p {
+              has_empty_mid = true
+            }
+            seg_s = k + 1
+          } else {
+            let kk = toks[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+              d = d + 1
+            } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+              if d > 0 { d = d - 1 }
+            }
+          }
+          k = k + 1
+        }
+      }
+      if !has_empty_mid && arg_count == 1 {
+        let op_b = base_offset + toks[i + 1].start_byte
+        if !safe_offsets.contains(op_b) {
+          let ln = if line_offset > 0 { line_offset } else { toks[i + 1].line }
+          diags.push(diag_error(
+            "MBT2PION_UNDISPOSED_PROBE_SITE",
+            file,
+            ln,
+            toks[i + 1].col,
+            "undisposed `.code_unit_at(...)` call remained after Stage A.5",
+          ))
+          drift_ledger.push(DriftEntry::{
+            category: "mbt_code_unit_at_probe",
+            file: file,
+            line: ln,
+            col: toks[i + 1].col,
+            expr: ".code_unit_at(...)",
+            resolution: "blocked",
+            status: "unresolved",
+            detail: "undisposed probe candidate after Stage A.5 (raw-token audit)",
+          })
+        }
       }
     } else if t.kind == TokenKind::Dot && i + 1 < n && toks[i + 1].raw == "val" {
       let op_b = base_offset + toks[i + 1].start_byte
@@ -3823,7 +4423,7 @@ fn run_stage_a5_core(
     let sites_by_file : Map[String, Array[ProbeSite]] = Map()
     let mut round_probes = 0
 
-    for f in cur_files {
+    for fi, f in cur_files {
       let smap = match safe_map_by_file.get(f.rel_path) {
         Some(m) => m
         None => Map()
@@ -3843,6 +4443,7 @@ fn run_stage_a5_core(
         f.rel_path,
         f.content,
         skip_map,
+        fi,
         0,
         declared_values,
         declared_types,
@@ -3891,7 +4492,17 @@ fn run_stage_a5_core(
     let pionc_diags = parse_pionc_diagnostics(raw_json)
 
     let raw_results : Array[ProbeResult] = []
+    let proven_builtin_peq_all : Map[String, Bool] = Map()
+    let peq_marker = "`physical_equal` does not accept named argument `mbt_peq_probe__"
     for pd in pionc_diags {
+      let mi = pd.message.index_of(peq_marker)
+      if mi >= 0 {
+        let rest = pd.message.slice(mi + peq_marker.length(), pd.message.length())
+        let bt = rest.index_of("`")
+        if bt > 0 {
+          proven_builtin_peq_all[rest.slice(0, bt)] = true
+        }
+      }
       match extract_probe_with_id_from_diag(pd) {
         Some((pkind, pid, rty)) =>
         raw_results.push(ProbeResult::{
@@ -3947,7 +4558,7 @@ fn run_stage_a5_core(
     let round_unresolved : Array[(String, String, ProbeSite, Int)] = []
     let mut any_changed = false
     let mut newly_marked_safe = false
-    for f in cur_files {
+    for fi, f in cur_files {
       let sites = match sites_by_file.get(f.rel_path) {
         Some(xs) => xs
         None => []
@@ -3975,6 +4586,9 @@ fn run_stage_a5_core(
       // Lexed at most once per file per round, on the first matched site; each rewrite still gets
       // its own fresh copy because `fresh_stage_b_ident` records the names it allocates.
       let mut file_used_idents_base : Option[Map[String, Bool]] = None
+      let mut file_tokens_opt : Option[Array[Token]] = None
+      let matched_entries : Array[(ProbeSite, Int, Int, String)] = []
+      let proven_str_u16_spans : Map[String, Bool] = Map()
       for site in sites {
         // Compute exact slot index in this `InitItem`'s `probe_origins` list (using structured
         // `InitOriginRecord`s when available so user/redacted `// origin:` comments can never hijack it!)
@@ -4128,52 +4742,92 @@ fn run_stage_a5_core(
           consumed[matched_idx] = true
           total_resolved = total_resolved + 1
           let matched_ty = probe_results[matched_idx].resolved_type
-          if slot_key.length() > 0 && site_slot >= 0 {
-            round_newly_used.push((slot_key, site_slot))
+          if (site.probe_kind == "mbt_idx_probe" || site.probe_kind == "mbt_code_unit_at_probe") && matched_ty == "String" {
+            proven_str_u16_spans[site.start_byte.to_string() + ":" + site.end_byte.to_string()] = true
           }
-          let (disp_file, disp_line, disp_col) = resolve_init_order_origin_structured(init_origins_by_file, f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
-          let file_used_idents = match file_used_idents_base {
-            Some(base) => base.copy()
-            None => {
-              let base = collect_used_idents(f.content)
-              file_used_idents_base = Some(base)
-              base.copy()
-            }
-          }
-          match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
-            Some(repl) => {
-              edits.push((site.start_byte, site.end_byte, repl))
-              remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
-              probe_dispositions.push(ProbeDisposition::{
-                probe_id: site.probe_id,
-                probe_kind: site.probe_kind,
-                file: disp_file,
-                line: disp_line,
-                col: disp_col,
-                resolved_type: matched_ty,
-                disposition: "rewritten",
-              })
-            }
-            None => {
-              if !smap.contains(site.op_byte) {
-                smap[site.op_byte] = true
-                slist.push(site.op_byte)
-                newly_marked_safe = true
-              }
-              probe_dispositions.push(ProbeDisposition::{
-                probe_id: site.probe_id,
-                probe_kind: site.probe_kind,
-                file: disp_file,
-                line: disp_line,
-                col: disp_col,
-                resolved_type: matched_ty,
-                disposition: "kept_safe",
-              })
-            }
-          }
+          matched_entries.push((site, matched_idx, site_slot, slot_key))
         } else {
           // Defer unresolved probe reporting until fixpoint so cascading probes can resolve in the next round.
           round_unresolved.push((f.rel_path, f.content, site, site_slot))
+        }
+      }
+      for entry in matched_entries {
+        let (raw_site, matched_idx, site_slot, slot_key) = entry
+        let matched_ty = probe_results[matched_idx].resolved_type
+        let site = if raw_site.probe_kind == "mbt_code_unit_at_probe" && matched_ty == "String" {
+          let ftoks = match file_tokens_opt {
+            Some(ts) => ts
+            None => {
+              let ts = lex_moonbit(f.content)
+              file_tokens_opt = Some(ts)
+              ts
+            }
+          }
+          let safe_u16 = is_safe_code_unit_at_site_in_file(ftoks, fi, raw_site.start_byte, raw_site.end_byte, proven_str_u16_spans, proven_builtin_peq_all)
+          ProbeSite::{
+            probe_id: raw_site.probe_id,
+            file: raw_site.file,
+            probe_kind: raw_site.probe_kind,
+            start_byte: raw_site.start_byte,
+            end_byte: raw_site.end_byte,
+            op_byte: raw_site.op_byte,
+            line: raw_site.line,
+            col: raw_site.col,
+            lhs_expr: raw_site.lhs_expr,
+            rhs_expr: raw_site.rhs_expr,
+            assign_op: if safe_u16 { "safe_u16" } else { "" },
+            slice_hi: raw_site.slice_hi,
+            divisor_is_zero: raw_site.divisor_is_zero,
+            rhs_has_lit: raw_site.rhs_has_lit,
+            rhs_is_neg: raw_site.rhs_is_neg,
+            rhs_u64: raw_site.rhs_u64,
+            rhs_overflow: raw_site.rhs_overflow,
+          }
+        } else {
+          raw_site
+        }
+        if slot_key.length() > 0 && site_slot >= 0 {
+          round_newly_used.push((slot_key, site_slot))
+        }
+        let (disp_file, disp_line, disp_col) = resolve_init_order_origin_structured(init_origins_by_file, f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
+        let file_used_idents = match file_used_idents_base {
+          Some(base) => base.copy()
+          None => {
+            let base = collect_used_idents(f.content)
+            file_used_idents_base = Some(base)
+            base.copy()
+          }
+        }
+        match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
+          Some(repl) => {
+            edits.push((site.start_byte, site.end_byte, repl))
+            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+            probe_dispositions.push(ProbeDisposition::{
+              probe_id: site.probe_id,
+              probe_kind: site.probe_kind,
+              file: disp_file,
+              line: disp_line,
+              col: disp_col,
+              resolved_type: matched_ty,
+              disposition: "rewritten",
+            })
+          }
+          None => {
+            if !smap.contains(site.op_byte) {
+              smap[site.op_byte] = true
+              slist.push(site.op_byte)
+              newly_marked_safe = true
+            }
+            probe_dispositions.push(ProbeDisposition::{
+              probe_id: site.probe_id,
+              probe_kind: site.probe_kind,
+              file: disp_file,
+              line: disp_line,
+              col: disp_col,
+              resolved_type: matched_ty,
+              disposition: "kept_safe",
+            })
+          }
         }
       }
       for nu in round_newly_used {
