@@ -18901,3 +18901,180 @@ test "wave_aa1_wasm_opt_unit_checks" {
     "hot local must be reordered into 1-byte LEB slot < 128 (max 1-byte local.get count=" + hot_1b_gets.to_string() + ")",
   )
 }
+
+///|
+/// Pre-index reference: per-call linear scan over one type checker's methods and
+/// impls (what `qbe_any_method_has_ret_default` did before `qbe_ret_default_methods`).
+fn rdm_ref_tc_has(tc : TypeChecker, mname : String) -> Bool {
+  let mut i = 0
+  while i < tc.method_names.length() {
+    let mk = tc.method_names[i]
+    if qbe_method_key_matches(mk, mname) {
+      match tc.methods.get(mk) {
+        Some(mi) => if qbe_params_have_ret_default(mi.decl.params) { return true }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < tc.impl_keys.length() {
+    match tc.impls.get(tc.impl_keys[i]) {
+      Some(ii) =>
+        match ii.methods.get(mname) {
+          Some(mi) => if qbe_params_have_ret_default(mi.decl.params) { return true }
+          None => ()
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn rdm_ref_any(g : QbeGen, mname : String) -> Bool {
+  if rdm_ref_tc_has(g.tc, mname) {
+    return true
+  }
+  let mut pi = 0
+  while pi < g.tc.all_imported_pkg_names.length() {
+    match g.tc.all_imported_pkgs.get(g.tc.all_imported_pkg_names[pi]) {
+      Some(ipkg) => if rdm_ref_tc_has(ipkg.tc, mname) { return true }
+      None => ()
+    }
+    pi = pi + 1
+  }
+  false
+}
+
+///|
+fn rdm_add_probes(tc : TypeChecker, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < tc.method_names.length() {
+    let mk = tc.method_names[i]
+    out.push(mk)
+    let mut p = 0
+    while p <= mk.length() {
+      out.push(slice_str(mk, p, mk.length()))
+      p = p + 1
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < tc.impl_keys.length() {
+    match tc.impls.get(tc.impl_keys[i]) {
+      Some(ii) => {
+        let ks = ii.methods.keys()
+        let mut j = 0
+        while j < ks.length() {
+          out.push(ks[j])
+          out.push("::" + ks[j])
+          j = j + 1
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn rdm_call_args(tc : TypeChecker, fname : String) -> Array[Array[Expr]] {
+  let out : Array[Array[Expr]] = []
+  match tc.fns.get(fname) {
+    Some(fi) => {
+      let mut i = 0
+      while i < fi.decl.body.length() {
+        match fi.decl.body[i] {
+          SLet(_, _, _, ECall(_, args, _), _) => out.push(args)
+          _ => ()
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  out
+}
+
+///|
+test "rdm: indexed qbe_any_method_has_ret_default and guard shortcuts match the per-call scan" {
+  let dep_cr = check_source_files_with_imports(
+    "dep",
+    ["dep.pion"],
+    [
+      "pub struct D { pub v : Int }\n" +
+      "pub fn D::early(self : D, go : Bool, y~ : Int = if go { dep_calc() } else { 2 }) -> Int { self.v + y }\n" +
+      "pub fn D::plain(self : D, y~ : Int = 3) -> Int { self.v + y }\n" +
+      "pub fn dep_calc() -> Int { 5 }\n" +
+      "pub trait Tr {\n  fn tm(self : Self) -> Int\n  fn tq(self : Self) -> Int\n}\n" +
+      "impl Tr for D {\n  fn tm(self : D) -> Int { self.v }\n  fn tq(self : D) -> Int { self.v + 1 }\n}\n",
+    ],
+    [],
+    true,
+  )
+  assert_true(dep_cr.diagnostics.length() == 0, check_result_to_json(dep_cr.diagnostics))
+  let dep = imported_pkg_new("dep", dep_cr.tc)
+  let src = "import \"dep\"\n" +
+    "struct L { v : Int }\n" +
+    "fn helper() -> Int { 4 }\n" +
+    "fn L::lret(self : L, y~ : Int = helper()) -> Int { self.v + y }\n" +
+    "fn L::lplain(self : L) -> Int { self.v }\n" +
+    "fn L::lnone(self : L, y~ : Int = 9) -> Int { self.v + y }\n" +
+    "trait Ar {\n  fn am(self : Self, k : Int) -> Int\n}\n" +
+    "impl Ar for L {\n  fn am(self : L, k : Int) -> Int { self.v + k }\n}\n" +
+    "fn sink(a : Int, b : Int, c : Int, d : Int) -> Int { a + b + c + d }\n" +
+    "fn probe(o : dep::D, l : L, r : Result[Int, String]) -> Result[Int, String] {\n" +
+    "  let a = sink(l.lplain(), o.plain(), 1 + 2, l.lnone())\n" +
+    "  let b = sink(l.lplain(), o.early(true), 3, 4)\n" +
+    "  let c = sink(r?, 1, 2, l.lplain())\n" +
+    "  let d = sink(1, 2, 3, l.lret())\n" +
+    "  let e = sink(l.lret(), 2, 3, 4)\n" +
+    "  let f = sink(1, l.am(2), 3, o.tm())\n" +
+    "  Ok(a + b + c + d + e + f)\n" +
+    "}\n"
+  let cr = check_source_files_with_imports("app", ["app.pion"], [src], [dep], true)
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let g = qbe_new_for_target_name(cr.tc, false, false, false, "")
+  let probes : Array[String] = ["", "::", "early", "plain", "lret", "lplain", "lnone", "tm", "tq", "am", "nope", "D::early", "L::lret"]
+  rdm_add_probes(cr.tc, probes)
+  rdm_add_probes(dep_cr.tc, probes)
+  let mut n_true = 0
+  let mut i = 0
+  while i < probes.length() {
+    let want = rdm_ref_any(g, probes[i])
+    assert_eq(qbe_any_method_has_ret_default(g, probes[i]), want)
+    if want {
+      n_true = n_true + 1
+    }
+    i = i + 1
+  }
+  // Defaults that call (same package and cross package) are both seen.
+  assert_true(qbe_any_method_has_ret_default(g, "lret"), "lret")
+  assert_true(qbe_any_method_has_ret_default(g, "early"), "early")
+  assert_true(!qbe_any_method_has_ret_default(g, "plain"), "plain")
+  assert_true(!qbe_any_method_has_ret_default(g, "lnone"), "lnone")
+  assert_true(!qbe_any_method_has_ret_default(g, "tm"), "tm")
+  assert_true(n_true > 0, "n_true")
+
+  let calls = rdm_call_args(cr.tc, "probe")
+  assert_eq(calls.length(), 6)
+  let want_exit = [false, true, true, true, true, false]
+  let mut ci = 0
+  while ci < calls.length() {
+    let args = calls[ci]
+    assert_eq(qbe_guards_any_exit(g, args), want_exit[ci])
+    let gs = qbe_arg_guards_in_order(g, args)
+    assert_eq(qbe_guards_exit_before_all(g, gs, args), qbe_guards_any_exit(g, args))
+    let orders : Array[Array[Int]] = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [0, 0, 1, 2], [0, 1, 2]]
+    let mut oi = 0
+    while oi < orders.length() {
+      let ord = orders[oi]
+      let ogs = if ord.length() == args.length() { qbe_arg_guards(g, args, ord) } else { gs }
+      assert_eq(qbe_guards_exit_before_order(g, ogs, args, ord), qbe_guards_any_exit(g, args))
+      oi = oi + 1
+    }
+    ci = ci + 1
+  }
+}
