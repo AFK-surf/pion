@@ -453,15 +453,28 @@ def main():
             "MBT2PION_UNSUPPORTED_SYNTAX",
         )
 
-        # 4d. Tampered `structs` sidecar & ghost struct sidecar rejected (P1-2)
+        # 4d. Tampered `structs` sidecar (valid JSON with flipped `is_mut`, NOT truncated!) & ghost struct sidecar rejected (P1-2 + Astra #4)
         p_orig_tamp = os.path.join(work, "p_orig_tamp")
         shutil.copytree(p_orig, p_orig_tamp)
         abi_p = os.path.join(p_orig_tamp, "src", "mbt2pion_abi.json")
-        open(abi_p, "w").write(open(abi_p).read().replace('"is_mut":true', '"is_mut":false'))
+        abi_data = json.load(open(abi_p))
+        flipped = False
+        for st in abi_data["payload"]["structs"]:
+            for fld in st["fields"]:
+                if fld["is_mut"] is True:
+                    fld["is_mut"] = False
+                    flipped = True
+                    break
+            if flipped:
+                break
+        assert flipped, "expected at least one mutable field in f43orig ABI structs"
+        with open(abi_p, "w") as fh:
+            json.dump(abi_data, fh, separators=(",", ":"))
+        assert json.load(open(abi_p))["payload"]["structs"], "tampered ABI must remain valid JSON"
         assert_publish_blocked(
             bin_path, args.pionc, work, "tampered_structs",
             "pub fn f(b : @f43orig.Buffer) -> Int { b.cap }\n",
-            "MBT2PION_DEP_ABI_ERROR",
+            "tampered `mbt2pion_abi.json`",
             ["--dep", f"f43orig={p_orig_tamp}"],
         )
         p_ghost = os.path.join(work, "p_ghost")
