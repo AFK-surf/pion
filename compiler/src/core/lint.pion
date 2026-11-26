@@ -1193,35 +1193,50 @@ fn lint_check_imports(
   tc : TypeChecker,
   raw_sources : Map[String, String],
   idx_cache : Map[String, LintFileIndex],
-  extra_import_files : Array[SourceFile],
+  active_extra_files : Array[SourceFile],
+  inactive_target_files : Array[SourceFile],
+  file_target_preds : Map[String, String],
   extra_files_incomplete : Bool,
   out : Array[Diagnostic],
 ) -> Unit {
-  let all_files : Array[SourceFile] = []
+  let active_files : Array[SourceFile] = []
   let mut fi = 0
   while fi < pkg.files.length() {
-    all_files.push(pkg.files[fi])
+    active_files.push(pkg.files[fi])
     fi = fi + 1
   }
   fi = 0
-  while fi < extra_import_files.length() {
-    all_files.push(extra_import_files[fi])
+  while fi < active_extra_files.length() {
+    active_files.push(active_extra_files[fi])
     fi = fi + 1
   }
 
-  // 1. Build package-wide alias -> path map, valid alias set, and conflict flags.
+  // 1. Build active-target alias -> path map, conflict flags, and declaring
+  //    `[targets]` predicate sets. Inactive `[targets]` files do NOT pollute
+  //    active-target `alias_conflict` (mutually exclusive targets may bind the
+  //    same alias to different packages).
   let alias_path : Map[String, String] = Map([])
   let alias_conflict : Map[String, Bool] = Map([])
   let known_aliases : Map[String, String] = Map([])
+  let alias_has_uncond_decl : Map[String, Bool] = Map([])
+  let alias_decl_preds : Map[String, Bool] = Map([])
   fi = 0
-  while fi < all_files.length() {
-    let f = all_files[fi]
+  while fi < active_files.length() {
+    let f = active_files[fi]
+    let f_pred = match file_target_preds.get(f.path) {
+      Some(p) => p
+      None => "*"
+    }
     let mut ii = 0
     while ii < f.imports.length() {
       let imp = f.imports[ii]
       if tc.import_aliases.contains(imp.alias_name) {
         known_aliases.set(imp.alias_name, imp.path)
       }
+      if f_pred == "*" {
+        alias_has_uncond_decl.set(imp.alias_name, true)
+      }
+      alias_decl_preds.set(imp.alias_name + "\n" + f_pred, true)
       match alias_path.get(imp.alias_name) {
         Some(prev_path) =>
           if prev_path != imp.path {
@@ -1234,16 +1249,16 @@ fn lint_check_imports(
     fi = fi + 1
   }
 
-  // 2. Scan every file in the package (active + extra/inactive `[targets]`) for
-  //    external alias usage. Inactive files ONLY protect active unused imports
-  //    from deletion — they NEVER receive cross-target L_IMPLICIT_IMPORT edits.
+  // 2. Scan active files AND inactive `[targets]` files for external alias usage.
+  //    Active extra files (e.g. `*_test.pion`) protect imports without being
+  //    mislabeled as inactive target files; inactive `[targets]` files ONLY
+  //    protect active unused imports from deletion.
   let usages : Array[LintImportUsage] = []
   let pkg_has_implicit_user : Map[String, Bool] = Map([])
   let inactive_implicit_user : Map[String, String] = Map([])
   fi = 0
-  while fi < all_files.length() {
-    let is_active_file = fi < pkg.files.length()
-    let f = all_files[fi]
+  while fi < active_files.length() {
+    let f = active_files[fi]
     let u = lint_scan_imports_file(tc.import_aliases, f)
     usages.push(u)
     let declared : Map[String, Bool] = Map([])
@@ -1257,7 +1272,27 @@ fn lint_check_imports(
       let al = u.used_order[ui]
       if !declared.contains(al) {
         pkg_has_implicit_user.set(al, true)
-        if !is_active_file && !inactive_implicit_user.contains(al) {
+      }
+      ui = ui + 1
+    }
+    fi = fi + 1
+  }
+  fi = 0
+  while fi < inactive_target_files.length() {
+    let f = inactive_target_files[fi]
+    let u = lint_scan_imports_file(tc.import_aliases, f)
+    let declared : Map[String, Bool] = Map([])
+    let mut ii = 0
+    while ii < f.imports.length() {
+      declared.set(f.imports[ii].alias_name, true)
+      ii = ii + 1
+    }
+    let mut ui = 0
+    while ui < u.used_order.length() {
+      let al = u.used_order[ui]
+      if !declared.contains(al) {
+        pkg_has_implicit_user.set(al, true)
+        if !inactive_implicit_user.contains(al) {
           inactive_implicit_user.set(al, f.path)
         }
       }
@@ -1266,11 +1301,17 @@ fn lint_check_imports(
     fi = fi + 1
   }
 
+  let has_inactive_targets = inactive_target_files.length() > 0
+
   // 3. Emit L_UNUSED_IMPORT & L_IMPLICIT_IMPORT ONLY for active `pkg.files`.
   fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
     let u = usages[fi]
+    let f_pred = match file_target_preds.get(f.path) {
+      Some(p) => p
+      None => "*"
+    }
     let fidx_opt = lint_get_file_index(raw_sources, idx_cache, f.path)
     let has_src = match fidx_opt {
       Some(_) => true
@@ -1292,8 +1333,6 @@ fn lint_check_imports(
     let toks_aligned = imp_toks.ok && imp_toks.spans.length() == f.imports.length()
 
     let declared : Map[String, String] = Map([])
-    // Pre-compute which import lines in this file will safely be deleted so
-    // blank-line collapsing accounts for adjacent deleted imports.
     let del_lines : Map[Int, Bool] = Map([])
     let seen_pre : Map[String, String] = Map([])
     let mut ii = 0
@@ -1406,8 +1445,15 @@ fn lint_check_imports(
           Some(s) => s
           None => span_new(f.path, 1, 1)
         }
+        // Cross-target safety: when the package has inactive `[targets]` files,
+        // only auto-insert into `f` if `al` is declared unconditionally (`"*"`)
+        // or by a file with the exact same `[targets]` predicate as `f`.
+        let pred_safe = !has_inactive_targets ||
+          alias_has_uncond_decl.contains(al) ||
+          alias_decl_preds.contains(al + "\n" + f_pred)
         let edit_opt = if !alias_conflict.contains(al) &&
           !extra_files_incomplete &&
+          pred_safe &&
           has_src {
           match alias_path.get(al) {
             Some(p) => lint_make_insert_import_edit(f, raw_src, starts, imp_toks, p, al)
@@ -1418,7 +1464,7 @@ fn lint_check_imports(
         }
         let fix_hint = match alias_path.get(al) {
           Some(p) =>
-            if !alias_conflict.contains(al) {
+            if !alias_conflict.contains(al) && pred_safe {
               "add `" + lint_format_import_line(p, al) + "` at the top of `" + f.path + "`"
             } else {
               "add an explicit `import` for `" + al + "` at the top of `" + f.path + "`"
@@ -2648,6 +2694,7 @@ fn lint_check_fn_decl(
   out : Array[Diagnostic],
 ) -> Unit {
   let idents : Map[String, Bool] = Map([])
+  idents.set(fd.name, true)
   let mut tpi = 0
   while tpi < fd.type_params.length() {
     idents.set(fd.type_params[tpi], true)
@@ -2693,6 +2740,7 @@ fn lint_check_extern_fn_decl(
     return
   }
   let idents : Map[String, Bool] = Map([])
+  idents.set(ef.name, true)
   lint_collect_idents_params(idents, ef.params)
   lint_collect_idents_type(idents, ef.ret_ty)
   lint_collect_idents_stmts(idents, ef.body)
@@ -2728,6 +2776,7 @@ fn lint_check_const_decl(
   out : Array[Diagnostic],
 ) -> Unit {
   let idents : Map[String, Bool] = Map([])
+  idents.set(cd.name, true)
   lint_collect_idents_type(idents, cd.ty)
   lint_collect_idents_expr(idents, cd.value)
   let ctx = LintDeclCtx::{
@@ -2821,11 +2870,13 @@ fn lint_check_file_lengths_list(
 /// files) so cross-file import usage is never underestimated. When
 /// `extra_files_incomplete` is true (e.g. an extra file failed to read/parse),
 /// all import deletion edits in the package are conservatively suppressed.
-pub fn lint_package_opts(
+pub fn lint_package_full(
   pkg : Package,
   tc : TypeChecker,
   raw_sources : Map[String, String],
-  extra_import_files : Array[SourceFile],
+  active_extra_files : Array[SourceFile],
+  inactive_target_files : Array[SourceFile],
+  file_target_preds : Map[String, String],
   extra_files_incomplete : Bool,
 ) -> Array[Diagnostic] {
   let out : Array[Diagnostic] = []
@@ -2835,12 +2886,14 @@ pub fn lint_package_opts(
     tc,
     raw_sources,
     idx_cache,
-    extra_import_files,
+    active_extra_files,
+    inactive_target_files,
+    file_target_preds,
     extra_files_incomplete,
     out,
   )
   lint_check_file_lengths_list(pkg.files, raw_sources, out)
-  lint_check_file_lengths_list(extra_import_files, raw_sources, out)
+  lint_check_file_lengths_list(inactive_target_files, raw_sources, out)
   let mut fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
@@ -2867,6 +2920,25 @@ pub fn lint_package_opts(
     fi = fi + 1
   }
   lint_sort_and_dedup_diags(out)
+}
+
+///|
+pub fn lint_package_opts(
+  pkg : Package,
+  tc : TypeChecker,
+  raw_sources : Map[String, String],
+  extra_import_files : Array[SourceFile],
+  extra_files_incomplete : Bool,
+) -> Array[Diagnostic] {
+  lint_package_full(
+    pkg,
+    tc,
+    raw_sources,
+    [],
+    extra_import_files,
+    Map([]),
+    extra_files_incomplete,
+  )
 }
 
 ///|

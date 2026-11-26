@@ -172,9 +172,9 @@ printf '%s' "$WS_FIX2" | grep -q '"ok":true' || { echo "FAIL: workspace --fix id
 printf '%s' "$WS_FIX2" | grep -q '"fixed":0' || { echo "FAIL: workspace --fix not idempotent: $WS_FIX2" >&2; exit 1; }
 
 # 5. [targets] inactive file isolation & fmt-clean:
-#    5a) Host-only `import "ext_dep" as Box` vs wasm-only local `struct Box`:
+#    5a) Host-only `import "ext_dep" as Box` + shared `caller.pion` vs wasm-only local `struct Box`:
 #        host `pionc lint --fix` MUST NEVER inject `import` into inactive `wasm_only.pion`
-#        (must keep `wasm_only.pion` byte-identical and `pionc check --target wasm32` green!).
+#        OR into shared `caller.pion` (must keep `wasm32` `pionc check` green!).
 TGT_PKG="$TMP_DIR/tgt_pkg"
 mkdir -p "$TGT_PKG/src"
 cat > "$TGT_PKG/pion.toml" <<'EOF'
@@ -196,23 +196,32 @@ pub fn host_fn() -> Int {
   Box::add(1, 2)
 }
 EOF
+cat > "$TGT_PKG/src/caller.pion" <<'EOF'
+pub fn call_box() -> Int {
+  Box::add(3, 4)
+}
+EOF
 cat > "$TGT_PKG/src/wasm_only.pion" <<'EOF'
 struct Box { v : Int }
 
-fn Box::num() -> Int {
-  42
+fn Box::add(a : Int, b : Int) -> Int {
+  let b_val = Box::{ v: a + b }
+  b_val.v
 }
 
 pub fn wasm_fn() -> Int {
-  let b = Box::{ v: Box::num() }
-  b.v
+  call_box()
 }
 EOF
 WASM_HASH_BEFORE="$(file_sha256 "$TGT_PKG/src/wasm_only.pion")"
+CALLER_HASH_BEFORE="$(file_sha256 "$TGT_PKG/src/caller.pion")"
+set +e
 TGT_FIX="$("$PIONC" lint --fix --json "$TGT_PKG")"
-printf '%s' "$TGT_FIX" | grep -q '"ok":true' || { echo "FAIL: tgt_pkg --fix failed: $TGT_FIX" >&2; exit 1; }
+set -e
 WASM_HASH_AFTER="$(file_sha256 "$TGT_PKG/src/wasm_only.pion")"
+CALLER_HASH_AFTER="$(file_sha256 "$TGT_PKG/src/caller.pion")"
 [ "$WASM_HASH_BEFORE" = "$WASM_HASH_AFTER" ] || { echo "FAIL: host lint --fix modified inactive wasm_only.pion!" >&2; exit 1; }
+[ "$CALLER_HASH_BEFORE" = "$CALLER_HASH_AFTER" ] || { echo "FAIL: host lint --fix injected host-only import into shared caller.pion! $TGT_FIX" >&2; exit 1; }
 "$PIONC" check --target wasm32 --json "$TGT_PKG" | grep -q '"ok":true' || { echo "FAIL: wasm32 check broken after host lint --fix!" >&2; exit 1; }
 
 #    5b) Deleting sole unused import + multi-space `let mut  w` must pass `pionc fmt --check`.
@@ -450,7 +459,9 @@ set -e
 [ "$ISO_RC" -ne 0 ] || { echo "FAIL: expected L_UNREACHABLE_CODE in iso_pkg: $ISO_OUT" >&2; exit 1; }
 printf '%s' "$ISO_OUT" | grep -q '"code":"L_UNREACHABLE_CODE"' || { echo "FAIL: test fn panic masked prod L_UNREACHABLE_CODE: $ISO_OUT" >&2; exit 1; }
 
-# 11. P2-6 & R2 P2-2: CLI edge guards + unified --fix --json failure schema.
+# 11. P2-6, R2 P2-2, R3 P1-2, R3 P1-4, R3 P2-1, R3 P2-2:
+#     CLI edge guards, lock failure fail-closed, nested sub-package isolation,
+#     E_* symlink edit stripping, and all 4 `--fix --json` argument error schemas.
 EMPTY_DIR="$TMP_DIR/empty_dir"
 mkdir -p "$EMPTY_DIR"
 set +e
@@ -460,15 +471,97 @@ EMPTY_FIX_OUT="$("$PIONC" lint --fix --json "$EMPTY_DIR")"
 EMPTY_FIX_RC=$?
 MIX_OUT="$("$PIONC" lint --json "$ISO_PKG" "$SINGLE")"
 MIX_RC=$?
+ARG_ERR1="$("$PIONC" lint --fix --json --target)"
+ARG_RC1=$?
+ARG_ERR2="$("$PIONC" lint --fix --json --target=bogus "$SINGLE")"
+ARG_RC2=$?
+ARG_ERR3="$("$PIONC" lint --fix --json --bad-opt "$SINGLE")"
+ARG_RC3=$?
+ARG_ERR4="$(cd "$EMPTY_DIR" && "$PIONC" lint --fix --json)"
+ARG_RC4=$?
 set -e
 [ "$EMPTY_RC" -ne 0 ] || { echo "FAIL: empty directory must not return ok:true: $EMPTY_OUT" >&2; exit 1; }
 [ "$EMPTY_FIX_RC" -ne 0 ] || { echo "FAIL: --fix on empty directory must fail: $EMPTY_FIX_OUT" >&2; exit 1; }
-printf '%s' "$EMPTY_FIX_OUT" | grep -q '"fixed":0' || { echo "FAIL: --fix --json error missing fixed:0: $EMPTY_FIX_OUT" >&2; exit 1; }
-printf '%s' "$EMPTY_FIX_OUT" | grep -q '"files":\[\]' || { echo "FAIL: --fix --json error missing files:[]: $EMPTY_FIX_OUT" >&2; exit 1; }
-printf '%s' "$EMPTY_FIX_OUT" | grep -q '"diagnostics":\[\]' || { echo "FAIL: --fix --json error missing diagnostics:[]: $EMPTY_FIX_OUT" >&2; exit 1; }
 [ "$MIX_RC" -ne 0 ] || { echo "FAIL: mixing manifest root with multiple targets must fail: $MIX_OUT" >&2; exit 1; }
+for ERR_PAIR in "$ARG_RC1|$ARG_ERR1" "$ARG_RC2|$ARG_ERR2" "$ARG_RC3|$ARG_ERR3" "$ARG_RC4|$ARG_ERR4" "$EMPTY_FIX_RC|$EMPTY_FIX_OUT"; do
+  ERC="${ERR_PAIR%%|*}"
+  EJSON="${ERR_PAIR#*|}"
+  [ "$ERC" -ne 0 ] || { echo "FAIL: expected non-zero rc: $EJSON" >&2; exit 1; }
+  printf '%s' "$EJSON" | grep -q '"fixed":0' || { echo "FAIL: --fix --json error missing fixed:0: $EJSON" >&2; exit 1; }
+  printf '%s' "$EJSON" | grep -q '"files":\[\]' || { echo "FAIL: --fix --json error missing files:[]: $EJSON" >&2; exit 1; }
+  printf '%s' "$EJSON" | grep -q '"diagnostics":\[\]' || { echo "FAIL: --fix --json error missing diagnostics:[]: $EJSON" >&2; exit 1; }
+done
 
-# 12. Real examples/ packages lint clean, and dynamic dogfood check explicitly
+# R3 P1-2: Unwritable/file PION_CACHE_DIR must fail closed before writing any source file.
+LOCK_FILE_BLOCKER="$TMP_DIR/not_a_dir"
+printf 'blocker\n' > "$LOCK_FILE_BLOCKER"
+LOCK_SRC="$TMP_DIR/lock_src.pion"
+cat > "$LOCK_SRC" <<'EOF'
+pub fn f() -> Int {
+  let mut x = 1
+  x
+}
+EOF
+LOCK_HASH_BEFORE="$(file_sha256 "$LOCK_SRC")"
+set +e
+LOCK_OUT="$(PION_CACHE_DIR="$LOCK_FILE_BLOCKER" "$PIONC" lint --fix --json "$LOCK_SRC")"
+LOCK_RC=$?
+set -e
+[ "$LOCK_RC" -ne 0 ] || { echo "FAIL: lock acquisition failure must exit non-zero: $LOCK_OUT" >&2; exit 1; }
+printf '%s' "$LOCK_OUT" | grep -q '"fixed":0' || { echo "FAIL: lock failure must report fixed:0: $LOCK_OUT" >&2; exit 1; }
+LOCK_HASH_AFTER="$(file_sha256 "$LOCK_SRC")"
+[ "$LOCK_HASH_BEFORE" = "$LOCK_HASH_AFTER" ] || { echo "FAIL: lock failure still modified source file!" >&2; exit 1; }
+
+# R3 P1-4: Nested sub-package (`outer/src/pion.toml`) must NOT be owned/linted by `outer`.
+OUTER_PKG="$TMP_DIR/outer_pkg"
+mkdir -p "$OUTER_PKG/src"
+cat > "$OUTER_PKG/pion.toml" <<'EOF'
+[package]
+name = "outer_pkg"
+version = "0.1.0"
+EOF
+cat > "$OUTER_PKG/lib.pion" <<'EOF'
+pub fn outer_ok() -> Int {
+  1
+}
+EOF
+cat > "$OUTER_PKG/src/pion.toml" <<'EOF'
+[package]
+name = "nested_pkg"
+version = "0.1.0"
+EOF
+cat > "$OUTER_PKG/src/nested.pion" <<'EOF'
+pub fn nested_dirty() -> Int {
+  let mut unused_mut = 7
+  unused_mut
+}
+EOF
+OUTER_OUT="$("$PIONC" lint --json "$OUTER_PKG")"
+[ "$OUTER_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: nested src/pion.toml leaked into outer lint: $OUTER_OUT" >&2; exit 1; }
+
+# R3 P2-1: E_* diagnostics on symlink targets must also strip non-committable edits.
+SYM_E_REAL="$TMP_DIR/sym_e_real.pion"
+cat > "$SYM_E_REAL" <<'EOF'
+pub fn bad() -> Int {
+  let x = 1
+  x = 2
+  x
+}
+EOF
+SYM_E_LINK="$TMP_DIR/sym_e_link.pion"
+ln -s "$SYM_E_REAL" "$SYM_E_LINK"
+set +e
+SYM_E_OUT="$("$PIONC" lint --json "$SYM_E_LINK")"
+SYM_E_RC=$?
+set -e
+[ "$SYM_E_RC" -ne 0 ] || { echo "FAIL: expected E_* on sym_e_link" >&2; exit 1; }
+printf '%s' "$SYM_E_OUT" | grep -q '"code":"E_TYPE_MISMATCH"' || { echo "FAIL: missing E_TYPE_MISMATCH: $SYM_E_OUT" >&2; exit 1; }
+if printf '%s' "$SYM_E_OUT" | grep -q '"edits"'; then
+  echo "FAIL: E_* on symlink must strip edits: $SYM_E_OUT" >&2
+  exit 1
+fi
+
+# 12. Real examples/ packages lint clean, and strict dynamic dogfood check explicitly
 #     including all `compiler/src/core/*.pion` (including `lint*_test.pion`).
 for EX in examples/text_stats examples/http_loopback; do
   EX_OUT="$("$PIONC" lint --json "$ROOT_DIR/$EX")"
@@ -476,11 +569,18 @@ for EX in examples/text_stats examples/http_loopback; do
 done
 set +e
 CORE_LINT_OUT="$("$PIONC" lint --json "$ROOT_DIR/compiler/src/core"/*.pion)"
+CORE_LINT_RC=$?
 set -e
+if [ "$CORE_LINT_RC" -ne 0 ] && [ "$CORE_LINT_RC" -ne 1 ]; then
+  echo "FAIL: unexpected exit code $CORE_LINT_RC from core dogfood lint" >&2
+  exit 1
+fi
 python3 - "$CORE_LINT_OUT" "$ROOT_DIR/compiler/src/core" <<'PYEOF'
 import glob, json, os, sys
 d = json.loads(sys.argv[1])
-diags = d.get("diagnostics", [])
+assert "error" not in d, f"unexpected error field in core dogfood JSON: {d}"
+assert isinstance(d.get("diagnostics"), list), f"missing diagnostics array in core dogfood JSON: {d}"
+diags = d["diagnostics"]
 e_diags = [x for x in diags if str(x.get("code", "")).startswith("E_")]
 if e_diags:
     print("FAIL: unexpected E_* diagnostics in core/*.pion dogfood:", e_diags, file=sys.stderr)
