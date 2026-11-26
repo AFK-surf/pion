@@ -647,6 +647,8 @@ pub struct StageAContext {
   active_generics : Map[String, Bool]
   used_idents : Map[String, Bool]
   synth_sp_temps : Map[String, Bool]
+  ffi_symbols : Array[FfiSymbolMapping]
+  orig_extern_c_locs : Map[String, (Int, Int)]
   mut cur_is_test : Bool
   mut cur_is_blackbox : Bool
   mut cur_out_rel : String
@@ -712,6 +714,8 @@ pub fn stage_a_context_new(
     active_generics: Map(),
     used_idents: Map(),
     synth_sp_temps: Map(),
+    ffi_symbols: [],
+    orig_extern_c_locs: Map(),
     cur_is_test: false,
     cur_is_blackbox: false,
     cur_out_rel: "",
@@ -14965,11 +14969,9 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
 
 ///| Lower a single `.mbt` file through Stage A, emitting declaration anchors,
 ///| extracting top-level `let`/`fn init` into `ctx.init_items`, and recording span maps.
-///| Exact Pion compiler C-ABI parameter type allowlist (`compiler/src/core/types.pion`).
+///| Exact Pion compiler C-ABI parameter type allowlist (shared with `lower_ffi.pion`).
 fn is_pion_c_abi_param_type(ty : String) -> Bool {
-  let t = ty.trim()
-  t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" || t == "Double" ||
-  t == "Float" || t == "Float32" || t == "Bool" || t == "Byte" || t == "Int8" || t == "Ptr"
+  is_pion_c_abi_scalar_type(ty)
 }
 
 ///| Exact Pion compiler C-ABI return type allowlist (param types + `Unit`).
@@ -16497,6 +16499,11 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             ""
           }
           let is_legal_c_ffi = extern_abi == "\"C\"" && decl_end == lb + 2 && tokens[lb + 1].kind == TokenKind::StringLit
+          let mut decl_code = if is_legal_c_ffi {
+            vis + "extern \"C\" fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + rhs_raw
+          } else {
+            vis + extern_prefix + "fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + rhs_raw
+          }
           if !is_legal_c_ffi {
             ctx.diags.push(diag_error(
               "MBT2PION_UNSUPPORTED_SYNTAX",
@@ -16505,13 +16512,26 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               decl_col,
               "unsupported MoonBit extern/intrinsic function declaration `= ...` (requires explicit lowering or overlay)",
             ))
-          } else {
+          } else if ctx.opts.ffi_shim_prefix.length() == 0 {
             let ret_ty = if ret_str.starts_with(" -> ") {
               ret_str.slice(4, ret_str.length()).trim()
             } else {
               "Unit"
             }
-            if pending_ffi_attrs.length() > 0 || !check_pion_c_abi_params(p_str) || !is_pion_c_abi_ret_type(ret_ty) {
+            let raw_sym = if rhs_raw.length() >= 3 && rhs_raw.starts_with("\"") && rhs_raw.ends_with("\"") {
+              rhs_raw.slice(1, rhs_raw.length() - 1)
+            } else {
+              ""
+            }
+            if !is_valid_ffi_ident(raw_sym) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+                sf.rel_path,
+                decl_line,
+                decl_col,
+                "extern \"C\" function `" + fn_name + "` has invalid C symbol `" + rhs_raw + "` (expected valid C identifier `[A-Za-z_][A-Za-z0-9_]*`)",
+              ))
+            } else if pending_ffi_attrs.length() > 0 || !check_pion_c_abi_params(p_str) || !is_pion_c_abi_ret_type(ret_ty) {
               ctx.diags.push(diag_error(
                 "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
                 sf.rel_path,
@@ -16519,12 +16539,126 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 decl_col,
                 "extern \"C\" function `" + fn_name + "` uses non-C-ABI Pion type or unsupported MoonBit FFI attribute (requires explicit lowering or overlay)",
               ))
+            } else {
+              let fallback_col = if tokens[decl_start].line == decl_line { tokens[decl_start].col } else { decl_col }
+              let (sym_line, sym_col) = match ctx.orig_extern_c_locs.get(sf.rel_path + "::" + fn_name + "::" + raw_sym) {
+                Some(loc) => loc
+                None =>
+                match ctx.orig_extern_c_locs.get(sf.rel_path + "::" + fn_name) {
+                  Some(loc) => loc
+                  None => (decl_line, fallback_col)
+                }
+              }
+              ctx.ffi_symbols.push(FfiSymbolMapping::{
+                file: sf.rel_path,
+                line: sym_line,
+                col: sym_col,
+                fn_name: fn_name,
+                emitted_pion_fn: fn_name,
+                raw_c_symbol: raw_sym,
+                emitted_c_symbol: raw_sym,
+                bridged: false,
+              })
             }
-          }
-          let decl_code = if is_legal_c_ffi {
-            vis + "extern \"C\" fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + rhs_raw
+          } else if !is_valid_ffi_shim_prefix(ctx.opts.ffi_shim_prefix) {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+              sf.rel_path,
+              decl_line,
+              decl_col,
+              "invalid `--ffi-shim-prefix` `" + ctx.opts.ffi_shim_prefix + "` (expected valid C identifier prefix `[A-Za-z_][A-Za-z0-9_]*`)",
+            ))
           } else {
-            vis + extern_prefix + "fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + rhs_raw
+            let ffi_res = try_lower_extern_c_fn_with_prefix(
+              vis,
+              fn_name,
+              p_str,
+              ret_str,
+              rhs_raw,
+              pending_ffi_attrs,
+              ctx.used_idents,
+              ctx.opts.ffi_shim_prefix,
+            )
+            if !ffi_res.ok {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+                sf.rel_path,
+                decl_line,
+                decl_col,
+                "extern \"C\" function `" + fn_name + "` cannot be lowered: " + ffi_res.error_msg,
+              ))
+            } else {
+              let mbt_compat_shadowed = if ffi_res.needs_bridge {
+                let alias_conflict = match ctx.symtab.pkg_aliases.get("mbt_compat") {
+                  Some(target_pkg) => target_pkg != "mbt_compat"
+                  None => false
+                }
+                let import_conflict = match ctx.symtab.moon_import_paths.get("mbt_compat") {
+                  Some(target_path) => target_path != "mbt_compat" && !target_path.ends_with("/mbt_compat")
+                  None => false
+                }
+                let top_level_conflict = ctx.symtab.local_fn_names.contains("mbt_compat") ||
+                ctx.symtab.local_value_names.contains("mbt_compat") ||
+                ctx.symtab.const_defs.contains("mbt_compat") ||
+                ctx.symtab.using_values.contains("mbt_compat") ||
+                ctx.symtab.local_types.contains("mbt_compat") ||
+                ctx.symtab.using_types.contains("mbt_compat")
+                let mut param_conflict = false
+                match parse_ffi_params(p_str) {
+                  Ok(ps) => {
+                    for p in ps {
+                      if p.name == "mbt_compat" {
+                        param_conflict = true
+                      }
+                    }
+                  }
+                  Err(_) => ()
+                }
+                alias_conflict || import_conflict || top_level_conflict || param_conflict
+              } else {
+                false
+              }
+              if mbt_compat_shadowed {
+                ctx.diags.push(diag_error(
+                  "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+                  sf.rel_path,
+                  decl_line,
+                  decl_col,
+                  "bridged extern \"C\" function `" + fn_name + "` requires unshadowed `mbt_compat` package namespace",
+                ))
+              } else {
+                let raw_sym = if rhs_raw.length() >= 2 && rhs_raw.starts_with("\"") && rhs_raw.ends_with("\"") {
+                  rhs_raw.slice(1, rhs_raw.length() - 1)
+                } else {
+                  rhs_raw
+                }
+                let emitted_sym = if ffi_res.c_symbol.length() >= 2 && ffi_res.c_symbol.starts_with("\"") && ffi_res.c_symbol.ends_with("\"") {
+                  ffi_res.c_symbol.slice(1, ffi_res.c_symbol.length() - 1)
+                } else {
+                  ffi_res.c_symbol
+                }
+                decl_code = ffi_res.code
+                let fallback_col = if tokens[decl_start].line == decl_line { tokens[decl_start].col } else { decl_col }
+                let (sym_line, sym_col) = match ctx.orig_extern_c_locs.get(sf.rel_path + "::" + fn_name + "::" + raw_sym) {
+                  Some(loc) => loc
+                  None =>
+                  match ctx.orig_extern_c_locs.get(sf.rel_path + "::" + fn_name) {
+                    Some(loc) => loc
+                    None => (decl_line, fallback_col)
+                  }
+                }
+                ctx.ffi_symbols.push(FfiSymbolMapping::{
+                  file: sf.rel_path,
+                  line: sym_line,
+                  col: sym_col,
+                  fn_name: fn_name,
+                  emitted_pion_fn: ffi_res.emitted_pion_fn,
+                  raw_c_symbol: raw_sym,
+                  emitted_c_symbol: emitted_sym,
+                  bridged: ffi_res.needs_bridge,
+                })
+              }
+            }
           }
           let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[decl_end - 1].end_byte)
           out_sb.write_string(attrs_trivia.to_string() + kept_attrs.to_string() + vis_trivia)
