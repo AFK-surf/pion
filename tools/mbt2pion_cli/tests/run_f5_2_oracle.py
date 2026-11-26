@@ -108,8 +108,49 @@ pub fn run_map_short_circuit() -> String {
     r5.to_string()
 }
 
+pub struct NBag {
+  log : Array[String]
+  inner : NBag?
+  vals : Map[String, Int]
+}
+
+pub fn NBag::get(self : NBag, k : String) -> NBag? {
+  self.log.push(k)
+  if k == "a" {
+    self.inner
+  } else if k == "b" {
+    Some(self)
+  } else if self.vals.get(k) is Some(v) && v == 1 {
+    Some(self)
+  } else {
+    None
+  }
+}
+
+pub fn run_nested_map_dfs() -> String {
+  // 1. Nested hit: strict depth-first order must be "a" -> "x" -> "b" ("axb")
+  let log1 : Array[String] = []
+  let in1 : NBag = { log: log1, inner: None, vals: { "x": 1 } }
+  let out1 : NBag = { log: log1, inner: Some(in1), vals: {} }
+  let h1 = if out1 is { "a": { "x": _, .. }, "b": _, .. } { 1 } else { 0 }
+
+  // 2. Inner key fails in guard: must stop at "x", NEVER query "b" ("ax")
+  let log2 : Array[String] = []
+  let in2 : NBag = { log: log2, inner: None, vals: { "x": 2 } }
+  let out2 : NBag = { log: log2, inner: Some(in2), vals: {} }
+  let f2 = fn(nb : NBag) -> Int {
+    guard nb is { "a": { "x": _, .. }, "b": _, .. } else {
+      return 0
+    }
+    1
+  }
+  let h2 = f2(out2)
+
+  h1.to_string() + ":" + log1.join("") + "|" + h2.to_string() + ":" + log2.join("")
+}
+
 pub fn run_all() -> String {
-  run_map_is_1() + " :: " + run_map_is_guard() + " :: " + run_map_is_shadow() + " :: " + run_map_short_circuit()
+  run_map_is_1() + " :: " + run_map_is_guard() + " :: " + run_map_is_shadow() + " :: " + run_map_short_circuit() + " :: " + run_nested_map_dfs()
 }
 '''
 
@@ -151,6 +192,12 @@ const uint8_t *pion_demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t 
   }
   *out_len = g_buf_len;
   return g_buf;
+}
+
+int32_t pion_demo_pick(const uint8_t *data_ptr, int32_t data_len, int32_t tag) {
+  (void)data_ptr;
+  (void)data_len;
+  return tag;
 }
 '''
 
@@ -195,6 +242,16 @@ fn ffi_read_buf(tag : String) -> Bytes {
   __ffi_ret_bytes
 }
 
+extern "C" fn __mbt_c_ffi_pick(data_ptr : Ptr, data_len : Int, __ffi_data_len : Int) -> Int = "pion_demo_pick"
+fn pick(data : Bytes, __ffi_data_len : Int) -> Int {
+  let __ffi_data_len_1 = data.length()
+  let __ffi_data_buf = ptr_alloc(if __ffi_data_len_1 > 0 { __ffi_data_len_1.to_int64() } else { 1L })
+  if __ffi_data_len_1 > 0 { bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len_1) }
+  let __ffi_res = __mbt_c_ffi_pick(__ffi_data_buf, __ffi_data_len_1, __ffi_data_len)
+  ptr_free(__ffi_data_buf)
+  __ffi_res
+}
+
 pub fn main(w : World) -> Int {
   let s = ffi_start("/tmp", "https://ex", 1)
   let u = ffi_start("/你好🚀", "h", 0)
@@ -203,10 +260,11 @@ pub fn main(w : World) -> Int {
   let out = ffi_read_buf("ok")
   let empty_b = ffi_read_buf("")
   let null_s = ffi_null_str()
+  let picked = pick(payload, 77)
   let b0 = out[0].to_int()
   let b1 = out[1].to_int()
   let b2 = out[2].to_int()
-  io_println(w, s.to_string() + "|" + u.to_string() + "|" + ffi_scheme() + "|" + null_s.length().to_string() + "|" + empty_b.length().to_string() + "|" + out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string())
+  io_println(w, s.to_string() + "|" + u.to_string() + "|" + ffi_scheme() + "|" + null_s.length().to_string() + "|" + empty_b.length().to_string() + "|" + picked.to_string() + "|" + out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string())
   0
 }
 '''
@@ -262,7 +320,7 @@ def main():
         nat_bin = os.path.join(tmp, "map_is_nat")
         run_cmd([args.pionc, "build", "-o", nat_bin, pion_out])
         pion_nat_out = run_cmd([nat_bin])
-        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999 :: 0:1|0:1|0:1|12:2:a,b|4"
+        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999 :: 0:1|0:1|0:1|12:2:a,b|4 :: 1:axb|0:ax"
         assert pion_nat_out == expected, f"Pion native mismatch: {pion_nat_out!r} != {expected!r}"
         print(f"[PASS] Pion native map-is: {pion_nat_out}")
 
@@ -303,8 +361,8 @@ def main():
         ffi_out = run_cmd([ffi_bin])
         # s: 4*100 + 10*10 + 1 + 1 + 2 = 504
         # u: "/你好🚀" is 1 + 3 + 3 + 4 = 11 UTF-8 bytes -> 11*100 + 1*10 + 0 + 1 + 2 = 1113
-        # null_s.length() = 0, empty_b.length() = 0; 0x10^4=20, 0x20^4=36, 0x30^4=52
-        expected_ffi = "504|1113|pion-scheme|0|0|3:20,36,52"
+        # null_s.length() = 0, empty_b.length() = 0, picked = 77; 0x10^4=20, 0x20^4=36, 0x30^4=52
+        expected_ffi = "504|1113|pion-scheme|0|0|77|3:20,36,52"
         assert ffi_out == expected_ffi, f"FFI bridge native mismatch: {ffi_out!r} != {expected_ffi!r}"
         print(f"[PASS] Pion native C-ABI FFI bridge: {ffi_out}")
 
