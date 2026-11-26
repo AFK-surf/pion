@@ -1,0 +1,635 @@
+///|
+/// Comprehensive unit, adversarial, and dogfood tests for `compiler/src/core/lint.pion`.
+
+///|
+fn lt_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    abort("lint_test failed: " + msg)
+  }
+}
+
+///|
+fn lt_has_code(diags : Array[Diagnostic], code : String) -> Bool {
+  let mut i = 0
+  while i < diags.length() {
+    if diags[i].code == code {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn lt_count_code(diags : Array[Diagnostic], code : String) -> Int {
+  let mut n = 0
+  let mut i = 0
+  while i < diags.length() {
+    if diags[i].code == code {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  n
+}
+
+///|
+fn lt_apply_machine_edits(src : String, file : String, diags : Array[Diagnostic]) -> String {
+  let starts = lint_line_starts(src)
+  let e_starts : Array[Int] = []
+  let e_ends : Array[Int] = []
+  let e_reps : Array[String] = []
+  let mut di = 0
+  while di < diags.length() {
+    let es = diags[di].edits
+    let mut ei = 0
+    while ei < es.length() {
+      let e = es[ei]
+      if e.file == file && e.applicability == "machine" {
+        let s_off = lint_line_col_to_offset(src, starts, e.line, e.col)
+        let e_off = lint_line_col_to_offset(src, starts, e.end_line, e.end_col)
+        if s_off >= 0 && e_off >= s_off && e_off <= src.length() {
+          e_starts.push(s_off)
+          e_ends.push(e_off)
+          e_reps.push(e.replacement)
+        }
+      }
+      ei = ei + 1
+    }
+    di = di + 1
+  }
+  // Sort descending by (start, end).
+  let n = e_starts.length()
+  let mut i = 1
+  while i < n {
+    let cs = e_starts[i]
+    let ce = e_ends[i]
+    let cr = e_reps[i]
+    let mut j = i - 1
+    while j >= 0 && (e_starts[j] < cs || (e_starts[j] == cs && e_ends[j] < ce)) {
+      e_starts[j + 1] = e_starts[j]
+      e_ends[j + 1] = e_ends[j]
+      e_reps[j + 1] = e_reps[j]
+      j = j - 1
+    }
+    e_starts[j + 1] = cs
+    e_ends[j + 1] = ce
+    e_reps[j + 1] = cr
+    i = i + 1
+  }
+  let mut cur = src
+  let mut last_start = src.length() + 1
+  i = 0
+  while i < n {
+    if e_ends[i] <= last_start {
+      cur = t_str_slice(cur, 0, e_starts[i]) + e_reps[i] + t_str_from(cur, e_ends[i])
+      last_start = e_starts[i]
+    }
+    i = i + 1
+  }
+  cur
+}
+
+///|
+fn lt_lint_one(src : String) -> Array[Diagnostic] {
+  lint_source_files_with_imports("testpkg", ["main.pion"], [src], [], false)
+}
+
+///|
+fn lt_make_dep_pkg(name : String, src : String) -> ImportedPkg {
+  let cr = check_source_files_with_imports_mapped(
+    name,
+    [name + ".pion"],
+    [src],
+    [],
+    [],
+    [],
+    true,
+    false,
+  )
+  lt_assert(cr.diagnostics.length() == 0, "dep pkg clean: " + check_result_to_json(cr.diagnostics))
+  imported_pkg_new(name, cr.tc)
+}
+
+///|
+test "lint: L_IMPLICIT_IMPORT and L_UNUSED_IMPORT two-round fix and edge cases" {
+  let dep = lt_make_dep_pkg(
+    "dep",
+    "pub struct Box { pub v : Int }\n" +
+    "pub enum Kind { A(Int), B }\n" +
+    "pub trait Show { fn show(self : Self) -> String }\n" +
+    "pub fn add(a : Int, b : Int) -> Int { a + b }\n" +
+    "pub fn Box::make(v : Int) -> Box { Box::{ v: v } }\n" +
+    "pub fn Btn(label~ : String) -> String { label }\n",
+  )
+
+  // File a.pion imports dep but doesn't use it; b.pion uses dep implicitly.
+  let a_src = "import \"dep\"\npub fn helper() -> Int { 1 }\n"
+  let b_src =
+    "pub fn run(k : dep::Kind) -> String {\n" +
+    "  let bx = dep::Box::make(dep::add(1, 2))\n" +
+    "  let _bx2 = dep::Box::{ v: bx.v }\n" +
+    "  let n = match k {\n" +
+    "    dep::Kind::A(v) => v\n" +
+    "    dep::Kind::B => 0\n" +
+    "  }\n" +
+    "  let s = \"n=\\{dep::add(n, bx.v)}\"\n" +
+    "  <dep::Btn label={s} />\n" +
+    "}\n"
+  let d1 = lint_source_files_with_imports(
+    "app",
+    ["a.pion", "b.pion"],
+    [a_src, b_src],
+    [dep],
+    true,
+  )
+  lt_assert(lt_has_code(d1, "L_UNUSED_IMPORT"), check_result_to_json(d1))
+  lt_assert(lt_has_code(d1, "L_IMPLICIT_IMPORT"), check_result_to_json(d1))
+  // Round 1 safety: a.pion's L_UNUSED_IMPORT MUST NOT have a delete edit yet
+  // because b.pion still implicitly depends on `dep`.
+  let mut i = 0
+  while i < d1.length() {
+    if d1[i].code == "L_UNUSED_IMPORT" {
+      lt_assert(d1[i].edits.length() == 0, "round 1 must not delete implicit dep: " + check_result_to_json(d1))
+    }
+    if d1[i].code == "L_IMPLICIT_IMPORT" {
+      lt_assert(d1[i].edits.length() == 1 && d1[i].edits[0].applicability == "machine", check_result_to_json(d1))
+    }
+    i = i + 1
+  }
+  // Apply round 1 machine edits: b.pion gets `import "dep"`.
+  let a_r1 = lt_apply_machine_edits(a_src, "a.pion", d1)
+  let b_r1 = lt_apply_machine_edits(b_src, "b.pion", d1)
+  assert_eq(a_r1, a_src)
+  lt_assert(t_str_find(b_r1, "import \"dep\"\n") != None, b_r1)
+
+  // Round 2: now a.pion's L_UNUSED_IMPORT safely gets its delete edit!
+  let d2 = lint_source_files_with_imports(
+    "app",
+    ["a.pion", "b.pion"],
+    [a_r1, b_r1],
+    [dep],
+    true,
+  )
+  assert_eq(d2.length(), 1)
+  assert_eq(d2[0].code, "L_UNUSED_IMPORT")
+  assert_eq(d2[0].edits.length(), 1)
+  let a_r2 = lt_apply_machine_edits(a_r1, "a.pion", d2)
+  let d3 = lint_source_files_with_imports(
+    "app",
+    ["a.pion", "b.pion"],
+    [a_r2, b_r1],
+    [dep],
+    true,
+  )
+  assert_eq(d3.length(), 0)
+
+  // Inline comment on unused import line: diagnose, no delete edit.
+  let c_src = "import \"dep\" // keep comment\npub fn f() -> Int { 1 }\n"
+  let dc = lint_source_files_with_imports("app", ["c.pion"], [c_src], [dep], true)
+  assert_eq(dc.length(), 1)
+  assert_eq(dc[0].code, "L_UNUSED_IMPORT")
+  assert_eq(dc[0].edits.length(), 0)
+
+  // Duplicate import in same file: second one flagged with machine delete edit.
+  let dup_src = "import \"dep\"\nimport \"dep\"\npub fn f() -> Int { dep::add(1, 2) }\n"
+  let ddup = lint_source_files_with_imports("app", ["dup.pion"], [dup_src], [dep], true)
+  assert_eq(ddup.length(), 1)
+  assert_eq(ddup[0].code, "L_UNUSED_IMPORT")
+  assert_eq(ddup[0].edits.length(), 1)
+  let dup_fixed = lt_apply_machine_edits(dup_src, "dup.pion", ddup)
+  assert_eq(lint_source_files_with_imports("app", ["dup.pion"], [dup_fixed], [dep], true).length(), 0)
+
+  // Conflicting alias paths in same package: L_IMPLICIT_IMPORT emits NO edit.
+  let dep2 = lt_make_dep_pkg("dep2", "pub fn sub(a : Int, b : Int) -> Int { a - b }\n")
+  let cf_a = "import \"dep\" as d\npub fn fa() -> Int { 0 }\n"
+  let cf_b = "import \"dep2\" as d\npub fn fb() -> Int { 0 }\n"
+  let cf_c = "pub fn fc() -> Int { d::sub(3, 1) }\n"
+  let dcf = lint_source_files_with_imports(
+    "app",
+    ["a.pion", "b.pion", "c.pion"],
+    [cf_a, cf_b, cf_c],
+    [dep, dep2],
+    true,
+  )
+  let mut saw_imp = false
+  i = 0
+  while i < dcf.length() {
+    if dcf[i].code == "L_IMPLICIT_IMPORT" {
+      saw_imp = true
+      assert_eq(dcf[i].edits.length(), 0)
+    }
+    i = i + 1
+  }
+  lt_assert(saw_imp, check_result_to_json(dcf))
+
+  // Extra (inactive target) file implicitly using `dep` protects active unused import from deletion.
+  let cr_act = check_source_files_with_imports_mapped(
+    "app",
+    ["a.pion"],
+    [a_src],
+    [dep],
+    [],
+    [],
+    true,
+    true,
+  )
+  assert_eq(cr_act.diagnostics.length(), 0)
+  let extra_pr = parse_source("wasm_only.pion", "pub fn w() -> Int { dep::add(1, 2) }\n")
+  let raw_m : Map[String, String] = Map([])
+  raw_m.set("a.pion", a_src)
+  let d_ext = lint_package(cr_act.pkg, cr_act.tc, raw_m, [extra_pr.file])
+  assert_eq(d_ext.length(), 1)
+  assert_eq(d_ext[0].code, "L_UNUSED_IMPORT")
+  assert_eq(d_ext[0].edits.length(), 0)
+}
+
+///|
+test "lint: L_UNUSED_LOCAL positives, capture-guard, exemptions, shorthands, and EIs" {
+  // Single SLet unused -> machine edit renames to `_x`.
+  let s1 = "pub fn f() -> Int {\n  let x = 42\n  1\n}\n"
+  let d1 = lt_lint_one(s1)
+  assert_eq(d1.length(), 1)
+  assert_eq(d1[0].code, "L_UNUSED_LOCAL")
+  assert_eq(d1[0].edits.length(), 1)
+  let s1_fixed = lt_apply_machine_edits(s1, "main.pion", d1)
+  assert_eq(s1_fixed, "pub fn f() -> Int {\n  let _x = 42\n  1\n}\n")
+  assert_eq(lt_lint_one(s1_fixed).length(), 0)
+
+  // Adversarial capture guard: `let _v = 7; let v = 4; _v` MUST NOT emit edit!
+  let cap1 = "pub fn f() -> Int {\n  let _v = 7\n  let v = 4\n  _v\n}\n"
+  let dcap1 = lt_lint_one(cap1)
+  assert_eq(dcap1.length(), 1)
+  assert_eq(dcap1[0].code, "L_UNUSED_LOCAL")
+  assert_eq(dcap1[0].edits.length(), 0)
+
+  // Package-level `_v` const also blocks auto-rename.
+  let cap2 = "let _v : Int = 9\npub fn f() -> Int {\n  let v = 4\n  _v\n}\n"
+  let dcap2 = lt_lint_one(cap2)
+  assert_eq(dcap2.length(), 1)
+  assert_eq(dcap2[0].code, "L_UNUSED_LOCAL")
+  assert_eq(dcap2[0].edits.length(), 0)
+
+  // SLetTuple, SForRange, SForIn, match PIdent, EIs unused -> diagnostic, no edit.
+  let s2 =
+    "pub fn f(xs : Array[Int], o : Option[Int]) -> Int {\n" +
+    "  let (a, b) = (1, 2)\n" +
+    "  for i in 0..<3 { let _ = 0 }\n" +
+    "  for k, v in xs { let _ = k }\n" +
+    "  let _ = match o {\n" +
+    "    Some(m) => 1\n" +
+    "    None => 0\n" +
+    "  }\n" +
+    "  if o is Some(z) { let _ = 0 }\n" +
+    "  a\n" +
+    "}\n"
+  let d2 = lt_lint_one(s2)
+  assert_eq(lt_count_code(d2, "L_UNUSED_LOCAL"), 5)
+  let mut i = 0
+  while i < d2.length() {
+    assert_eq(d2[i].edits.length(), 0)
+    i = i + 1
+  }
+
+  // Exemptions & valid uses: params, `_` prefix, JSX `__jsx_p_N`, EInterp,
+  // struct shorthand, named arg shorthand, debug_assert, EIs && / guard.
+  let clean =
+    "struct Pt { x : Int, y : Int }\n" +
+    "fn mk(a~ : Int) -> Int { a }\n" +
+    "fn Tag(text~ : String) -> String { text }\n" +
+    "pub fn ok(unused_param : Int, w : World, o : Option[Int]) -> String {\n" +
+    "  let _ = w\n" +
+    "  let _ignored = 1\n" +
+    "  let x = 10\n" +
+    "  let y = 20\n" +
+    "  let pt = Pt::{ x, y }\n" +
+    "  let a = pt.x + pt.y\n" +
+    "  let r = mk(a~)\n" +
+    "  debug_assert(r > 0, \"ok\")\n" +
+    "  let mut acc = 0\n" +
+    "  if o is Some(v) && v > 0 {\n" +
+    "    acc = v\n" +
+    "  }\n" +
+    "  guard o is Some(gv) else {\n" +
+    "    return \"none\"\n" +
+    "  }\n" +
+    "  let cls = fn(unused_cp : Int) -> Int { acc + gv }\n" +
+    "  let msg = \"res=\\{cls(1)}\"\n" +
+    "  <Tag text={msg} />\n" +
+    "}\n"
+  let dclean = lt_lint_one(clean)
+  lt_assert(dclean.length() == 0, check_result_to_json(dclean))
+}
+
+///|
+test "lint: L_UNUSED_MUT positives, #verify push, mut self, EMutArg, and closure capture" {
+  // Unused mut -> diagnostic + machine edit removing `"mut "`.
+  let s1 = "pub fn f() -> Int {\n  let mut x = 10\n  x + 1\n}\n"
+  let d1 = lt_lint_one(s1)
+  assert_eq(d1.length(), 1)
+  assert_eq(d1[0].code, "L_UNUSED_MUT")
+  assert_eq(d1[0].edits.length(), 1)
+  let s1_fixed = lt_apply_machine_edits(s1, "main.pion", d1)
+  assert_eq(s1_fixed, "pub fn f() -> Int {\n  let x = 10\n  x + 1\n}\n")
+  assert_eq(lt_lint_one(s1_fixed).length(), 0)
+
+  // #verify container push does NOT require `let mut` -> L_UNUSED_MUT.
+  let sv =
+    "#verify\n" +
+    "pub fn push_v() -> Int {\n" +
+    "  let mut arr : Array[Int] = [1]\n" +
+    "  arr.push(2)\n" +
+    "  arr.length()\n" +
+    "}\n"
+  let dv = lt_lint_one(sv)
+  assert_eq(dv.length(), 1)
+  assert_eq(dv[0].code, "L_UNUSED_MUT")
+  let sv_fixed = lt_apply_machine_edits(sv, "main.pion", dv)
+  assert_eq(lt_lint_one(sv_fixed).length(), 0)
+
+  // All valid mut uses: assign, compound assign, closure assign, EMutArg,
+  // EMutArg(s.f), mut self method call, mut param, mut self param.
+  let clean =
+    "struct Counter { mut n : Int }\n" +
+    "struct Wrap { mut c : Counter }\n" +
+    "fn Counter::inc(mut self : Counter) -> Unit { self.n = self.n + 1 }\n" +
+    "fn bump(mut x : Int) -> Unit { x = x + 1 }\n" +
+    "pub fn ok(mut p : Int) -> Int {\n" +
+    "  let mut a = 1\n" +
+    "  a = 2\n" +
+    "  let mut b = 3\n" +
+    "  b += 4\n" +
+    "  let mut c = 5\n" +
+    "  let f = fn() -> Unit { c = c + 1 }\n" +
+    "  f()\n" +
+    "  let mut d = 6\n" +
+    "  bump(mut d)\n" +
+    "  let mut cnt = Counter::{ n: 0 }\n" +
+    "  cnt.inc()\n" +
+    "  let mut w = Wrap::{ c: Counter::{ n: 1 } }\n" +
+    "  w.c.inc()\n" +
+    "  bump(mut w.c.n)\n" +
+    "  p + a + b + c + d + cnt.n + w.c.n\n" +
+    "}\n"
+  let dclean = lt_lint_one(clean)
+  lt_assert(dclean.length() == 0, check_result_to_json(dclean))
+}
+
+///|
+test "lint: L_UNREACHABLE_CODE positives, fn panic shadow, while true tail, and or-pattern dedup" {
+  // Return / panic / both-branch if / exhaustive match -> 1 diag per dead run.
+  let s1 =
+    "pub fn f(b : Bool) -> Int {\n" +
+    "  if b {\n" +
+    "    return 1\n" +
+    "    let _ = 2\n" +
+    "    let _ = 3\n" +
+    "  }\n" +
+    "  panic(\"boom\")\n" +
+    "  4\n" +
+    "}\n"
+  let d1 = lt_lint_one(s1)
+  assert_eq(lt_count_code(d1, "L_UNREACHABLE_CODE"), 2)
+
+  // Adversarial 1: local `fn panic` shadow does NOT diverge!
+  let shadow_panic =
+    "fn panic(msg : String) -> Int { msg.length() }\n" +
+    "pub fn f() -> Int {\n" +
+    "  let _ = panic(\"not diverging\")\n" +
+    "  42\n" +
+    "}\n"
+  let dsp = lt_lint_one(shadow_panic)
+  lt_assert(dsp.length() == 0, check_result_to_json(dsp))
+
+  // Adversarial 2: `while true` followed by required tail expression MUST NOT trigger!
+  let while_tail =
+    "pub fn f(n : Int) -> Int {\n" +
+    "  let mut i = 0\n" +
+    "  while true {\n" +
+    "    if i >= n {\n" +
+    "      return i\n" +
+    "    }\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  0\n" +
+    "}\n"
+  let dwt = lt_lint_one(while_tail)
+  lt_assert(dwt.length() == 0, check_result_to_json(dwt))
+
+  // Adversarial 3: or-pattern shared body expansion MUST deduplicate to 1 diag.
+  let or_pat =
+    "enum E { A(Int), B(Int) }\n" +
+    "pub fn f(e : E) -> Int {\n" +
+    "  match e {\n" +
+    "    A(x) | B(x) => {\n" +
+    "      let dead = 99\n" +
+    "      x\n" +
+    "    }\n" +
+    "  }\n" +
+    "}\n"
+  let dor = lt_lint_one(or_pat)
+  assert_eq(dor.length(), 1)
+  assert_eq(dor[0].code, "L_UNUSED_LOCAL")
+}
+
+///|
+test "lint: L_SELF_ASSIGN positives and exclusions" {
+  let s1 =
+    "struct S { mut v : Int }\n" +
+    "pub fn f(a : Array[Int], i : Int) -> Int {\n" +
+    "  let mut x = 1\n" +
+    "  x = x\n" +
+    "  let s = S::{ v: 2 }\n" +
+    "  s.v = s.v\n" +
+    "  x += x\n" +
+    "  a[i] = a[i]\n" +
+    "  x + s.v\n" +
+    "}\n"
+  let d1 = lt_lint_one(s1)
+  assert_eq(lt_count_code(d1, "L_SELF_ASSIGN"), 2)
+  assert_eq(d1.length(), 2)
+}
+
+///|
+test "lint: L_FILE_TOO_LONG 10000 vs 10001 boundary, CRLF, UTF-8, and [verify] raw count" {
+  // Build a 10000-line file (2 lines of fn + 9998 blank/comment lines).
+  let sb = StringBuilder()
+  sb.write_string("pub fn f() -> Int {\n")
+  let mut i = 0
+  while i < 9998 {
+    sb.write_string("// pad\n")
+    i = i + 1
+  }
+  sb.write_string("  1\n}\n")
+  let src_10001 = sb.to_string()
+  assert_eq(lint_count_lines(src_10001), 10001)
+  let d_over = lt_lint_one(src_10001)
+  assert_eq(d_over.length(), 1)
+  assert_eq(d_over[0].code, "L_FILE_TOO_LONG")
+  assert_eq(d_over[0].line, 10001)
+  assert_eq(d_over[0].col, 1)
+  assert_eq(d_over[0].edits.length(), 0)
+
+  // Exactly 10000 lines: clean even when `[verify] enabled = true` appends `#![verify]`.
+  let sb2 = StringBuilder()
+  sb2.write_string("pub fn f() -> Int {\n")
+  i = 0
+  while i < 9997 {
+    sb2.write_string("// pad\r\n")
+    i = i + 1
+  }
+  sb2.write_string("  1\r\n}\r\n")
+  let raw_10000 = sb2.to_string()
+  assert_eq(lint_count_lines(raw_10000), 10000)
+  let ver_sources = manifest_apply_verify([raw_10000], true)
+  let cr = check_source_files_with_imports_mapped(
+    "vpkg",
+    ["v.pion"],
+    ver_sources,
+    [],
+    [],
+    [],
+    false,
+    true,
+  )
+  assert_eq(cr.diagnostics.length(), 0)
+  let raw_map : Map[String, String] = Map([])
+  raw_map.set("v.pion", raw_10000)
+  let d_ok = lint_package(cr.pkg, cr.tc, raw_map, [])
+  assert_eq(d_ok.length(), 0)
+
+  // CRLF + UTF-8 edit offset precision.
+  let crlf_utf8 = "// 中文注释\r\npub fn f() -> Int {\r\n  let mut x = 1\r\n  let y = 2\r\n  x\r\n}\r\n"
+  let d_u = lt_lint_one(crlf_utf8)
+  assert_eq(d_u.length(), 2)
+  let fixed_u = lt_apply_machine_edits(crlf_utf8, "main.pion", d_u)
+  assert_eq(
+    fixed_u,
+    "// 中文注释\r\npub fn f() -> Int {\r\n  let x = 1\r\n  let _y = 2\r\n  x\r\n}\r\n",
+  )
+  assert_eq(lt_lint_one(fixed_u).length(), 0)
+}
+
+///|
+extern "C" fn lt_c_fopen(path : Ptr, mode : Ptr) -> Ptr = "fopen"
+
+///|
+extern "C" fn lt_c_fseek(fp : Ptr, off : Int64, whence : Int) -> Int = "fseek"
+
+///|
+extern "C" fn lt_c_ftell(fp : Ptr) -> Int64 = "ftell"
+
+///|
+extern "C" fn lt_c_fread(buf : Ptr, sz : Int64, n : Int64, fp : Ptr) -> Int64 = "fread"
+
+///|
+extern "C" fn lt_c_fclose(fp : Ptr) -> Int = "fclose"
+
+///|
+extern "C" fn lt_c_calloc(n : Int64, sz : Int64) -> Ptr = "calloc"
+
+///|
+extern "C" fn lt_c_free(p : Ptr) -> Unit = "free"
+
+///|
+fn lt_try_read(path : String) -> String {
+  let fp = lt_c_fopen(path.as_cstr(), "rb".as_cstr())
+  if fp == ptr_null() {
+    return ""
+  }
+  let _ = lt_c_fseek(fp, 0L, 2)
+  let sz = lt_c_ftell(fp)
+  let _ = lt_c_fseek(fp, 0L, 0)
+  if sz <= 0L {
+    let _ = lt_c_fclose(fp)
+    return ""
+  }
+  let buf = lt_c_calloc(sz + 1L, 1L)
+  if buf == ptr_null() {
+    let _ = lt_c_fclose(fp)
+    return ""
+  }
+  let _ = lt_c_fread(buf, 1L, sz, fp)
+  let _ = lt_c_fclose(fp)
+  let out = cstr_to_str(buf)
+  lt_c_free(buf)
+  out
+}
+
+///|
+fn lt_read_core_file(name : String) -> String {
+  let prefixes = [
+    "compiler/src/core/",
+    "../compiler/src/core/",
+    "../../compiler/src/core/",
+    "",
+  ]
+  let mut i = 0
+  while i < prefixes.length() {
+    let txt = lt_try_read(prefixes[i] + name)
+    if txt.length() > 0 {
+      return txt
+    }
+    i = i + 1
+  }
+  abort("could not locate core file: " + name)
+}
+
+///|
+test "lint: dogfood self-check on compiler/src/core yields 0 L_* diagnostics on lint.pion and lint_test.pion" {
+  let file_names = [
+    "ast.pion",
+    "cas.pion",
+    "diag.pion",
+    "fmt.pion",
+    "inline_rc.pion",
+    "lean.pion",
+    "lexer.pion",
+    "lint.pion",
+    "llbc.pion",
+    "manifest.pion",
+    "mutarg.pion",
+    "parser.pion",
+    "qbe.pion",
+    "query.pion",
+    "sig.pion",
+    "types.pion",
+    "verify.pion",
+    "wasm.pion",
+    "test_helpers_test.pion",
+    "lint_test.pion",
+  ]
+  let paths : Array[String] = []
+  let sources : Array[String] = []
+  let raw_map : Map[String, String] = Map([])
+  let mut i = 0
+  while i < file_names.length() {
+    let fname = file_names[i]
+    let src = lt_read_core_file(fname)
+    paths.push(fname)
+    sources.push(src)
+    raw_map.set(fname, src)
+    i = i + 1
+  }
+  let cr = check_source_files_with_imports_mapped(
+    "core",
+    paths,
+    sources,
+    [],
+    [],
+    [],
+    false,
+    true,
+  )
+  lt_assert(cr.diagnostics.length() == 0, "core check clean: " + check_result_to_json(cr.diagnostics))
+  let diags = lint_package(cr.pkg, cr.tc, raw_map, [])
+  let mine : Array[Diagnostic] = []
+  i = 0
+  while i < diags.length() {
+    if diags[i].file == "lint.pion" || diags[i].file == "lint_test.pion" {
+      mine.push(diags[i])
+    }
+    i = i + 1
+  }
+  lt_assert(mine.length() == 0, "dogfood lint diagnostics: " + check_result_to_json(mine))
+}

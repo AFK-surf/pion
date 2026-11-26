@@ -708,6 +708,30 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - Writes `<dir>/<Pkg>/{Types,Funs,FunsExternal_Template}.lean` (and `FunsExternal.lean` when absent or unmodified since the last extraction) for every package with something in the closure, upstream first; build them with a Lake library per package next to `lean/` (`scripts/test-lean.sh`). Packages whose `lean_module_name` is unique within the extracted subgraph keep their clean declared module name (e.g. `Vlib`), while colliding Lean module names (e.g. two distinct `json` sources or `my_pkg` vs `my__pkg`) are disambiguated using their canonical package ID.
 - JSON output: `{"ok":true,"out":"<dir>","packages":[{"name":"vlib","lean_mod":"Vlib","files":["Vlib/Types.lean",...],"types":N,"funs":N,"externals":["opaque_len",...]}]}` (`types`: structs + enums + traits; `funs`: functions + constants + trait dictionaries).
 
+### 5.6 `pionc lint [--fix] [--locked] [--offline] [--target <target>] [--json] [input1 ...]`
+- Built-in independent linter enforcing 7 mandatory, zero-configuration `L_*` rules (no `pion.toml` `[lint]` toggles, no `--disable`/`--allow`/`--max-*` flags, no inline `#allow(...)` suppressions).
+- **Target & package selection**:
+  - Single file, flat file list, or directory without `pion.toml`: loads and lints the given files directly (same as `pionc check`).
+  - No positional target: defaults to `"."` when `pion.toml` or `src/` exists.
+  - Manifest root (single package or `[workspace]`): loads the dependency graph with `--locked`/`--offline`/`--target`, then selects packages strictly by `--no-deps` canonical directory semantics (virtual workspace → expanded `members`; hybrid workspace → root + `members`; single package → that package only). External git/registry dependencies and non-member `../path` dependencies are never linted or modified by `--fix`.
+  - Selected packages always type-check real bodies (never skipped via `.pionsig`). Production sources are checked first; if any `E_*` diagnostic occurs anywhere in the graph or selected package (production or `*_test.pion`), `pionc lint` prints the `E_*` diagnostics and exits `1` without running lint or writing disk.
+  - Import rules (`L_IMPLICIT_IMPORT`, `L_UNUSED_IMPORT`) scan every `.pion` file in the selected package directory (production, `*_test.pion`, and inactive `[targets]` files) so cross-target or test-only references are never misclassified as unused.
+  - Physical line counts (`L_FILE_TOO_LONG`) and `--fix` edit offsets are always computed against the original on-disk file text (never counting `#![verify]` injected by `[verify] enabled = true`).
+- **Output & exit code**:
+  - Default / `--json`: `{"ok":bool,"diagnostics":[...]}` (sorted deterministically by `(file, line, col, code, message)` and deduplicated).
+  - `--fix`: `{"ok":bool,"fixed":N,"files":[...],"diagnostics":[...]}`.
+  - Exit code is `0` iff `diagnostics` is empty, otherwise `1`.
+- **Transactional `--fix`**: collects only `L_*` edits with `applicability == "machine"` whose canonical target path lies within a selected package directory (preventing symlink escapes into dependencies), applies non-overlapping edits in memory up to 3 rounds, re-runs full production + test type checking in memory, and atomically writes disk only when re-checking produces 0 `E_*` errors and on-disk contents have not changed since being read. Re-running `--fix` on a clean/fixed package is strictly idempotent (`fixed: 0`).
+- **Mandatory `L_*` diagnostic codes**:
+  - `L_IMPLICIT_IMPORT` (`"machine"` edit when unambiguous across the package): file uses an external package alias `alias::` without declaring `import` for it in that file.
+  - `L_UNUSED_IMPORT` (`"machine"` edit when no other file in the package implicitly depends on the alias and the import occupies its own clean line): declared `import` is unused in this file or duplicated in the same file.
+  - `L_UNUSED_LOCAL` (`"machine"` edit renaming single `SLet` `name` → `_name` only when `_name` does not appear anywhere in the enclosing top-level declaration or package-level `consts`/`fns`): local binding (`SLet`, `SLetTuple`, `SForRange`, `SForIn`, `match`/`is` `PIdent`) is never referenced; `_`-prefixed names and all parameters are exempt.
+  - `L_UNUSED_MUT` (`"machine"` edit deleting `"mut "`): local `let mut` binding is never reassigned, passed as `mut <place>`, or used as receiver of a `mut self` method.
+  - `L_UNREACHABLE_CODE` (no edit): statement following a statically diverging statement (`return`, `break`, `continue`, `TNever`/`never_calls` expression, all-diverging `if`/`match`, or diverging block); reported once per unreachable run. Loops (`while`/`for`) and `guard` are never treated as unconditionally diverging.
+  - `L_SELF_ASSIGN` (no edit): `lhs = rhs` where both sides are syntactically identical pure `EIdent`/`EField` chains (`x = x`, `self.pos = self.pos`); excludes compound assignment, indexing, and calls.
+  - `L_FILE_TOO_LONG` (no edit): original on-disk `.pion` file exceeds `10000` physical lines (reported at `10001:1`).
+  - Executable `before`/`after` examples for all 7 `L_*` codes live in `docs/diagnostics.md` and are verified by `compiler/src/core/diagnostics_doc_test.pion`.
+
 ---
 
 ## 6. Global Content-Addressed Cache (CAS) & `pion.toml` Contract
