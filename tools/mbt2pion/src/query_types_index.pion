@@ -1,0 +1,1163 @@
+///| Structured index over `pionc check --server` (`include_types: true`) / `pionc query types --json`
+///| output for O(1) expression-type, receiver-type, call-target, and `for_iter` lookups.
+///| Uses a single-pass zero-AST streaming JSON scanner so multi-megabyte responses parse in milliseconds.
+///| Strictly fail-closed: `ambiguous: true`, empty types, or `<error>`/`?`/`TError` types never match.
+
+pub struct QtExprEntry {
+  start_byte : Int
+  end_byte : Int
+  op_byte : Int
+  role : String
+  ty : String
+  ty_canon : String
+  receiver_ty : String
+  receiver_ty_canon : String
+  ambiguous : Bool
+}
+
+pub struct QtCallEntry {
+  start_byte : Int
+  end_byte : Int
+  op_byte : Int
+  kind : String
+  target : String
+  target_canon : String
+  ret_ty : String
+  ret_ty_canon : String
+  ambiguous : Bool
+}
+
+pub struct QtFileIndex {
+  rel_path : String
+  exprs : Array[QtExprEntry]
+  calls : Array[QtCallEntry]
+  by_op_byte : Map[Int, Array[Int]]
+  by_span : Map[String, Array[Int]]
+  calls_by_op : Map[Int, Array[Int]]
+  interp_holes : Array[Int]
+  for_iters : Array[Int]
+}
+
+pub struct PkgQueryTypes {
+  ok : Bool
+  files : Map[String, QtFileIndex]
+}
+
+pub fn empty_pkg_query_types() -> PkgQueryTypes {
+  PkgQueryTypes::{ ok: false, files: Map() }
+}
+
+fn qt_normalize_rel_path(raw : String) -> String {
+  let s = if raw.index_of("__mbt_probe.pion") >= 0 {
+    str_replace_all(raw, "__mbt_probe.pion", ".pion")
+  } else {
+    raw
+  }
+  if s.starts_with("src/") {
+    s.slice(4, s.length())
+  } else {
+    s
+  }
+}
+
+fn qt_is_lower_hex(c : Int) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+}
+
+///| Strip compiler canonical package-hash suffixes (`__<8hex>::` -> `::`) from display type strings
+///| so Stage A.5 type checks match `mbt_compat::ArrayView[T]` identically to diagnostic messages,
+///| while leaving `ty_canon` / `receiver_ty_canon` untouched with full canonical package identity.
+pub fn qt_strip_pkg_hash(ty : String) -> String {
+  if ty.index_of("__") < 0 {
+    return ty
+  }
+  let n = ty.length()
+  let sb = StringBuilder()
+  let mut i = 0
+  let mut seg = 0
+  while i + 12 <= n {
+    if ty.code_unit_at(i) == 95 && ty.code_unit_at(i + 1) == 95 &&
+    ty.code_unit_at(i + 10) == 58 && ty.code_unit_at(i + 11) == 58 {
+      let mut all_hex = true
+      let mut k = i + 2
+      while k < i + 10 {
+        if !qt_is_lower_hex(ty.code_unit_at(k)) {
+          all_hex = false
+          break
+        }
+        k = k + 1
+      }
+      if all_hex {
+        if i > seg {
+          sb.write_string(ty.slice(seg, i))
+        }
+        seg = i + 10
+        i = i + 12
+        continue
+      }
+    }
+    i = i + 1
+  }
+  if seg == 0 {
+    return ty
+  }
+  if seg < n {
+    sb.write_string(ty.slice(seg, n))
+  }
+  sb.to_string()
+}
+
+///| Check whether a type string from `query types` is concrete and trusted (fail-closed on errors/unknowns).
+pub fn qt_is_trusted_type(ty : String) -> Bool {
+  let t = ty.trim()
+  t.length() > 0 && t != "?" && t != "<error>" && t != "<unknown>" && t != "TError"
+}
+
+fn qt_is_builtin_primitive_type(t : String) -> Bool {
+  t == "Int" || t == "Int64" || t == "Int16" || t == "Int8" ||
+  t == "UInt" || t == "UInt64" || t == "UInt16" || t == "UInt8" ||
+  t == "Double" || t == "Float" || t == "Bool" || t == "Char" ||
+  t == "Byte" || t == "String" || t == "Bytes" || t == "Unit" ||
+  t == "StringBuilder" || t == "Never"
+}
+
+fn qt_is_builtin_container_head(h : String) -> Bool {
+  h == "Array" || h == "FixedArray" || h == "Option" || h == "Result" ||
+  h == "Map" || h == "Set" || h == "Ref" || h == "Iter" || h == "ArrayView"
+}
+
+fn qt_split_top_level_type_args(inner : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut depth = 0
+  let mut start = 0
+  let mut i = 0
+  let n = inner.length()
+  while i < n {
+    let c = inner.code_unit_at(i)
+    if c == 91 || c == 40 {
+      depth = depth + 1
+    } else if c == 93 || c == 41 {
+      if depth > 0 { depth = depth - 1 }
+    } else if c == 44 && depth == 0 {
+      out.push(inner.slice(start, i).trim())
+      start = i + 1
+    }
+    i = i + 1
+  }
+  let tail = inner.slice(start, n).trim()
+  if tail.length() > 0 {
+    out.push(tail)
+  }
+  out
+}
+
+///| Check whether a canonical type string (`ty_canon` / `receiver_ty_canon`) is completely ground
+///| (no error types, no `dyn`/function types, and no bare generic type parameters like `T`).
+///| Accepts built-in primitives, package-qualified nominal types (`pkg::Name`), and same-package
+///| nominal types explicitly present in `declared_types`. Strictly fail-closed otherwise.
+pub fn qt_is_ground_canon_type(ty_canon : String, declared_types : Map[String, Bool]) -> Bool {
+  let t = ty_canon.trim()
+  if !qt_is_trusted_type(t) || t.starts_with("dyn ") || t.starts_with("fn(") {
+    return false
+  }
+  if t.starts_with("(") && t.ends_with(")") {
+    let inner = t.slice(1, t.length() - 1).trim()
+    if inner.length() == 0 {
+      return true
+    }
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() == 0 {
+      return false
+    }
+    for pt in parts {
+      if !qt_is_ground_canon_type(pt, declared_types) {
+        return false
+      }
+    }
+    return true
+  }
+  let lb = t.index_of("[")
+  if lb >= 0 {
+    if !t.ends_with("]") {
+      return false
+    }
+    let head = t.slice(0, lb).trim()
+    if !(qt_is_builtin_container_head(head) || head.index_of("::") > 0 || declared_types.contains(head)) {
+      return false
+    }
+    let inner = t.slice(lb + 1, t.length() - 1).trim()
+    let args = qt_split_top_level_type_args(inner)
+    if args.length() == 0 {
+      return false
+    }
+    for a in args {
+      if !qt_is_ground_canon_type(a, declared_types) {
+        return false
+      }
+    }
+    return true
+  }
+  qt_is_builtin_primitive_type(t) || t.index_of("::") > 0 || declared_types.contains(t)
+}
+
+///| True when a ground canonical type is a built-in container whose mutating methods
+///| (`.remove`, `.pop`, `.clear`, `.push`, etc.) only mutate its own storage and never
+///| invoke user code that could mutate a distinct `Array[Elem]`.
+pub fn qt_is_builtin_isolated_container(ty_canon : String) -> Bool {
+  ty_canon.starts_with("Array[") || ty_canon.starts_with("FixedArray[") ||
+  ty_canon.starts_with("Map[") || ty_canon.starts_with("Set[") ||
+  ty_canon == "StringBuilder"
+}
+
+// ---------------------------------------------------------------------------
+// Zero-AST single-pass streaming JSON scanner for `query types` payloads
+// ---------------------------------------------------------------------------
+
+struct QtScan {
+  s : String
+  n : Int
+  mut p : Int
+  mut err : Bool
+}
+
+fn qts_ws(sc : QtScan) -> Unit {
+  while sc.p < sc.n {
+    let c = sc.s.code_unit_at(sc.p)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      sc.p = sc.p + 1
+    } else {
+      break
+    }
+  }
+}
+
+fn qts_peek(sc : QtScan) -> Int {
+  if sc.p < sc.n { sc.s.code_unit_at(sc.p) } else { -1 }
+}
+
+fn qts_hex(c : Int) -> Int {
+  if c >= 48 && c <= 57 { c - 48 }
+  else if c >= 97 && c <= 102 { c - 87 }
+  else if c >= 65 && c <= 70 { c - 55 }
+  else { -1 }
+}
+
+///| Read a JSON string at `sc.p` (must point at `"`). Fast-paths unescaped strings via a single `slice`.
+fn qts_str(sc : QtScan) -> String {
+  if qts_peek(sc) != 34 {
+    sc.err = true
+    return ""
+  }
+  sc.p = sc.p + 1
+  let start = sc.p
+  while sc.p < sc.n {
+    let c = sc.s.code_unit_at(sc.p)
+    if c == 34 {
+      let out = sc.s.slice(start, sc.p)
+      sc.p = sc.p + 1
+      return out
+    }
+    if c == 92 {
+      break
+    }
+    sc.p = sc.p + 1
+  }
+  if sc.p >= sc.n {
+    sc.err = true
+    return ""
+  }
+  let sb = StringBuilder()
+  let mut run = start
+  while sc.p < sc.n {
+    let c = sc.s.code_unit_at(sc.p)
+    if c == 34 {
+      if sc.p > run {
+        sb.write_string(sc.s.slice(run, sc.p))
+      }
+      sc.p = sc.p + 1
+      return sb.to_string()
+    }
+    if c == 92 {
+      if sc.p > run {
+        sb.write_string(sc.s.slice(run, sc.p))
+      }
+      sc.p = sc.p + 1
+      if sc.p >= sc.n {
+        sc.err = true
+        return ""
+      }
+      let e = sc.s.code_unit_at(sc.p)
+      sc.p = sc.p + 1
+      if e == 34 { sb.write_char('"') }
+      else if e == 92 { sb.write_char('\\') }
+      else if e == 47 { sb.write_char('/') }
+      else if e == 110 { sb.write_char('\n') }
+      else if e == 114 { sb.write_char('\r') }
+      else if e == 116 { sb.write_char('\t') }
+      else if e == 98 { sb.write_char((8).unsafe_to_char()) }
+      else if e == 102 { sb.write_char((12).unsafe_to_char()) }
+      else if e == 117 && sc.p + 4 <= sc.n {
+        let h0 = qts_hex(sc.s.code_unit_at(sc.p))
+        let h1 = qts_hex(sc.s.code_unit_at(sc.p + 1))
+        let h2 = qts_hex(sc.s.code_unit_at(sc.p + 2))
+        let h3 = qts_hex(sc.s.code_unit_at(sc.p + 3))
+        if h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0 {
+          let cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3
+          sc.p = sc.p + 4
+          if cp >= 55296 && cp <= 56319 && sc.p + 6 <= sc.n &&
+          sc.s.code_unit_at(sc.p) == 92 && sc.s.code_unit_at(sc.p + 1) == 117 {
+            let l0 = qts_hex(sc.s.code_unit_at(sc.p + 2))
+            let l1 = qts_hex(sc.s.code_unit_at(sc.p + 3))
+            let l2 = qts_hex(sc.s.code_unit_at(sc.p + 4))
+            let l3 = qts_hex(sc.s.code_unit_at(sc.p + 5))
+            if l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0 {
+              let lo = l0 * 4096 + l1 * 256 + l2 * 16 + l3
+              if lo >= 56320 && lo <= 57343 {
+                sc.p = sc.p + 6
+                let full_cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                sb.write_char(full_cp.unsafe_to_char())
+              }
+            }
+          } else if cp < 55296 || cp > 57343 {
+            sb.write_char(cp.unsafe_to_char())
+          }
+        }
+      }
+      run = sc.p
+    } else {
+      sc.p = sc.p + 1
+    }
+  }
+  sc.err = true
+  ""
+}
+
+fn qts_skip_str(sc : QtScan) -> Unit {
+  if qts_peek(sc) != 34 {
+    sc.err = true
+    return
+  }
+  sc.p = sc.p + 1
+  while sc.p < sc.n {
+    let c = sc.s.code_unit_at(sc.p)
+    if c == 34 {
+      sc.p = sc.p + 1
+      return
+    }
+    if c == 92 {
+      sc.p = sc.p + 2
+    } else {
+      sc.p = sc.p + 1
+    }
+  }
+  sc.err = true
+}
+
+fn qts_int(sc : QtScan, def : Int) -> Int {
+  qts_ws(sc)
+  let mut neg = false
+  if qts_peek(sc) == 45 {
+    neg = true
+    sc.p = sc.p + 1
+  }
+  let mut v = 0
+  let mut saw = false
+  while sc.p < sc.n {
+    let c = sc.s.code_unit_at(sc.p)
+    if c >= 48 && c <= 57 {
+      v = v * 10 + (c - 48)
+      saw = true
+      sc.p = sc.p + 1
+    } else {
+      break
+    }
+  }
+  if !saw {
+    qts_skip_val(sc)
+    return def
+  }
+  if neg { 0 - v } else { v }
+}
+
+fn qts_bool(sc : QtScan) -> Bool {
+  qts_ws(sc)
+  let c = qts_peek(sc)
+  if c == 116 && sc.p + 4 <= sc.n && sc.s.slice(sc.p, sc.p + 4) == "true" {
+    sc.p = sc.p + 4
+    return true
+  }
+  if c == 102 && sc.p + 5 <= sc.n && sc.s.slice(sc.p, sc.p + 5) == "false" {
+    sc.p = sc.p + 5
+    return false
+  }
+  qts_skip_val(sc)
+  false
+}
+
+///| Skip any JSON value in O(N) bytes with zero heap allocation (iterative for flat tokens, bounded depth).
+fn qts_skip_val(sc : QtScan) -> Unit {
+  qts_ws(sc)
+  let c = qts_peek(sc)
+  if c == 34 {
+    qts_skip_str(sc)
+    return
+  }
+  if c == 123 || c == 91 {
+    let mut depth = 1
+    sc.p = sc.p + 1
+    while sc.p < sc.n && depth > 0 {
+      let ch = sc.s.code_unit_at(sc.p)
+      if ch == 34 {
+        qts_skip_str(sc)
+      } else if ch == 123 || ch == 91 {
+        depth = depth + 1
+        sc.p = sc.p + 1
+      } else if ch == 125 || ch == 93 {
+        depth = depth - 1
+        sc.p = sc.p + 1
+      } else {
+        sc.p = sc.p + 1
+      }
+    }
+    if depth != 0 {
+      sc.err = true
+    }
+    return
+  }
+  // Number, true, false, null
+  let start = sc.p
+  while sc.p < sc.n {
+    let ch = sc.s.code_unit_at(sc.p)
+    if ch == 44 || ch == 125 || ch == 93 || ch == 32 || ch == 9 || ch == 10 || ch == 13 {
+      break
+    }
+    sc.p = sc.p + 1
+  }
+  if sc.p == start {
+    sc.err = true
+  }
+}
+
+fn qts_parse_expr_obj(
+  sc : QtScan,
+  exprs : Array[QtExprEntry],
+  by_op_byte : Map[Int, Array[Int]],
+  by_span : Map[String, Array[Int]],
+  interp_holes : Array[Int],
+  for_iters : Array[Int],
+) -> Unit {
+  qts_ws(sc)
+  if qts_peek(sc) != 123 {
+    qts_skip_val(sc)
+    return
+  }
+  sc.p = sc.p + 1
+  let mut sb = -1
+  let mut eb = -1
+  let mut ob = -1
+  let mut role = ""
+  let mut ty = ""
+  let mut ty_c = ""
+  let mut rty = ""
+  let mut rty_c = ""
+  let mut ambig = false
+  while !sc.err && sc.p < sc.n {
+    qts_ws(sc)
+    let c = qts_peek(sc)
+    if c == 125 {
+      sc.p = sc.p + 1
+      break
+    }
+    if c == 44 {
+      sc.p = sc.p + 1
+      continue
+    }
+    let key = qts_str(sc)
+    qts_ws(sc)
+    if qts_peek(sc) != 58 {
+      sc.err = true
+      return
+    }
+    sc.p = sc.p + 1
+    qts_ws(sc)
+    if key == "start_byte" {
+      sb = qts_int(sc, -1)
+    } else if key == "end_byte" {
+      eb = qts_int(sc, -1)
+    } else if key == "op_byte" {
+      ob = qts_int(sc, -1)
+    } else if key == "role" {
+      role = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ty" {
+      ty = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ty_canon" {
+      ty_c = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "receiver_ty" {
+      rty = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "receiver_ty_canon" {
+      rty_c = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ambiguous" {
+      ambig = qts_bool(sc)
+    } else {
+      qts_skip_val(sc)
+    }
+  }
+  let idx = exprs.length()
+  let disp_ty = qt_strip_pkg_hash(ty)
+  let disp_rty = qt_strip_pkg_hash(rty)
+  exprs.push(QtExprEntry::{
+    start_byte: sb,
+    end_byte: eb,
+    op_byte: ob,
+    role: role,
+    ty: disp_ty,
+    ty_canon: if ty_c.length() > 0 { ty_c } else { ty },
+    receiver_ty: disp_rty,
+    receiver_ty_canon: if rty_c.length() > 0 { rty_c } else { rty },
+    ambiguous: ambig,
+  })
+  if ob >= 0 {
+    match by_op_byte.get(ob) {
+      Some(b) => b.push(idx)
+      None => by_op_byte[ob] = [idx]
+    }
+  }
+  if sb >= 0 && eb >= sb {
+    let sk = sb.to_string() + ":" + eb.to_string()
+    match by_span.get(sk) {
+      Some(b) => b.push(idx)
+      None => by_span[sk] = [idx]
+    }
+  }
+  if role == "interp_hole" {
+    interp_holes.push(idx)
+  } else if role == "for_iter" {
+    for_iters.push(idx)
+  }
+}
+
+fn qts_parse_call_obj(
+  sc : QtScan,
+  calls : Array[QtCallEntry],
+  calls_by_op : Map[Int, Array[Int]],
+) -> Unit {
+  qts_ws(sc)
+  if qts_peek(sc) != 123 {
+    qts_skip_val(sc)
+    return
+  }
+  sc.p = sc.p + 1
+  let mut sb = -1
+  let mut eb = -1
+  let mut ob = -1
+  let mut kind = ""
+  let mut target = ""
+  let mut tc = ""
+  let mut ret = ""
+  let mut ret_c = ""
+  let mut ambig = false
+  while !sc.err && sc.p < sc.n {
+    qts_ws(sc)
+    let c = qts_peek(sc)
+    if c == 125 {
+      sc.p = sc.p + 1
+      break
+    }
+    if c == 44 {
+      sc.p = sc.p + 1
+      continue
+    }
+    let key = qts_str(sc)
+    qts_ws(sc)
+    if qts_peek(sc) != 58 {
+      sc.err = true
+      return
+    }
+    sc.p = sc.p + 1
+    qts_ws(sc)
+    if key == "start_byte" {
+      sb = qts_int(sc, -1)
+    } else if key == "end_byte" {
+      eb = qts_int(sc, -1)
+    } else if key == "op_byte" {
+      ob = qts_int(sc, -1)
+    } else if key == "kind" {
+      kind = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "target" {
+      target = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "target_canon" {
+      tc = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ret_ty" {
+      ret = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ret_ty_canon" {
+      ret_c = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "ambiguous" {
+      ambig = qts_bool(sc)
+    } else {
+      qts_skip_val(sc)
+    }
+  }
+  let cidx = calls.length()
+  calls.push(QtCallEntry::{
+    start_byte: sb,
+    end_byte: eb,
+    op_byte: ob,
+    kind: kind,
+    target: target,
+    target_canon: if tc.length() > 0 { tc } else { target },
+    ret_ty: ret,
+    ret_ty_canon: if ret_c.length() > 0 { ret_c } else { ret },
+    ambiguous: ambig,
+  })
+  if ob >= 0 {
+    match calls_by_op.get(ob) {
+      Some(b) => b.push(cidx)
+      None => calls_by_op[ob] = [cidx]
+    }
+  }
+}
+
+fn qts_parse_file_obj(sc : QtScan, out_files : Map[String, QtFileIndex]) -> Unit {
+  qts_ws(sc)
+  if qts_peek(sc) != 123 {
+    qts_skip_val(sc)
+    return
+  }
+  sc.p = sc.p + 1
+  let mut raw_file = ""
+  let exprs : Array[QtExprEntry] = []
+  let calls : Array[QtCallEntry] = []
+  let by_op_byte : Map[Int, Array[Int]] = Map()
+  let by_span : Map[String, Array[Int]] = Map()
+  let calls_by_op : Map[Int, Array[Int]] = Map()
+  let interp_holes : Array[Int] = []
+  let for_iters : Array[Int] = []
+  while !sc.err && sc.p < sc.n {
+    qts_ws(sc)
+    let c = qts_peek(sc)
+    if c == 125 {
+      sc.p = sc.p + 1
+      break
+    }
+    if c == 44 {
+      sc.p = sc.p + 1
+      continue
+    }
+    let key = qts_str(sc)
+    qts_ws(sc)
+    if qts_peek(sc) != 58 {
+      sc.err = true
+      return
+    }
+    sc.p = sc.p + 1
+    qts_ws(sc)
+    if key == "file" {
+      raw_file = if qts_peek(sc) == 34 { qts_str(sc) } else { qts_skip_val(sc); "" }
+    } else if key == "expr_tys" && qts_peek(sc) == 91 {
+      sc.p = sc.p + 1
+      while !sc.err && sc.p < sc.n {
+        qts_ws(sc)
+        let ec = qts_peek(sc)
+        if ec == 93 {
+          sc.p = sc.p + 1
+          break
+        }
+        if ec == 44 {
+          sc.p = sc.p + 1
+          continue
+        }
+        qts_parse_expr_obj(sc, exprs, by_op_byte, by_span, interp_holes, for_iters)
+      }
+    } else if key == "call_targets" && qts_peek(sc) == 91 {
+      sc.p = sc.p + 1
+      while !sc.err && sc.p < sc.n {
+        qts_ws(sc)
+        let cc = qts_peek(sc)
+        if cc == 93 {
+          sc.p = sc.p + 1
+          break
+        }
+        if cc == 44 {
+          sc.p = sc.p + 1
+          continue
+        }
+        qts_parse_call_obj(sc, calls, calls_by_op)
+      }
+    } else {
+      qts_skip_val(sc)
+    }
+  }
+  if raw_file.length() > 0 {
+    let rel = qt_normalize_rel_path(raw_file)
+    out_files[rel] = QtFileIndex::{
+      rel_path: rel,
+      exprs: exprs,
+      calls: calls,
+      by_op_byte: by_op_byte,
+      by_span: by_span,
+      calls_by_op: calls_by_op,
+      interp_holes: interp_holes,
+      for_iters: for_iters,
+    }
+  }
+}
+
+///| Parse `pionc check --server` (`include_types: true`) or `pionc query types --json` output
+///| using a single-pass zero-AST streaming scanner.
+///| Accepts either top-level `"types": [...]` (server response) or `"files": [...]` (`query types` CLI).
+pub fn parse_pkg_query_types_json(raw_json : String) -> PkgQueryTypes {
+  let n = raw_json.length()
+  if n == 0 {
+    return empty_pkg_query_types()
+  }
+  let start = raw_json.index_of("{")
+  if start < 0 {
+    return empty_pkg_query_types()
+  }
+  let sc = QtScan::{ s: raw_json, n: n, p: start, err: false }
+  if qts_peek(sc) != 123 {
+    return empty_pkg_query_types()
+  }
+  sc.p = sc.p + 1
+  let out_files : Map[String, QtFileIndex] = Map()
+  let mut saw_types = false
+  let mut saw_proto_err = false
+  while !sc.err && sc.p < sc.n {
+    qts_ws(sc)
+    let c = qts_peek(sc)
+    if c == 125 {
+      sc.p = sc.p + 1
+      break
+    }
+    if c == 44 {
+      sc.p = sc.p + 1
+      continue
+    }
+    let key = qts_str(sc)
+    qts_ws(sc)
+    if qts_peek(sc) != 58 {
+      sc.err = true
+      break
+    }
+    sc.p = sc.p + 1
+    qts_ws(sc)
+    if key == "protocol_error" {
+      saw_proto_err = true
+      qts_skip_val(sc)
+    } else if (key == "types" || key == "files") && qts_peek(sc) == 91 {
+      saw_types = true
+      sc.p = sc.p + 1
+      while !sc.err && sc.p < sc.n {
+        qts_ws(sc)
+        let fc = qts_peek(sc)
+        if fc == 93 {
+          sc.p = sc.p + 1
+          break
+        }
+        if fc == 44 {
+          sc.p = sc.p + 1
+          continue
+        }
+        qts_parse_file_obj(sc, out_files)
+      }
+    } else {
+      qts_skip_val(sc)
+    }
+  }
+  if sc.err || saw_proto_err || !saw_types {
+    return empty_pkg_query_types()
+  }
+  PkgQueryTypes::{ ok: true, files: out_files }
+}
+
+///| Scan backward over ASCII whitespace from `pos` to find an immediately preceding `.` byte offset, or -1.
+fn qt_prev_dot_byte(src : String, pos : Int) -> Int {
+  let mut p = pos - 1
+  while p >= 0 {
+    let c = src.code_unit_at(p)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p = p - 1
+    } else if c == 46 {
+      return p
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+///| Scan backward over ASCII whitespace from `end_excl` to find the exclusive end byte of the preceding token.
+fn qt_trim_end_before(src : String, start_incl : Int, end_excl : Int) -> Int {
+  let mut p = end_excl
+  while p > start_incl {
+    let c = src.code_unit_at(p - 1)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p = p - 1
+    } else {
+      break
+    }
+  }
+  p
+}
+
+///| Extract a unique, unambiguous, trusted receiver type from a bucket of `QtExprEntry` indices.
+fn qt_unique_receiver_ty(qfi : QtFileIndex, bucket : Array[Int], use_canon : Bool) -> Option[String] {
+  let mut found = ""
+  for idx in bucket {
+    let e = qfi.exprs[idx]
+    let rty = if use_canon { e.receiver_ty_canon } else { e.receiver_ty }
+    if rty.length() == 0 {
+      continue
+    }
+    if e.ambiguous || !qt_is_trusted_type(rty) {
+      return None
+    }
+    if found.length() == 0 {
+      found = rty
+    } else if found != rty {
+      return None
+    }
+  }
+  if found.length() > 0 { Some(found) } else { None }
+}
+
+///| Extract a unique, unambiguous, trusted expression type from a bucket of `QtExprEntry` indices.
+fn qt_unique_expr_ty(qfi : QtFileIndex, bucket : Array[Int], use_canon : Bool) -> Option[String] {
+  let mut found = ""
+  for idx in bucket {
+    let e = qfi.exprs[idx]
+    if e.ambiguous {
+      return None
+    }
+    let ty = if use_canon { e.ty_canon } else { e.ty }
+    if !qt_is_trusted_type(ty) {
+      return None
+    }
+    if found.length() == 0 {
+      found = ty
+    } else if found != ty {
+      return None
+    }
+  }
+  if found.length() > 0 { Some(found) } else { None }
+}
+
+///| Lookup the receiver expression's own type by span `[start_byte, recv_end)` (handling optional outer parens).
+fn qt_lookup_expr_span_ty(
+  qfi : QtFileIndex,
+  src : String,
+  start_byte : Int,
+  end_byte : Int,
+  use_canon : Bool,
+) -> Option[String] {
+  let mut s = start_byte
+  let mut e = qt_trim_end_before(src, s, end_byte)
+  while s < e {
+    let c = src.code_unit_at(s)
+    if c == 32 || c == 9 || c == 10 || c == 13 { s = s + 1 } else { break }
+  }
+  if s < 0 || e <= s {
+    return None
+  }
+  let sk = s.to_string() + ":" + e.to_string()
+  match qfi.by_span.get(sk) {
+    Some(b) =>
+    match qt_unique_expr_ty(qfi, b, use_canon) {
+      Some(t) => return Some(t)
+      None => ()
+    }
+    None => ()
+  }
+  // If wrapped in outer parentheses `(expr)`, try the inner span once.
+  if e - s >= 2 && src.code_unit_at(s) == 40 && src.code_unit_at(e - 1) == 41 {
+    let mut s2 = s + 1
+    let e2 = qt_trim_end_before(src, s2, e - 1)
+    while s2 < e2 {
+      let c = src.code_unit_at(s2)
+      if c == 32 || c == 9 || c == 10 || c == 13 { s2 = s2 + 1 } else { break }
+    }
+    if s2 < e2 {
+      let sk2 = s2.to_string() + ":" + e2.to_string()
+      match qfi.by_span.get(sk2) {
+        Some(b) => return qt_unique_expr_ty(qfi, b, use_canon)
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+///| Lookup the receiver type at a `.method(...)` / `.field` / `[idx]` operator byte offset.
+pub fn qt_lookup_receiver_ty_at_op(
+  qfi : QtFileIndex,
+  src : String,
+  op_byte : Int,
+  start_byte : Int,
+  end_byte : Int,
+  use_canon : Bool,
+) -> Option[String] {
+  if op_byte >= 0 {
+    match qfi.by_op_byte.get(op_byte) {
+      Some(b) =>
+      match qt_unique_receiver_ty(qfi, b, use_canon) {
+        Some(t) => return Some(t)
+        None => ()
+      }
+      None => ()
+    }
+    let dot_b = qt_prev_dot_byte(src, op_byte)
+    if dot_b >= 0 {
+      match qfi.by_op_byte.get(dot_b) {
+        Some(b) =>
+        match qt_unique_receiver_ty(qfi, b, use_canon) {
+          Some(t) => return Some(t)
+          None => ()
+        }
+        None => ()
+      }
+      // Fallback: look up the receiver sub-expression span `[start_byte, dot_b)`.
+      if start_byte >= 0 && dot_b > start_byte {
+        match qt_lookup_expr_span_ty(qfi, src, start_byte, dot_b, use_canon) {
+          Some(t) => return Some(t)
+          None => ()
+        }
+      }
+    } else if start_byte >= 0 && op_byte > start_byte {
+      // Index expression `recv[idx]`: `op_byte` points at `[`, receiver span is `[start_byte, op_byte)`.
+      match qt_lookup_expr_span_ty(qfi, src, start_byte, op_byte, use_canon) {
+        Some(t) => return Some(t)
+        None => ()
+      }
+    }
+  }
+  if start_byte >= 0 && end_byte >= start_byte {
+    let sk = start_byte.to_string() + ":" + end_byte.to_string()
+    match qfi.by_span.get(sk) {
+      Some(b) => return qt_unique_receiver_ty(qfi, b, use_canon)
+      None => ()
+    }
+  }
+  None
+}
+
+///| Sort byte edits ascending by `start_byte` (insertion sort; edits per file are small and non-overlapping).
+fn qt_sort_edits(edits : Array[(Int, Int, String)]) -> Array[(Int, Int, String)] {
+  let out : Array[(Int, Int, String)] = []
+  for ed in edits {
+    out.push(ed)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && out[j].0 > key.0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| Remap an operator byte offset through sorted non-overlapping edits; returns -1 if inside an edited span.
+fn qt_remap_op_byte(op : Int, sorted_edits : Array[(Int, Int, String)]) -> Int {
+  if op < 0 {
+    return -1
+  }
+  let mut delta = 0
+  for ed in sorted_edits {
+    let s = ed.0
+    let e = ed.1
+    if op < s {
+      break
+    }
+    if op >= e {
+      delta = delta + (ed.2.length() - (e - s))
+    } else {
+      return -1
+    }
+  }
+  op + delta
+}
+
+///| Remap an expression span `(start_byte, end_byte)` through sorted non-overlapping edits.
+///| Preserves enclosing spans when a strictly smaller child sub-expression was edited (e.g. `a[i].length()`
+///| or `outer[inner.length()]`), and returns `(-1, -1)` if the span itself was replaced or partially overlapped.
+fn qt_remap_span(sb : Int, eb : Int, sorted_edits : Array[(Int, Int, String)]) -> (Int, Int) {
+  if sb < 0 || eb < sb {
+    return (-1, -1)
+  }
+  let mut s_delta = 0
+  let mut e_delta = 0
+  for ed in sorted_edits {
+    let s = ed.0
+    let e = ed.1
+    let d = ed.2.length() - (e - s)
+    if eb <= s {
+      break
+    }
+    if e <= sb {
+      s_delta = s_delta + d
+      e_delta = e_delta + d
+    } else if s >= sb && e <= eb && !(s == sb && e == eb) {
+      e_delta = e_delta + d
+    } else {
+      return (-1, -1)
+    }
+  }
+  (sb + s_delta, eb + e_delta)
+}
+
+///| Remap a `QtFileIndex` in-memory after applying byte edits so nested probe layers resolve without extra RPCs.
+pub fn remap_qt_file_index(qfi : QtFileIndex, edits : Array[(Int, Int, String)]) -> QtFileIndex {
+  if edits.length() == 0 {
+    return qfi
+  }
+  let sedits = qt_sort_edits(edits)
+  let exprs : Array[QtExprEntry] = []
+  let by_op_byte : Map[Int, Array[Int]] = Map()
+  let by_span : Map[String, Array[Int]] = Map()
+  let interp_holes : Array[Int] = []
+  let for_iters : Array[Int] = []
+
+  for e in qfi.exprs {
+    let new_op = qt_remap_op_byte(e.op_byte, sedits)
+    let (new_sb, new_eb) = qt_remap_span(e.start_byte, e.end_byte, sedits)
+    if new_op < 0 && new_sb < 0 {
+      continue
+    }
+    let idx = exprs.length()
+    exprs.push(QtExprEntry::{
+      start_byte: new_sb,
+      end_byte: new_eb,
+      op_byte: new_op,
+      role: e.role,
+      ty: e.ty,
+      ty_canon: e.ty_canon,
+      receiver_ty: e.receiver_ty,
+      receiver_ty_canon: e.receiver_ty_canon,
+      ambiguous: e.ambiguous,
+    })
+    if new_op >= 0 {
+      match by_op_byte.get(new_op) {
+        Some(b) => b.push(idx)
+        None => by_op_byte[new_op] = [idx]
+      }
+    }
+    if new_sb >= 0 && new_eb >= new_sb {
+      let sk = new_sb.to_string() + ":" + new_eb.to_string()
+      match by_span.get(sk) {
+        Some(b) => b.push(idx)
+        None => by_span[sk] = [idx]
+      }
+    }
+    if e.role == "interp_hole" {
+      interp_holes.push(idx)
+    } else if e.role == "for_iter" {
+      for_iters.push(idx)
+    }
+  }
+
+  let calls : Array[QtCallEntry] = []
+  let calls_by_op : Map[Int, Array[Int]] = Map()
+  for c in qfi.calls {
+    let new_op = qt_remap_op_byte(c.op_byte, sedits)
+    let (new_sb, new_eb) = qt_remap_span(c.start_byte, c.end_byte, sedits)
+    if new_op < 0 && new_sb < 0 {
+      continue
+    }
+    let cidx = calls.length()
+    calls.push(QtCallEntry::{
+      start_byte: new_sb,
+      end_byte: new_eb,
+      op_byte: new_op,
+      kind: c.kind,
+      target: c.target,
+      target_canon: c.target_canon,
+      ret_ty: c.ret_ty,
+      ret_ty_canon: c.ret_ty_canon,
+      ambiguous: c.ambiguous,
+    })
+    if new_op >= 0 {
+      match calls_by_op.get(new_op) {
+        Some(b) => b.push(cidx)
+        None => calls_by_op[new_op] = [cidx]
+      }
+    }
+  }
+
+  QtFileIndex::{
+    rel_path: qfi.rel_path,
+    exprs: exprs,
+    calls: calls,
+    by_op_byte: by_op_byte,
+    by_span: by_span,
+    calls_by_op: calls_by_op,
+    interp_holes: interp_holes,
+    for_iters: for_iters,
+  }
+}
+
+///| Lookup a `ProbeSite`'s resolved type directly from `QtFileIndex` (strictly fail-closed).
+///| Returns `None` on ambiguity, missing entry, error type, or unsupported probe kind so caller falls back.
+pub fn lookup_probe_site_type_from_qt(
+  qfi : QtFileIndex,
+  src : String,
+  site : ProbeSite,
+) -> Option[String] {
+  let pk = site.probe_kind
+  if pk == "mbt_len_probe" || pk == "mbt_idx_probe" || pk == "mbt_val_probe" {
+    return qt_lookup_receiver_ty_at_op(qfi, src, site.op_byte, site.start_byte, site.end_byte, false)
+  }
+  if pk == "mbt_div_probe" || pk == "mbt_mod_probe" {
+    if site.op_byte >= 0 {
+      match qfi.by_op_byte.get(site.op_byte) {
+        Some(b) =>
+        match qt_unique_expr_ty(qfi, b, false) {
+          Some(t) => return Some(t)
+          None => ()
+        }
+        None => ()
+      }
+    }
+    return qt_lookup_expr_span_ty(qfi, src, site.start_byte, site.end_byte, false)
+  }
+  if pk == "mbt_show_probe" {
+    // Either `<recv>.to_string()` (op_byte points at `to_string`) or an `interp_hole` `\{expr}`.
+    if site.op_byte >= 0 && site.op_byte + 9 <= src.length() &&
+    src.slice(site.op_byte, site.op_byte + 9) == "to_string" {
+      return qt_lookup_receiver_ty_at_op(qfi, src, site.op_byte, site.start_byte, site.end_byte, false)
+    }
+    match qt_lookup_expr_span_ty(qfi, src, site.start_byte, site.end_byte, false) {
+      Some(t) => return Some(t)
+      None => ()
+    }
+    for hi in qfi.interp_holes {
+      let e = qfi.exprs[hi]
+      if e.start_byte >= site.start_byte && e.end_byte <= site.end_byte {
+        if e.ambiguous || !qt_is_trusted_type(e.ty) {
+          return None
+        }
+        let mut ok_pad = true
+        let mut p = site.start_byte
+        while p < e.start_byte {
+          let c = src.code_unit_at(p)
+          if c != 32 && c != 9 && c != 10 && c != 13 && c != 40 { ok_pad = false; break }
+          p = p + 1
+        }
+        let mut q = e.end_byte
+        while ok_pad && q < site.end_byte {
+          let c = src.code_unit_at(q)
+          if c != 32 && c != 9 && c != 10 && c != 13 && c != 41 { ok_pad = false; break }
+          q = q + 1
+        }
+        if ok_pad {
+          return Some(e.ty)
+        }
+      }
+    }
+    return None
+  }
+  None
+}

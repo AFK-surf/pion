@@ -265,6 +265,12 @@ pub struct ShrinkPkg {
   // Last name of every path iterated (a `for .. in` body, an iteration callback, a kept iterator) where the
   // iteration may call a function of the package (which could shrink that array).
   iterated_tails : Map[String, String]
+  // Canonical ground `Array[...]` types observed for each iterated tail (from `query_types`).
+  iterated_tail_tys : Map[String, Map[String, Bool]]
+  // Tails where at least one iteration site lacked a ground unambiguous canonical type (fail-closed).
+  iterated_tail_unknown : Map[String, Bool]
+  // Package-declared nominal types (`struct`/`enum`) for ground canonical type checks.
+  declared_types : Map[String, Bool]
   // `pub` functions / methods of the package (callers outside it may iterate what they are given).
   risky_fns : Map[String, String]
   // Functions / methods a snapshot of the package could be live around: called inside an iteration scope or used as
@@ -275,7 +281,16 @@ pub struct ShrinkPkg {
 }
 
 pub fn ShrinkPkg::empty() -> ShrinkPkg {
-  ShrinkPkg::{ array_fields: Map(), iterated_tails: Map(), risky_fns: Map(), iter_fns: Map(), visible_fields: Map() }
+  ShrinkPkg::{
+    array_fields: Map(),
+    iterated_tails: Map(),
+    iterated_tail_tys: Map(),
+    iterated_tail_unknown: Map(),
+    declared_types: Map(),
+    risky_fns: Map(),
+    iter_fns: Map(),
+    visible_fields: Map(),
+  }
 }
 
 ///| Name of the path ending at `end_idx` (`a.b.c` -> `c`; `f(x).c` -> `c`), or "".
@@ -328,8 +343,91 @@ pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
   collect_shrink_pkg_tokens(all_tokens)
 }
 
+///| First token index of the receiver path ending at `end_idx` (`a.b[i].c` -> `a`), or `end_idx`.
+fn receiver_path_start_token(tokens : Array[Token], end_idx : Int) -> Int {
+  if end_idx < 0 {
+    return -1
+  }
+  let mut h = end_idx
+  while h > 0 {
+    if tokens[h].kind == TokenKind::RBracket || tokens[h].kind == TokenKind::RParen {
+      let lb = find_open_before(tokens, h, 0)
+      if lb > 0 && (tokens[lb - 1].kind == TokenKind::Ident || tokens[lb - 1].kind == TokenKind::RBracket || tokens[lb - 1].kind == TokenKind::RParen) {
+        h = lb - 1
+        continue
+      }
+      if lb >= 0 {
+        h = lb
+      }
+      break
+    }
+    if h >= 2 && tokens[h - 1].kind == TokenKind::Dot &&
+    (tokens[h - 2].kind == TokenKind::Ident || tokens[h - 2].kind == TokenKind::RBracket || tokens[h - 2].kind == TokenKind::RParen) {
+      h = h - 2
+      continue
+    }
+    break
+  }
+  h
+}
+
+///| Collect package-declared nominal type names (`struct Name`, `enum Name`) from lexed tokens
+///| so `qt_is_ground_canon_type` distinguishes same-package nominal types from generic type parameters.
+fn collect_declared_nominal_types_tokens(all_tokens : Array[Array[Token]]) -> Map[String, Bool] {
+  let out : Map[String, Bool] = Map()
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    while i + 1 < n {
+      if (ts[i].raw == "struct" || ts[i].raw == "enum") &&
+      (ts[i + 1].kind == TokenKind::UpperIdent || ts[i + 1].kind == TokenKind::Ident) {
+        out[ts[i + 1].raw] = true
+      }
+      i = i + 1
+    }
+  }
+  out
+}
+
+fn shrink_record_iterated_tail(
+  pkg : ShrinkPkg,
+  tail : String,
+  line_str : String,
+  ty_opt : Option[String],
+  declared_types : Map[String, Bool],
+) -> Unit {
+  pkg.iterated_tails[tail] = line_str
+  match ty_opt {
+    Some(ty_c) =>
+    if qt_is_ground_canon_type(ty_c, declared_types) {
+      match pkg.iterated_tail_tys.get(tail) {
+        Some(m) => m[ty_c] = true
+        None => {
+          let m : Map[String, Bool] = Map()
+          m[ty_c] = true
+          pkg.iterated_tail_tys[tail] = m
+        }
+      }
+    } else {
+      pkg.iterated_tail_unknown[tail] = true
+    }
+    None => pkg.iterated_tail_unknown[tail] = true
+  }
+}
+
 ///| Builds `ShrinkPkg` from already-lexed tokens of the package's generated files.
 pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg {
+  collect_shrink_pkg_tokens_with_qt(all_tokens, [], [], empty_pkg_query_types())
+}
+
+///| Builds `ShrinkPkg` from already-lexed tokens plus optional `PkgQueryTypes` for real nominal array types.
+///| Strictly fail-closed: any iteration site without a ground unambiguous canonical type marks its tail unknown.
+pub fn collect_shrink_pkg_tokens_with_qt(
+  all_tokens : Array[Array[Token]],
+  rel_paths : Array[String],
+  contents : Array[String],
+  pkg_qt : PkgQueryTypes,
+) -> ShrinkPkg {
   let pkg = ShrinkPkg::empty()
   let fns : Map[String, Bool] = Map()
   for ts in all_tokens {
@@ -347,7 +445,19 @@ pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg 
       None => ()
     }
   }
-  for ts in all_tokens {
+  let decl_tys = collect_declared_nominal_types_tokens(all_tokens)
+  for k in decl_tys.keys() {
+    pkg.declared_types[k] = true
+  }
+  let mut file_idx = 0
+  while file_idx < all_tokens.length() {
+    let ts = all_tokens[file_idx]
+    let fcontent = if file_idx < contents.length() { contents[file_idx] } else { "" }
+    let qfi_opt : Option[QtFileIndex] = if pkg_qt.ok && file_idx < rel_paths.length() {
+      pkg_qt.files.get(rel_paths[file_idx])
+    } else {
+      None
+    }
     let n = ts.length()
     // Visible fields: `pub struct S { f : T }` without `priv`.
     let mut i = 0
@@ -418,7 +528,16 @@ pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg 
           }
           let tail = path_tail(ts, tail_i)
           if !private && tail.length() > 0 && calls_package_fn(ts, j, close, fns) {
-            pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+            let ty_opt = match qfi_opt {
+              Some(qfi) =>
+              if in_i + 1 <= tail_i {
+                qt_lookup_expr_span_ty(qfi, fcontent, ts[in_i + 1].start_byte, ts[tail_i].end_byte, true)
+              } else {
+                None
+              }
+              None => None
+            }
+            shrink_record_iterated_tail(pkg, tail, "line " + tk.line.to_string(), ty_opt, pkg.declared_types)
           }
         }
       }
@@ -439,7 +558,13 @@ pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg 
           chain_end
         }
         if tail.length() > 0 && chain_end > t && calls_package_fn(ts, t + 2, scope_end, fns) {
-          pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+          let rs = receiver_path_start_token(ts, t - 1)
+          let rsb = if rs >= 0 { ts[rs].start_byte } else { -1 }
+          let ty_opt = match qfi_opt {
+            Some(qfi) => qt_lookup_receiver_ty_at_op(qfi, fcontent, ts[t + 1].start_byte, rsb, -1, true)
+            None => None
+          }
+          shrink_record_iterated_tail(pkg, tail, "line " + tk.line.to_string(), ty_opt, pkg.declared_types)
         }
       }
       if tk.raw == "mbt_compat" && ts[t + 1].kind == TokenKind::ColonColon && t + 4 < n &&
@@ -452,11 +577,21 @@ pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg 
         }
         let tail = path_tail(ts, a)
         if tail.length() > 0 && calls_package_fn(ts, t + 3, close, fns) {
-          pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+          let ty_opt = match qfi_opt {
+            Some(qfi) =>
+            if t + 4 <= a {
+              qt_lookup_expr_span_ty(qfi, fcontent, ts[t + 4].start_byte, ts[a].end_byte, true)
+            } else {
+              None
+            }
+            None => None
+          }
+          shrink_record_iterated_tail(pkg, tail, "line " + tk.line.to_string(), ty_opt, pkg.declared_types)
         }
       }
       t = t + 1
     }
+    file_idx = file_idx + 1
   }
   // Call graph (top-level function name -> package functions its body calls), then everything reachable from a
   // function called inside an iteration (or used as a value) can run inside that iteration too.
@@ -527,6 +662,19 @@ pub fn collect_shrink_pkg_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg 
 ///| Why `recv.shrink_to_fit()` at token `name_i` (the `shrink_to_fit` token) could be observed by a buffer
 ///| snapshot -- in its function, or (through `pkg`) in a caller -- or "" when none can.
 pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkPkg) -> String {
+  shrink_snapshot_hazard_with_qt(tokens, name_i, pkg, "", None)
+}
+
+///| Real-type-aware `shrink_snapshot_hazard`: when `qfi_opt` provides a ground unambiguous canonical type
+///| for `recv` and all package iterations of `tail` have ground unambiguous canonical types that do not
+///| include `recv`'s type, nominal type disjointness rules out cross-type tail collisions (fail-closed otherwise).
+pub fn shrink_snapshot_hazard_with_qt(
+  tokens : Array[Token],
+  name_i : Int,
+  pkg : ShrinkPkg,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+) -> String {
   let n = tokens.length()
   let body_open = outermost_body_open(tokens, name_i)
   if body_open < 0 {
@@ -581,7 +729,35 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
   //    function may run inside a caller's iteration.
   let tail = path_tail(tokens, name_i - 2)
   match if private { None } else { pkg.iterated_tails.get(tail) } {
-    Some(at) => return "the package iterates an array named `" + tail + "` (" + at + ") around calls that may reach it"
+    Some(at) => {
+      let mut disjoint_by_type = false
+      if !pkg.iterated_tail_unknown.contains(tail) {
+        match qfi_opt {
+          Some(qfi) => {
+            let rs = receiver_path_start_token(tokens, name_i - 2)
+            let rsb = if rs >= 0 { tokens[rs].start_byte } else { -1 }
+            let recv_ty_opt = qt_lookup_receiver_ty_at_op(qfi, content, tokens[name_i].start_byte, rsb, -1, true)
+            match recv_ty_opt {
+              Some(recv_ty_c) =>
+              if qt_is_ground_canon_type(recv_ty_c, pkg.declared_types) {
+                match pkg.iterated_tail_tys.get(tail) {
+                  Some(tys_map) =>
+                  if !tys_map.contains(recv_ty_c) {
+                    disjoint_by_type = true
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
+      if !disjoint_by_type {
+        return "the package iterates an array named `" + tail + "` (" + at + ") around calls that may reach it"
+      }
+    }
     None => ()
   }
   // Receiver path head and length.
@@ -1110,6 +1286,24 @@ fn kept_iter_mutations(
   callables : Map[String, Bool],
   flags : Array[Bool],
 ) -> String {
+  kept_iter_mutations_with_qt(tokens, names, computed, s, e, body_open, head, callables, flags, "", "", None, Map())
+}
+
+fn kept_iter_mutations_with_qt(
+  tokens : Array[Token],
+  names : Map[String, Bool],
+  computed : Bool,
+  s : Int,
+  e : Int,
+  body_open : Int,
+  head : String,
+  callables : Map[String, Bool],
+  flags : Array[Bool],
+  iter_ty_canon : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  declared_types : Map[String, Bool],
+) -> String {
   // `flags`: [appended, written in place] so far, shared by every part that runs while it is kept (interpolation
   // holes, closures defined before it, the region): only both together are a hazard (`appends_and_writes`).
   let mut t = s
@@ -1129,21 +1323,63 @@ fn kept_iter_mutations(
       if tk.kind == TokenKind::Dot && t + 2 < e && tokens[t + 1].kind == TokenKind::Ident &&
       tokens[t + 2].kind == TokenKind::LParen {
         let m = tokens[t + 1].raw
-        if m == "push" {
-          flags[0] = true
-        } else if m == "set" || m == "unsafe_set" {
-          flags[1] = true
-        } else if m != "iter" && is_array_mutating_method(m) {
-          return "`." + m + "(..)` runs while an iterator of a computed array is kept"
-        } else if !is_read_only_array_method(m) && head.length() > 0 && receiver_root(tokens, t - 1) == head {
-          return "`." + m + "(..)` on `" + head + "` may change the array of a kept iterator over a non-local array"
+        let mut disjoint_builtin_mut = false
+        if iter_ty_canon.length() > 0 && (m == "push" || m == "set" || m == "unsafe_set" || (m != "iter" && is_array_mutating_method(m))) {
+          match qfi_opt {
+            Some(qfi) => {
+              let ms = receiver_path_start_token(tokens, t - 1)
+              let msb = if ms >= 0 { tokens[ms].start_byte } else { -1 }
+              match qt_lookup_receiver_ty_at_op(qfi, content, tokens[t + 1].start_byte, msb, -1, true) {
+                Some(mt) =>
+                if qt_is_ground_canon_type(mt, declared_types) && qt_is_builtin_isolated_container(mt) && mt != iter_ty_canon {
+                  disjoint_builtin_mut = true
+                }
+                None => ()
+              }
+            }
+            None => ()
+          }
+        }
+        if !disjoint_builtin_mut {
+          if m == "push" {
+            flags[0] = true
+          } else if m == "set" || m == "unsafe_set" {
+            flags[1] = true
+          } else if m != "iter" && is_array_mutating_method(m) {
+            return "`." + m + "(..)` runs while an iterator of a computed array is kept"
+          } else if !is_read_only_array_method(m) && head.length() > 0 && receiver_root(tokens, t - 1) == head {
+            return "`." + m + "(..)` on `" + head + "` may change the array of a kept iterator over a non-local array"
+          }
         }
       } else if tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
       tokens[t - 2].raw == "mbt_compat" && t + 1 < e && tokens[t + 1].kind == TokenKind::LParen {
-        if tk.raw == "arr_push" || tk.raw == "arr_push_iter" {
-          flags[0] = true
-        } else if is_mbt_compat_arr_mutating(tk.raw) {
-          return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
+        let mut disjoint_compat_mut = false
+        if iter_ty_canon.length() > 0 && (tk.raw == "arr_push" || tk.raw == "arr_push_iter" || is_mbt_compat_arr_mutating(tk.raw)) {
+          let close = find_matching_delim(tokens, t + 1)
+          let mut a = t + 2
+          while a + 1 < close && tokens[a + 1].kind != TokenKind::Comma && tokens[a + 1].kind != TokenKind::RParen {
+            a = a + 1
+          }
+          if t + 2 <= a {
+            match qfi_opt {
+              Some(qfi) =>
+              match qt_lookup_expr_span_ty(qfi, content, tokens[t + 2].start_byte, tokens[a].end_byte, true) {
+                Some(mt) =>
+                if qt_is_ground_canon_type(mt, declared_types) && mt.starts_with("Array[") && mt != iter_ty_canon {
+                  disjoint_compat_mut = true
+                }
+                None => ()
+              }
+              None => ()
+            }
+          }
+        }
+        if !disjoint_compat_mut {
+          if tk.raw == "arr_push" || tk.raw == "arr_push_iter" {
+            flags[0] = true
+          } else if is_mbt_compat_arr_mutating(tk.raw) {
+            return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
+          }
         }
       } else if head.length() > 0 && tk.kind == TokenKind::Ident && tk.raw == head && !qualified &&
       t > 0 && (tokens[t - 1].kind == TokenKind::LParen || tokens[t - 1].kind == TokenKind::Comma) &&
@@ -1222,6 +1458,19 @@ fn appends_and_writes(flags : Array[Bool]) -> String {
 ///| aliases of the root; an iterator consumed in its expression is checked for changes made by its own callbacks.
 ///| Why the iterator could observe a difference, or "".
 pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
+  kept_iter_hazard_with_qt(tokens, dot_i, "", None, Map())
+}
+
+///| Real-type-aware `kept_iter_hazard`: when `qfi_opt` provides a ground unambiguous canonical `Array[...]`
+///| receiver type for `.iter()`, mutations of disjoint built-in containers (`Map`, `Set`, `Array[Other]`)
+///| inside the function are excluded while unknown/ambiguous/generic/user-struct calls remain fail-closed.
+pub fn kept_iter_hazard_with_qt(
+  tokens : Array[Token],
+  dot_i : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  declared_types : Map[String, Bool],
+) -> String {
   let close_p = find_matching_delim(tokens, dot_i + 2)
   if close_p < 0 {
     return "unbalanced `.iter(`"
@@ -1235,6 +1484,17 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
     return ""
   }
   let body_close = find_matching_delim(tokens, body_open)
+  let iter_ty_canon = match qfi_opt {
+    Some(qfi) => {
+      let is_tok = receiver_path_start_token(tokens, dot_i - 1)
+      let isb = if is_tok >= 0 { tokens[is_tok].start_byte } else { -1 }
+      match qt_lookup_receiver_ty_at_op(qfi, content, tokens[dot_i + 1].start_byte, isb, -1, true) {
+        Some(t) => if qt_is_ground_canon_type(t, declared_types) && t.starts_with("Array[") { t } else { "" }
+        None => ""
+      }
+    }
+    None => ""
+  }
   // Only an array this function allocated (and has not handed out before the iterator) has all its names here;
   // any other (a parameter, a field, a module-level array) may be aliased anywhere: every change counts.
   let fresh_root = root.length() > 0 && fresh_local_binding(tokens, root, body_open, dot_i, true)
@@ -1265,7 +1525,7 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
     if pre.length() > 0 {
       return pre
     }
-    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables, flags)
+    let why = kept_iter_mutations_with_qt(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables, flags, iter_ty_canon, content, qfi_opt, declared_types)
     if why.length() > 0 {
       return why + " (inside the iterator chain's callbacks)"
     }
@@ -1281,7 +1541,7 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
   if pre.length() > 0 {
     return pre
   }
-  let why = kept_iter_mutations(tokens, names, computed, start, body_close, body_open, root, callables, flags)
+  let why = kept_iter_mutations_with_qt(tokens, names, computed, start, body_close, body_open, root, callables, flags, iter_ty_canon, content, qfi_opt, declared_types)
   if why.length() > 0 {
     return why
   }

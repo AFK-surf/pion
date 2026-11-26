@@ -819,40 +819,171 @@ fn json_quote_str(s : String) -> String {
   sb.to_string()
 }
 
-///| Verify that a `pionc check --server` NDJSON response is valid JSON with matching `id`,
-///| boolean `ok`, array `diagnostics`, and no `protocol_error`.
+///| Zero-AST streaming validator for `pionc check --server` NDJSON responses:
+///| verifies valid top-level JSON object, matching integer `id`, boolean `ok`,
+///| array `diagnostics`, and no `protocol_error` without materializing multi-MB `types` arrays.
 fn is_valid_check_server_resp(raw : String, expected_id : Int) -> Bool {
-  let trimmed = raw.trim()
-  if trimmed.length() == 0 {
+  let n = raw.length()
+  let mut p = 0
+  while p < n {
+    let c = raw.code_unit_at(p)
+    if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { break }
+  }
+  if p >= n || raw.code_unit_at(p) != 123 {
     return false
   }
-  match json::parse(trimmed) {
-    Ok(v) => {
-      match json::obj_get(v, "protocol_error") {
-        Some(_) => return false
-        None => ()
-      }
-      let id_ok = match json::obj_get(v, "id") {
-        Some(iv) => match json::as_int(iv) { Some(n) => n == expected_id.to_int64(), None => false }
-        None => false
-      }
-      if !id_ok {
+  p = p + 1
+  let mut id_ok = false
+  let mut ok_is_bool = false
+  let mut diags_is_arr = false
+  let mut saw_proto_err = false
+  let mut expect_comma_or_end = false
+  while p < n {
+    while p < n {
+      let c = raw.code_unit_at(p)
+      if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { break }
+    }
+    if p >= n {
+      return false
+    }
+    let ch = raw.code_unit_at(p)
+    if ch == 125 {
+      p = p + 1
+      break
+    }
+    if expect_comma_or_end {
+      if ch != 44 {
         return false
       }
-      let ok_is_bool = match json::obj_get(v, "ok") {
-        Some(ov) => match json::as_bool(ov) { Some(_) => true, None => false }
-        None => false
+      p = p + 1
+      while p < n {
+        let c = raw.code_unit_at(p)
+        if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { break }
       }
-      if !ok_is_bool {
+      if p >= n || raw.code_unit_at(p) != 34 {
         return false
       }
-      match json::obj_get(v, "diagnostics") {
-        Some(dv) => match json::as_arr(dv) { Some(_) => true, None => false }
-        None => false
+    } else if ch != 34 {
+      return false
+    }
+    // Parse top-level key string
+    p = p + 1
+    let ks = p
+    while p < n {
+      let kc = raw.code_unit_at(p)
+      if kc == 34 { break }
+      if kc == 92 { p = p + 2 } else { p = p + 1 }
+    }
+    if p >= n {
+      return false
+    }
+    let key = raw.slice(ks, p)
+    p = p + 1
+    while p < n {
+      let c = raw.code_unit_at(p)
+      if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { break }
+    }
+    if p >= n || raw.code_unit_at(p) != 58 {
+      return false
+    }
+    p = p + 1
+    while p < n {
+      let c = raw.code_unit_at(p)
+      if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { break }
+    }
+    if p >= n {
+      return false
+    }
+    let vc = raw.code_unit_at(p)
+    if key == "protocol_error" {
+      saw_proto_err = true
+    } else if key == "id" {
+      let mut neg = false
+      let mut ip = p
+      if vc == 45 { neg = true; ip = ip + 1 }
+      let mut iv = 0L
+      let mut digits = 0
+      while ip < n {
+        let dc = raw.code_unit_at(ip)
+        if dc >= 48 && dc <= 57 {
+          if digits < 18 {
+            iv = iv * 10L + (dc - 48).to_int64()
+          }
+          digits = digits + 1
+          ip = ip + 1
+        } else {
+          break
+        }
+      }
+      let next_c = if ip < n { raw.code_unit_at(ip) } else { 125 }
+      let valid_delim = next_c == 44 || next_c == 125 || next_c == 32 || next_c == 9 || next_c == 10 || next_c == 13
+      if digits > 0 && digits <= 18 && valid_delim {
+        let parsed = if neg { 0L - iv } else { iv }
+        id_ok = parsed == expected_id.to_int64()
+      }
+    } else if key == "ok" {
+      if vc == 116 && p + 4 <= n && raw.slice(p, p + 4) == "true" {
+        ok_is_bool = true
+      } else if vc == 102 && p + 5 <= n && raw.slice(p, p + 5) == "false" {
+        ok_is_bool = true
+      }
+    } else if key == "diagnostics" {
+      if vc == 91 {
+        diags_is_arr = true
       }
     }
-    Err(_) => false
+    // Skip value (string, object/array with balanced depth, or primitive)
+    if vc == 34 {
+      p = p + 1
+      while p < n {
+        let sc = raw.code_unit_at(p)
+        if sc == 34 { p = p + 1; break }
+        if sc == 92 { p = p + 2 } else { p = p + 1 }
+      }
+    } else if vc == 123 || vc == 91 {
+      let mut depth = 1
+      p = p + 1
+      while p < n && depth > 0 {
+        let sc = raw.code_unit_at(p)
+        if sc == 34 {
+          p = p + 1
+          while p < n {
+            let qc = raw.code_unit_at(p)
+            if qc == 34 { p = p + 1; break }
+            if qc == 92 { p = p + 2 } else { p = p + 1 }
+          }
+        } else if sc == 123 || sc == 91 {
+          depth = depth + 1
+          p = p + 1
+        } else if sc == 125 || sc == 93 {
+          depth = depth - 1
+          p = p + 1
+        } else {
+          p = p + 1
+        }
+      }
+      if depth != 0 {
+        return false
+      }
+    } else {
+      let vs = p
+      while p < n {
+        let sc = raw.code_unit_at(p)
+        if sc == 44 || sc == 125 || sc == 32 || sc == 9 || sc == 10 || sc == 13 { break }
+        p = p + 1
+      }
+      if p == vs {
+        return false
+      }
+    }
+    expect_comma_or_end = true
   }
+  // Ensure only whitespace remains after closing `}`
+  while p < n {
+    let c = raw.code_unit_at(p)
+    if c == 32 || c == 9 || c == 10 || c == 13 { p = p + 1 } else { return false }
+  }
+  !saw_proto_err && id_ok && ok_is_bool && diags_is_arr
 }
 
 ///| Run `pionc check --json` on a batch of `(rel_path, content)` files in a clean scratch directory.
@@ -1655,6 +1786,104 @@ pub fn main(world : World) -> Int {
   let server_imp_src : Array[String] = [""]
   let check_server_dir = join_path(scratch_root, "check_server")
 
+  let run_server_rpc = fn(eff_batch : Array[(String, String)], include_types : Bool) -> Option[String] {
+    if server_disabled[0] {
+      return None
+    }
+    if server_handle[0] < 0 {
+      let _ = proc_exec(world, ["rm", "-rf", check_server_dir])
+      let srv_src = join_path(check_server_dir, "src")
+      let _ = fs_mkdir_p(world, srv_src)
+      let toml_sb = StringBuilder()
+      toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+      let imp_sb = StringBuilder()
+      let seen_dep : Map[String, Bool] = Map()
+      for dep in check_deps {
+        if !seen_dep.contains(dep.0) {
+          seen_dep[dep.0] = true
+          toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
+          imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
+        }
+      }
+      let imp_txt = imp_sb.to_string()
+      server_imp_src[0] = imp_txt
+      let _ = fs_write(world, join_path(check_server_dir, "pion.toml"), toml_sb.to_string())
+      if imp_txt.length() > 0 {
+        let _ = fs_write(world, join_path(srv_src, "__mbt_dep_imports.pion"), imp_txt)
+      }
+      let h = c_check_server_start(pionc_bin.as_cstr(), check_server_dir.as_cstr())
+      if h >= 0 {
+        server_handle[0] = h
+      } else {
+        server_disabled[0] = true
+        return None
+      }
+    }
+    if server_handle[0] >= 0 {
+      // Deduplicate root-relative paths (last wins, matching `fs_write` semantics) to satisfy strict JSON no-dup-keys.
+      let rel_order : Array[String] = []
+      let rel_src : Map[String, String] = Map()
+      if server_imp_src[0].length() > 0 {
+        let imp_key = "src/__mbt_dep_imports.pion"
+        rel_order.push(imp_key)
+        rel_src[imp_key] = server_imp_src[0]
+      }
+      let mut has_test_files = false
+      for pair in eff_batch {
+        let check_rel = if pair.0.ends_with("_test.pion") {
+          has_test_files = true
+          pair.0.slice(0, pair.0.length() - 5) + "__mbt_probe.pion"
+        } else {
+          pair.0
+        }
+        let full_key = "src/" + check_rel
+        if !rel_src.contains(full_key) {
+          rel_order.push(full_key)
+        }
+        rel_src[full_key] = pair.1
+      }
+      server_req_id[0] = server_req_id[0] + 1
+      let req_sb = StringBuilder()
+      req_sb.write_string("{\"id\":")
+      req_sb.write_string(server_req_id[0].to_string())
+      req_sb.write_string(",\"files\":{")
+      let mut first_f = true
+      for rk in rel_order {
+        match rel_src.get(rk) {
+          Some(src_txt) => {
+            if !first_f { req_sb.write_string(",") }
+            first_f = false
+            req_sb.write_string(json_quote_str(rk))
+            req_sb.write_string(":")
+            req_sb.write_string(json_quote_str(src_txt))
+          }
+          None => ()
+        }
+      }
+      req_sb.write_string("},\"full_replace\":true")
+      if include_types {
+        req_sb.write_string(",\"include_types\":true")
+      }
+      req_sb.write_string("}")
+      let req_str = req_sb.to_string()
+      let req_id = server_req_id[0]
+      let rc = c_check_server_rpc(server_handle[0], req_str.as_cstr(), req_str.length())
+      if rc >= 0 {
+        let resp = cstr_to_str(c_check_server_last_resp(server_handle[0]))
+        if is_valid_check_server_resp(resp, req_id) {
+          if has_test_files {
+            return Some(m2p::str_replace_all(resp, "__mbt_probe.pion", ".pion"))
+          }
+          return Some(resp)
+        }
+      }
+      c_check_server_stop(server_handle[0])
+      server_handle[0] = -1
+      server_disabled[0] = true
+    }
+    None
+  }
+
   let check_cb = fn(batch : Array[(String, String)]) -> String {
     let eff_batch = if verified_companions.length() > 0 {
       let b : Array[(String, String)] = []
@@ -1664,88 +1893,9 @@ pub fn main(world : World) -> Int {
     } else {
       batch
     }
-    if !server_disabled[0] {
-      if server_handle[0] < 0 {
-        let _ = proc_exec(world, ["rm", "-rf", check_server_dir])
-        let srv_src = join_path(check_server_dir, "src")
-        let _ = fs_mkdir_p(world, srv_src)
-        let toml_sb = StringBuilder()
-        toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
-        let imp_sb = StringBuilder()
-        let seen_dep : Map[String, Bool] = Map()
-        for dep in check_deps {
-          if !seen_dep.contains(dep.0) {
-            seen_dep[dep.0] = true
-            toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
-            imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
-          }
-        }
-        let imp_txt = imp_sb.to_string()
-        server_imp_src[0] = imp_txt
-        let _ = fs_write(world, join_path(check_server_dir, "pion.toml"), toml_sb.to_string())
-        if imp_txt.length() > 0 {
-          let _ = fs_write(world, join_path(srv_src, "__mbt_dep_imports.pion"), imp_txt)
-        }
-        let h = c_check_server_start(pionc_bin.as_cstr(), check_server_dir.as_cstr())
-        if h >= 0 {
-          server_handle[0] = h
-        } else {
-          server_disabled[0] = true
-        }
-      }
-      if server_handle[0] >= 0 {
-        // Deduplicate root-relative paths (last wins, matching `fs_write` semantics) to satisfy strict JSON no-dup-keys.
-        let rel_order : Array[String] = []
-        let rel_src : Map[String, String] = Map()
-        if server_imp_src[0].length() > 0 {
-          let imp_key = "src/__mbt_dep_imports.pion"
-          rel_order.push(imp_key)
-          rel_src[imp_key] = server_imp_src[0]
-        }
-        for pair in eff_batch {
-          let check_rel = if pair.0.ends_with("_test.pion") {
-            pair.0.slice(0, pair.0.length() - 5) + "__mbt_probe.pion"
-          } else {
-            pair.0
-          }
-          let full_key = "src/" + check_rel
-          if !rel_src.contains(full_key) {
-            rel_order.push(full_key)
-          }
-          rel_src[full_key] = pair.1
-        }
-        server_req_id[0] = server_req_id[0] + 1
-        let req_sb = StringBuilder()
-        req_sb.write_string("{\"id\":")
-        req_sb.write_string(server_req_id[0].to_string())
-        req_sb.write_string(",\"files\":{")
-        let mut first_f = true
-        for rk in rel_order {
-          match rel_src.get(rk) {
-            Some(src_txt) => {
-              if !first_f { req_sb.write_string(",") }
-              first_f = false
-              req_sb.write_string(json_quote_str(rk))
-              req_sb.write_string(":")
-              req_sb.write_string(json_quote_str(src_txt))
-            }
-            None => ()
-          }
-        }
-        req_sb.write_string("},\"full_replace\":true}")
-        let req_str = req_sb.to_string()
-        let req_id = server_req_id[0]
-        let rc = c_check_server_rpc(server_handle[0], req_str.as_cstr(), req_str.length())
-        if rc >= 0 {
-          let resp = cstr_to_str(c_check_server_last_resp(server_handle[0]))
-          if is_valid_check_server_resp(resp, req_id) {
-            return m2p::str_replace_all(resp, "__mbt_probe.pion", ".pion")
-          }
-        }
-        c_check_server_stop(server_handle[0])
-        server_handle[0] = -1
-        server_disabled[0] = true
-      }
+    match run_server_rpc(eff_batch, false) {
+      Some(resp) => return resp
+      None => ()
     }
     let (_, raw_out) = run_pionc_check_batch_status(
       world,
@@ -1756,6 +1906,21 @@ pub fn main(world : World) -> Int {
       eff_batch,
     )
     raw_out
+  }
+
+  let query_types_cb = fn(batch : Array[(String, String)]) -> String {
+    let eff_batch = if verified_companions.length() > 0 {
+      let b : Array[(String, String)] = []
+      for item in batch { b.push(item) }
+      for vc in verified_companions { b.push((vc.0, vc.1)) }
+      b
+    } else {
+      batch
+    }
+    match run_server_rpc(eff_batch, true) {
+      Some(resp) => resp
+      None => ""
+    }
   }
 
   // Wave M1.2 A.5: load ALL target enums & fn signatures from `--dep` packages via `pionc doc --json`
@@ -1899,7 +2064,7 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  let res = m2p::transpile_package_with_abis_and_companions(
+  let res = m2p::transpile_package_with_query_types(
     sources,
     api_map,
     recipes,
@@ -1913,6 +2078,7 @@ pub fn main(world : World) -> Int {
     pre_diags,
     run_probes,
     check_cb,
+    query_types_cb,
   )
 
   if server_handle[0] >= 0 {
