@@ -535,6 +535,30 @@ def main():
             assert p_sp.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in sp_comb, f"{sp_name} must block:\n{sp_comb}"
             assert not os.listdir(sp_out), f"blocked publish `{sp_name}` must leave --out empty"
 
+        # 3l-split2. Closed-field local struct `Holder { id : Int }` with sibling-file `impl Add for Holder` MUST NOT escape via remove/pop
+        for sp_name, f_body in [
+            ("split_holder_nl_remove", "struct Holder { id : Int }\nlet hs : Array[Holder] = [{ id: 1 }]\nfn use_g(v : ArrayView[Int]) -> Int {\n  let e =\n    hs.remove(0)\n  let _ = e + e\n  v[0]\n}\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_holder_blk_remove", "struct Holder { id : Int }\nlet hs : Array[Holder] = [{ id: 1 }]\nfn use_g(v : ArrayView[Int]) -> Int { let e = { hs.remove(0) }; let _ = e + e; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_holder_blk_pop", "struct Holder { id : Int }\nlet hs : Array[Holder] = [{ id: 1 }]\nfn use_g(v : ArrayView[Int]) -> Int { match { hs.pop() } { Some(e) => { let _ = e + e }; None => () }; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+        ]:
+            sp_src = os.path.join(work, f"neg_{sp_name}_src")
+            sp_out = os.path.join(work, f"neg_{sp_name}_out")
+            sp_rep = os.path.join(work, f"neg_{sp_name}_rep.json")
+            os.makedirs(sp_src)
+            os.makedirs(sp_out)
+            with open(os.path.join(sp_src, "g.mbt"), "w") as fh:
+                fh.write("let side : Array[Int] = [0]\nimpl Add for Holder with add(self, other) { let _ = other; side[0] = 99; self }\n")
+            with open(os.path.join(sp_src, "f.mbt"), "w") as fh:
+                fh.write(f_body)
+            p_sp = subprocess.run(
+                [bin_path, "--src", sp_src, "--out", sp_out, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", sp_rep],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+            )
+            sp_comb = p_sp.stdout + "\n" + p_sp.stderr + "\n" + (open(sp_rep).read() if os.path.exists(sp_rep) else "")
+            assert p_sp.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in sp_comb, f"{sp_name} must block:\n{sp_comb}"
+            assert not os.listdir(sp_out), f"blocked publish `{sp_name}` must leave --out empty"
+
         # 3l. Cross-package `@dep.Hook` equality and method dispatch inside RO_VIEW callee MUST fail closed
         hook_src = os.path.join(work, "hookdep_src")
         hook_out = os.path.join(work, "p_hookdep")
