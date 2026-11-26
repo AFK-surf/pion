@@ -3826,24 +3826,18 @@ fn stage_b_check_kept_iter_with_summary(
   }
   let mut why = kept_iter_hazard_with_qt(tokens, dot_i, content, qfi_opt, declared_types)
   if why.length() == 0 {
-    // Soundness check: for immediate `.iter().(any|all|find_first)(cb)` on a non-fresh receiver,
-    // also require `mutation_summary` to rule out trait/operator/indirect-closure mutations.
+    // Soundness check: for immediate `.iter().(any|all|find_first)(cb)` on ANY named receiver
+    // (including fresh locals, which can still be mutated via stored closures), always require
+    // `mutation_summary` to rule out trait/operator/indirect-closure mutations.
     let close_p = find_matching_delim(tokens, dot_i + 2)
     let is_imm_pred = close_p == dot_i + 3 && close_p + 3 < tokens.length() &&
     tokens[close_p + 1].kind == TokenKind::Dot &&
     (tokens[close_p + 2].raw == "any" || tokens[close_p + 2].raw == "all" || tokens[close_p + 2].raw == "find_first") &&
     tokens[close_p + 3].kind == TokenKind::LParen
     if is_imm_pred && !is_array_literal_end(tokens, dot_i - 1) {
-      let body_open = outermost_body_open(tokens, dot_i)
-      let root = receiver_root(tokens, dot_i - 1)
-      let is_fresh = body_open >= 0 && root.length() > 0 && fresh_local_binding(tokens, root, body_open, dot_i, true)
-      if !is_fresh {
-        match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
-          Some(_) => return true
-          None => why = "callback in immediate `.iter()." + tokens[close_p + 2].raw + "(...)` may mutate the array (trait/operator/opaque/mutating call)"
-        }
-      } else {
-        return true
+      match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
+        Some(_) => return true
+        None => why = "callback in immediate `.iter()." + tokens[close_p + 2].raw + "(...)` may mutate the array (trait/operator/opaque/mutating call)"
       }
     } else {
       return true
@@ -3880,6 +3874,27 @@ fn stage_b_check_kept_iter_with_summary(
     why + " (fail-closed)",
   ))
   false
+}
+
+fn stage_b_is_simple_ident(s : String) -> Bool {
+  if s.length() == 0 {
+    return false
+  }
+  let c0 = s.code_unit_at(0)
+  let ok0 = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95
+  if !ok0 {
+    return false
+  }
+  let mut k = 1
+  while k < s.length() {
+    let c = s.code_unit_at(k)
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+    if !ok {
+      return false
+    }
+    k = k + 1
+  }
+  true
 }
 
 ///| Gate D: Rewrite provably read-only `for <vars> in <arr[lo:hi]> { <body> }` borrowed-slice loops
@@ -3924,7 +3939,10 @@ fn stage_b_rewrite_borrowed_slice_for_loops(
         let for_lidx = tokens[i].line - 1
         let lb_lidx = tokens[lb].line - 1
         let rb_lidx = if rb > lb { tokens[rb].line - 1 } else { -1 }
+        let has_leading_label = i > 0 && tokens[i - 1].kind == TokenKind::Colon
+        let has_trailing_else = rb > lb && rb + 1 < n && tokens[rb + 1].raw == "else"
         if rb > lb && for_lidx == lb_lidx && for_lidx >= 0 && rb_lidx < lines.length() &&
+        !has_leading_label && !has_trailing_else &&
         !mutated_lines.contains(for_lidx) && !mutated_lines.contains(rb_lidx) {
           let is_s = in_i + 1
           let is_e = lb
@@ -4026,18 +4044,27 @@ fn stage_b_rewrite_borrowed_slice_for_loops(
               let elem_ty = ms_extract_array_elem_ty(rt_clean)
               let vars_str = content.slice(tokens[i + 1].start_byte, tokens[in_i - 1].end_byte).trim()
               let comma_idx = vars_str.index_of(",")
+              let mut vars_ok = false
               let loop_vt : Map[String, String] = Map()
               if comma_idx >= 0 {
                 let iv_nm = vars_str.slice(0, comma_idx).trim()
                 let ev_nm = vars_str.slice(comma_idx + 1, vars_str.length()).trim()
-                loop_vt[iv_nm] = "Int"
-                if elem_ty.length() > 0 { loop_vt[ev_nm] = elem_ty }
-              } else if elem_ty.length() > 0 {
-                loop_vt[vars_str] = elem_ty
+                if stage_b_is_simple_ident(iv_nm) && stage_b_is_simple_ident(ev_nm) {
+                  vars_ok = true
+                  loop_vt[iv_nm] = "Int"
+                  if elem_ty.length() > 0 { loop_vt[ev_nm] = elem_ty }
+                }
+              } else if stage_b_is_simple_ident(vars_str) {
+                vars_ok = true
+                if elem_ty.length() > 0 { loop_vt[vars_str] = elem_ty }
               }
-              let body_sum = summarize_expr_span(mut_summary, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, loop_vt, active_gen)
+              let body_sum = if vars_ok {
+                summarize_expr_span(mut_summary, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, loop_vt, active_gen)
+              } else {
+                FnMutationSummary::empty()
+              }
               let elem_check = if ms_ty_contains_generic(elem_ty, active_gen) { "" } else { elem_ty }
-              if !summary_may_mutate_array(body_sum, elem_check) {
+              if vars_ok && !summary_may_mutate_array(body_sum, elem_check) {
                 let recv_str = content.slice(tokens[recv_s].start_byte, tokens[recv_e - 1].end_byte).trim()
                 let lo_str = content.slice(tokens[lo_s].start_byte, tokens[lo_e - 1].end_byte).trim()
                 let hi_str = content.slice(tokens[hi_s].start_byte, tokens[hi_e - 1].end_byte).trim()

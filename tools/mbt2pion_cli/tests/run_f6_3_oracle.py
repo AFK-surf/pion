@@ -51,9 +51,10 @@ fn score(v : Int) -> Int {
   v * 2 + 1
 }
 
-// Gate A: non-escaping local array iterated then cleared and shrunk
+// Gate A: non-escaping local array allocated via `Array::make` iterated then cleared and shrunk
+// (unlocks `mutation_summary_allow_a` in drift_ledger)
 pub fn run_gate_a() -> String {
-  let faded : Array[Int] = [10, 20, 30]
+  let faded : Array[Int] = Array::make(3, 10)
   let mut total = 0
   for v in faded {
     total = total + score(v)
@@ -288,6 +289,147 @@ pub fn run() -> Int {
 }
 ''',
     ),
+    (
+        "neg_class2_impl_eq_with_equal",
+        r'''
+struct EvilEq {
+  xs : Array[Int]
+}
+impl Eq for EvilEq with equal(self, other) {
+  self.xs.clear()
+  let _ = other
+  true
+}
+pub fn run(xs : Array[Int], a : EvilEq, b : EvilEq) -> Option[Int] {
+  xs.search_by(fn(_x) {
+    a == b
+  })
+}
+''',
+    ),
+    (
+        "neg_class2_unary_neg_newline",
+        r'''
+struct EvilNeg {
+  xs : Array[Int]
+}
+impl Neg for EvilNeg with neg(self) {
+  self.xs.clear()
+  self
+}
+pub fn run(xs : Array[Int], b : EvilNeg) -> Option[Int] {
+  xs.search_by(fn(_x) {
+    let y = 1
+    let _ = y
+    let _ =
+    -(b)
+    false
+  })
+}
+''',
+    ),
+    (
+        "neg_iter_next_lazy_mut",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  let it = xs.iter().map(fn(x) {
+    xs.clear()
+    x
+  })
+  xs.iter().any(fn(_x) {
+    let _ = it.next()
+    true
+  })
+}
+''',
+    ),
+    (
+        "neg_static_hof_fixed_array_makei",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    let _ = FixedArray::makei(1, fn(_) {
+      xs.clear()
+      0
+    })
+    true
+  })
+}
+''',
+    ),
+    (
+        "neg_static_hof_option_map",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    let _ = Option::map(Some(1), fn(_) {
+      xs.clear()
+      0
+    })
+    true
+  })
+}
+''',
+    ),
+    (
+        "neg_pattern_shadow_pure_fn",
+        r'''
+fn helper() -> Unit {
+  ()
+}
+pub fn run(xs : Array[Int], opt : Option[() -> Unit]) -> Bool {
+  xs.iter().any(fn(_x) {
+    match opt {
+      Some(helper) => helper()
+      None => ()
+    }
+    true
+  })
+}
+''',
+    ),
+    (
+        "neg_gate_c_fresh_local_reentrant",
+        r'''
+pub fn run() -> Bool {
+  let xs : Array[Int] = [1, 2, 3]
+  let k = fn() { xs.clear() }
+  let bs : Array[() -> Unit] = [k]
+  xs.iter().any(fn(_) {
+    (bs[0])()
+    true
+  })
+}
+''',
+    ),
+    (
+        "neg_gate_d_labeled_for_slice",
+        r'''
+pub fn run(xs : Array[Int]) -> Int {
+  let mut acc = 0
+  outer~: for x in xs[1:] {
+    acc = acc + x
+    if x > 10 {
+      break outer~
+    }
+  }
+  acc
+}
+''',
+    ),
+    (
+        "neg_gate_a_kept_iter2_shrink",
+        r'''
+pub fn run() -> Int {
+  let a : Array[Int] = Array::make(3, 1)
+  let it = a.iter2()
+  a.shrink_to_fit()
+  a[0] = 9
+  let _ = it
+  a.length()
+}
+''',
+    ),
 ]
 
 
@@ -365,7 +507,7 @@ def main():
         print(f"[LEDGER] categories: {sorted(cats)} unresolved={ledger.get('unresolved_entries')}")
         if ledger.get("unresolved_entries", 1) != 0:
             raise RuntimeError(f"Unexpected unresolved ledger entries: {ledger}")
-        for req_cat in ("mutation_summary_allow_b", "mutation_summary_allow_c", "mutation_summary_allow_d"):
+        for req_cat in ("mutation_summary_allow_a", "mutation_summary_allow_b", "mutation_summary_allow_c", "mutation_summary_allow_d"):
             if req_cat not in cats:
                 raise RuntimeError(f"Missing expected allow ledger category `{req_cat}` in {sorted(cats)}")
 
@@ -419,7 +561,7 @@ def main():
                 )
             print(f"[NEG PASS] {name}: fail-closed (rc={p.returncode})")
 
-    print("[PASS] Wave F6-3a 4-target oracle + 8 adversarial fail-closed cases: ALL OK")
+    print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES)} adversarial fail-closed cases: ALL OK")
 
 
 if __name__ == "__main__":

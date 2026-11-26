@@ -230,16 +230,148 @@ fn ms_is_pure_builtin_method(m : String) -> Bool {
   m == "reinterpret_as_int" || m == "reinterpret_as_uint" || m == "reinterpret_as_int64" ||
   m == "reinterpret_as_uint64" || m == "to_bits" || m == "to_bytes" || m == "keys" ||
   m == "contains_key" || m == "slot_len" || m == "slot_live" || m == "slot_key" ||
-  m == "slot_val" || m == "join" || m == "split" || m == "iter" || m == "next" ||
-  m == "head" || m == "count" || m == "as_view" || m == "view" || m == "view_from" ||
+  m == "slot_val" || m == "join" || m == "split" || m == "iter" ||
+  m == "as_view" || m == "view" || m == "view_from" ||
   m == "exact_view" || m == "to_owned"
 }
 
-fn ms_is_builtin_static_pure_prefix(q : String) -> Bool {
-  q == "Int" || q == "Int64" || q == "UInt" || q == "UInt64" || q == "Double" ||
-  q == "Float" || q == "Bool" || q == "Char" || q == "Byte" || q == "String" ||
-  q == "Bytes" || q == "Option" || q == "Result" || q == "StringBuilder" ||
-  q == "Map" || q == "FixedArray" || q == "ImmArray"
+fn ms_is_pure_static_method(q : String, name : String) -> Bool {
+  if q == "Int" || q == "Int64" || q == "UInt" || q == "UInt64" || q == "Double" ||
+  q == "Float" || q == "Bool" || q == "Char" || q == "Byte" {
+    return name == "default" || name == "from_int" || name == "from_uint" || name == "from_double" ||
+    name == "from_int64" || name == "from_uint64" || name == "min" || name == "max" ||
+    name == "abs" || name == "to_string" || name == "is_nan" || name == "is_inf" ||
+    name == "max_value" || name == "min_value" || name == "infinity" || name == "neg_infinity" ||
+    name == "not_a_number" || name == "from_char" || name == "from_code_unit" ||
+    name == "reinterpret_as_int" || name == "reinterpret_as_uint" || name == "reinterpret_as_double"
+  }
+  if q == "String" || q == "StringBuilder" || q == "ImmArray" {
+    return name == "new" || name == "default" || name == "from_array" || name == "of" ||
+    name == "make" || name == "length" || name == "is_empty" || name == "get" ||
+    name == "size_hint"
+  }
+  false
+}
+
+///| Collect identifiers bound in pattern positions (`for <pat> in`, `match` arm patterns,
+///| `if ... is <pat>`, and destructuring `let <pat> =`) so pattern bindings shadowing
+///| top-level pure functions are treated as unknown callables (fail-closed).
+fn ms_is_pattern_kw(raw : String) -> Bool {
+  raw == "_" || raw == "if" || raw == "else" || raw == "true" || raw == "false" ||
+  raw == "mut" || raw == "as" || raw == "in" || raw == "is" || raw == "let" ||
+  raw == "match" || raw == "for" || raw == "while" || raw == "return" ||
+  raw == "break" || raw == "continue" || raw == "fn"
+}
+
+fn ms_add_pat_idents(tokens : Array[Token], s : Int, e : Int, out : Map[String, Bool]) -> Unit {
+  let mut k = s
+  while k < e {
+    if tokens[k].kind == TokenKind::Ident && !ms_is_pattern_kw(tokens[k].raw) {
+      // Skip struct field labels `field: pat` (the value pattern is scanned next)
+      if !(k + 1 < e && tokens[k + 1].kind == TokenKind::Colon) {
+        out[tokens[k].raw] = true
+      }
+    }
+    k = k + 1
+  }
+}
+
+fn ms_collect_pattern_bound_idents(tokens : Array[Token], body_open : Int, out : Map[String, Bool]) -> Unit {
+  if body_open < 0 || body_open >= tokens.length() {
+    return
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  if body_close <= body_open {
+    return
+  }
+  let mut i = body_open + 1
+  while i < body_close {
+    let raw = tokens[i].raw
+    // 1. `for <pat> in`
+    if raw == "for" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
+      let mut j = i + 1
+      let mut d = 0
+      while j < body_close {
+        let jk = tokens[j].kind
+        if d == 0 && (tokens[j].raw == "in" || jk == TokenKind::LBrace || jk == TokenKind::Semi) { break }
+        if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { d = d + 1 }
+        else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        j = j + 1
+      }
+      if j < body_close && tokens[j].raw == "in" {
+        ms_add_pat_idents(tokens, i + 1, j, out)
+      }
+    }
+    // 2. `if ... is <pat>` (or `while ... is <pat>`)
+    if raw == "is" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
+      let mut j = i + 1
+      let mut d = 0
+      while j < body_close {
+        let jk = tokens[j].kind
+        if d == 0 && (jk == TokenKind::LBrace || jk == TokenKind::AmpAmp || jk == TokenKind::PipePipe || jk == TokenKind::RParen || jk == TokenKind::Semi) { break }
+        if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { d = d + 1 }
+        else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        j = j + 1
+      }
+      ms_add_pat_idents(tokens, i + 1, j, out)
+    }
+    // 3. Destructuring `let <pat> =` (skip plain `let [mut] x [: T] =` which `callable_locals` handles)
+    if raw == "let" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
+      let mut ni = i + 1
+      if ni < body_close && tokens[ni].raw == "mut" { ni = ni + 1 }
+      let is_simple_let = ni + 1 < body_close && tokens[ni].kind == TokenKind::Ident &&
+      (tokens[ni + 1].kind == TokenKind::Eq || tokens[ni + 1].kind == TokenKind::Colon)
+      if !is_simple_let && ni < body_close {
+        let mut eq_i = ni
+        let mut d = 0
+        while eq_i < body_close {
+          let ek = tokens[eq_i].kind
+          if d == 0 && (ek == TokenKind::Eq || ek == TokenKind::Semi || ek == TokenKind::LBrace) { break }
+          if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { d = d + 1 }
+          else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+          eq_i = eq_i + 1
+        }
+        if eq_i < body_close && tokens[eq_i].kind == TokenKind::Eq {
+          ms_add_pat_idents(tokens, ni, eq_i, out)
+        }
+      }
+    }
+    // 4. `match` arm patterns: scan backward from `=>` at arm level
+    if tokens[i].kind == TokenKind::FatArrow {
+      let mut ps = i - 1
+      let mut d = 0
+      while ps > body_open {
+        let pk = tokens[ps].kind
+        if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace {
+          if d == 0 && pk == TokenKind::RBrace { break }
+          d = d + 1
+        } else if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace {
+          if d == 0 { break }
+          d = d - 1
+        } else if d == 0 && (pk == TokenKind::Semi || pk == TokenKind::FatArrow) {
+          break
+        } else if d == 0 && tokens[ps].newline_before {
+          // Include `ps` itself as the start of this arm pattern line
+          ps = ps - 1
+          break
+        }
+        ps = ps - 1
+      }
+      // Stop before `if` guard inside the match arm if present
+      let mut pat_end = i
+      let mut g = ps + 1
+      let mut gd = 0
+      while g < i {
+        let gk = tokens[g].kind
+        if gk == TokenKind::LParen || gk == TokenKind::LBracket || gk == TokenKind::LBrace { gd = gd + 1 }
+        else if gk == TokenKind::RParen || gk == TokenKind::RBracket || gk == TokenKind::RBrace { if gd > 0 { gd = gd - 1 } }
+        else if gd == 0 && tokens[g].raw == "if" { pat_end = g; break }
+        g = g + 1
+      }
+      ms_add_pat_idents(tokens, ps + 1, pat_end, out)
+    }
+    i = i + 1
+  }
 }
 
 fn ms_is_derive_method(m : String) -> Bool {
@@ -380,8 +512,10 @@ fn ms_op_name_to_symbol(op_name : String) -> String {
   if op_name == "sub" { return "-" }
   if op_name == "mul" { return "*" }
   if op_name == "div" { return "/" }
+  if op_name == "mod" { return "%" }
   if op_name == "neg" { return "-" }
-  if op_name == "eq" { return "==" }
+  if op_name == "eq" || op_name == "equal" || op_name == "op_equal" { return "==" }
+  if op_name == "compare" { return "<" }
   ""
 }
 
@@ -568,7 +702,7 @@ fn ms_infer_expr_ty(
   // receiver `Array[E]` before Stage B rewrites unknown methods), then fall back to `qfi_opt`.
   if tk.kind == TokenKind::Ident && !(end_i > 0 && (tokens[end_i - 1].kind == TokenKind::Dot || tokens[end_i - 1].kind == TokenKind::ColonColon)) {
     match local_var_types.get(tk.raw) {
-      Some(t) => if t.length() > 0 { return t }
+      Some(t) => if t == "__AMBIG__" { return "" } else if t.length() > 0 { return t }
       None => ()
     }
   }
@@ -626,6 +760,7 @@ fn ms_infer_expr_ty(
           if m == "length" || m == "to_int" || m == "index_of" || m == "compare" || m == "code_unit_at" { return "Int" }
           if m == "is_empty" || m == "is_some" || m == "is_none" || m == "starts_with" || m == "ends_with" || m == "contains" { return "Bool" }
           if m == "to_string" || m == "trim" || m == "slice" || m == "join" { return "String" }
+          if m == "iter" { return "MbtIter" }
           let recv_ty = ms_infer_expr_ty(pkg, tokens, lp - 3, content, qfi_opt, local_var_types)
           let rh = ms_type_head(recv_ty)
           if rh.length() > 0 {
@@ -665,6 +800,16 @@ fn ms_parse_nonneg_int(s : String) -> Int {
   v
 }
 
+fn ms_record_local_var_ty(out : Map[String, String], vname : String, ty_s : String) -> Unit {
+  if ty_s.length() == 0 {
+    return
+  }
+  match out.get(vname) {
+    Some(prev) => if prev != ty_s { out[vname] = "__AMBIG__" }
+    None => out[vname] = ty_s
+  }
+}
+
 ///| Collect local `let [mut] x [: T] = rhs` variable types in `[s, e)` into `out`.
 fn ms_collect_local_var_types(
   pkg : PkgMutationSummary,
@@ -695,9 +840,7 @@ fn ms_collect_local_var_types(
           }
           if eq_i < e && eq_i > ni + 2 {
             let ty_s = ms_join_token_slice(tokens, ni + 2, eq_i)
-            if ty_s.length() > 0 {
-              out[vname] = ty_s
-            }
+            ms_record_local_var_ty(out, vname, ty_s)
           }
         } else if ni + 2 < e && tokens[ni + 1].kind == TokenKind::Eq {
           let rhs_s = ni + 2
@@ -706,12 +849,10 @@ fn ms_collect_local_var_types(
             // Check simple struct literal `Type::{ ... }` or `Type::new(...)` or `rhs` type
             if rhs_s + 2 < rhs_e && tokens[rhs_s].kind == TokenKind::UpperIdent &&
             tokens[rhs_s + 1].kind == TokenKind::ColonColon && tokens[rhs_s + 2].kind == TokenKind::LBrace {
-              out[vname] = tokens[rhs_s].raw
+              ms_record_local_var_ty(out, vname, tokens[rhs_s].raw)
             } else {
               let rty = ms_infer_expr_ty(pkg, tokens, rhs_e - 1, content, qfi_opt, out)
-              if rty.length() > 0 {
-                out[vname] = rty
-              }
+              ms_record_local_var_ty(out, vname, rty)
             }
           }
         }
@@ -875,13 +1016,33 @@ fn ms_scan_span(
       }
     }
 
-    // Class 2: Binary operator impls (`+ - * / % == != < <= > >=`)
+    // Class 2: Binary & unary operator impls (`+ - * / % == != < <= > >=`)
     let op_sym = ms_is_token_binop(tk)
     if op_sym.length() > 0 && pkg.custom_ops.contains(op_sym) {
-      let lhs_ty = if i > s { ms_infer_expr_ty(pkg, tokens, i - 1, content, qfi_opt, local_var_types) } else { "" }
+      let mut is_unary_minus = false
+      if op_sym == "-" {
+        if i <= s || tokens[i].newline_before {
+          is_unary_minus = true
+        } else {
+          let pk = tokens[i - 1].kind
+          let prev_ends_expr = pk == TokenKind::Ident || pk == TokenKind::UpperIdent ||
+          pk == TokenKind::IntLit || pk == TokenKind::FloatLit || pk == TokenKind::StringLit ||
+          pk == TokenKind::CharLit || pk == TokenKind::ByteCharLit || pk == TokenKind::ByteStringLit ||
+          pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace
+          if !prev_ends_expr {
+            is_unary_minus = true
+          }
+        }
+      }
+      let lhs_ty = if is_unary_minus || i <= s { "" } else { ms_infer_expr_ty(pkg, tokens, i - 1, content, qfi_opt, local_var_types) }
       let rhs_end = if i + 1 < e { ms_postfix_expr_end(tokens, i + 1, e) } else { -1 }
       let rhs_ty = if rhs_end >= i + 1 { ms_infer_expr_ty(pkg, tokens, rhs_end, content, qfi_opt, local_var_types) } else { "" }
-      if !(ms_is_builtin_scalar_ty(lhs_ty) && (rhs_ty.length() == 0 || ms_is_builtin_scalar_ty(rhs_ty))) {
+      let is_pure_scalar_op = if is_unary_minus {
+        ms_is_builtin_scalar_ty(rhs_ty)
+      } else {
+        ms_is_builtin_scalar_ty(lhs_ty) && ms_is_builtin_scalar_ty(rhs_ty)
+      }
+      if !is_pure_scalar_op {
         if pkg.ext_custom_ops.contains(op_sym) {
           sum.unknown = true
         } else {
@@ -965,9 +1126,12 @@ fn ms_scan_span(
             }
           }
         } else if pk == TokenKind::Ident {
-          // Variable reassignment `xs = ...`
+          // Variable reassignment `xs = ...`: fail-closed when LHS type is unknown
           let vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
-          if vty.length() > 0 && (str_has(vty, "Array") || ms_extract_nested_array_elem_ty(vty).length() > 0) {
+          if vty.length() == 0 {
+            sum.mutates_any_array = true
+            sum.unknown = true
+          } else if str_has(vty, "Array") || ms_extract_nested_array_elem_ty(vty).length() > 0 {
             let elem = ms_extract_nested_array_elem_ty(vty)
             ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
           }
@@ -999,39 +1163,55 @@ fn ms_scan_span(
             // Class 3: calling a function-typed struct field `s.cb(...)`
             sum.unknown = true
           } else if ms_is_array_mutating_method(m) {
-            // Class 7: mutating array method
-            if ms_is_shrink_method(m) {
-              sum.reaches_shrink = true
-            }
-            if recv_head == "Map" || recv_head == "OrderedMap" {
-              // Map::set / Map::remove / Map::clear: check if value holds Array
-              let nested = ms_extract_nested_array_elem_ty(recv_ty)
-              if nested.length() > 0 || str_has(recv_ty, "Array") {
-                ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+            let is_builtin_mut_container = recv_head == "Array" || recv_head == "FixedArray" ||
+            recv_head == "ArrayBuf" || recv_head == "ArrayView" || recv_head == "Map" ||
+            recv_head == "OrderedMap" || recv_head == "OrderedSet" || recv_head == "StringBuilder"
+            if is_builtin_mut_container {
+              // Class 7: mutating built-in container method
+              if ms_is_shrink_method(m) {
+                sum.reaches_shrink = true
               }
-            } else if recv_head == "StringBuilder" {
-              ()
+              if recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet" {
+                // Map::set / Map::remove / Map::clear: check if value holds Array
+                let nested = ms_extract_nested_array_elem_ty(recv_ty)
+                if nested.length() > 0 || str_has(recv_ty, "Array") {
+                  ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+                }
+              } else if recv_head == "StringBuilder" {
+                ()
+              } else {
+                let elem = ms_extract_array_elem_ty(recv_ty)
+                ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+              }
+              // If this mutating method takes a callback (`retain`, `sort_by`, `sort_by_key`, `map_in_place`),
+              // also analyze its callback argument!
+              if m == "retain" || m == "sort_by" || m == "sort_by_key" || m == "map_in_place" {
+                let cargs = ms_split_call_args(tokens, lp, rp)
+                if cargs.length() >= 1 {
+                  let last_a = cargs[cargs.length() - 1]
+                  ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+                }
+              }
+            } else if recv_head.length() > 0 {
+              // User-defined or external type method named `clear`/`push`/`set`/...:
+              // resolve via method call so `reaches_shrink` / `unknown` propagate!
+              ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
             } else {
-              let elem = ms_extract_array_elem_ty(recv_ty)
-              ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
-            }
-            // If this mutating method takes a callback (`retain`, `sort_by`, `sort_by_key`, `map_in_place`),
-            // also analyze its callback argument!
-            if m == "retain" || m == "sort_by" || m == "sort_by_key" || m == "map_in_place" {
-              let cargs = ms_split_call_args(tokens, lp, rp)
-              if cargs.length() >= 1 {
-                let last_a = cargs[cargs.length() - 1]
-                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+              // Unknown receiver type: fail-closed on both mutation and unknown!
+              if ms_is_shrink_method(m) {
+                sum.reaches_shrink = true
               }
+              sum.mutates_any_array = true
+              sum.unknown = true
             }
           } else if m == "map" || m == "mapi" || m == "filter" || m == "filter_map" ||
           m == "each" || m == "eachi" || m == "fold" || m == "any" || m == "all" ||
           m == "find_first" || m == "search_by" || m == "map_or" || m == "bind" {
-            // Higher-order read-only method on Array / MbtIter / Option: analyze callback!
-            let is_known_builtin_recv = recv_head == "Array" || recv_head == "FixedArray" ||
-            recv_head == "ArrayView" || recv_head == "ArrayBuf" || recv_head == "MbtIter" ||
-            recv_head == "Option" || recv_head == "Result" ||
-            (!pkg.method_overloads.contains(m) && !pkg.dep_methods.contains(m))
+            // Higher-order read-only method on Array / MbtIter / Option: require proven built-in receiver and non-trait method!
+            let is_known_builtin_recv = !pkg.trait_methods.contains(m) &&
+            (recv_head == "Array" || recv_head == "FixedArray" ||
+              recv_head == "ArrayView" || recv_head == "ArrayBuf" || recv_head == "MbtIter" ||
+              recv_head == "Option" || recv_head == "Result")
             if !is_known_builtin_recv {
               ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
             } else {
@@ -1061,8 +1241,7 @@ fn ms_scan_span(
               sum.unknown = true
             }
           } else if ms_is_pure_builtin_method(m) &&
-          (ms_is_builtin_scalar_ty(recv_ty) || ms_is_builtin_container_head(recv_head) ||
-            (recv_head.length() == 0 && !pkg.method_overloads.contains(m) && !pkg.dep_methods.contains(m) && !pkg.trait_methods.contains(m))) {
+          (ms_is_builtin_scalar_ty(recv_ty) || ms_is_builtin_container_head(recv_head)) {
             ()
           } else {
             ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
@@ -1121,8 +1300,8 @@ fn ms_scan_span(
               // Unknown `mbt_compat::*` helper -> fail-closed
               sum.unknown = true
             }
-          } else if q == "Array" || q == "ArrayBuf" || q == "ArrayView" {
-            // Class 7: UFCS `Array::push(xs, v)` etc.
+          } else if q == "Array" || q == "FixedArray" || q == "ArrayBuf" || q == "ArrayView" {
+            // Class 7: UFCS `Array::push(xs, v)` / `FixedArray::set(xs, 0, v)` / `FixedArray::makei(...)` etc.
             if ms_is_array_mutating_method(name) {
               if ms_is_shrink_method(name) {
                 sum.reaches_shrink = true
@@ -1134,13 +1313,77 @@ fn ms_scan_span(
                 ""
               }
               ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+              if name == "retain" || name == "sort_by" || name == "sort_by_key" || name == "map_in_place" {
+                if cargs.length() >= 2 {
+                  let last_a = cargs[cargs.length() - 1]
+                  ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, elem, sum, callees_out, collect_edges, depth + 1)
+                }
+              }
+            } else if name == "makei" {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              if cargs.length() >= 2 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, "Int", sum, callees_out, collect_edges, depth + 1)
+              } else {
+                sum.unknown = true
+              }
             } else if name == "new" || name == "make" || name == "with_capacity" || name == "from_array" ||
             ms_is_pure_builtin_method(name) {
               ()
             } else {
               sum.unknown = true
             }
-          } else if ms_is_builtin_static_pure_prefix(q) {
+          } else if q == "Map" || q == "OrderedMap" {
+            if name == "new" || name == "from_array" || name == "of" {
+              ()
+            } else if ms_is_array_mutating_method(name) {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              let a0_ty = if cargs.length() >= 1 {
+                ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types)
+              } else {
+                ""
+              }
+              if a0_ty.length() == 0 {
+                sum.mutates_any_array = true
+                sum.unknown = true
+              } else if str_has(a0_ty, "Array") || ms_extract_nested_array_elem_ty(a0_ty).length() > 0 {
+                ms_record_array_mutation(sum, ms_extract_nested_array_elem_ty(a0_ty), active_generics, pkg.declared_types)
+              }
+            } else {
+              sum.unknown = true
+            }
+          } else if q == "Option" || q == "Result" {
+            if name == "map" || name == "map_or" || name == "bind" || name == "map_err" {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              if cargs.length() >= 2 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, "", sum, callees_out, collect_edges, depth + 1)
+              } else {
+                sum.unknown = true
+              }
+            } else if name == "Some" || name == "None" || name == "Ok" || name == "Err" ||
+            name == "unwrap" || name == "unwrap_or" || name == "is_some" || name == "is_none" ||
+            name == "is_ok" || name == "is_err" {
+              ()
+            } else {
+              sum.unknown = true
+            }
+          } else if q == "Bytes" {
+            if name == "makei" {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              if cargs.length() >= 2 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, "Int", sum, callees_out, collect_edges, depth + 1)
+              } else {
+                sum.unknown = true
+              }
+            } else if name == "new" || name == "make" || name == "from_array" || name == "of" ||
+            name == "length" || name == "is_empty" || name == "get" {
+              ()
+            } else {
+              sum.unknown = true
+            }
+          } else if ms_is_pure_static_method(q, name) {
             ()
           } else if is_ctor_name(name) {
             // Qualified enum constructor `Enum::Variant(...)`
@@ -1231,7 +1474,12 @@ fn ms_resolve_method_call(
   callees_out : Array[String],
   collect_edges : Bool,
 ) -> Unit {
-  if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
+  if recv_head.length() == 0 {
+    // Unknown receiver type (could be external, generic, or `dyn`) -> strictly fail-closed!
+    sum.unknown = true
+    return
+  }
+  if pkg.fn_keys.contains(recv_head + "::" + m) {
     ms_add_call_effect(pkg, recv_head + "::" + m, sum, callees_out, collect_edges)
     return
   }
@@ -1239,12 +1487,14 @@ fn ms_resolve_method_call(
     sum.unknown = true
     return
   }
+  if !pkg.declared_types.contains(recv_head) {
+    // Receiver is an external / non-package type -> fail-closed!
+    sum.unknown = true
+    return
+  }
   match pkg.method_overloads.get(m) {
     Some(ov) =>
     if ov.length() == 0 {
-      sum.unknown = true
-    } else if recv_head.length() > 0 && !pkg.declared_types.contains(recv_head) {
-      // Receiver is a known external type -> fail-closed!
       sum.unknown = true
     } else {
       for fk in ov {
@@ -1354,11 +1604,26 @@ pub fn collect_pkg_mutation_summary(
   let pkg = PkgMutationSummary::empty()
   for k in dep_methods.keys() {
     pkg.dep_methods[k] = true
-    if k == " eq" {
+    if k == "eq" || k == "equal" || k == "op_equal" {
       pkg.custom_ops["=="] = true
       pkg.custom_ops["!="] = true
       pkg.ext_custom_ops["=="] = true
       pkg.ext_custom_ops["!="] = true
+    } else if k == "compare" {
+      pkg.custom_ops["<"] = true
+      pkg.custom_ops["<="] = true
+      pkg.custom_ops[">"] = true
+      pkg.custom_ops[">="] = true
+      pkg.ext_custom_ops["<"] = true
+      pkg.ext_custom_ops["<="] = true
+      pkg.ext_custom_ops[">"] = true
+      pkg.ext_custom_ops[">="] = true
+    } else if k == "output" {
+      pkg.custom_ops["Show"] = true
+      pkg.ext_custom_ops["Show"] = true
+    } else if k == "op_get" || k == "op_set" {
+      pkg.custom_ops["[]"] = true
+      pkg.ext_custom_ops["[]"] = true
     }
   }
   for k in op_lookup.keys() {
@@ -1468,13 +1733,18 @@ pub fn collect_pkg_mutation_summary(
           continue
         }
       }
-      // `impl Trait for Type { ... }`
+      // `impl Trait for Type with m(...) { ... }` or `impl Trait for Type { fn ... }`
       if tk.raw == "impl" && i + 1 < n {
         let mut o = i + 1
         let mut trait_nm = ""
         let mut target_ty = ""
         let mut saw_for = false
+        let mut with_i = -1
         while o < n && ts[o].kind != TokenKind::LBrace {
+          if ts[o].raw == "with" && with_i < 0 {
+            with_i = o
+            break
+          }
           if ts[o].raw == "for" {
             saw_for = true
           } else if !saw_for && (ts[o].kind == TokenKind::UpperIdent || ts[o].kind == TokenKind::Ident) && trait_nm.length() == 0 {
@@ -1484,9 +1754,33 @@ pub fn collect_pkg_mutation_summary(
           }
           o = o + 1
         }
-        if o < n && ts[o].kind == TokenKind::LBrace {
+        let op_syms = ms_op_trait_to_symbols(trait_nm)
+        for sym in op_syms {
+          pkg.custom_ops[sym] = true
+        }
+        if with_i > 0 {
+          let (next_i, decl_opt) = ms_parse_fn_decl(pkg, ts, with_i, n, fi, target_ty)
+          match decl_opt {
+            Some(dc) => {
+              decls.push(dc)
+              for sym in op_syms {
+                ms_add_op_impl_fn(pkg, sym, dc.key)
+              }
+              if dc.bare_name == "op_get" || dc.bare_name == "op_set" {
+                ms_add_op_impl_fn(pkg, "[]", dc.key)
+              }
+              i = next_i
+              continue
+            }
+            None => {
+              for sym in op_syms {
+                pkg.ext_custom_ops[sym] = true
+              }
+            }
+          }
+        } else if o < n && ts[o].kind == TokenKind::LBrace {
           let close = find_matching_delim(ts, o)
-          let op_syms = ms_op_trait_to_symbols(trait_nm)
+          let mut parsed_any = false
           let mut k = o + 1
           let mut id = 0
           while k + 1 < close {
@@ -1497,6 +1791,7 @@ pub fn collect_pkg_mutation_summary(
               let (next_k, decl_opt) = ms_parse_fn_decl(pkg, ts, k, close, fi, target_ty)
               match decl_opt {
                 Some(dc) => {
+                  parsed_any = true
                   decls.push(dc)
                   for sym in op_syms {
                     ms_add_op_impl_fn(pkg, sym, dc.key)
@@ -1512,8 +1807,17 @@ pub fn collect_pkg_mutation_summary(
             }
             k = k + 1
           }
+          if !parsed_any {
+            for sym in op_syms {
+              pkg.ext_custom_ops[sym] = true
+            }
+          }
           i = close + 1
           continue
+        } else {
+          for sym in op_syms {
+            pkg.ext_custom_ops[sym] = true
+          }
         }
       }
       // Top-level `fn` / `fn[T]` / `fn Type::method`
@@ -1522,9 +1826,10 @@ pub fn collect_pkg_mutation_summary(
         match decl_opt {
           Some(dc) => {
             decls.push(dc)
-            // Detect Stage A operator pre-pass functions `__mbt_op_<op>_<Type>`
-            if dc.bare_name.starts_with("__mbt_op_") {
-              let rest = dc.bare_name.slice(9, dc.bare_name.length())
+            // Detect Stage A operator pre-pass functions `mbt_op_<op>_<Type>` (and legacy `__mbt_op_`)
+            if dc.bare_name.starts_with("mbt_op_") || dc.bare_name.starts_with("__mbt_op_") {
+              let pfx_len = if dc.bare_name.starts_with("__mbt_op_") { 9 } else { 7 }
+              let rest = dc.bare_name.slice(pfx_len, dc.bare_name.length())
               let us = rest.index_of("_")
               if us > 0 {
                 let sym = ms_op_name_to_symbol(rest.slice(0, us))
@@ -1566,6 +1871,7 @@ pub fn collect_pkg_mutation_summary(
       }
     }
     let callables = callable_locals(ts, dc.body_open)
+    ms_collect_pattern_bound_idents(ts, dc.body_open, callables)
     let active_gen = match pkg.fn_generics.get(dc.key) {
       Some(g) => g
       None => Map()
@@ -1739,6 +2045,7 @@ pub fn summarize_expr_span(
 ) -> FnMutationSummary {
   let sum = FnMutationSummary::empty()
   let callables = if fn_body_open >= 0 { callable_locals(tokens, fn_body_open) } else { Map() }
+  if fn_body_open >= 0 { ms_collect_pattern_bound_idents(tokens, fn_body_open, callables) }
   let vt : Map[String, String] = Map()
   // Seed with enclosing function's parameter types + locals
   if fn_body_open >= 0 {
@@ -1783,6 +2090,7 @@ pub fn summarize_callback_arg(
 ) -> FnMutationSummary {
   let sum = FnMutationSummary::empty()
   let callables = if fn_body_open >= 0 { callable_locals(tokens, fn_body_open) } else { Map() }
+  if fn_body_open >= 0 { ms_collect_pattern_bound_idents(tokens, fn_body_open, callables) }
   let vt : Map[String, String] = Map()
   if fn_body_open >= 0 {
     let fstart = fn_start_of(tokens, fn_body_open)
