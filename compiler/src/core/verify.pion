@@ -103,6 +103,10 @@ struct VCtx {
   loop_had_cont : Array[Bool]
   loop_break_moved : Array[VMoved]
   loop_exit_moved : Array[VMoved]
+  /// Per open loop: a reachable `break`, and a reachable false condition
+  /// (an exit of a `while` / C-style `for` other than `break`).
+  loop_had_break : Array[Bool]
+  loop_had_exit : Array[Bool]
   reported : Map[String, Bool]
   forbidden_seen : Map[String, Bool]
   /// Binding IDs of roots of live borrowed views (`for x in r`, a pattern
@@ -1008,7 +1012,9 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     EIdent(n, sp) => {
       match v_lookup(ctx, n) {
         Some(b) =>
-          if vm_contains(ctx.moved, b.id) {
+          // Unreachable code (after a diverging statement) reads nothing:
+          // only the static subset checks apply there.
+          if !ctx.diverged && vm_contains(ctx.moved, b.id) {
             v_err(
               ctx,
               sp,
@@ -1079,6 +1085,9 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
           }
           ctx.diverged = ctx.diverged && df_l
         } else {
+          // Unreachable right operand: static checks only (no move reports
+          // while `ctx.diverged` is set), then the short-circuit state.
+          let _ = v_cond(ctx, r, true)
           ctx.moved = mf_l
           ctx.diverged = df_l
         }
@@ -1468,6 +1477,11 @@ fn v_cond(ctx : VCtx, cond : Expr, bind_is : Bool) -> (VMoved, Bool) {
     EBinary("&&", l, r, _) => {
       let (mf_l, df_l) = v_cond(ctx, l, bind_is)
       if ctx.diverged {
+        // Unreachable right operand: static checks only, state unchanged.
+        let m_keep = v_copy_moved(ctx.moved)
+        let _ = v_cond(ctx, r, bind_is)
+        ctx.moved = m_keep
+        ctx.diverged = true
         return (mf_l, df_l)
       }
       let (mf_r, df_r) = v_cond(ctx, r, bind_is)
@@ -1497,6 +1511,14 @@ fn v_cond(ctx : VCtx, cond : Expr, bind_is : Bool) -> (VMoved, Bool) {
 }
 
 ///|
+fn v_is_true_lit(cond : Expr) -> Bool {
+  match cond {
+    EBool(true, _) => true
+    _ => false
+  }
+}
+
+///|
 fn v_loop_body(ctx : VCtx, has_cond : Bool, run : (Int) -> Unit) -> Unit {
   let d0 = ctx.diverged
   let m_entry = v_copy_moved(ctx.moved)
@@ -1504,7 +1526,23 @@ fn v_loop_body(ctx : VCtx, has_cond : Bool, run : (Int) -> Unit) -> Unit {
   ctx.loop_had_cont.push(false)
   ctx.loop_break_moved.push(vm_new())
   ctx.loop_exit_moved.push(vm_new())
+  ctx.loop_had_break.push(false)
+  ctx.loop_had_exit.push(false)
   let idx = ctx.loop_cont_moved.length() - 1
+  if d0 {
+    // An unreachable loop: one pass for the static checks only, no back
+    // edges, and it stays unreachable.
+    run(0)
+    let _ = ctx.loop_cont_moved.pop()
+    let _ = ctx.loop_had_cont.pop()
+    let _ = ctx.loop_break_moved.pop()
+    let _ = ctx.loop_exit_moved.pop()
+    let _ = ctx.loop_had_break.pop()
+    let _ = ctx.loop_had_exit.pop()
+    ctx.moved = m_entry
+    ctx.diverged = true
+    return
+  }
   // Pass 0: first iteration from `m_entry`.
   run(0)
   let end0_div = ctx.diverged
@@ -1581,7 +1619,17 @@ fn v_loop_body(ctx : VCtx, has_cond : Bool, run : (Int) -> Unit) -> Unit {
   let _ = ctx.loop_had_cont.pop()
   let _ = ctx.loop_break_moved.pop()
   let _ = ctx.loop_exit_moved.pop()
-  ctx.diverged = d0
+  let had_break = match ctx.loop_had_break.pop() {
+    Some(v) => v
+    None => false
+  }
+  let had_exit = match ctx.loop_had_exit.pop() {
+    Some(v) => v
+    None => false
+  }
+  // A condition-tested loop whose condition never reaches false (`while
+  // true`) and that has no reachable `break` does not fall through.
+  ctx.diverged = d0 || (has_cond && !had_exit && !had_break)
 }
 
 ///|
@@ -1701,8 +1749,9 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
         v_push(ctx)
         let (m_false, d_false) = v_cond(ctx, cond, true)
         let top = ctx.loop_exit_moved.length() - 1
-        if !d_false {
+        if !d_false && !v_is_true_lit(cond) {
           v_union_into(ctx.loop_exit_moved[top], m_false)
+          ctx.loop_had_exit[top] = true
         }
         if pass < 2 {
           v_stmts(ctx, body, false)
@@ -1713,6 +1762,8 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
     SFor(init_s, cond, step_s, body, _) => {
       v_push(ctx)
       v_stmt(ctx, init_s, false)
+      // An `init` that leaves (e.g. `continue` of an enclosing loop) makes
+      // the loop unreachable: `v_loop_body` then runs the static checks only.
       v_loop_body(ctx, true, fn(pass : Int) -> Unit {
         let pin_base = ctx.pinned.length()
         v_push(ctx)
@@ -1720,8 +1771,9 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
         v_pop(ctx)
         v_unpin_to(ctx, pin_base)
         let top = ctx.loop_exit_moved.length() - 1
-        if !d_false {
+        if !d_false && !v_is_true_lit(cond) {
           v_union_into(ctx.loop_exit_moved[top], m_false)
+          ctx.loop_had_exit[top] = true
         }
         if pass < 2 {
           v_push(ctx)
@@ -1742,6 +1794,9 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
             ctx.loop_cont_moved[top] = vm_new()
             ctx.loop_had_cont[top] = false
             ctx.diverged = false
+            v_stmt(ctx, step_s, false)
+          } else {
+            // Unreachable step: static checks only (`ctx.diverged` stays set).
             v_stmt(ctx, step_s, false)
           }
         }
@@ -1803,6 +1858,7 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
     SBreak(_) => {
       if !ctx.diverged && ctx.loop_break_moved.length() > 0 {
         v_union_into(ctx.loop_break_moved[ctx.loop_break_moved.length() - 1], ctx.moved)
+        ctx.loop_had_break[ctx.loop_had_break.length() - 1] = true
       }
       ctx.diverged = true
     }
@@ -1843,6 +1899,8 @@ pub fn verify_check_fn(
     loop_had_cont: [],
     loop_break_moved: [],
     loop_exit_moved: [],
+    loop_had_break: [],
+    loop_had_exit: [],
     reported: Map([]),
     forbidden_seen: Map([]),
     pinned: [],
