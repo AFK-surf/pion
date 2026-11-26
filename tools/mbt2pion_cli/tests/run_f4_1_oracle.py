@@ -579,6 +579,156 @@ pub fn f(xs : Array[Int], a : SneakyEq, b : SneakyEq) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_indirect_call_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+struct Holder { mk_bad : () -> BadEq }
+pub fn f(xs : Array[Int], h : Holder, target : BadEq) -> Int {
+  let mut s = 0
+  for x in xs {
+    if (h.mk_bad)() == target { s = s + x }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_local_alias_box_clear": (r'''
+struct Box { items : Array[Int] }
+pub fn f(b : Box) -> Int {
+  let xs = b.items
+  let mut s = 0
+  for x in xs {
+    b.items.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_pub_field_wrapper_bad_eq": (r'''
+pub(all) struct BadInner { same : (BadInner) -> Bool }
+pub impl Eq for BadInner with equal(self, other) { (self.same)(other) }
+pub(all) struct WrapPub { i : BadInner } derive(Eq)
+pub fn f(xs : Array[Int], a : WrapPub, b : WrapPub) -> Int {
+  let mut s = 0
+  for x in xs {
+    if a == b { s = s + x }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_typed_field_alias_grow_write": (r'''
+struct Box { items : Array[Int] }
+pub fn f(b : Box) -> Int {
+  let ys : Array[Int] = b.items
+  let mut s = 0
+  for x in b.items {
+    ys.push(4)
+    ys[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_paren_field_alias_grow_write": (r'''
+struct Box { items : Array[Int] }
+pub fn f(b : Box) -> Int {
+  let ys = (b.items)
+  let mut s = 0
+  for x in b.items {
+    ys.push(4)
+    ys[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_sibling_field_grow_write": (r'''
+struct Two { a : Array[Int]; b : Array[Int] }
+pub fn f(v : Two) -> Int {
+  let mut s = 0
+  for x in v.a {
+    v.b.push(4)
+    v.b[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_computed_call_grow_write": (r'''
+fn ident(xs : Array[Int]) -> Array[Int] { xs }
+pub fn f(xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in ident(xs) {
+    xs.push(4)
+    xs[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_computed_index_grow_write": (r'''
+pub fn f(bag : Array[Array[Int]], xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in bag[0] {
+    xs.push(4)
+    xs[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_local_closure_wipe": (r'''
+pub fn f() -> Int {
+  let xs = [1, 2, 3]
+  let wipe = fn() { xs.clear() }
+  let mut s = 0
+  for x in xs {
+    if x == 1 { wipe() }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_let_shadow_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+struct Holder { xs : Array[Int]; bad : BadEq }
+pub fn f(t : Holder) -> Int {
+  let mut s = 0
+  for k in t.xs {
+    let k = t.bad
+    if k == k { s = s + 1 }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_tuple_shadow_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+struct Holder { xs : Array[Int]; bad : BadEq }
+pub fn f(t : Holder, pair : (BadEq, Int)) -> Int {
+  let mut s = 0
+  for k in t.xs {
+    let (k, _) = pair
+    if k == t.bad { s = s + 1 }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_match_shadow_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+struct Holder { xs : Array[Int]; bad : BadEq }
+pub fn f(t : Holder, opt : BadEq?) -> Int {
+  let mut s = 0
+  for k in t.xs {
+    match opt {
+      Some(k) => if k == t.bad { s = s + 1 }
+      None => ()
+    }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
 }
 
 
