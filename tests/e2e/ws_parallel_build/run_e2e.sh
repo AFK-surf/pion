@@ -749,4 +749,131 @@ test ! -d "$CAS_DEF4/ws_stage"
 test "$("$TMP_DIR/def_j4")" = "empty=42"
 echo "Default threshold small-pkg in-process fast-path: OK"
 
+# --- Contract A.13: Cross-package cold vs hot `.pionstub` runtime parity (generic fns, escapes, ECall(EField), SForIn, SLetTuple, generic method & generic impl) ---
+WS_STUB="$TMP_DIR/ws_stub_fidelity"
+mkdir -p "$WS_STUB/up/src" "$WS_STUB/app/src"
+cat <<'EOF' > "$WS_STUB/up/pion.toml"
+[package]
+name = "up"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$WS_STUB/up/src/lib.pion"
+pub struct Holder {
+  f : (Int) -> Int
+}
+pub fn Holder::f(self : Holder, x : Int) -> Int {
+  x + 1000
+}
+pub fn pad1() -> Int { 1 }
+pub fn pad2() -> Int { 2 }
+pub fn pad3() -> Int { 3 }
+pub fn pad4() -> Int { 4 }
+
+pub fn call_field[T](h : Holder, t : T, x : Int) -> Int {
+  let _ = t
+  (h.f)(x)
+}
+
+pub fn check_escapes[T](t : T, def_s~ : String = "\x1b[0m") -> String {
+  let _ = t
+  let c_nl : Char = '\n'
+  let b_esc : Byte = b'\x1b'
+  let c_sq : Char = '\''
+  let c_bs : Char = '\\'
+  let s_esc : String = "\x1b[0m"
+  let b0 = def_s.code_unit_at(0)
+  let s0 = s_esc.code_unit_at(0)
+  "nl=" + c_nl.to_int().to_string() +
+    ",esc=" + b_esc.to_int().to_string() +
+    ",sq=" + c_sq.to_int().to_string() +
+    ",bs=" + c_bs.to_int().to_string() +
+    ",ds=" + b0.to_string() +
+    ",ss=" + s0.to_string()
+}
+
+pub fn sum_loops[T](xs : Array[Int], t : T) -> Int {
+  let _ = t
+  let mut acc = 0
+  for x in xs {
+    acc = acc + x
+  }
+  for i, x in xs {
+    acc = acc + i * 10 + x
+  }
+  for let (a, b) = (0, 3); a < 1; acc = acc + b {
+    acc = acc + b
+    break
+  }
+  acc
+}
+
+pub trait Wrap {
+  fn tag_of(self) -> Int
+}
+pub struct WBox {
+  tag : Int
+}
+pub impl Wrap for WBox {
+  fn tag_of(self) -> Int {
+    self.tag
+  }
+}
+let priv_bias : Int = 10
+fn priv_helper(x : Int) -> Int {
+  x + priv_bias
+}
+pub fn call_priv[T](x : Int, t : T) -> Int {
+  let _ = t
+  priv_helper(x)
+}
+
+pub fn WBox::wrap_id[T](self : WBox, y : T) -> T {
+  let _ = self.tag
+  y
+}
+pub fn WBox::add_tag[T](self : WBox, y : Int, t : T) -> Int {
+  let _ = t
+  self.tag + y
+}
+EOF
+cat <<'EOF' > "$WS_STUB/app/pion.toml"
+[package]
+name = "app_stub"
+version = "0.1.0"
+
+[dependencies]
+up = { path = "../up" }
+EOF
+cat <<'EOF' > "$WS_STUB/app/src/main.pion"
+import "up"
+
+pub fn main(w : World) -> Int {
+  let h = up::Holder::{ f: fn(x : Int) -> Int { x + 1 } }
+  let cf = up::call_field(h, 0, 5)
+  let es = up::check_escapes(0)
+  let lp = up::sum_loops([2, 4, 6], 0)
+  let wb = up::WBox::{ tag: 9 }
+  let wi = wb.add_tag(wb.wrap_id(77), "ok")
+  let pv = up::call_priv(5, "p")
+  io_println(w, "field=" + cf.to_string() + " " + es + " loop=" + lp.to_string() + " wrap=" + wi.to_string() + " priv=" + pv.to_string())
+  0
+}
+EOF
+CAS_STUB="$TMP_DIR/cas_stub_fidelity"
+mkdir -p "$CAS_STUB"
+PION_CACHE_DIR="$CAS_STUB" "$PIONC" build --jobs 1 -o "$TMP_DIR/stub_cold" "$WS_STUB/app"
+STUB_COLD_OUT="$("$TMP_DIR/stub_cold")"
+echo "Contract A.13 cold=$STUB_COLD_OUT"
+# Verify `up` actually emitted a non-empty `.pionstub` containing `call_field`
+UP_STUB_FILE=$(grep -l "pub fn call_field" "$CAS_STUB"/sig/*.pionstub | head -n 1 || true)
+test -n "$UP_STUB_FILE" || { echo "FAIL: no .pionstub with call_field"; ls -la "$CAS_STUB"/sig/; exit 1; }
+# Touch app only so `up` is loaded from its cached `.pionstub` on hot rebuild
+printf '\n// hot-stub-rebuild\n' >> "$WS_STUB/app/src/main.pion"
+PION_CACHE_DIR="$CAS_STUB" "$PIONC" build --jobs 1 -o "$TMP_DIR/stub_hot" "$WS_STUB/app"
+STUB_HOT_OUT="$("$TMP_DIR/stub_hot")"
+echo "Contract A.13 hot=$STUB_HOT_OUT"
+test "$STUB_COLD_OUT" = "field=6 nl=10,esc=27,sq=39,bs=92,ds=27,ss=27 loop=57 wrap=86 priv=15"
+test "$STUB_COLD_OUT" = "$STUB_HOT_OUT"
+echo "Contract A.13 (cold vs hot .pionstub fidelity: ECall(EField), escapes, SForIn, SLetTuple, generic method & impl): OK"
+
 echo "PASS: ws_parallel_build (Contract A & Contract B)"

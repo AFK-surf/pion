@@ -191,23 +191,29 @@ fn write_param_sig_ex(
   } else if param.label_kind == 2 {
     sb.write_string("?")
   }
-  if spaced_colon {
-    sb.write_string(" : ")
-  } else {
-    sb.write_string(": ")
+  let skip_ty = emit_stub_default &&
+    match param.ty {
+      TyMissing(_) => true
+      _ => false
+    }
+  if !skip_ty {
+    if spaced_colon {
+      sb.write_string(" : ")
+    } else {
+      sb.write_string(": ")
+    }
+    sb.write_string(type_expr_to_string(param.ty))
   }
-  sb.write_string(type_expr_to_string(param.ty))
   match param.default_expr {
     Some(def) => {
       sb.write_string(" = ")
-      match format_simple_default_expr(def) {
-        Some(s) => sb.write_string(s)
-        None =>
-          if emit_stub_default {
-            stub_write_expr(sb, def)
-          } else {
-            sb.write_string("<expr>")
-          }
+      if emit_stub_default {
+        stub_write_expr(sb, def)
+      } else {
+        match format_simple_default_expr(def) {
+          Some(s) => sb.write_string(s)
+          None => sb.write_string("<expr>")
+        }
       }
     }
     None => ()
@@ -7923,15 +7929,27 @@ pub fn xpkg_fn_is_inlinable_tc(tc : TypeChecker, fd : FnDecl) -> Bool {
 }
 
 ///|
+/// Lexer preserves escape sequences verbatim inside `CharLit` / `ByteLit`
+/// payloads (`'\n'` -> `"\\n"`, `b'\x1b'` -> `"\\x1b"`, `'\''` -> `"\\'"`),
+/// so emit the payload verbatim without double-escaping.
 fn stub_write_char_lit(sb : StringBuilder, prefix : String, s : String) -> Unit {
   sb.write_string(prefix)
+  sb.write_string(s)
+  sb.write_string("'")
+}
+
+///|
+/// Escape a decoded string payload using Pion's own string escape syntax
+/// (`\n`, `\r`, `\t`, `\\`, `\"`, `\0`, and `\u{XX}` for other control bytes),
+/// avoiding JSON `\u00XX` escapes that Pion's lexer rejects.
+fn stub_write_str_escaped(sb : StringBuilder, s : String) -> Unit {
   let mut i = 0
   while i < s.length() {
     let ch = str_code_at(s, i)
     if ch == 92 {
       sb.write_string("\\\\")
-    } else if ch == 39 {
-      sb.write_string("\\'")
+    } else if ch == 34 {
+      sb.write_string("\\\"")
     } else if ch == 10 {
       sb.write_string("\\n")
     } else if ch == 13 {
@@ -7941,15 +7959,22 @@ fn stub_write_char_lit(sb : StringBuilder, prefix : String, s : String) -> Unit 
     } else if ch == 0 {
       sb.write_string("\\0")
     } else if ch < 32 || ch == 127 {
-      sb.write_string("\\x")
+      sb.write_string("\\u{")
       sb.write_char(hex_digit((ch >> 4) & 15))
       sb.write_char(hex_digit(ch & 15))
+      sb.write_string("}")
     } else {
       sb.write_string(slice_str(s, i, i + 1))
     }
     i = i + 1
   }
-  sb.write_string("'")
+}
+
+///|
+fn stub_write_str_lit(sb : StringBuilder, s : String) -> Unit {
+  sb.write_string("\"")
+  stub_write_str_escaped(sb, s)
+  sb.write_string("\"")
 }
 
 ///|
@@ -7959,7 +7984,7 @@ fn stub_write_pat(sb : StringBuilder, pat : Pattern) -> Unit {
     PIdent(name, _) => sb.write_string(name)
     PBool(b, _) => sb.write_string(if b { "true" } else { "false" })
     PInt(s, _) => sb.write_string(s)
-    PString(s, _) => sb.write_string(json_quote(s))
+    PString(s, _) => stub_write_str_lit(sb, s)
     PChar(s, _) => stub_write_char_lit(sb, "'", s)
     PTuple(subs, _) => {
       sb.write_string("(")
@@ -8029,7 +8054,7 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
     EBool(b, _) => sb.write_string(if b { "true" } else { "false" })
     EByte(s, _) => stub_write_char_lit(sb, "b'", s)
     EChar(s, _) => stub_write_char_lit(sb, "'", s)
-    EString(s, _) => sb.write_string(json_quote(s))
+    EString(s, _) => stub_write_str_lit(sb, s)
     EUnit(_) => sb.write_string("()")
     EIdent(name, _) => sb.write_string(name)
     EPath(q, m, _) => {
@@ -8136,7 +8161,17 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       sb.write_string(" }")
     }
     ECall(callee, args, _) => {
-      stub_write_expr(sb, callee)
+      let need_paren = match callee {
+        EIdent(_, _) | EPath(_, _, _) => false
+        _ => true
+      }
+      if need_paren {
+        sb.write_string("(")
+        stub_write_expr(sb, callee)
+        sb.write_string(")")
+      } else {
+        stub_write_expr(sb, callee)
+      }
       sb.write_string("(")
       let mut i = 0
       while i < args.length() {
@@ -8285,10 +8320,7 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       let mut i = 0
       while i < parts.length() {
         match parts[i] {
-          EString(s, _) => {
-            let q = json_quote(s)
-            sb.write_string(slice_str(q, 1, q.length() - 1))
-          }
+          EString(s, _) => stub_write_str_escaped(sb, s)
           other => {
             sb.write_string("\\{")
             stub_write_expr(sb, other)
@@ -8311,6 +8343,27 @@ fn stub_write_stmt_inline(sb : StringBuilder, st : Stmt) -> Unit {
         sb.write_string("mut ")
       }
       sb.write_string(name)
+      match ty {
+        TyMissing(_) => ()
+        _ => {
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(ty))
+        }
+      }
+      sb.write_string(" = ")
+      stub_write_expr(sb, init)
+    }
+    SLetTuple(names, ty, init, _) => {
+      sb.write_string("let (")
+      let mut ni = 0
+      while ni < names.length() {
+        if ni > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(names[ni])
+        ni = ni + 1
+      }
+      sb.write_string(")")
       match ty {
         TyMissing(_) => ()
         _ => {
@@ -8440,9 +8493,11 @@ fn stub_write_stmts(sb : StringBuilder, stmts : Array[Stmt]) -> Unit {
       }
       SForIn(kname, vname, iter_e, fbody, _) => {
         sb.write_string("for ")
-        if vname.length() > 0 {
+        if kname.length() > 0 && vname.length() > 0 {
           sb.write_string(kname)
           sb.write_string(", ")
+          sb.write_string(vname)
+        } else if vname.length() > 0 {
           sb.write_string(vname)
         } else {
           sb.write_string(kname)
@@ -8469,16 +8524,273 @@ fn stub_write_stmts(sb : StringBuilder, stmts : Array[Stmt]) -> Unit {
 }
 
 ///|
+/// Collect identifiers/method names referenced inside `e` for private-helper
+/// reachability from generic fns/impls and complex pub default args.
+fn stub_collect_refs_expr(
+  e : Expr,
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  match e {
+    EIdent(name, _) => out_names.push(name)
+    EPath(q, m, _) => {
+      out_names.push(q + "::" + m)
+      out_names.push(m)
+    }
+    EDotVariant(_, args, _) => stub_collect_refs_exprs(args, out_names, out_methods)
+    EUnary(_, inner, _) | EMutArg(inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
+      stub_collect_refs_expr(inner, out_names, out_methods)
+    EIs(inner, _, _) => stub_collect_refs_expr(inner, out_names, out_methods)
+    EBinary(_, lhs, rhs, _) => {
+      stub_collect_refs_expr(lhs, out_names, out_methods)
+      stub_collect_refs_expr(rhs, out_names, out_methods)
+    }
+    ECall(callee, args, _) => {
+      stub_collect_refs_expr(callee, out_names, out_methods)
+      stub_collect_refs_exprs(args, out_names, out_methods)
+    }
+    EField(obj, _, _) => stub_collect_refs_expr(obj, out_names, out_methods)
+    EMethodCall(recv, mname, args, _) => {
+      out_methods.push(mname)
+      stub_collect_refs_expr(recv, out_names, out_methods)
+      stub_collect_refs_exprs(args, out_names, out_methods)
+    }
+    EIndex(obj, idx, _) => {
+      stub_collect_refs_expr(obj, out_names, out_methods)
+      stub_collect_refs_expr(idx, out_names, out_methods)
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) =>
+      stub_collect_refs_exprs(elems, out_names, out_methods)
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => stub_collect_refs_expr(base, out_names, out_methods)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        stub_collect_refs_expr(fields[i].value, out_names, out_methods)
+        i = i + 1
+      }
+    }
+    EBlock(stmts, _) => stub_collect_refs_stmts(stmts, out_names, out_methods)
+    EIf(cond, then_stmts, else_opt, _) => {
+      stub_collect_refs_expr(cond, out_names, out_methods)
+      stub_collect_refs_stmts(then_stmts, out_names, out_methods)
+      match else_opt {
+        Some(el) => stub_collect_refs_expr(el, out_names, out_methods)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      stub_collect_refs_expr(scrut, out_names, out_methods)
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(g) => stub_collect_refs_expr(g, out_names, out_methods)
+          None => ()
+        }
+        stub_collect_refs_expr(arms[i].body, out_names, out_methods)
+        i = i + 1
+      }
+    }
+    EClosure(_, _, body, _) => stub_collect_refs_stmts(body, out_names, out_methods)
+    EScope(a, b, _) | ESpawn(a, b, _) => {
+      stub_collect_refs_expr(a, out_names, out_methods)
+      stub_collect_refs_expr(b, out_names, out_methods)
+    }
+    ENamedArg(_, _, inner, _) => stub_collect_refs_expr(inner, out_names, out_methods)
+    _ => ()
+  }
+}
+
+///|
+fn stub_collect_refs_exprs(
+  es : Array[Expr],
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  let mut i = 0
+  while i < es.length() {
+    stub_collect_refs_expr(es[i], out_names, out_methods)
+    i = i + 1
+  }
+}
+
+///|
+fn stub_collect_refs_stmts(
+  stmts : Array[Stmt],
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) =>
+        stub_collect_refs_expr(init, out_names, out_methods)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        stub_collect_refs_expr(lhs, out_names, out_methods)
+        stub_collect_refs_expr(rhs, out_names, out_methods)
+      }
+      SGuard(cond, body, _) | SWhile(cond, body, _) => {
+        stub_collect_refs_expr(cond, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SFor(init_st, cond, step_st, body, _) => {
+        stub_collect_refs_stmts([init_st], out_names, out_methods)
+        stub_collect_refs_expr(cond, out_names, out_methods)
+        stub_collect_refs_stmts([step_st], out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SForRange(_, s, e, _, body, _) => {
+        stub_collect_refs_expr(s, out_names, out_methods)
+        stub_collect_refs_expr(e, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SForIn(_, _, it, body, _) => {
+        stub_collect_refs_expr(it, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SReturn(Some(e), _) | SExpr(e, _) => stub_collect_refs_expr(e, out_names, out_methods)
+      SDebugAssert(c, m, _) => {
+        stub_collect_refs_expr(c, out_names, out_methods)
+        stub_collect_refs_expr(m, out_names, out_methods)
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn stub_fn_key(fd : FnDecl) -> String {
+  if fd.receiver_type != "" {
+    fd.receiver_type + "::" + fd.name
+  } else {
+    fd.name
+  }
+}
+
+///|
+/// Compute the transitive closure of private functions and private constants
+/// reachable from generic fn/impl bodies or pub default-arg expressions so
+/// cross-package monomorphization/default expansion never calls a `{ panic() }`
+/// private stub.
+fn stub_collect_reachable_priv_deps(
+  pkg : Package,
+) -> (Map[String, Bool], Map[String, Bool]) {
+  let priv_fns : Map[String, FnDecl] = Map([])
+  let priv_methods_by_name : Map[String, Array[String]] = Map([])
+  let priv_consts : Map[String, Expr] = Map([])
+  let q_names : Array[String] = []
+  let q_methods : Array[String] = []
+
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) => {
+          let fk = stub_fn_key(fd)
+          if !fd.is_pub && fd.type_params.length() == 0 {
+            priv_fns.set(fk, fd)
+            if fd.receiver_type != "" {
+              sig_demand_map_push_unique(priv_methods_by_name, fd.name, fk)
+            }
+          }
+          if fd.type_params.length() > 0 {
+            stub_collect_refs_stmts(fd.body, q_names, q_methods)
+          }
+          if fd.is_pub {
+            let mut pi = 0
+            while pi < fd.params.length() {
+              match fd.params[pi].default_expr {
+                Some(def) => stub_collect_refs_expr(def, q_names, q_methods)
+                None => ()
+              }
+              pi = pi + 1
+            }
+          }
+        }
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            let m = id.methods[mi]
+            if id.type_params.length() > 0 || m.type_params.length() > 0 {
+              stub_collect_refs_stmts(m.body, q_names, q_methods)
+            }
+            mi = mi + 1
+          }
+        }
+        DConst(cd) =>
+          if !cd.is_pub {
+            priv_consts.set(cd.name, cd.value)
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+
+  let keep_fns : Map[String, Bool] = Map([])
+  let keep_consts : Map[String, Bool] = Map([])
+  let mut ni = 0
+  let mut mi = 0
+  while ni < q_names.length() || mi < q_methods.length() {
+    while ni < q_names.length() {
+      let nm = q_names[ni]
+      ni = ni + 1
+      if !keep_fns.contains(nm) {
+        match priv_fns.get(nm) {
+          Some(fd) => {
+            keep_fns.set(nm, true)
+            stub_collect_refs_stmts(fd.body, q_names, q_methods)
+          }
+          None => ()
+        }
+      }
+      if !keep_consts.contains(nm) {
+        match priv_consts.get(nm) {
+          Some(val_e) => {
+            keep_consts.set(nm, true)
+            stub_collect_refs_expr(val_e, q_names, q_methods)
+          }
+          None => ()
+        }
+      }
+    }
+    while mi < q_methods.length() {
+      let mn = q_methods[mi]
+      mi = mi + 1
+      match priv_methods_by_name.get(mn) {
+        Some(fks) => {
+          let mut ki = 0
+          while ki < fks.length() {
+            q_names.push(fks[ki])
+            ki = ki + 1
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  (keep_fns, keep_consts)
+}
+
+///|
 /// Emit a minimal parseable `.pion` stub containing only top-level declarations
 /// (structs, enums, const types, and fn signatures with `{ panic() }` bodies).
 pub fn emit_file_stub(f : SourceFile) -> String {
-  emit_file_stub_with_syms(f, None)
+  emit_file_stub_with_syms(f, None, Map([]), Map([]))
 }
 
 ///|
 fn emit_file_stub_with_syms(
   f : SourceFile,
   xpkg_syms : Option[XpkgPubSyms],
+  keep_priv_fns : Map[String, Bool],
+  keep_priv_consts : Map[String, Bool],
 ) -> String {
   let sb = StringBuilder()
   let mut di = 0
@@ -8580,6 +8892,7 @@ fn emit_file_stub_with_syms(
         sb.write_string(") -> ")
         sb.write_string(type_expr_to_string(fd.ret_ty))
         let emit_body = fd.type_params.length() > 0 ||
+          keep_priv_fns.contains(stub_fn_key(fd)) ||
           match xpkg_syms {
             Some(syms) =>
               xpkg_fn_is_inlinable(syms, fd) ||
@@ -8653,12 +8966,7 @@ fn emit_file_stub_with_syms(
             if j > 0 {
               sb.write_string(", ")
             }
-            if m.params[j].is_mut {
-              sb.write_string("mut ")
-            }
-            sb.write_string(m.params[j].name)
-            sb.write_string(" : ")
-            sb.write_string(type_expr_to_string(m.params[j].ty))
+            write_param_sig_ex(sb, m.params[j], true, true)
             j = j + 1
           }
           sb.write_string(") -> ")
@@ -8701,23 +9009,19 @@ fn emit_file_stub_with_syms(
           }
           sb.write_string("  fn ")
           sb.write_string(m.name)
+          sb.write_string(format_type_params_with_bounds(m.type_params, m.type_bounds))
           sb.write_string("(")
           let mut j = 0
           while j < m.params.length() {
             if j > 0 {
               sb.write_string(", ")
             }
-            if m.params[j].is_mut {
-              sb.write_string("mut ")
-            }
-            sb.write_string(m.params[j].name)
-            sb.write_string(" : ")
-            sb.write_string(type_expr_to_string(m.params[j].ty))
+            write_param_sig_ex(sb, m.params[j], true, true)
             j = j + 1
           }
           sb.write_string(") -> ")
           sb.write_string(type_expr_to_string(m.ret_ty))
-          if id.type_params.length() > 0 {
+          if id.type_params.length() > 0 || m.type_params.length() > 0 {
             sb.write_string(" {\n")
             stub_write_stmts(sb, m.body)
             sb.write_string("  }\n")
@@ -8736,10 +9040,11 @@ fn emit_file_stub_with_syms(
         sb.write_string(cd.name)
         sb.write_string(" : ")
         sb.write_string(type_expr_to_string(cd.ty))
-        let emit_const_val = match xpkg_syms {
-          Some(_) => !cd.is_pub && xpkg_is_const_scalar_expr(cd.value)
-          None => false
-        }
+        let emit_const_val = keep_priv_consts.contains(cd.name) ||
+          match xpkg_syms {
+            Some(_) => !cd.is_pub && xpkg_is_const_scalar_expr(cd.value)
+            None => false
+          }
         if emit_const_val {
           sb.write_string(" = ")
           stub_write_expr(sb, cd.value)
@@ -8854,7 +9159,13 @@ fn pkg_non_generic_fn_count(pkg : Package) -> Int {
           }
         DImpl(id) =>
           if id.type_params.length() == 0 {
-            cnt = cnt + id.methods.length()
+            let mut mi = 0
+            while mi < id.methods.length() {
+              if id.methods[mi].type_params.length() == 0 {
+                cnt = cnt + 1
+              }
+              mi = mi + 1
+            }
           }
         _ => ()
       }
@@ -8897,12 +9208,20 @@ pub fn emit_pion_stub(pkg : Package) -> String {
     fi = fi + 1
   }
   let syms = xpkg_pub_syms_from_pkg(pkg)
+  let (keep_priv_fns, keep_priv_consts) = stub_collect_reachable_priv_deps(pkg)
   fi = 0
   while fi < pkg.files.length() {
-    sb.write_string(emit_file_stub_with_syms(pkg.files[fi], Some(syms)))
+    sb.write_string(emit_file_stub_with_syms(pkg.files[fi], Some(syms), keep_priv_fns, keep_priv_consts))
     fi = fi + 1
   }
-  sb.to_string()
+  let stub_txt = sb.to_string()
+  if stub_txt.length() > 0 {
+    let pr = parse_source(pkg.name + ".pionstub", stub_txt)
+    if pr.diagnostics.length() > 0 {
+      return ""
+    }
+  }
+  stub_txt
 }
 
 ///|
