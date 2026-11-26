@@ -933,7 +933,7 @@ p = sys.argv[1]
 txt = open(p).read()
 # Drop the trailing sha256 line
 lines = txt.splitlines()
-assert lines[0] == "v2" and lines[-1].startswith("sha256:"), lines
+assert lines[0] == "v3" and lines[-1].startswith("sha256:"), lines
 open(p, "w").write("\n".join(lines[:-1]) + "\n")
 PYEOF
 PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_K1" "$PIONC" build -o "$TMP_DIR/k2_bin" "$WS_K1/pkg" 2>"$TMP_DIR/k2.trace"
@@ -983,6 +983,149 @@ ln -sfn "$WS_K3/d2/sub" "$WS_K3/pkg/sym_dir"
 PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_K3" "$PIONC" build -o "$TMP_DIR/k3_bin2" "$WS_K3/pkg" 2>"$TMP_DIR/k3.trace"
 grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/k3.trace" || fail "Scenario K3 expected MISS after symlink-dir + .. retarget"
 [ "$("$TMP_DIR/k3_bin2")" = "202" ] || fail "Scenario K3 expected 202 after symlink-dir + .. retarget"
-echo "(K) transitive parent shadowing + truncated v2 .deps + symlink-dir/.. retarget -> OK"
+echo "(K) transitive parent shadowing + truncated v3 .deps + symlink-dir/.. retarget -> OK"
+
+# ============================================================================
+# Scenario L (Round 5): Pre-existing dual headers (#include_next) -> 100% HIT,
+#   quoted external/system header shadowed by new sibling -> MISS,
+#   intermediate directory symlink swap with preserved old mtime -> self-heal
+# ============================================================================
+# L1 (Opus R4): Two non-/usr dirs with same-named header both included via #include_next
+WS_L1="$TMP_DIR/ws_l1"
+mkdir -p "$WS_L1/pkg/src" "$WS_L1/inc_a" "$WS_L1/inc_b"
+cat > "$WS_L1/inc_b/dual.h" <<'EOF'
+#define DUAL_B 30
+EOF
+cat > "$WS_L1/inc_a/dual.h" <<'EOF'
+#include_next "dual.h"
+#define DUAL_A (DUAL_B + 12)
+EOF
+cat > "$WS_L1/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "dual.h"
+int64_t l1_val(void) { return DUAL_A; }
+EOF
+cat > "$WS_L1/pkg/pion.toml" <<'EOF'
+[package]
+name = "l1_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../inc_a", "-I../inc_b"]
+EOF
+cat > "$WS_L1/pkg/src/main.pion" <<'EOF'
+extern "C" fn l1_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, l1_val().to_string()) }
+EOF
+CAS_L1="$TMP_DIR/cas_l1"
+mkdir -p "$CAS_L1"
+PION_CACHE_DIR="$CAS_L1" "$PIONC" build -o "$TMP_DIR/l1_bin1" "$WS_L1/pkg"
+[ "$("$TMP_DIR/l1_bin1")" = "42" ] || fail "Scenario L1 cold expected 42"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_L1" "$PIONC" build -o "$TMP_DIR/l1_bin2" "$WS_L1/pkg" 2>"$TMP_DIR/l1_hot.trace"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/l1_hot.trace" || fail "Scenario L1 expected warm HIT on pre-existing dual headers (#include_next)"
+[ "$("$TMP_DIR/l1_bin2")" = "42" ] || fail "Scenario L1 warm expected 42"
+
+# L2 (Astra #3): Nested project header quotes external/system header, then sibling added
+WS_L2="$TMP_DIR/ws_l2"
+mkdir -p "$WS_L2/pkg/src" "$WS_L2/sub" "$WS_L2/ext_sdk/include"
+cat > "$WS_L2/ext_sdk/include/ext_sys.h" <<'EOF'
+#define EXT_SYS_VAL 50
+EOF
+cat > "$WS_L2/sub/a.h" <<'EOF'
+#include "ext_sys.h"
+EOF
+cat > "$WS_L2/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "../sub/a.h"
+int64_t l2_val(void) { return EXT_SYS_VAL; }
+EOF
+cat > "$WS_L2/pkg/pion.toml" <<EOF
+[package]
+name = "l2_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-isystem", "$WS_L2/ext_sdk/include"]
+EOF
+cat > "$WS_L2/pkg/src/main.pion" <<'EOF'
+extern "C" fn l2_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, l2_val().to_string()) }
+EOF
+CAS_L2="$TMP_DIR/cas_l2"
+mkdir -p "$CAS_L2"
+PION_CACHE_DIR="$CAS_L2" "$PIONC" build -o "$TMP_DIR/l2_bin1" "$WS_L2/pkg"
+[ "$("$TMP_DIR/l2_bin1")" = "50" ] || fail "Scenario L2 cold expected 50"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_L2" "$PIONC" build -o "$TMP_DIR/l2_bin2" "$WS_L2/pkg" 2>"$TMP_DIR/l2_hot.trace"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/l2_hot.trace" || fail "Scenario L2 expected warm HIT before shadowing"
+# Now add sibling `sub/ext_sys.h` shadowing the -isystem header for `sub/a.h`
+cat > "$WS_L2/sub/ext_sys.h" <<'EOF'
+#define EXT_SYS_VAL 95
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_L2" "$PIONC" build -o "$TMP_DIR/l2_bin3" "$WS_L2/pkg" 2>"$TMP_DIR/l2_miss.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/l2_miss.trace" || fail "Scenario L2 expected MISS when sibling shadows external/system header"
+[ "$("$TMP_DIR/l2_bin3")" = "95" ] || fail "Scenario L2 expected 95 after sibling shadow"
+
+# L3 (Astra #2): Intermediate directory symlink swap during compile with preserved old mtime
+WS_L3="$TMP_DIR/ws_l3"
+mkdir -p "$WS_L3/pkg/src" "$WS_L3/dir_v1" "$WS_L3/dir_v2"
+cat > "$WS_L3/dir_v1/hdr.h" <<'EOF'
+#define L3_VAL 111
+EOF
+cat > "$WS_L3/dir_v2/hdr.h" <<'EOF'
+#define L3_VAL 222
+EOF
+touch -t 202001010000 "$WS_L3/dir_v1/hdr.h" "$WS_L3/dir_v2/hdr.h" "$WS_L3/dir_v1" "$WS_L3/dir_v2"
+ln -s "$WS_L3/dir_v1" "$WS_L3/pkg/inc_link"
+cat > "$WS_L3/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "inc_link/hdr.h"
+int64_t l3_val(void) { return L3_VAL; }
+EOF
+cat > "$WS_L3/pkg/pion.toml" <<'EOF'
+[package]
+name = "l3_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_L3/pkg/src/main.pion" <<'EOF'
+extern "C" fn l3_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, l3_val().to_string()) }
+EOF
+
+RACY_SYMLINK_CC="$TMP_DIR/racy_symlink_cc.sh"
+cat > "$RACY_SYMLINK_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+"${REAL_CC_BIN}" "$@"
+RC=$?
+if [ "$RC" = "0" ] && [ "${INJECT_SWAP:-0}" = "1" ]; then
+  case "$*" in
+    *-c*stub.c*)
+      ln -sfn "${SWAP_TARGET}" "${SWAP_LINK}"
+      ;;
+  esac
+fi
+exit "$RC"
+EOF
+chmod +x "$RACY_SYMLINK_CC"
+
+CAS_L3="$TMP_DIR/cas_l3"
+mkdir -p "$CAS_L3"
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_SWAP=1 SWAP_LINK="$WS_L3/pkg/inc_link" SWAP_TARGET="$WS_L3/dir_v2" CC="$RACY_SYMLINK_CC" \
+  PION_CACHE_DIR="$CAS_L3" "$PIONC" build -o "$TMP_DIR/l3_bin1" "$WS_L3/pkg"
+[ "$("$TMP_DIR/l3_bin1")" = "111" ] || fail "Scenario L3 run 1 expected 111"
+# Next run (no race) MUST MISS and pick up 222 because ancestor symlink swap was caught!
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_SWAP=0 SWAP_LINK="$WS_L3/pkg/inc_link" SWAP_TARGET="$WS_L3/dir_v2" CC="$RACY_SYMLINK_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_L3" "$PIONC" build -o "$TMP_DIR/l3_bin2" "$WS_L3/pkg" 2>"$TMP_DIR/l3_2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/l3_2.trace" || fail "Scenario L3 expected MISS after intermediate dir symlink swap"
+[ "$("$TMP_DIR/l3_bin2")" = "222" ] || fail "Scenario L3 expected 222 after intermediate dir symlink swap"
+
+echo "(L) dual-header #include_next HIT + external sibling shadow + intermediate symlink swap self-heal -> OK"
 
 echo "PASS: cas_pin_and_cstub_deps"
