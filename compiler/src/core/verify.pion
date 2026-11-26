@@ -1012,7 +1012,9 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     EIdent(n, sp) => {
       match v_lookup(ctx, n) {
         Some(b) =>
-          if vm_contains(ctx.moved, b.id) {
+          // Unreachable code (after a diverging statement) reads nothing:
+          // only the static subset checks apply there.
+          if !ctx.diverged && vm_contains(ctx.moved, b.id) {
             v_err(
               ctx,
               sp,
@@ -1519,6 +1521,20 @@ fn v_loop_body(ctx : VCtx, has_cond : Bool, run : (Int) -> Unit) -> Unit {
   ctx.loop_had_break.push(false)
   ctx.loop_had_exit.push(false)
   let idx = ctx.loop_cont_moved.length() - 1
+  if d0 {
+    // An unreachable loop: one pass for the static checks only, no back
+    // edges, and it stays unreachable.
+    run(0)
+    let _ = ctx.loop_cont_moved.pop()
+    let _ = ctx.loop_had_cont.pop()
+    let _ = ctx.loop_break_moved.pop()
+    let _ = ctx.loop_exit_moved.pop()
+    let _ = ctx.loop_had_break.pop()
+    let _ = ctx.loop_had_exit.pop()
+    ctx.moved = m_entry
+    ctx.diverged = true
+    return
+  }
   // Pass 0: first iteration from `m_entry`.
   run(0)
   let end0_div = ctx.diverged
@@ -1739,58 +1755,55 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
       v_push(ctx)
       v_stmt(ctx, init_s, false)
       // An `init` that leaves (e.g. `continue` of an enclosing loop) makes
-      // the whole loop unreachable.
-      if !ctx.diverged {
-        v_loop_body(ctx, true, fn(pass : Int) -> Unit {
-          let pin_base = ctx.pinned.length()
+      // the loop unreachable: `v_loop_body` then runs the static checks only.
+      v_loop_body(ctx, true, fn(pass : Int) -> Unit {
+        let pin_base = ctx.pinned.length()
+        v_push(ctx)
+        let (m_false, d_false) = v_cond(ctx, cond, false)
+        v_pop(ctx)
+        v_unpin_to(ctx, pin_base)
+        let top = ctx.loop_exit_moved.length() - 1
+        if !d_false && !v_is_true_lit(cond) {
+          v_union_into(ctx.loop_exit_moved[top], m_false)
+          ctx.loop_had_exit[top] = true
+        }
+        if pass < 2 {
           v_push(ctx)
-          let (m_false, d_false) = v_cond(ctx, cond, false)
+          v_stmts(ctx, body, false)
           v_pop(ctx)
-          v_unpin_to(ctx, pin_base)
-          let top = ctx.loop_exit_moved.length() - 1
-          if !d_false && !v_is_true_lit(cond) {
-            v_union_into(ctx.loop_exit_moved[top], m_false)
-            ctx.loop_had_exit[top] = true
-          }
-          if pass < 2 {
-            v_push(ctx)
-            v_stmts(ctx, body, false)
-            v_pop(ctx)
-            let had_cont = ctx.loop_had_cont[top]
-            if !ctx.diverged || had_cont {
-              let pre_step = if !ctx.diverged && had_cont {
-                let u = v_copy_moved(ctx.moved)
-                v_union_into(u, ctx.loop_cont_moved[top])
-                u
-              } else if had_cont {
-                v_copy_moved(ctx.loop_cont_moved[top])
-              } else {
-                ctx.moved
-              }
-              ctx.moved = pre_step
-              ctx.loop_cont_moved[top] = vm_new()
-              ctx.loop_had_cont[top] = false
-              ctx.diverged = false
-              v_stmt(ctx, step_s, false)
+          let had_cont = ctx.loop_had_cont[top]
+          if !ctx.diverged || had_cont {
+            let pre_step = if !ctx.diverged && had_cont {
+              let u = v_copy_moved(ctx.moved)
+              v_union_into(u, ctx.loop_cont_moved[top])
+              u
+            } else if had_cont {
+              v_copy_moved(ctx.loop_cont_moved[top])
+            } else {
+              ctx.moved
             }
+            ctx.moved = pre_step
+            ctx.loop_cont_moved[top] = vm_new()
+            ctx.loop_had_cont[top] = false
+            ctx.diverged = false
+            v_stmt(ctx, step_s, false)
+          } else {
+            // Unreachable step: static checks only (`ctx.diverged` stays set).
+            v_stmt(ctx, step_s, false)
           }
-        })
-      }
+        }
+      })
       v_pop(ctx)
     }
     SForRange(vname, start_e, end_e, _, body, _) => {
       v_expr(ctx, start_e, false)
-      if !ctx.diverged {
-        v_expr(ctx, end_e, false)
-      }
-      if !ctx.diverged {
-        v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
-          v_push(ctx)
-          v_define(ctx, vname, TInt, vk_local, false)
-          v_stmts(ctx, body, false)
-          v_pop(ctx)
-        })
-      }
+      v_expr(ctx, end_e, false)
+      v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
+        v_push(ctx)
+        v_define(ctx, vname, TInt, vk_local, false)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+      })
     }
     SForIn(idx_name, vname, iter_e, body, _) => {
       let iter_root = v_place_root(iter_e)
@@ -1811,23 +1824,21 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
       } else {
         -1
       }
-      if !ctx.diverged {
-        v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
-          let pin_base = ctx.pinned.length()
-          if iter_id >= 0 {
-            ctx.pinned.push(iter_id)
-          }
-          v_push(ctx)
-          if idx_name != "" {
-            v_define(ctx, idx_name, TInt, vk_local, false)
-          }
-          let k = if v_is_unique(ctx, elem) { vk_borrowed } else { vk_local }
-          v_define(ctx, vname, elem, k, false)
-          v_stmts(ctx, body, false)
-          v_pop(ctx)
-          v_unpin_to(ctx, pin_base)
-        })
-      }
+      v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
+        let pin_base = ctx.pinned.length()
+        if iter_id >= 0 {
+          ctx.pinned.push(iter_id)
+        }
+        v_push(ctx)
+        if idx_name != "" {
+          v_define(ctx, idx_name, TInt, vk_local, false)
+        }
+        let k = if v_is_unique(ctx, elem) { vk_borrowed } else { vk_local }
+        v_define(ctx, vname, elem, k, false)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+        v_unpin_to(ctx, pin_base)
+      })
     }
     SReturn(opt, _) => {
       match opt {
