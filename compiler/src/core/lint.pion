@@ -1,0 +1,3006 @@
+///|
+/// Built-in independent linter module for `pionc lint`.
+/// Enforces 7 mandatory, zero-configuration rules (`L_*`) strictly read-only
+/// on top of `CheckedPackage` (`pkg`, `tc`) and original on-disk source texts.
+
+///|
+fn lint_starts_with_underscore(name : String) -> Bool {
+  name.length() > 0 && str_code_at(name, 0) == 95
+}
+
+///|
+fn lint_is_ident_char(c : Int) -> Bool {
+  (c >= 97 && c <= 122) ||
+  (c >= 65 && c <= 90) ||
+  (c >= 48 && c <= 57) ||
+  c == 95
+}
+
+///|
+struct LintFileIndex {
+  src : String
+  starts : Array[Int]
+}
+
+///|
+fn lint_get_file_index(
+  raw_sources : Map[String, String],
+  cache : Map[String, LintFileIndex],
+  file : String,
+) -> Option[LintFileIndex] {
+  match cache.get(file) {
+    Some(idx) => Some(idx)
+    None =>
+      match raw_sources.get(file) {
+        Some(src) => {
+          let idx = LintFileIndex::{ src: src, starts: lint_line_starts(src) }
+          cache.set(file, idx)
+          Some(idx)
+        }
+        None => None
+      }
+  }
+}
+
+///|
+fn lint_line_starts(src : String) -> Array[Int] {
+  let starts : Array[Int] = [0]
+  let mut i = 0
+  while i < src.length() {
+    if str_code_at(src, i) == 10 {
+      starts.push(i + 1)
+    }
+    i = i + 1
+  }
+  starts
+}
+
+///|
+fn lint_line_col_to_offset(
+  src : String,
+  starts : Array[Int],
+  line : Int,
+  col : Int,
+) -> Int {
+  if line < 1 || col < 1 || line > starts.length() {
+    return -1
+  }
+  let ls = starts[line - 1]
+  let off = ls + (col - 1)
+  if off < ls || off > src.length() {
+    return -1
+  }
+  off
+}
+
+///|
+/// Converts a 1-based `(line, scalar_col)` from `lexer.pion` (`Span`) into a
+/// byte offset inside `src`. Handles non-ASCII UTF-8 scalars earlier on the
+/// same line accurately.
+fn lint_scalar_col_to_offset(
+  src : String,
+  starts : Array[Int],
+  line : Int,
+  scalar_col : Int,
+) -> Int {
+  if line < 1 || scalar_col < 1 || line > starts.length() {
+    return -1
+  }
+  let ls = starts[line - 1]
+  let le = if line < starts.length() { starts[line] } else { src.length() }
+  let utf8 = host_str_is_utf8()
+  let mut pos = ls
+  let mut cur_col = 1
+  while cur_col < scalar_col && pos < le {
+    let c = str_code_at(src, pos)
+    if c < 0x80 {
+      pos = pos + 1
+    } else {
+      pos = pos + str_scalar_len(src, pos, utf8)
+    }
+    cur_col = cur_col + 1
+  }
+  if cur_col != scalar_col || pos > src.length() {
+    return -1
+  }
+  pos
+}
+
+///|
+fn lint_line_is_blank(src : String, starts : Array[Int], line : Int) -> Bool {
+  if line < 1 || line > starts.length() {
+    return false
+  }
+  let ls = starts[line - 1]
+  let le = if line < starts.length() { starts[line] } else { src.length() }
+  let mut i = ls
+  while i < le {
+    let c = str_code_at(src, i)
+    if c != 32 && c != 9 && c != 13 && c != 10 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+struct LintPos {
+  line : Int
+  col : Int
+}
+
+///|
+fn lint_offset_to_line_col(starts : Array[Int], off : Int) -> LintPos {
+  let mut lo = 0
+  let mut hi = starts.length() - 1
+  while lo < hi {
+    let mid = (lo + hi + 1) / 2
+    if starts[mid] <= off {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  LintPos::{ line: lo + 1, col: off - starts[lo] + 1 }
+}
+
+///|
+/// Counts physical lines in `src`: `\r\n` counts as 1 line, a trailing `\n`
+/// does not add an extra line, and a non-empty file without trailing `\n`
+/// counts its final line.
+pub fn lint_count_lines(src : String) -> Int {
+  let len = src.length()
+  if len == 0 {
+    return 0
+  }
+  let mut nl = 0
+  let mut i = 0
+  while i < len {
+    if str_code_at(src, i) == 10 {
+      nl = nl + 1
+    }
+    i = i + 1
+  }
+  if str_code_at(src, len - 1) == 10 {
+    nl
+  } else {
+    nl + 1
+  }
+}
+
+///|
+fn lint_detect_eol(src : String) -> String {
+  let mut i = 0
+  while i < src.length() {
+    if str_code_at(src, i) == 10 {
+      if i > 0 && str_code_at(src, i - 1) == 13 {
+        return "\r\n"
+      }
+      return "\n"
+    }
+    i = i + 1
+  }
+  "\n"
+}
+
+///|
+fn lint_skip_ws_and_comments(src : String, start : Int) -> Int {
+  let len = src.length()
+  let mut i = start
+  while i < len {
+    let c = str_code_at(src, i)
+    if c == 32 || c == 9 || c == 13 || c == 10 {
+      i = i + 1
+    } else if c == 47 && i + 1 < len && str_code_at(src, i + 1) == 47 {
+      i = i + 2
+      while i < len && str_code_at(src, i) != 10 {
+        i = i + 1
+      }
+    } else if c == 47 && i + 1 < len && str_code_at(src, i + 1) == 42 {
+      i = i + 2
+      while i + 1 < len && !(str_code_at(src, i) == 42 && str_code_at(src, i + 1) == 47) {
+        i = i + 1
+      }
+      if i + 1 < len {
+        i = i + 2
+      } else {
+        i = len
+      }
+    } else {
+      break
+    }
+  }
+  i
+}
+
+///|
+fn lint_match_keyword_at(src : String, pos : Int, kw : String) -> Bool {
+  let len = src.length()
+  let klen = kw.length()
+  if pos < 0 || pos + klen > len {
+    return false
+  }
+  let mut i = 0
+  while i < klen {
+    if str_code_at(src, pos + i) != str_code_at(kw, i) {
+      return false
+    }
+    i = i + 1
+  }
+  if pos > 0 && lint_is_ident_char(str_code_at(src, pos - 1)) {
+    return false
+  }
+  if pos + klen < len && lint_is_ident_char(str_code_at(src, pos + klen)) {
+    return false
+  }
+  true
+}
+
+///|
+fn lint_diag_with_edit(
+  sp : Span,
+  code : String,
+  message : String,
+  expected : String,
+  found : String,
+  fixit : String,
+  edit_opt : Option[TextEdit],
+) -> Diagnostic {
+  let edits : Array[TextEdit] = []
+  match edit_opt {
+    Some(e) => edits.push(e)
+    None => ()
+  }
+  Diagnostic::{
+    file: sp.file,
+    line: sp.line,
+    col: sp.col,
+    code: code,
+    message: message,
+    expected: expected,
+    found: found,
+    fixit: fixit,
+    edits: edits,
+  }
+}
+
+///|
+fn lint_str_cmp(a : String, b : String) -> Int {
+  let al = a.length()
+  let bl = b.length()
+  let min_l = if al < bl { al } else { bl }
+  let mut i = 0
+  while i < min_l {
+    let ca = str_code_at(a, i)
+    let cb = str_code_at(b, i)
+    if ca < cb {
+      return -1
+    }
+    if ca > cb {
+      return 1
+    }
+    i = i + 1
+  }
+  if al < bl {
+    -1
+  } else if al > bl {
+    1
+  } else {
+    0
+  }
+}
+
+///|
+fn lint_diag_cmp(a : Diagnostic, b : Diagnostic) -> Int {
+  let fc = lint_str_cmp(a.file, b.file)
+  if fc != 0 {
+    return fc
+  }
+  if a.line < b.line {
+    return -1
+  }
+  if a.line > b.line {
+    return 1
+  }
+  if a.col < b.col {
+    return -1
+  }
+  if a.col > b.col {
+    return 1
+  }
+  let cc = lint_str_cmp(a.code, b.code)
+  if cc != 0 {
+    return cc
+  }
+  lint_str_cmp(a.message, b.message)
+}
+
+///|
+pub fn lint_sort_and_dedup_diags(diags : Array[Diagnostic]) -> Array[Diagnostic] {
+  let n = diags.length()
+  let sorted : Array[Diagnostic] = []
+  let mut i = 0
+  while i < n {
+    sorted.push(diags[i])
+    i = i + 1
+  }
+  // Insertion sort (deterministic, stable).
+  i = 1
+  while i < n {
+    let cur = sorted[i]
+    let mut j = i - 1
+    while j >= 0 && lint_diag_cmp(sorted[j], cur) > 0 {
+      sorted[j + 1] = sorted[j]
+      j = j - 1
+    }
+    sorted[j + 1] = cur
+    i = i + 1
+  }
+  let out : Array[Diagnostic] = []
+  i = 0
+  while i < sorted.length() {
+    let d = sorted[i]
+    if out.length() == 0 || lint_diag_cmp(out[out.length() - 1], d) != 0 {
+      out.push(d)
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn lint_stmt_span(s : Stmt) -> Span {
+  match s {
+    SLet(_, _, _, _, sp) => sp
+    SLetTuple(_, _, _, sp) => sp
+    SAssign(_, _, sp) => sp
+    SCompoundAssign(_, _, _, sp) => sp
+    SGuard(_, _, sp) => sp
+    SWhile(_, _, sp) => sp
+    SFor(_, _, _, _, sp) => sp
+    SForRange(_, _, _, _, _, sp) => sp
+    SForIn(_, _, _, _, sp) => sp
+    SReturn(_, sp) => sp
+    SBreak(sp) => sp
+    SContinue(sp) => sp
+    SDebugAssert(_, _, sp) => sp
+    SExpr(_, sp) => sp
+  }
+}
+
+///|
+// =============================================================================
+// Rules 1 & 2: L_IMPLICIT_IMPORT and L_UNUSED_IMPORT
+// =============================================================================
+
+///|
+struct LintImportUsage {
+  used_order : Array[String]
+  first_span : Map[String, Span]
+}
+
+///|
+fn lint_record_alias_use(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  alias_name : String,
+  sp : Span,
+) -> Unit {
+  if alias_name.length() == 0 {
+    return
+  }
+  if !valid_aliases.contains(alias_name) {
+    return
+  }
+  if !usage.first_span.contains(alias_name) {
+    usage.used_order.push(alias_name)
+    usage.first_span.set(alias_name, sp)
+  }
+}
+
+///|
+fn lint_record_qual_name_use(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  name : String,
+  sp : Span,
+) -> Unit {
+  if has_qual_sep(name) {
+    let qp = split_qual_name(name)
+    lint_record_alias_use(valid_aliases, usage, qp.prefix, sp)
+  }
+}
+
+///|
+fn lint_scan_imports_type(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  t : TypeExpr,
+) -> Unit {
+  match t {
+    TyName(name, args, sp) => {
+      lint_record_qual_name_use(valid_aliases, usage, name, sp)
+      let mut i = 0
+      while i < args.length() {
+        lint_scan_imports_type(valid_aliases, usage, args[i])
+        i = i + 1
+      }
+    }
+    TyFn(ps, ret, _) => {
+      let mut i = 0
+      while i < ps.length() {
+        lint_scan_imports_type(valid_aliases, usage, ps[i])
+        i = i + 1
+      }
+      lint_scan_imports_type(valid_aliases, usage, ret)
+    }
+    TyTuple(ts, _) => {
+      let mut i = 0
+      while i < ts.length() {
+        lint_scan_imports_type(valid_aliases, usage, ts[i])
+        i = i + 1
+      }
+    }
+    TyDynTrait(name, sp) => lint_record_qual_name_use(valid_aliases, usage, name, sp)
+    TyMissing(_) => ()
+  }
+}
+
+///|
+fn lint_scan_imports_pat(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  p : Pattern,
+) -> Unit {
+  match p {
+    PWild(_) => ()
+    PIdent(_, _) => ()
+    PBool(_, _) => ()
+    PInt(_, _) => ()
+    PString(_, _) => ()
+    PChar(_, _) => ()
+    PVariant(qual, _, pats, _, sp) => {
+      if qual.length() > 0 {
+        let prefix = if has_qual_sep(qual) { split_qual_name(qual).prefix } else { qual }
+        lint_record_alias_use(valid_aliases, usage, prefix, sp)
+      }
+      let mut i = 0
+      while i < pats.length() {
+        lint_scan_imports_pat(valid_aliases, usage, pats[i])
+        i = i + 1
+      }
+    }
+    PTuple(pats, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_scan_imports_pat(valid_aliases, usage, pats[i])
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn lint_scan_imports_params(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  params : Array[Param],
+) -> Unit {
+  let mut i = 0
+  while i < params.length() {
+    lint_scan_imports_type(valid_aliases, usage, params[i].ty)
+    match params[i].default_expr {
+      Some(de) => lint_scan_imports_expr(valid_aliases, usage, de)
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_scan_imports_bounds(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  bounds : Array[TypeBound],
+  sp : Span,
+) -> Unit {
+  let mut i = 0
+  while i < bounds.length() {
+    let ts = bounds[i].traits
+    let mut j = 0
+    while j < ts.length() {
+      lint_record_qual_name_use(valid_aliases, usage, ts[j], sp)
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_scan_imports_stmts(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  stmts : Array[Stmt],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    lint_scan_imports_stmt(valid_aliases, usage, stmts[i])
+    i = i + 1
+  }
+}
+
+///|
+fn lint_scan_imports_stmt(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  s : Stmt,
+) -> Unit {
+  match s {
+    SLet(_, _, ty, init, _) => {
+      lint_scan_imports_type(valid_aliases, usage, ty)
+      lint_scan_imports_expr(valid_aliases, usage, init)
+    }
+    SLetTuple(_, ty, init, _) => {
+      lint_scan_imports_type(valid_aliases, usage, ty)
+      lint_scan_imports_expr(valid_aliases, usage, init)
+    }
+    SAssign(lhs, rhs, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, lhs)
+      lint_scan_imports_expr(valid_aliases, usage, rhs)
+    }
+    SCompoundAssign(_, lhs, rhs, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, lhs)
+      lint_scan_imports_expr(valid_aliases, usage, rhs)
+    }
+    SGuard(cond, else_b, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, cond)
+      lint_scan_imports_stmts(valid_aliases, usage, else_b)
+    }
+    SWhile(cond, body, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, cond)
+      lint_scan_imports_stmts(valid_aliases, usage, body)
+    }
+    SFor(init_s, cond, step_s, body, _) => {
+      lint_scan_imports_stmt(valid_aliases, usage, init_s)
+      lint_scan_imports_expr(valid_aliases, usage, cond)
+      lint_scan_imports_stmt(valid_aliases, usage, step_s)
+      lint_scan_imports_stmts(valid_aliases, usage, body)
+    }
+    SForRange(_, start_e, end_e, _, body, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, start_e)
+      lint_scan_imports_expr(valid_aliases, usage, end_e)
+      lint_scan_imports_stmts(valid_aliases, usage, body)
+    }
+    SForIn(_, _, iter_e, body, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, iter_e)
+      lint_scan_imports_stmts(valid_aliases, usage, body)
+    }
+    SReturn(opt_e, _) =>
+      match opt_e {
+        Some(e) => lint_scan_imports_expr(valid_aliases, usage, e)
+        None => ()
+      }
+    SBreak(_) => ()
+    SContinue(_) => ()
+    SDebugAssert(cond, msg, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, cond)
+      lint_scan_imports_expr(valid_aliases, usage, msg)
+    }
+    SExpr(e, _) => lint_scan_imports_expr(valid_aliases, usage, e)
+  }
+}
+
+///|
+fn lint_scan_imports_exprs(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  es : Array[Expr],
+) -> Unit {
+  let mut i = 0
+  while i < es.length() {
+    lint_scan_imports_expr(valid_aliases, usage, es[i])
+    i = i + 1
+  }
+}
+
+///|
+fn lint_scan_imports_expr(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  e : Expr,
+) -> Unit {
+  match e {
+    EInt(_, _) => ()
+    EInt64(_, _) => ()
+    EUInt(_, _) => ()
+    EUInt64(_, _) => ()
+    EDouble(_, _) => ()
+    EFloat(_, _) => ()
+    EBool(_, _) => ()
+    EByte(_, _) => ()
+    EChar(_, _) => ()
+    EString(_, _) => ()
+    EIdent(_, _) => ()
+    EPath(qual, _, sp) => {
+      let prefix = if has_qual_sep(qual) { split_qual_name(qual).prefix } else { qual }
+      lint_record_alias_use(valid_aliases, usage, prefix, sp)
+    }
+    EDotVariant(_, args, _) => lint_scan_imports_exprs(valid_aliases, usage, args)
+    EUnary(_, inner, _) => lint_scan_imports_expr(valid_aliases, usage, inner)
+    EBinary(_, lhs, rhs, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, lhs)
+      lint_scan_imports_expr(valid_aliases, usage, rhs)
+    }
+    ECall(callee, args, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, callee)
+      lint_scan_imports_exprs(valid_aliases, usage, args)
+    }
+    EField(obj, _, _) => lint_scan_imports_expr(valid_aliases, usage, obj)
+    EMethodCall(obj, _, args, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, obj)
+      lint_scan_imports_exprs(valid_aliases, usage, args)
+    }
+    EIndex(obj, idx, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, obj)
+      lint_scan_imports_expr(valid_aliases, usage, idx)
+    }
+    EArrayLit(es, _) => lint_scan_imports_exprs(valid_aliases, usage, es)
+    EStructLit(sname, base, fields, sp) => {
+      lint_record_qual_name_use(valid_aliases, usage, sname, sp)
+      match base {
+        Some(be) => lint_scan_imports_expr(valid_aliases, usage, be)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        lint_scan_imports_expr(valid_aliases, usage, fields[i].value)
+        i = i + 1
+      }
+    }
+    ETuple(es, _) => lint_scan_imports_exprs(valid_aliases, usage, es)
+    EBlock(stmts, _) => lint_scan_imports_stmts(valid_aliases, usage, stmts)
+    EIf(cond, then_s, else_opt, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, cond)
+      lint_scan_imports_stmts(valid_aliases, usage, then_s)
+      match else_opt {
+        Some(ee) => lint_scan_imports_expr(valid_aliases, usage, ee)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, scrut)
+      let mut i = 0
+      while i < arms.length() {
+        lint_scan_imports_pat(valid_aliases, usage, arms[i].pat)
+        match arms[i].guard_expr {
+          Some(ge) => lint_scan_imports_expr(valid_aliases, usage, ge)
+          None => ()
+        }
+        lint_scan_imports_expr(valid_aliases, usage, arms[i].body)
+        i = i + 1
+      }
+    }
+    EIs(scrut, pat, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, scrut)
+      lint_scan_imports_pat(valid_aliases, usage, pat)
+    }
+    EClosure(params, ret_ty, body, _) => {
+      lint_scan_imports_params(valid_aliases, usage, params)
+      lint_scan_imports_type(valid_aliases, usage, ret_ty)
+      lint_scan_imports_stmts(valid_aliases, usage, body)
+    }
+    EScope(w, f, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, w)
+      lint_scan_imports_expr(valid_aliases, usage, f)
+    }
+    ESpawn(s, f, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, s)
+      lint_scan_imports_expr(valid_aliases, usage, f)
+    }
+    EMove(inner, _) => lint_scan_imports_expr(valid_aliases, usage, inner)
+    EAs(inner, ty, _) => {
+      lint_scan_imports_expr(valid_aliases, usage, inner)
+      lint_scan_imports_type(valid_aliases, usage, ty)
+    }
+    ETry(inner, _) => lint_scan_imports_expr(valid_aliases, usage, inner)
+    EInterp(parts, _) => lint_scan_imports_exprs(valid_aliases, usage, parts)
+    ENamedArg(_, _, arg_e, _) => lint_scan_imports_expr(valid_aliases, usage, arg_e)
+    EMutArg(place, _) => lint_scan_imports_expr(valid_aliases, usage, place)
+    EUnit(_) => ()
+  }
+}
+
+///|
+fn lint_scan_imports_fn(
+  valid_aliases : Map[String, String],
+  usage : LintImportUsage,
+  fd : FnDecl,
+) -> Unit {
+  if fd.receiver_type.length() > 0 {
+    lint_record_qual_name_use(valid_aliases, usage, fd.receiver_type, fd.span)
+  }
+  lint_scan_imports_bounds(valid_aliases, usage, fd.type_bounds, fd.span)
+  lint_scan_imports_params(valid_aliases, usage, fd.params)
+  lint_scan_imports_type(valid_aliases, usage, fd.ret_ty)
+  lint_scan_imports_stmts(valid_aliases, usage, fd.body)
+}
+
+///|
+fn lint_scan_imports_file(
+  valid_aliases : Map[String, String],
+  f : SourceFile,
+) -> LintImportUsage {
+  let usage = LintImportUsage::{ used_order: [], first_span: Map([]) }
+  let mut i = 0
+  while i < f.decls.length() {
+    match f.decls[i] {
+      DStruct(sd) => {
+        let mut fi = 0
+        while fi < sd.fields.length() {
+          lint_scan_imports_type(valid_aliases, usage, sd.fields[fi].ty)
+          fi = fi + 1
+        }
+      }
+      DEnum(ed) => {
+        let mut vi = 0
+        while vi < ed.variants.length() {
+          let fs = ed.variants[vi].fields
+          let mut fi = 0
+          while fi < fs.length() {
+            lint_scan_imports_type(valid_aliases, usage, fs[fi])
+            fi = fi + 1
+          }
+          vi = vi + 1
+        }
+      }
+      DFn(fd) => lint_scan_imports_fn(valid_aliases, usage, fd)
+      DExternFn(ef) => {
+        lint_scan_imports_params(valid_aliases, usage, ef.params)
+        lint_scan_imports_type(valid_aliases, usage, ef.ret_ty)
+        if ef.has_body {
+          lint_scan_imports_stmts(valid_aliases, usage, ef.body)
+        }
+      }
+      DTrait(td) => {
+        let mut mi = 0
+        while mi < td.methods.length() {
+          lint_scan_imports_params(valid_aliases, usage, td.methods[mi].params)
+          lint_scan_imports_type(valid_aliases, usage, td.methods[mi].ret_ty)
+          mi = mi + 1
+        }
+      }
+      DImpl(id) => {
+        if id.trait_name.length() > 0 {
+          lint_record_qual_name_use(valid_aliases, usage, id.trait_name, id.span)
+        }
+        if id.target_type.length() > 0 {
+          lint_record_qual_name_use(valid_aliases, usage, id.target_type, id.span)
+        }
+        let mut ai = 0
+        while ai < id.target_type_args.length() {
+          lint_scan_imports_type(valid_aliases, usage, id.target_type_args[ai])
+          ai = ai + 1
+        }
+        lint_scan_imports_bounds(valid_aliases, usage, id.type_bounds, id.span)
+        let mut mi = 0
+        while mi < id.methods.length() {
+          lint_scan_imports_fn(valid_aliases, usage, id.methods[mi])
+          mi = mi + 1
+        }
+      }
+      DConst(cd) => {
+        lint_scan_imports_type(valid_aliases, usage, cd.ty)
+        lint_scan_imports_expr(valid_aliases, usage, cd.value)
+      }
+      DTest(td) => lint_scan_imports_stmts(valid_aliases, usage, td.body)
+    }
+    i = i + 1
+  }
+  usage
+}
+
+///|
+fn lint_format_import_line(path : String, alias_name : String) -> String {
+  if default_import_alias(path) == alias_name {
+    "import " + json_quote(path)
+  } else {
+    "import " + json_quote(path) + " as " + alias_name
+  }
+}
+
+///|
+struct LintImportTokSpan {
+  start_line : Int
+  end_line : Int
+  clean_single_line : Bool
+  end_line_clean : Bool
+}
+
+///|
+struct LintFileImportTokens {
+  ok : Bool
+  spans : Array[LintImportTokSpan]
+}
+
+///|
+fn lint_tok_is_hash(k : TokenKind) -> Bool {
+  match k {
+    Hash => true
+    _ => false
+  }
+}
+
+///|
+fn lint_tok_is_ident(k : TokenKind) -> Bool {
+  match k {
+    Ident(_) => true
+    _ => false
+  }
+}
+
+///|
+fn lint_tok_is_bang(k : TokenKind) -> Bool {
+  match k {
+    Bang => true
+    _ => false
+  }
+}
+
+///|
+/// True when `toks[ti]` is immediately preceded by a declaration attribute
+/// (`#attr`, `#attr(...)`, `#[...]`, or `#![...]`). Deleting that `import` line
+/// would silently re-attach the attribute to the following declaration.
+fn lint_tok_preceded_by_attr(toks : Array[Token], ti : Int) -> Bool {
+  if ti <= 0 {
+    return false
+  }
+  let prev = toks[ti - 1].kind
+  // Case 1: `#ident`
+  if lint_tok_is_ident(prev) && ti >= 2 && lint_tok_is_hash(toks[ti - 2].kind) {
+    return true
+  }
+  // Case 2: `#[...]` or `#![...]`
+  let is_rb = match prev {
+    RBracket => true
+    _ => false
+  }
+  if is_rb {
+    let mut depth = 1
+    let mut k = ti - 2
+    while k >= 0 && depth > 0 {
+      match toks[k].kind {
+        RBracket => depth = depth + 1
+        LBracket => depth = depth - 1
+        _ => ()
+      }
+      if depth == 0 {
+        break
+      }
+      k = k - 1
+    }
+    if depth == 0 {
+      if k >= 1 && lint_tok_is_hash(toks[k - 1].kind) {
+        return true
+      }
+      if k >= 2 && lint_tok_is_bang(toks[k - 1].kind) && lint_tok_is_hash(toks[k - 2].kind) {
+        return true
+      }
+    }
+  }
+  // Case 3: `#ident(...)`
+  let is_rp = match prev {
+    RParen => true
+    _ => false
+  }
+  if is_rp {
+    let mut depth = 1
+    let mut k = ti - 2
+    while k >= 0 && depth > 0 {
+      match toks[k].kind {
+        RParen => depth = depth + 1
+        LParen => depth = depth - 1
+        _ => ()
+      }
+      if depth == 0 {
+        break
+      }
+      k = k - 1
+    }
+    if depth == 0 && k >= 2 && lint_tok_is_ident(toks[k - 1].kind) && lint_tok_is_hash(toks[k - 2].kind) {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Lexes `src` and extracts exact `[start_line, end_line]` token spans for every
+/// top-level `import "..." [as ident]` declaration. Marks `clean_single_line`
+/// only when all tokens of that declaration live on one physical line, no other
+/// token shares that line, the raw line contains no comments or trailing junk,
+/// and no declaration attribute (`#verify`, `#[...]`, ...) precedes it.
+/// Marks `end_line_clean` only when no token follows this import on `end_line`.
+fn lint_scan_import_tokens(
+  file : String,
+  src : String,
+  starts : Array[Int],
+) -> LintFileImportTokens {
+  let lr = lex(file, src)
+  if lr.diagnostics.length() > 0 {
+    return LintFileImportTokens::{ ok: false, spans: [] }
+  }
+  let toks = lr.tokens
+  let line_tok_count : Map[Int, Int] = Map([])
+  let mut ti = 0
+  while ti < toks.length() {
+    let is_eof = match toks[ti].kind {
+      Eof => true
+      _ => false
+    }
+    if !is_eof {
+      let ln = toks[ti].span.line
+      let prev = match line_tok_count.get(ln) {
+        Some(n) => n
+        None => 0
+      }
+      line_tok_count.set(ln, prev + 1)
+    }
+    ti = ti + 1
+  }
+  let spans : Array[LintImportTokSpan] = []
+  ti = 0
+  while ti < toks.length() {
+    let is_imp = match toks[ti].kind {
+      KwImport => true
+      _ => false
+    }
+    if is_imp {
+      let start_line = toks[ti].span.line
+      let mut end_line = start_line
+      let mut tok_cnt = 1
+      let mut j = ti + 1
+      let has_str = if j < toks.length() {
+        match toks[j].kind {
+          StringLit(_) => true
+          _ => false
+        }
+      } else {
+        false
+      }
+      if has_str {
+        end_line = toks[j].span.line
+        tok_cnt = tok_cnt + 1
+        j = j + 1
+        let has_as = if j < toks.length() {
+          match toks[j].kind {
+            KwAs => true
+            _ => false
+          }
+        } else {
+          false
+        }
+        if has_as {
+          end_line = toks[j].span.line
+          tok_cnt = tok_cnt + 1
+          j = j + 1
+          let has_id = if j < toks.length() {
+            match toks[j].kind {
+              Ident(_) => true
+              _ => false
+            }
+          } else {
+            false
+          }
+          if has_id {
+            end_line = toks[j].span.line
+            tok_cnt = tok_cnt + 1
+            j = j + 1
+          }
+        }
+      }
+      let line_total = match line_tok_count.get(start_line) {
+        Some(n) => n
+        None => 0
+      }
+      let next_on_end_line = if j < toks.length() {
+        let next_is_eof = match toks[j].kind {
+          Eof => true
+          _ => false
+        }
+        !next_is_eof && toks[j].span.line == end_line
+      } else {
+        false
+      }
+      let end_line_clean = !next_on_end_line
+      let preceded_by_attr = lint_tok_preceded_by_attr(toks, ti)
+      let clean_single = start_line == end_line &&
+        line_total == tok_cnt &&
+        !preceded_by_attr &&
+        lint_is_clean_single_import_line(src, starts, start_line)
+      spans.push(LintImportTokSpan::{
+        start_line: start_line,
+        end_line: end_line,
+        clean_single_line: clean_single,
+        end_line_clean: end_line_clean,
+      })
+      ti = j
+    } else {
+      ti = ti + 1
+    }
+  }
+  LintFileImportTokens::{ ok: true, spans: spans }
+}
+
+///|
+/// Verifies that physical line `line` (1-based) in `src` contains ONLY a single
+/// `import "..." [as ident]` with no comments or other characters.
+fn lint_is_clean_single_import_line(
+  src : String,
+  starts : Array[Int],
+  line : Int,
+) -> Bool {
+  if line < 1 || line > starts.length() {
+    return false
+  }
+  let ls = starts[line - 1]
+  let le = if line < starts.length() { starts[line] } else { src.length() }
+  let mut content_end = le
+  if content_end > ls && str_code_at(src, content_end - 1) == 10 {
+    content_end = content_end - 1
+  }
+  if content_end > ls && str_code_at(src, content_end - 1) == 13 {
+    content_end = content_end - 1
+  }
+  let mut i = ls
+  while i < content_end && (str_code_at(src, i) == 32 || str_code_at(src, i) == 9) {
+    i = i + 1
+  }
+  if !lint_match_keyword_at(src, i, "import") {
+    return false
+  }
+  i = i + 6
+  let ws1_start = i
+  while i < content_end && (str_code_at(src, i) == 32 || str_code_at(src, i) == 9) {
+    i = i + 1
+  }
+  if i == ws1_start || i >= content_end || str_code_at(src, i) != 34 {
+    return false
+  }
+  i = i + 1
+  while i < content_end && str_code_at(src, i) != 34 {
+    if str_code_at(src, i) == 92 {
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  if i >= content_end || str_code_at(src, i) != 34 {
+    return false
+  }
+  i = i + 1
+  while i < content_end && (str_code_at(src, i) == 32 || str_code_at(src, i) == 9) {
+    i = i + 1
+  }
+  if i < content_end {
+    if !lint_match_keyword_at(src, i, "as") {
+      return false
+    }
+    i = i + 2
+    let ws2_start = i
+    while i < content_end && (str_code_at(src, i) == 32 || str_code_at(src, i) == 9) {
+      i = i + 1
+    }
+    if i == ws2_start || i >= content_end || !lint_is_ident_char(str_code_at(src, i)) {
+      return false
+    }
+    while i < content_end && lint_is_ident_char(str_code_at(src, i)) {
+      i = i + 1
+    }
+    while i < content_end && (str_code_at(src, i) == 32 || str_code_at(src, i) == 9) {
+      i = i + 1
+    }
+    if i != content_end {
+      return false
+    }
+  }
+  true
+}
+
+///|
+/// Creates a `"machine"` TextEdit deleting clean single-line import `line`,
+/// collapsing any leading blank line or consecutive double blank line left
+/// behind so the result stays `pionc fmt --check` clean.
+fn lint_make_delete_import_edit(
+  file : String,
+  src : String,
+  starts : Array[Int],
+  line : Int,
+  del_lines : Map[Int, Bool],
+) -> Option[TextEdit] {
+  if line < 1 || line > starts.length() {
+    return None
+  }
+  let ls = starts[line - 1]
+  let le = if line < starts.length() { starts[line] } else { src.length() }
+  if line >= starts.length() {
+    return Some(text_edit_replace(file, line, 1, line, le - ls + 1, "", "machine"))
+  }
+  // Find the nearest surviving line before `line`.
+  let mut prev = line - 1
+  while prev >= 1 && del_lines.contains(prev) {
+    prev = prev - 1
+  }
+  let mut end_line = line + 1
+  if !del_lines.contains(end_line) && end_line <= starts.length() {
+    let at_file_start = prev < 1
+    let prev_is_blank = prev >= 1 && lint_line_is_blank(src, starts, prev)
+    if at_file_start {
+      // Consume leading blank lines so file never starts with a blank line.
+      while end_line < starts.length() &&
+        !del_lines.contains(end_line) &&
+        lint_line_is_blank(src, starts, end_line) {
+        end_line = end_line + 1
+      }
+    } else if prev_is_blank && lint_line_is_blank(src, starts, end_line) {
+      // Collapse consecutive blank lines into one.
+      end_line = end_line + 1
+    }
+  }
+  if end_line <= starts.length() {
+    Some(text_edit_replace(file, line, 1, end_line, 1, "", "machine"))
+  } else {
+    Some(text_edit_replace(file, line, 1, starts.length(), src.length() - starts[starts.length() - 1] + 1, "", "machine"))
+  }
+}
+
+///|
+fn lint_make_insert_import_edit(
+  f : SourceFile,
+  src : String,
+  starts : Array[Int],
+  imp_toks : LintFileImportTokens,
+  imp_path : String,
+  alias_name : String,
+) -> Option[TextEdit] {
+  let eol = lint_detect_eol(src)
+  let stmt = lint_format_import_line(imp_path, alias_name)
+  if f.imports.length() == 0 {
+    return Some(text_edit_replace(f.path, 1, 1, 1, 1, stmt + eol, "machine"))
+  }
+  if !imp_toks.ok || imp_toks.spans.length() != f.imports.length() {
+    return None
+  }
+  let last_span = imp_toks.spans[imp_toks.spans.length() - 1]
+  if !last_span.end_line_clean {
+    return None
+  }
+  let last_end_line = last_span.end_line
+  if last_end_line >= 1 && last_end_line < starts.length() {
+    Some(text_edit_replace(f.path, last_end_line + 1, 1, last_end_line + 1, 1, stmt + eol, "machine"))
+  } else if last_end_line >= 1 && last_end_line == starts.length() {
+    let ls = starts[last_end_line - 1]
+    let end_col = src.length() - ls + 1
+    Some(text_edit_replace(f.path, last_end_line, end_col, last_end_line, end_col, eol + stmt + eol, "machine"))
+  } else {
+    None
+  }
+}
+
+///|
+fn lint_check_imports(
+  pkg : Package,
+  tc : TypeChecker,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+  active_extra_files : Array[SourceFile],
+  inactive_target_files : Array[SourceFile],
+  file_target_preds : Map[String, String],
+  has_target_rules : Bool,
+  extra_files_incomplete : Bool,
+  out : Array[Diagnostic],
+) -> Unit {
+  let active_files : Array[SourceFile] = []
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    active_files.push(pkg.files[fi])
+    fi = fi + 1
+  }
+  fi = 0
+  while fi < active_extra_files.length() {
+    active_files.push(active_extra_files[fi])
+    fi = fi + 1
+  }
+
+  // 1. Build active-target alias -> path map, conflict flags, and declaring
+  //    `[targets]` predicate sets. Inactive `[targets]` files do NOT pollute
+  //    active-target `alias_conflict` (mutually exclusive targets may bind the
+  //    same alias to different packages).
+  let alias_path : Map[String, String] = Map([])
+  let alias_conflict : Map[String, Bool] = Map([])
+  let known_aliases : Map[String, String] = Map([])
+  let alias_has_uncond_decl : Map[String, Bool] = Map([])
+  let alias_decl_preds : Map[String, Bool] = Map([])
+  fi = 0
+  while fi < active_files.length() {
+    let f = active_files[fi]
+    let f_pred = match file_target_preds.get(f.path) {
+      Some(p) => p
+      None => "*"
+    }
+    let mut ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      if tc.import_aliases.contains(imp.alias_name) {
+        known_aliases.set(imp.alias_name, imp.path)
+      }
+      if f_pred == "*" {
+        alias_has_uncond_decl.set(imp.alias_name, true)
+      }
+      alias_decl_preds.set(imp.alias_name + "\n" + f_pred, true)
+      match alias_path.get(imp.alias_name) {
+        Some(prev_path) =>
+          if prev_path != imp.path {
+            alias_conflict.set(imp.alias_name, true)
+          }
+        None => alias_path.set(imp.alias_name, imp.path)
+      }
+      ii = ii + 1
+    }
+    fi = fi + 1
+  }
+
+  // 2. Scan active files AND inactive `[targets]` files for external alias usage.
+  //    Active extra files (e.g. `*_test.pion`) protect imports without being
+  //    mislabeled as inactive target files; inactive `[targets]` files ONLY
+  //    protect active unused imports from deletion.
+  let usages : Array[LintImportUsage] = []
+  let pkg_has_implicit_user : Map[String, Bool] = Map([])
+  let inactive_implicit_user : Map[String, String] = Map([])
+  fi = 0
+  while fi < active_files.length() {
+    let f = active_files[fi]
+    let u = lint_scan_imports_file(tc.import_aliases, f)
+    usages.push(u)
+    let declared : Map[String, Bool] = Map([])
+    let mut ii = 0
+    while ii < f.imports.length() {
+      declared.set(f.imports[ii].alias_name, true)
+      ii = ii + 1
+    }
+    let mut ui = 0
+    while ui < u.used_order.length() {
+      let al = u.used_order[ui]
+      if !declared.contains(al) {
+        pkg_has_implicit_user.set(al, true)
+      }
+      ui = ui + 1
+    }
+    fi = fi + 1
+  }
+  fi = 0
+  while fi < inactive_target_files.length() {
+    let f = inactive_target_files[fi]
+    let u = lint_scan_imports_file(tc.import_aliases, f)
+    let declared : Map[String, Bool] = Map([])
+    let mut ii = 0
+    while ii < f.imports.length() {
+      declared.set(f.imports[ii].alias_name, true)
+      ii = ii + 1
+    }
+    let mut ui = 0
+    while ui < u.used_order.length() {
+      let al = u.used_order[ui]
+      if !declared.contains(al) {
+        pkg_has_implicit_user.set(al, true)
+        if !inactive_implicit_user.contains(al) {
+          inactive_implicit_user.set(al, f.path)
+        }
+      }
+      ui = ui + 1
+    }
+    fi = fi + 1
+  }
+
+  let has_inactive_targets = inactive_target_files.length() > 0
+
+  // 3. Emit L_UNUSED_IMPORT & L_IMPLICIT_IMPORT ONLY for active `pkg.files`.
+  fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let u = usages[fi]
+    let f_pred = match file_target_preds.get(f.path) {
+      Some(p) => p
+      None => "*"
+    }
+    let fidx_opt = lint_get_file_index(raw_sources, idx_cache, f.path)
+    let has_src = match fidx_opt {
+      Some(_) => true
+      None => false
+    }
+    let raw_src = match fidx_opt {
+      Some(idx) => idx.src
+      None => ""
+    }
+    let starts = match fidx_opt {
+      Some(idx) => idx.starts
+      None => []
+    }
+    let imp_toks = if has_src && f.imports.length() > 0 {
+      lint_scan_import_tokens(f.path, raw_src, starts)
+    } else {
+      LintFileImportTokens::{ ok: true, spans: [] }
+    }
+    let toks_aligned = imp_toks.ok && imp_toks.spans.length() == f.imports.length()
+
+    let declared : Map[String, String] = Map([])
+    let del_lines : Map[Int, Bool] = Map([])
+    let seen_pre : Map[String, String] = Map([])
+    let mut ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      let is_conflicted = alias_conflict.contains(imp.alias_name)
+      let can_del_line = has_src &&
+        toks_aligned &&
+        imp_toks.spans[ii].clean_single_line &&
+        !is_conflicted &&
+        !has_target_rules &&
+        !extra_files_incomplete
+      match seen_pre.get(imp.alias_name) {
+        Some(prev_path) =>
+          if can_del_line && prev_path == imp.path {
+            del_lines.set(imp_toks.spans[ii].start_line, true)
+          }
+        None => {
+          seen_pre.set(imp.alias_name, imp.path)
+          if !u.first_span.contains(imp.alias_name) &&
+            can_del_line &&
+            !pkg_has_implicit_user.contains(imp.alias_name) {
+            del_lines.set(imp_toks.spans[ii].start_line, true)
+          }
+        }
+      }
+      ii = ii + 1
+    }
+
+    ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      let is_conflicted = alias_conflict.contains(imp.alias_name)
+      let line_clean = has_src && toks_aligned && imp_toks.spans[ii].clean_single_line
+      match declared.get(imp.alias_name) {
+        Some(prev_path) => {
+          let edit_opt = if prev_path == imp.path &&
+            !is_conflicted &&
+            !has_target_rules &&
+            !extra_files_incomplete &&
+            line_clean {
+            lint_make_delete_import_edit(
+              f.path,
+              raw_src,
+              starts,
+              imp_toks.spans[ii].start_line,
+              del_lines,
+            )
+          } else {
+            None
+          }
+          out.push(
+            lint_diag_with_edit(
+              imp.span,
+              "L_UNUSED_IMPORT",
+              "duplicate import `" + imp.alias_name + "` in `" + f.path + "`",
+              "at most one import per alias in a file",
+              "duplicate `import " + json_quote(imp.path) + "`",
+              "remove the duplicate `import` declaration",
+              edit_opt,
+            ),
+          )
+        }
+        None => {
+          declared.set(imp.alias_name, imp.path)
+          if !u.first_span.contains(imp.alias_name) {
+            let edit_opt = if !pkg_has_implicit_user.contains(imp.alias_name) &&
+              !is_conflicted &&
+              !has_target_rules &&
+              !extra_files_incomplete &&
+              line_clean {
+              lint_make_delete_import_edit(
+                f.path,
+                raw_src,
+                starts,
+                imp_toks.spans[ii].start_line,
+                del_lines,
+              )
+            } else {
+              None
+            }
+            let fix_msg = match inactive_implicit_user.get(imp.alias_name) {
+              Some(inact_file) =>
+                "not auto-removed because inactive target file `" +
+                inact_file +
+                "` references `" +
+                imp.alias_name +
+                "::`; run `pionc lint --target <target>` to fix that target first"
+              None => "remove the unused `import` declaration"
+            }
+            out.push(
+              lint_diag_with_edit(
+                imp.span,
+                "L_UNUSED_IMPORT",
+                "unused import `" + imp.alias_name + "`",
+                "imported package alias referenced in this file",
+                "unused `import " + json_quote(imp.path) + "`",
+                fix_msg,
+                edit_opt,
+              ),
+            )
+          }
+        }
+      }
+      ii = ii + 1
+    }
+
+    let mut ui = 0
+    while ui < u.used_order.length() {
+      let al = u.used_order[ui]
+      if !declared.contains(al) && known_aliases.contains(al) {
+        let sp = match u.first_span.get(al) {
+          Some(s) => s
+          None => span_new(f.path, 1, 1)
+        }
+        // Cross-target safety: when the package or any transitive dependency
+        // declares `[targets]` rules, keep diagnostics/fixits but suppress
+        // machine import edits to avoid breaking another target.
+        let pred_safe = !has_target_rules &&
+          (!has_inactive_targets ||
+          alias_has_uncond_decl.contains(al) ||
+          alias_decl_preds.contains(al + "\n" + f_pred))
+        let edit_opt = if !alias_conflict.contains(al) &&
+          !extra_files_incomplete &&
+          pred_safe &&
+          has_src {
+          match alias_path.get(al) {
+            Some(p) => lint_make_insert_import_edit(f, raw_src, starts, imp_toks, p, al)
+            None => None
+          }
+        } else {
+          None
+        }
+        let fix_hint = match alias_path.get(al) {
+          Some(p) =>
+            if !alias_conflict.contains(al) && pred_safe {
+              "add `" + lint_format_import_line(p, al) + "` at the top of `" + f.path + "`"
+            } else {
+              "add an explicit `import` for `" + al + "` at the top of `" + f.path + "`"
+            }
+          None => "add an explicit `import` for `" + al + "` at the top of `" + f.path + "`"
+        }
+        out.push(
+          lint_diag_with_edit(
+            sp,
+            "L_IMPLICIT_IMPORT",
+            "implicit cross-file import `" + al + "::` used without declaring `import` in this file",
+            "explicit `import` declaration in `" + f.path + "`",
+            "implicit package alias `" + al + "`",
+            fix_hint,
+            edit_opt,
+          ),
+        )
+      }
+      ui = ui + 1
+    }
+    fi = fi + 1
+  }
+}
+
+///|
+// =============================================================================
+// Rules 3, 4, 5, 6: L_UNUSED_LOCAL, L_UNUSED_MUT, L_UNREACHABLE_CODE, L_SELF_ASSIGN
+// =============================================================================
+
+///|
+struct LintLocal {
+  name : String
+  is_mut : Bool
+  is_slet : Bool
+  exempt_unused : Bool
+  decl_span : Span
+  mut used : Bool
+  mut mut_needed : Bool
+}
+
+///|
+struct LintDeclCtx {
+  tc : TypeChecker
+  has_target_rules : Bool
+  locals : Array[LintLocal]
+  scopes : Array[Map[String, Int]]
+  /// Conservative `EIs` bindings tracked until the end of the enclosing top-level decl.
+  is_bindings : Map[String, Array[Int]]
+  /// All identifier names appearing anywhere inside the enclosing top-level decl.
+  decl_idents : Map[String, Bool]
+  out : Array[Diagnostic]
+}
+
+///|
+fn lint_collect_idents_pat(idents : Map[String, Bool], p : Pattern) -> Unit {
+  match p {
+    PWild(_) => ()
+    PIdent(name, _) => idents.set(name, true)
+    PBool(_, _) => ()
+    PInt(_, _) => ()
+    PString(_, _) => ()
+    PChar(_, _) => ()
+    PVariant(qual, vname, pats, _, _) => {
+      if qual.length() > 0 {
+        idents.set(qual, true)
+        if has_qual_sep(qual) {
+          let qp = split_qual_name(qual)
+          idents.set(qp.prefix, true)
+          idents.set(qp.name, true)
+        }
+      }
+      idents.set(vname, true)
+      let mut i = 0
+      while i < pats.length() {
+        lint_collect_idents_pat(idents, pats[i])
+        i = i + 1
+      }
+    }
+    PTuple(pats, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_collect_idents_pat(idents, pats[i])
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn lint_collect_idents_name(idents : Map[String, Bool], name : String) -> Unit {
+  if name.length() == 0 {
+    return
+  }
+  idents.set(name, true)
+  if has_qual_sep(name) {
+    let qp = split_qual_name(name)
+    idents.set(qp.prefix, true)
+    idents.set(qp.name, true)
+  }
+}
+
+///|
+fn lint_collect_idents_type(idents : Map[String, Bool], t : TypeExpr) -> Unit {
+  match t {
+    TyName(name, args, _) => {
+      lint_collect_idents_name(idents, name)
+      let mut i = 0
+      while i < args.length() {
+        lint_collect_idents_type(idents, args[i])
+        i = i + 1
+      }
+    }
+    TyFn(ps, ret, _) => {
+      let mut i = 0
+      while i < ps.length() {
+        lint_collect_idents_type(idents, ps[i])
+        i = i + 1
+      }
+      lint_collect_idents_type(idents, ret)
+    }
+    TyTuple(ts, _) => {
+      let mut i = 0
+      while i < ts.length() {
+        lint_collect_idents_type(idents, ts[i])
+        i = i + 1
+      }
+    }
+    TyDynTrait(name, _) => lint_collect_idents_name(idents, name)
+    TyMissing(_) => ()
+  }
+}
+
+///|
+fn lint_collect_idents_bounds(idents : Map[String, Bool], bounds : Array[TypeBound]) -> Unit {
+  let mut i = 0
+  while i < bounds.length() {
+    idents.set(bounds[i].param, true)
+    let mut j = 0
+    while j < bounds[i].traits.length() {
+      lint_collect_idents_name(idents, bounds[i].traits[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_collect_idents_params(idents : Map[String, Bool], params : Array[Param]) -> Unit {
+  let mut i = 0
+  while i < params.length() {
+    idents.set(params[i].name, true)
+    lint_collect_idents_type(idents, params[i].ty)
+    match params[i].default_expr {
+      Some(de) => lint_collect_idents_expr(idents, de)
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_collect_idents_stmts(idents : Map[String, Bool], stmts : Array[Stmt]) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    lint_collect_idents_stmt(idents, stmts[i])
+    i = i + 1
+  }
+}
+
+///|
+fn lint_collect_idents_stmt(idents : Map[String, Bool], s : Stmt) -> Unit {
+  match s {
+    SLet(name, _, ty, init, _) => {
+      idents.set(name, true)
+      lint_collect_idents_type(idents, ty)
+      lint_collect_idents_expr(idents, init)
+    }
+    SLetTuple(names, ty, init, _) => {
+      let mut i = 0
+      while i < names.length() {
+        idents.set(names[i], true)
+        i = i + 1
+      }
+      lint_collect_idents_type(idents, ty)
+      lint_collect_idents_expr(idents, init)
+    }
+    SAssign(lhs, rhs, _) => {
+      lint_collect_idents_expr(idents, lhs)
+      lint_collect_idents_expr(idents, rhs)
+    }
+    SCompoundAssign(_, lhs, rhs, _) => {
+      lint_collect_idents_expr(idents, lhs)
+      lint_collect_idents_expr(idents, rhs)
+    }
+    SGuard(cond, else_b, _) => {
+      lint_collect_idents_expr(idents, cond)
+      lint_collect_idents_stmts(idents, else_b)
+    }
+    SWhile(cond, body, _) => {
+      lint_collect_idents_expr(idents, cond)
+      lint_collect_idents_stmts(idents, body)
+    }
+    SFor(init_s, cond, step_s, body, _) => {
+      lint_collect_idents_stmt(idents, init_s)
+      lint_collect_idents_expr(idents, cond)
+      lint_collect_idents_stmt(idents, step_s)
+      lint_collect_idents_stmts(idents, body)
+    }
+    SForRange(vname, start_e, end_e, _, body, _) => {
+      idents.set(vname, true)
+      lint_collect_idents_expr(idents, start_e)
+      lint_collect_idents_expr(idents, end_e)
+      lint_collect_idents_stmts(idents, body)
+    }
+    SForIn(kname, vname, iter_e, body, _) => {
+      if kname.length() > 0 {
+        idents.set(kname, true)
+      }
+      if vname.length() > 0 {
+        idents.set(vname, true)
+      }
+      lint_collect_idents_expr(idents, iter_e)
+      lint_collect_idents_stmts(idents, body)
+    }
+    SReturn(opt_e, _) =>
+      match opt_e {
+        Some(e) => lint_collect_idents_expr(idents, e)
+        None => ()
+      }
+    SBreak(_) => ()
+    SContinue(_) => ()
+    SDebugAssert(cond, msg, _) => {
+      lint_collect_idents_expr(idents, cond)
+      lint_collect_idents_expr(idents, msg)
+    }
+    SExpr(e, _) => lint_collect_idents_expr(idents, e)
+  }
+}
+
+///|
+fn lint_collect_idents_exprs(idents : Map[String, Bool], es : Array[Expr]) -> Unit {
+  let mut i = 0
+  while i < es.length() {
+    lint_collect_idents_expr(idents, es[i])
+    i = i + 1
+  }
+}
+
+///|
+fn lint_collect_idents_expr(idents : Map[String, Bool], e : Expr) -> Unit {
+  match e {
+    EInt(_, _) => ()
+    EInt64(_, _) => ()
+    EUInt(_, _) => ()
+    EUInt64(_, _) => ()
+    EDouble(_, _) => ()
+    EFloat(_, _) => ()
+    EBool(_, _) => ()
+    EByte(_, _) => ()
+    EChar(_, _) => ()
+    EString(_, _) => ()
+    EIdent(name, _) => idents.set(name, true)
+    EPath(qual, mem, _) => {
+      idents.set(qual, true)
+      if has_qual_sep(qual) {
+        let qp = split_qual_name(qual)
+        idents.set(qp.prefix, true)
+        idents.set(qp.name, true)
+      }
+      idents.set(mem, true)
+    }
+    EDotVariant(vname, args, _) => {
+      idents.set(vname, true)
+      lint_collect_idents_exprs(idents, args)
+    }
+    EUnary(_, inner, _) => lint_collect_idents_expr(idents, inner)
+    EBinary(_, lhs, rhs, _) => {
+      lint_collect_idents_expr(idents, lhs)
+      lint_collect_idents_expr(idents, rhs)
+    }
+    ECall(callee, args, _) => {
+      lint_collect_idents_expr(idents, callee)
+      lint_collect_idents_exprs(idents, args)
+    }
+    EField(obj, fname, _) => {
+      idents.set(fname, true)
+      lint_collect_idents_expr(idents, obj)
+    }
+    EMethodCall(obj, mname, args, _) => {
+      idents.set(mname, true)
+      lint_collect_idents_expr(idents, obj)
+      lint_collect_idents_exprs(idents, args)
+    }
+    EIndex(obj, idx, _) => {
+      lint_collect_idents_expr(idents, obj)
+      lint_collect_idents_expr(idents, idx)
+    }
+    EArrayLit(es, _) => lint_collect_idents_exprs(idents, es)
+    EStructLit(sname, base, fields, _) => {
+      idents.set(sname, true)
+      if has_qual_sep(sname) {
+        let qp = split_qual_name(sname)
+        idents.set(qp.prefix, true)
+        idents.set(qp.name, true)
+      }
+      match base {
+        Some(be) => lint_collect_idents_expr(idents, be)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        idents.set(fields[i].name, true)
+        lint_collect_idents_expr(idents, fields[i].value)
+        i = i + 1
+      }
+    }
+    ETuple(es, _) => lint_collect_idents_exprs(idents, es)
+    EBlock(stmts, _) => lint_collect_idents_stmts(idents, stmts)
+    EIf(cond, then_s, else_opt, _) => {
+      lint_collect_idents_expr(idents, cond)
+      lint_collect_idents_stmts(idents, then_s)
+      match else_opt {
+        Some(ee) => lint_collect_idents_expr(idents, ee)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      lint_collect_idents_expr(idents, scrut)
+      let mut i = 0
+      while i < arms.length() {
+        lint_collect_idents_pat(idents, arms[i].pat)
+        match arms[i].guard_expr {
+          Some(ge) => lint_collect_idents_expr(idents, ge)
+          None => ()
+        }
+        lint_collect_idents_expr(idents, arms[i].body)
+        i = i + 1
+      }
+    }
+    EIs(scrut, pat, _) => {
+      lint_collect_idents_expr(idents, scrut)
+      lint_collect_idents_pat(idents, pat)
+    }
+    EClosure(params, ret_ty, body, _) => {
+      lint_collect_idents_params(idents, params)
+      lint_collect_idents_type(idents, ret_ty)
+      lint_collect_idents_stmts(idents, body)
+    }
+    EScope(w, f, _) => {
+      lint_collect_idents_expr(idents, w)
+      lint_collect_idents_expr(idents, f)
+    }
+    ESpawn(s, f, _) => {
+      lint_collect_idents_expr(idents, s)
+      lint_collect_idents_expr(idents, f)
+    }
+    EMove(inner, _) => lint_collect_idents_expr(idents, inner)
+    EAs(inner, ty, _) => {
+      lint_collect_idents_expr(idents, inner)
+      lint_collect_idents_type(idents, ty)
+    }
+    ETry(inner, _) => lint_collect_idents_expr(idents, inner)
+    EInterp(parts, _) => lint_collect_idents_exprs(idents, parts)
+    ENamedArg(aname, _, arg_e, _) => {
+      idents.set(aname, true)
+      lint_collect_idents_expr(idents, arg_e)
+    }
+    EMutArg(place, _) => lint_collect_idents_expr(idents, place)
+    EUnit(_) => ()
+  }
+}
+
+///|
+fn lint_push_scope(ctx : LintDeclCtx) -> Unit {
+  ctx.scopes.push(Map([]))
+}
+
+///|
+fn lint_pop_scope(ctx : LintDeclCtx) -> Unit {
+  if ctx.scopes.length() > 0 {
+    let _ = ctx.scopes.pop()
+  }
+}
+
+///|
+fn lint_bind_exempt(ctx : LintDeclCtx, name : String) -> Unit {
+  if name.length() > 0 && ctx.scopes.length() > 0 {
+    ctx.scopes[ctx.scopes.length() - 1].set(name, -1)
+  }
+}
+
+///|
+fn lint_bind_local(
+  ctx : LintDeclCtx,
+  name : String,
+  is_mut : Bool,
+  is_slet : Bool,
+  sp : Span,
+) -> Unit {
+  if name.length() == 0 {
+    return
+  }
+  let is_under = lint_starts_with_underscore(name)
+  if is_under && !(is_slet && is_mut) {
+    lint_bind_exempt(ctx, name)
+    return
+  }
+  let id = ctx.locals.length()
+  ctx.locals.push(LintLocal::{
+    name: name,
+    is_mut: is_mut,
+    is_slet: is_slet,
+    exempt_unused: is_under,
+    decl_span: sp,
+    used: false,
+    mut_needed: false,
+  })
+  if ctx.scopes.length() > 0 {
+    ctx.scopes[ctx.scopes.length() - 1].set(name, id)
+  }
+}
+
+///|
+fn lint_bind_is_pat(ctx : LintDeclCtx, p : Pattern) -> Unit {
+  match p {
+    PWild(_) => ()
+    PIdent(name, sp) =>
+      if name.length() > 0 && !lint_starts_with_underscore(name) {
+        let id = ctx.locals.length()
+        ctx.locals.push(LintLocal::{
+          name: name,
+          is_mut: false,
+          is_slet: false,
+          exempt_unused: false,
+          decl_span: sp,
+          used: false,
+          mut_needed: false,
+        })
+        match ctx.is_bindings.get(name) {
+          Some(arr) => arr.push(id)
+          None => ctx.is_bindings.set(name, [id])
+        }
+      }
+    PBool(_, _) => ()
+    PInt(_, _) => ()
+    PString(_, _) => ()
+    PChar(_, _) => ()
+    PVariant(_, _, pats, _, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_bind_is_pat(ctx, pats[i])
+        i = i + 1
+      }
+    }
+    PTuple(pats, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_bind_is_pat(ctx, pats[i])
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn lint_bind_match_pat(ctx : LintDeclCtx, p : Pattern) -> Unit {
+  match p {
+    PWild(_) => ()
+    PIdent(name, sp) => lint_bind_local(ctx, name, false, false, sp)
+    PBool(_, _) => ()
+    PInt(_, _) => ()
+    PString(_, _) => ()
+    PChar(_, _) => ()
+    PVariant(_, _, pats, _, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_bind_match_pat(ctx, pats[i])
+        i = i + 1
+      }
+    }
+    PTuple(pats, _) => {
+      let mut i = 0
+      while i < pats.length() {
+        lint_bind_match_pat(ctx, pats[i])
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn lint_lookup_scope(ctx : LintDeclCtx, name : String) -> Option[Int] {
+  let mut i = ctx.scopes.length() - 1
+  while i >= 0 {
+    match ctx.scopes[i].get(name) {
+      Some(id) => return Some(id)
+      None => ()
+    }
+    i = i - 1
+  }
+  None
+}
+
+///|
+fn lint_mark_used(ctx : LintDeclCtx, name : String) -> Unit {
+  match lint_lookup_scope(ctx, name) {
+    Some(id) =>
+      if id >= 0 {
+        ctx.locals[id].used = true
+      }
+    None => ()
+  }
+  // Conservatively mark any `EIs` binding of this name in the enclosing decl as used.
+  match ctx.is_bindings.get(name) {
+    Some(arr) => {
+      let mut i = 0
+      while i < arr.length() {
+        ctx.locals[arr[i]].used = true
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+}
+
+///|
+fn lint_mark_all_active_mut_needed(ctx : LintDeclCtx) -> Unit {
+  let mut i = 0
+  while i < ctx.scopes.length() {
+    let mut li = 0
+    while li < ctx.locals.length() {
+      let loc = ctx.locals[li]
+      if loc.is_mut {
+        match ctx.scopes[i].get(loc.name) {
+          Some(id) =>
+            if id == li {
+              loc.mut_needed = true
+            }
+          None => ()
+        }
+      }
+      li = li + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_mark_mut_needed(ctx : LintDeclCtx, name : String) -> Unit {
+  let mut matched = false
+  let mut shadow_count = 0
+  let mut i = ctx.scopes.length() - 1
+  while i >= 0 {
+    match ctx.scopes[i].get(name) {
+      Some(id) => {
+        if !matched {
+          matched = true
+          if id >= 0 {
+            ctx.locals[id].used = true
+            ctx.locals[id].mut_needed = true
+          }
+        } else if id >= 0 && ctx.locals[id].is_mut {
+          shadow_count = shadow_count + 1
+        }
+      }
+      None => ()
+    }
+    i = i - 1
+  }
+  if !matched || shadow_count > 0 {
+    // Also mark any outer shadowed mutable binding if ambiguity exists.
+    let mut k = ctx.scopes.length() - 1
+    while k >= 0 {
+      match ctx.scopes[k].get(name) {
+        Some(id) =>
+          if id >= 0 && ctx.locals[id].is_mut {
+            ctx.locals[id].mut_needed = true
+          }
+        None => ()
+      }
+      k = k - 1
+    }
+  }
+}
+
+///|
+fn lint_place_root_ident(e : Expr) -> Option[String] {
+  match e {
+    EIdent(name, _) => Some(name)
+    EField(obj, _, _) => lint_place_root_ident(obj)
+    EIndex(obj, _, _) => lint_place_root_ident(obj)
+    EInt(_, _) => None
+    EInt64(_, _) => None
+    EUInt(_, _) => None
+    EUInt64(_, _) => None
+    EDouble(_, _) => None
+    EFloat(_, _) => None
+    EBool(_, _) => None
+    EByte(_, _) => None
+    EChar(_, _) => None
+    EString(_, _) => None
+    EPath(_, _, _) => None
+    EDotVariant(_, _, _) => None
+    EUnary(_, _, _) => None
+    EBinary(_, _, _, _) => None
+    ECall(_, _, _) => None
+    EMethodCall(_, _, _, _) => None
+    EArrayLit(_, _) => None
+    EStructLit(_, _, _, _) => None
+    ETuple(_, _) => None
+    EBlock(_, _) => None
+    EIf(_, _, _, _) => None
+    EMatch(_, _, _) => None
+    EIs(_, _, _) => None
+    EClosure(_, _, _, _) => None
+    EScope(_, _, _) => None
+    ESpawn(_, _, _) => None
+    EMove(_, _) => None
+    EAs(_, _, _) => None
+    ETry(_, _) => None
+    EInterp(_, _) => None
+    ENamedArg(_, _, _, _) => None
+    EMutArg(_, _) => None
+    EUnit(_) => None
+  }
+}
+
+///|
+/// Returns the dotted path for pure `EIdent` / `EField` chains (`x`, `self.pos`),
+/// and `None` for any expression containing indexing, calls, or operators.
+fn lint_pure_place_path(e : Expr) -> Option[String] {
+  match e {
+    EIdent(name, _) => Some(name)
+    EField(obj, fname, _) =>
+      match lint_pure_place_path(obj) {
+        Some(p) => Some(p + "." + fname)
+        None => None
+      }
+    EInt(_, _) => None
+    EInt64(_, _) => None
+    EUInt(_, _) => None
+    EUInt64(_, _) => None
+    EDouble(_, _) => None
+    EFloat(_, _) => None
+    EBool(_, _) => None
+    EByte(_, _) => None
+    EChar(_, _) => None
+    EString(_, _) => None
+    EPath(_, _, _) => None
+    EDotVariant(_, _, _) => None
+    EUnary(_, _, _) => None
+    EBinary(_, _, _, _) => None
+    ECall(_, _, _) => None
+    EMethodCall(_, _, _, _) => None
+    EIndex(_, _, _) => None
+    EArrayLit(_, _) => None
+    EStructLit(_, _, _, _) => None
+    ETuple(_, _) => None
+    EBlock(_, _) => None
+    EIf(_, _, _, _) => None
+    EMatch(_, _, _) => None
+    EIs(_, _, _) => None
+    EClosure(_, _, _, _) => None
+    EScope(_, _, _) => None
+    ESpawn(_, _, _) => None
+    EMove(_, _) => None
+    EAs(_, _, _) => None
+    ETry(_, _) => None
+    EInterp(_, _) => None
+    ENamedArg(_, _, _, _) => None
+    EMutArg(_, _) => None
+    EUnit(_) => None
+  }
+}
+
+///|
+fn lint_ty_is_never(ty : Ty) -> Bool {
+  match ty {
+    TNever => true
+    _ => false
+  }
+}
+
+///|
+fn lint_expr_diverges(tc : TypeChecker, e : Expr) -> Bool {
+  let sk = span_key(expr_span(e))
+  if tc.never_calls.contains(sk) {
+    return true
+  }
+  match tc.expr_tys.get(sk) {
+    Some(ty) =>
+      if lint_ty_is_never(ty) {
+        return true
+      }
+    None => ()
+  }
+  match e {
+    EIf(_, then_s, else_opt, _) =>
+      match else_opt {
+        Some(ee) => lint_stmts_diverge(tc, then_s) && lint_expr_diverges(tc, ee)
+        None => false
+      }
+    EMatch(_, arms, _) => {
+      if arms.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < arms.length() {
+        if !lint_expr_diverges(tc, arms[i].body) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EBlock(stmts, _) => lint_stmts_diverge(tc, stmts)
+    EInt(_, _) => false
+    EInt64(_, _) => false
+    EUInt(_, _) => false
+    EUInt64(_, _) => false
+    EDouble(_, _) => false
+    EFloat(_, _) => false
+    EBool(_, _) => false
+    EByte(_, _) => false
+    EChar(_, _) => false
+    EString(_, _) => false
+    EIdent(_, _) => false
+    EPath(_, _, _) => false
+    EDotVariant(_, _, _) => false
+    EUnary(_, _, _) => false
+    EBinary(_, _, _, _) => false
+    ECall(_, _, _) => false
+    EField(_, _, _) => false
+    EMethodCall(_, _, _, _) => false
+    EIndex(_, _, _) => false
+    EArrayLit(_, _) => false
+    EStructLit(_, _, _, _) => false
+    ETuple(_, _) => false
+    EIs(_, _, _) => false
+    EClosure(_, _, _, _) => false
+    EScope(_, _, _) => false
+    ESpawn(_, _, _) => false
+    EMove(_, _) => false
+    EAs(_, _, _) => false
+    ETry(_, _) => false
+    EInterp(_, _) => false
+    ENamedArg(_, _, _, _) => false
+    EMutArg(_, _) => false
+    EUnit(_) => false
+  }
+}
+
+///|
+fn lint_stmt_diverges(tc : TypeChecker, s : Stmt) -> Bool {
+  match s {
+    SReturn(_, _) => true
+    SBreak(_) => true
+    SContinue(_) => true
+    SExpr(e, _) => lint_expr_diverges(tc, e)
+    SLet(_, _, _, _, _) => false
+    SLetTuple(_, _, _, _) => false
+    SAssign(_, _, _) => false
+    SCompoundAssign(_, _, _, _) => false
+    SGuard(_, _, _) => false
+    SWhile(_, _, _) => false
+    SFor(_, _, _, _, _) => false
+    SForRange(_, _, _, _, _, _) => false
+    SForIn(_, _, _, _, _) => false
+    SDebugAssert(_, _, _) => false
+  }
+}
+
+///|
+fn lint_stmts_diverge(tc : TypeChecker, stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if lint_stmt_diverges(tc, stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn lint_walk_block(ctx : LintDeclCtx, stmts : Array[Stmt]) -> Unit {
+  lint_push_scope(ctx)
+  let mut diverged = false
+  let mut reported_unreachable = false
+  let mut i = 0
+  while i < stmts.length() {
+    let s = stmts[i]
+    if diverged && !reported_unreachable {
+      reported_unreachable = true
+      ctx.out.push(
+        diag_new(
+          lint_stmt_span(s),
+          "L_UNREACHABLE_CODE",
+          "unreachable statement following diverging statement",
+          "reachable statement",
+          "unreachable statement",
+          "remove the unreachable code or fix the preceding control flow",
+        ),
+      )
+    }
+    lint_walk_stmt(ctx, s)
+    if !diverged && lint_stmt_diverges(ctx.tc, s) {
+      diverged = true
+    }
+    i = i + 1
+  }
+  lint_pop_scope(ctx)
+}
+
+///|
+fn lint_expr_ident_name(e : Expr) -> Option[String] {
+  match e {
+    EIdent(name, _) => Some(name)
+    EInt(_, _) => None
+    EInt64(_, _) => None
+    EUInt(_, _) => None
+    EUInt64(_, _) => None
+    EDouble(_, _) => None
+    EFloat(_, _) => None
+    EBool(_, _) => None
+    EByte(_, _) => None
+    EChar(_, _) => None
+    EString(_, _) => None
+    EPath(_, _, _) => None
+    EDotVariant(_, _, _) => None
+    EUnary(_, _, _) => None
+    EBinary(_, _, _, _) => None
+    ECall(_, _, _) => None
+    EField(_, _, _) => None
+    EMethodCall(_, _, _, _) => None
+    EIndex(_, _, _) => None
+    EArrayLit(_, _) => None
+    EStructLit(_, _, _, _) => None
+    ETuple(_, _) => None
+    EBlock(_, _) => None
+    EIf(_, _, _, _) => None
+    EMatch(_, _, _) => None
+    EIs(_, _, _) => None
+    EClosure(_, _, _, _) => None
+    EScope(_, _, _) => None
+    ESpawn(_, _, _) => None
+    EMove(_, _) => None
+    EAs(_, _, _) => None
+    ETry(_, _) => None
+    EInterp(_, _) => None
+    ENamedArg(_, _, _, _) => None
+    EMutArg(_, _) => None
+    EUnit(_) => None
+  }
+}
+
+///|
+fn lint_walk_stmt(ctx : LintDeclCtx, s : Stmt) -> Unit {
+  match s {
+    SLet(name, is_mut, _, init, sp) => {
+      lint_walk_expr(ctx, init)
+      lint_bind_local(ctx, name, is_mut, true, sp)
+    }
+    SLetTuple(names, _, init, sp) => {
+      lint_walk_expr(ctx, init)
+      let mut i = 0
+      while i < names.length() {
+        lint_bind_local(ctx, names[i], false, false, sp)
+        i = i + 1
+      }
+    }
+    SAssign(lhs, rhs, sp) => {
+      // Rule 6: L_SELF_ASSIGN on pure EIdent / EField chains.
+      match lint_pure_place_path(lhs) {
+        Some(lp) =>
+          match lint_pure_place_path(rhs) {
+            Some(rp) =>
+              if lp == rp {
+                ctx.out.push(
+                  diag_new(
+                    sp,
+                    "L_SELF_ASSIGN",
+                    "self-assignment `" + lp + " = " + rp + "` has no effect",
+                    "distinct source and target",
+                    lp + " = " + rp,
+                    "remove the redundant self-assignment or assign the intended value",
+                  ),
+                )
+              }
+            None => ()
+          }
+        None => ()
+      }
+      lint_walk_expr(ctx, rhs)
+      match lint_expr_ident_name(lhs) {
+        Some(name) => lint_mark_mut_needed(ctx, name)
+        None => lint_walk_expr(ctx, lhs)
+      }
+    }
+    SCompoundAssign(_, lhs, rhs, _) => {
+      lint_walk_expr(ctx, rhs)
+      match lint_expr_ident_name(lhs) {
+        Some(name) => lint_mark_mut_needed(ctx, name)
+        None => lint_walk_expr(ctx, lhs)
+      }
+    }
+    SGuard(cond, else_b, _) => {
+      lint_walk_expr(ctx, cond)
+      lint_walk_block(ctx, else_b)
+    }
+    SWhile(cond, body, _) => {
+      lint_walk_expr(ctx, cond)
+      lint_walk_block(ctx, body)
+    }
+    SFor(init_s, cond, step_s, body, _) => {
+      lint_push_scope(ctx)
+      lint_walk_stmt(ctx, init_s)
+      lint_walk_expr(ctx, cond)
+      lint_walk_block(ctx, body)
+      lint_walk_stmt(ctx, step_s)
+      lint_pop_scope(ctx)
+    }
+    SForRange(vname, start_e, end_e, _, body, sp) => {
+      lint_walk_expr(ctx, start_e)
+      lint_walk_expr(ctx, end_e)
+      lint_push_scope(ctx)
+      lint_bind_local(ctx, vname, false, false, sp)
+      lint_walk_block(ctx, body)
+      lint_pop_scope(ctx)
+    }
+    SForIn(kname, vname, iter_e, body, sp) => {
+      lint_walk_expr(ctx, iter_e)
+      lint_push_scope(ctx)
+      if kname.length() > 0 {
+        lint_bind_local(ctx, kname, false, false, sp)
+      }
+      if vname.length() > 0 {
+        lint_bind_local(ctx, vname, false, false, sp)
+      }
+      lint_walk_block(ctx, body)
+      lint_pop_scope(ctx)
+    }
+    SReturn(opt_e, _) =>
+      match opt_e {
+        Some(e) => lint_walk_expr(ctx, e)
+        None => ()
+      }
+    SBreak(_) => ()
+    SContinue(_) => ()
+    SDebugAssert(cond, msg, _) => {
+      lint_walk_expr(ctx, cond)
+      lint_walk_expr(ctx, msg)
+    }
+    SExpr(e, _) => lint_walk_expr(ctx, e)
+  }
+}
+
+///|
+fn lint_walk_exprs(ctx : LintDeclCtx, es : Array[Expr]) -> Unit {
+  let mut i = 0
+  while i < es.length() {
+    lint_walk_expr(ctx, es[i])
+    i = i + 1
+  }
+}
+
+///|
+fn lint_walk_expr(ctx : LintDeclCtx, e : Expr) -> Unit {
+  match e {
+    EInt(_, _) => ()
+    EInt64(_, _) => ()
+    EUInt(_, _) => ()
+    EUInt64(_, _) => ()
+    EDouble(_, _) => ()
+    EFloat(_, _) => ()
+    EBool(_, _) => ()
+    EByte(_, _) => ()
+    EChar(_, _) => ()
+    EString(_, _) => ()
+    EIdent(name, _) => lint_mark_used(ctx, name)
+    EPath(_, _, _) => ()
+    EDotVariant(_, args, _) => lint_walk_exprs(ctx, args)
+    EUnary(_, inner, _) => lint_walk_expr(ctx, inner)
+    EBinary(_, lhs, rhs, _) => {
+      lint_walk_expr(ctx, lhs)
+      lint_walk_expr(ctx, rhs)
+    }
+    ECall(callee, args, _) => {
+      lint_walk_expr(ctx, callee)
+      lint_walk_exprs(ctx, args)
+    }
+    EField(obj, _, _) => lint_walk_expr(ctx, obj)
+    EMethodCall(obj, _, args, sp) => {
+      lint_walk_expr(ctx, obj)
+      lint_walk_exprs(ctx, args)
+      let known_mut = ctx.tc.mut_recv_calls.contains(span_key(sp))
+      if known_mut || ctx.has_target_rules {
+        match lint_place_root_ident(obj) {
+          Some(root_name) => lint_mark_mut_needed(ctx, root_name)
+          None =>
+            if known_mut {
+              lint_mark_all_active_mut_needed(ctx)
+            }
+        }
+      }
+    }
+    EIndex(obj, idx, _) => {
+      lint_walk_expr(ctx, obj)
+      lint_walk_expr(ctx, idx)
+    }
+    EArrayLit(es, _) => lint_walk_exprs(ctx, es)
+    EStructLit(_, base, fields, _) => {
+      match base {
+        Some(be) => lint_walk_expr(ctx, be)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        lint_walk_expr(ctx, fields[i].value)
+        i = i + 1
+      }
+    }
+    ETuple(es, _) => lint_walk_exprs(ctx, es)
+    EBlock(stmts, _) => lint_walk_block(ctx, stmts)
+    EIf(cond, then_s, else_opt, _) => {
+      lint_walk_expr(ctx, cond)
+      lint_walk_block(ctx, then_s)
+      match else_opt {
+        Some(ee) => lint_walk_expr(ctx, ee)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      lint_walk_expr(ctx, scrut)
+      let mut i = 0
+      while i < arms.length() {
+        lint_push_scope(ctx)
+        lint_bind_match_pat(ctx, arms[i].pat)
+        match arms[i].guard_expr {
+          Some(ge) => lint_walk_expr(ctx, ge)
+          None => ()
+        }
+        lint_walk_expr(ctx, arms[i].body)
+        lint_pop_scope(ctx)
+        i = i + 1
+      }
+    }
+    EIs(scrut, pat, _) => {
+      lint_walk_expr(ctx, scrut)
+      lint_bind_is_pat(ctx, pat)
+    }
+    EClosure(params, _, body, _) => {
+      lint_push_scope(ctx)
+      let mut i = 0
+      while i < params.length() {
+        match params[i].default_expr {
+          Some(de) => lint_walk_expr(ctx, de)
+          None => ()
+        }
+        lint_bind_exempt(ctx, params[i].name)
+        i = i + 1
+      }
+      lint_walk_block(ctx, body)
+      lint_pop_scope(ctx)
+    }
+    EScope(w, f, _) => {
+      lint_walk_expr(ctx, w)
+      lint_walk_expr(ctx, f)
+    }
+    ESpawn(s, f, _) => {
+      lint_walk_expr(ctx, s)
+      lint_walk_expr(ctx, f)
+    }
+    EMove(inner, _) => lint_walk_expr(ctx, inner)
+    EAs(inner, _, _) => lint_walk_expr(ctx, inner)
+    ETry(inner, _) => lint_walk_expr(ctx, inner)
+    EInterp(parts, _) => lint_walk_exprs(ctx, parts)
+    ENamedArg(_, _, arg_e, _) => lint_walk_expr(ctx, arg_e)
+    EMutArg(place, _) => {
+      lint_walk_expr(ctx, place)
+      match lint_place_root_ident(place) {
+        Some(root_name) => lint_mark_mut_needed(ctx, root_name)
+        None => lint_mark_all_active_mut_needed(ctx)
+      }
+    }
+    EUnit(_) => ()
+  }
+}
+
+///|
+/// Locates the identifier `name` inside `let [mut] <name>` starting at `sp`
+/// (which points to `let`) in `src` and returns a `"machine"` edit renaming it
+/// to `_<name>`.
+fn lint_make_prefix_unused_edit(
+  src : String,
+  starts : Array[Int],
+  sp : Span,
+  name : String,
+) -> Option[TextEdit] {
+  let off0 = lint_scalar_col_to_offset(src, starts, sp.line, sp.col)
+  if off0 < 0 || !lint_match_keyword_at(src, off0, "let") {
+    return None
+  }
+  let mut p = lint_skip_ws_and_comments(src, off0 + 3)
+  if lint_match_keyword_at(src, p, "mut") {
+    p = lint_skip_ws_and_comments(src, p + 3)
+  }
+  if !lint_match_keyword_at(src, p, name) {
+    return None
+  }
+  let pos = lint_offset_to_line_col(starts, p)
+  Some(
+    text_edit_replace(
+      sp.file,
+      pos.line,
+      pos.col,
+      pos.line,
+      pos.col + name.length(),
+      "_" + name,
+      "machine",
+    ),
+  )
+}
+
+///|
+/// Locates `mut` + trailing horizontal ASCII space(s) inside `let mut <name>`
+/// starting at `sp` (which points to `let`) in `src` and returns a `"machine"`
+/// edit deleting them so `let mut  x` becomes `let x` (`pionc fmt` clean).
+fn lint_make_remove_mut_edit(
+  src : String,
+  starts : Array[Int],
+  sp : Span,
+) -> Option[TextEdit] {
+  let off0 = lint_scalar_col_to_offset(src, starts, sp.line, sp.col)
+  if off0 < 0 || !lint_match_keyword_at(src, off0, "let") {
+    return None
+  }
+  let p = lint_skip_ws_and_comments(src, off0 + 3)
+  if !lint_match_keyword_at(src, p, "mut") {
+    return None
+  }
+  // Require at least one horizontal ASCII space after `mut` (conservatively
+  // skip tabs/newlines) and consume all consecutive spaces so no double space remains.
+  let mut end_p = p + 3
+  while end_p < src.length() && str_code_at(src, end_p) == 32 {
+    end_p = end_p + 1
+  }
+  if end_p == p + 3 {
+    return None
+  }
+  let pos = lint_offset_to_line_col(starts, p)
+  let end_pos = lint_offset_to_line_col(starts, end_p)
+  if end_pos.line != pos.line {
+    return None
+  }
+  Some(
+    text_edit_replace(
+      sp.file,
+      pos.line,
+      pos.col,
+      end_pos.line,
+      end_pos.col,
+      "",
+      "machine",
+    ),
+  )
+}
+
+///|
+fn lint_finalize_decl_locals(
+  ctx : LintDeclCtx,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+) -> Unit {
+  let mut i = 0
+  while i < ctx.locals.length() {
+    let loc = ctx.locals[i]
+    let fidx_opt = lint_get_file_index(raw_sources, idx_cache, loc.decl_span.file)
+    if !loc.exempt_unused && !loc.used {
+      let cand = "_" + loc.name
+      let edit_opt = if loc.is_slet &&
+        !ctx.decl_idents.contains(cand) &&
+        !ctx.tc.consts.contains(cand) &&
+        !ctx.tc.fns.contains(cand) {
+        match fidx_opt {
+          Some(fidx) =>
+            lint_make_prefix_unused_edit(fidx.src, fidx.starts, loc.decl_span, loc.name)
+          None => None
+        }
+      } else {
+        None
+      }
+      ctx.out.push(
+        lint_diag_with_edit(
+          loc.decl_span,
+          "L_UNUSED_LOCAL",
+          "unused local variable `" + loc.name + "`",
+          "used local binding or `_`-prefixed name",
+          "unused `" + loc.name + "`",
+          "prefix with `_` (`_" + loc.name + "`) or remove the unused binding",
+          edit_opt,
+        ),
+      )
+    }
+    if loc.is_slet && loc.is_mut && !loc.mut_needed {
+      let edit_opt = match fidx_opt {
+        Some(fidx) => lint_make_remove_mut_edit(fidx.src, fidx.starts, loc.decl_span)
+        None => None
+      }
+      ctx.out.push(
+        lint_diag_with_edit(
+          loc.decl_span,
+          "L_UNUSED_MUT",
+          "variable `" + loc.name + "` does not need to be mutable",
+          "immutable `let " + loc.name + "`",
+          "unnecessary `let mut " + loc.name + "`",
+          "remove `mut` from `let mut " + loc.name + "`",
+          edit_opt,
+        ),
+      )
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn lint_check_fn_decl(
+  tc : TypeChecker,
+  has_target_rules : Bool,
+  fd : FnDecl,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+  out : Array[Diagnostic],
+) -> Unit {
+  let idents : Map[String, Bool] = Map([])
+  idents.set(fd.name, true)
+  let mut tpi = 0
+  while tpi < fd.type_params.length() {
+    idents.set(fd.type_params[tpi], true)
+    tpi = tpi + 1
+  }
+  lint_collect_idents_name(idents, fd.receiver_type)
+  lint_collect_idents_bounds(idents, fd.type_bounds)
+  lint_collect_idents_params(idents, fd.params)
+  lint_collect_idents_type(idents, fd.ret_ty)
+  lint_collect_idents_stmts(idents, fd.body)
+  let ctx = LintDeclCtx::{
+    tc: tc,
+    has_target_rules: has_target_rules,
+    locals: [],
+    scopes: [],
+    is_bindings: Map([]),
+    decl_idents: idents,
+    out: out,
+  }
+  lint_push_scope(ctx)
+  let mut i = 0
+  while i < fd.params.length() {
+    match fd.params[i].default_expr {
+      Some(de) => lint_walk_expr(ctx, de)
+      None => ()
+    }
+    lint_bind_exempt(ctx, fd.params[i].name)
+    i = i + 1
+  }
+  lint_walk_block(ctx, fd.body)
+  lint_pop_scope(ctx)
+  lint_finalize_decl_locals(ctx, raw_sources, idx_cache)
+}
+
+///|
+fn lint_check_extern_fn_decl(
+  tc : TypeChecker,
+  has_target_rules : Bool,
+  ef : ExternFnDecl,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+  out : Array[Diagnostic],
+) -> Unit {
+  if !ef.has_body {
+    return
+  }
+  let idents : Map[String, Bool] = Map([])
+  idents.set(ef.name, true)
+  lint_collect_idents_params(idents, ef.params)
+  lint_collect_idents_type(idents, ef.ret_ty)
+  lint_collect_idents_stmts(idents, ef.body)
+  let ctx = LintDeclCtx::{
+    tc: tc,
+    has_target_rules: has_target_rules,
+    locals: [],
+    scopes: [],
+    is_bindings: Map([]),
+    decl_idents: idents,
+    out: out,
+  }
+  lint_push_scope(ctx)
+  let mut i = 0
+  while i < ef.params.length() {
+    match ef.params[i].default_expr {
+      Some(de) => lint_walk_expr(ctx, de)
+      None => ()
+    }
+    lint_bind_exempt(ctx, ef.params[i].name)
+    i = i + 1
+  }
+  lint_walk_block(ctx, ef.body)
+  lint_pop_scope(ctx)
+  lint_finalize_decl_locals(ctx, raw_sources, idx_cache)
+}
+
+///|
+fn lint_check_const_decl(
+  tc : TypeChecker,
+  has_target_rules : Bool,
+  cd : ConstDecl,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+  out : Array[Diagnostic],
+) -> Unit {
+  let idents : Map[String, Bool] = Map([])
+  idents.set(cd.name, true)
+  lint_collect_idents_type(idents, cd.ty)
+  lint_collect_idents_expr(idents, cd.value)
+  let ctx = LintDeclCtx::{
+    tc: tc,
+    has_target_rules: has_target_rules,
+    locals: [],
+    scopes: [],
+    is_bindings: Map([]),
+    decl_idents: idents,
+    out: out,
+  }
+  lint_push_scope(ctx)
+  lint_walk_expr(ctx, cd.value)
+  lint_pop_scope(ctx)
+  lint_finalize_decl_locals(ctx, raw_sources, idx_cache)
+}
+
+///|
+fn lint_check_test_decl(
+  tc : TypeChecker,
+  has_target_rules : Bool,
+  td : TestDecl,
+  raw_sources : Map[String, String],
+  idx_cache : Map[String, LintFileIndex],
+  out : Array[Diagnostic],
+) -> Unit {
+  let idents : Map[String, Bool] = Map([])
+  lint_collect_idents_stmts(idents, td.body)
+  let ctx = LintDeclCtx::{
+    tc: tc,
+    has_target_rules: has_target_rules,
+    locals: [],
+    scopes: [],
+    is_bindings: Map([]),
+    decl_idents: idents,
+    out: out,
+  }
+  lint_walk_block(ctx, td.body)
+  lint_finalize_decl_locals(ctx, raw_sources, idx_cache)
+}
+
+///|
+// =============================================================================
+// Rule 7: L_FILE_TOO_LONG
+// =============================================================================
+
+///|
+fn lint_check_file_lengths_list(
+  files : Array[SourceFile],
+  raw_sources : Map[String, String],
+  out : Array[Diagnostic],
+) -> Unit {
+  let mut fi = 0
+  while fi < files.length() {
+    let f = files[fi]
+    match raw_sources.get(f.path) {
+      Some(raw_src) => {
+        let lines = lint_count_lines(raw_src)
+        if lines > 10000 {
+          out.push(
+            diag_new(
+              span_new(f.path, 10001, 1),
+              "L_FILE_TOO_LONG",
+              "file `" +
+              f.path +
+              "` has " +
+              lines.to_string() +
+              " lines (maximum allowed is 10000)",
+              "<= 10000 lines",
+              lines.to_string() + " lines",
+              "split `" +
+              f.path +
+              "` into multiple `.pion` files in the same package (same-package files share all symbols automatically)",
+            ),
+          )
+        }
+      }
+      None => ()
+    }
+    fi = fi + 1
+  }
+}
+
+///|
+// =============================================================================
+// Public Entry Points
+// =============================================================================
+
+///|
+/// Runs all 7 mandatory lint rules (`L_*`) on a type-checked package (`pkg`, `tc`).
+/// `raw_sources` maps each file path to its original on-disk source (without any
+/// injected `#![verify]` suffix). `extra_import_files` holds parsed `SourceFile`s
+/// for any additional `.pion` files in the same package (e.g. inactive `[targets]`
+/// files) so cross-file import usage is never underestimated. When
+/// `extra_files_incomplete` is true (e.g. an extra file failed to read/parse),
+/// all import deletion edits in the package are conservatively suppressed.
+pub fn lint_package_full(
+  pkg : Package,
+  tc : TypeChecker,
+  raw_sources : Map[String, String],
+  active_extra_files : Array[SourceFile],
+  inactive_target_files : Array[SourceFile],
+  file_target_preds : Map[String, String],
+  has_target_rules : Bool,
+  extra_files_incomplete : Bool,
+) -> Array[Diagnostic] {
+  let out : Array[Diagnostic] = []
+  let idx_cache : Map[String, LintFileIndex] = Map([])
+  lint_check_imports(
+    pkg,
+    tc,
+    raw_sources,
+    idx_cache,
+    active_extra_files,
+    inactive_target_files,
+    file_target_preds,
+    has_target_rules,
+    extra_files_incomplete,
+    out,
+  )
+  lint_check_file_lengths_list(pkg.files, raw_sources, out)
+  lint_check_file_lengths_list(inactive_target_files, raw_sources, out)
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DStruct(_) => ()
+        DEnum(_) => ()
+        DFn(fd) => lint_check_fn_decl(tc, has_target_rules, fd, raw_sources, idx_cache, out)
+        DExternFn(ef) => lint_check_extern_fn_decl(tc, has_target_rules, ef, raw_sources, idx_cache, out)
+        DTrait(_) => ()
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            lint_check_fn_decl(tc, has_target_rules, id.methods[mi], raw_sources, idx_cache, out)
+            mi = mi + 1
+          }
+        }
+        DConst(cd) => lint_check_const_decl(tc, has_target_rules, cd, raw_sources, idx_cache, out)
+        DTest(td) => lint_check_test_decl(tc, has_target_rules, td, raw_sources, idx_cache, out)
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  lint_sort_and_dedup_diags(out)
+}
+
+///|
+pub fn lint_package_opts(
+  pkg : Package,
+  tc : TypeChecker,
+  raw_sources : Map[String, String],
+  extra_import_files : Array[SourceFile],
+  extra_files_incomplete : Bool,
+) -> Array[Diagnostic] {
+  lint_package_full(
+    pkg,
+    tc,
+    raw_sources,
+    [],
+    extra_import_files,
+    Map([]),
+    false,
+    extra_files_incomplete,
+  )
+}
+
+///|
+pub fn lint_package(
+  pkg : Package,
+  tc : TypeChecker,
+  raw_sources : Map[String, String],
+  extra_import_files : Array[SourceFile],
+) -> Array[Diagnostic] {
+  lint_package_opts(pkg, tc, raw_sources, extra_import_files, false)
+}
+
+///|
+/// Convenience entry point for tests and single-package callers: type-checks
+/// with `record_analyze=true`, returns any `E_*` diagnostics immediately if
+/// checking fails, and otherwise returns `lint_package(...)`.
+pub fn lint_source_files_with_imports(
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+  imported : Array[ImportedPkg],
+  multi_pkg : Bool,
+) -> Array[Diagnostic] {
+  let cr = check_source_files_with_imports_mapped(
+    pkg_name,
+    paths,
+    sources,
+    imported,
+    [],
+    [],
+    multi_pkg,
+    true,
+  )
+  if cr.diagnostics.length() > 0 {
+    return cr.diagnostics
+  }
+  let raw_sources : Map[String, String] = Map([])
+  let mut i = 0
+  while i < paths.length() && i < sources.length() {
+    raw_sources.set(paths[i], sources[i])
+    i = i + 1
+  }
+  lint_package(cr.pkg, cr.tc, raw_sources, [])
+}

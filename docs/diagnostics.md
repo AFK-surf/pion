@@ -636,3 +636,174 @@ pub fn main() -> Int {
   A
 }
 ```
+
+---
+
+## Built-in Linter Diagnostics (`pionc lint`)
+
+The 7 mandatory `L_*` codes below are checked by `pionc lint` (and verified by `compiler/src/core/diagnostics_doc_test.pion`).
+
+### L_IMPLICIT_IMPORT
+
+A file references an external package alias (`dep::...`) without declaring `import "dep"` in that file, relying on an `import` written in another file of the same package.
+
+```pion before
+// @pkg dep
+pub fn add(a : Int, b : Int) -> Int {
+  a + b
+}
+
+// @pkg app
+// @file a.pion
+import "dep"
+
+pub fn fa() -> Int {
+  dep::add(1, 2)
+}
+
+// @file b.pion
+pub fn fb() -> Int {
+  dep::add(3, 4)
+}
+```
+
+```pion after
+// @pkg dep
+pub fn add(a : Int, b : Int) -> Int {
+  a + b
+}
+
+// @pkg app
+// @file a.pion
+import "dep"
+
+pub fn fa() -> Int {
+  dep::add(1, 2)
+}
+
+// @file b.pion
+import "dep"
+
+pub fn fb() -> Int {
+  dep::add(3, 4)
+}
+```
+
+### L_UNUSED_IMPORT
+
+A file declares an `import` whose alias is never referenced in that file (or duplicates an existing `import` in the same file).
+
+```pion before
+// @pkg dep
+pub fn add(a : Int, b : Int) -> Int {
+  a + b
+}
+
+// @pkg app
+import "dep"
+
+pub fn main() -> Int {
+  42
+}
+```
+
+```pion after
+// @pkg dep
+pub fn add(a : Int, b : Int) -> Int {
+  a + b
+}
+
+// @pkg app
+pub fn main() -> Int {
+  42
+}
+```
+
+### L_UNUSED_LOCAL
+
+A local binding (`let`, tuple destructuring, loop variable, or `match`/`is` pattern binding) is never referenced in its scope. Prefix intentionally unused bindings with `_`.
+
+```pion before
+pub fn compute(x : Int) -> Int {
+  let unused = x + 1
+  x * 2
+}
+```
+
+```pion after
+pub fn compute(x : Int) -> Int {
+  let _unused = x + 1
+  x * 2
+}
+```
+
+### L_UNUSED_MUT
+
+A local `let mut` binding is never reassigned, passed as `mut <place>`, or used as the receiver of a `mut self` method.
+
+```pion before
+pub fn double(x : Int) -> Int {
+  let mut y = x * 2
+  y
+}
+```
+
+```pion after
+pub fn double(x : Int) -> Int {
+  let y = x * 2
+  y
+}
+```
+
+### L_UNREACHABLE_CODE
+
+A statement appears after a statically diverging statement (`return`, `break`, `continue`, a `Never`-returning call such as `panic`/`abort`, or an all-diverging `if`/`match`/block).
+
+```pion before
+pub fn f(x : Int) -> Int {
+  return x + 1
+  0
+}
+```
+
+```pion after
+pub fn f(x : Int) -> Int {
+  return x + 1
+}
+```
+
+### L_SELF_ASSIGN
+
+A plain assignment `lhs = rhs` assigns a pure variable or field chain to itself (`x = x`, `self.pos = self.pos`).
+
+```pion before
+pub fn keep(n : Int) -> Int {
+  let mut x = n
+  x = x
+  x
+}
+```
+
+```pion after
+pub fn keep(n : Int) -> Int {
+  let x = n
+  x
+}
+```
+
+### L_FILE_TOO_LONG
+
+A single `.pion` source file exceeds `10000` physical lines. Split it into multiple `.pion` files in the same package (same-package files share all symbols automatically).
+
+```pion before
+// @pad_lines 10000
+pub fn ok() -> Int {
+  1
+}
+```
+
+```pion after
+pub fn ok() -> Int {
+  1
+}
+```

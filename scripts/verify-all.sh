@@ -522,6 +522,8 @@ sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
 # Wave L1-A: constant patterns, unified EIs scoping + ASan/LSan, closure fail-closed, builtin arity, test --json, struct lit & impl edit.
 sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC2"
+# Built-in independent linter (`pionc lint` + transactional `--fix`).
+sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 E2E
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
