@@ -1,0 +1,302 @@
+///| Wave M2-F4 Track F4-1 unit tests:
+///| 1. Stage B content-versioned caching zero-drift (cached == uncached byte-for-byte + diagnostics)
+///|    & order-sensitivity (edit A then audit B, reversed file order, mid-pass arr_iter lowering)
+///| 2. Exact MoonBit `(buf, init_len)` slot-stability invariant on `search_by`, `iter`, and `for .. in`
+///|    (single-op `insert`/`splice`/`resize`, `for x in f2 { f2.clear() }`, immediate-break `remove; break`)
+///| 3. Strict package-confined escape analysis, declaration-bound effect summaries (mutual recursion),
+///|    private struct closure fields `(e.off)()`, and `combobox`-style negative tests
+///| 4. Dep-only dangerous same-name method rejection (`sort_key_set_dep_methods` + `sort_key_env_of_with_deps`)
+
+fn f4_1_has_diag(ds : Array[Diag], code : String, needle : String) -> Bool {
+  for d in ds {
+    if d.code == code && str_has(d.message, needle) {
+      return true
+    }
+  }
+  false
+}
+
+fn f4_1_same_files(a : Array[GeneratedFile], b : Array[GeneratedFile]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].rel_path != b[i].rel_path || a[i].content != b[i].content {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn f4_1_same_diags(a : Array[Diag], b : Array[Diag]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i].code != b[i].code || a[i].file != b[i].file || a[i].line != b[i].line ||
+    a[i].col != b[i].col || a[i].message != b[i].message {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Synthetic `check_fn` that emits `unknown method` JSON diagnostics for `.shrink_to_fit()`, `.search_by(`,
+///| and `.iter()` in `batch`, allowing deterministic multi-round Stage B cached vs uncached comparison.
+fn f4_1_mock_check(batch : Array[(String, String)]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"diagnostics\":[")
+  let mut first = true
+  for pair in batch {
+    let fname = pair.0
+    let lines = pair.1.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      for m in ["shrink_to_fit", "search_by", "iter"] {
+        let needle = "." + m + "("
+        let idx = ln.index_of(needle)
+        if idx >= 0 {
+          if !first { sb.write_string(",") }
+          first = false
+          let col = idx + 2
+          sb.write_string("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"")
+          sb.write_string(fname)
+          sb.write_string("\",\"line\":")
+          sb.write_string((li + 1).to_string())
+          sb.write_string(",\"col\":")
+          sb.write_string(col.to_string())
+          sb.write_string(",\"message\":\"unknown method `")
+          sb.write_string(m)
+          sb.write_string("` on type `Array[Int]`\"}")
+        }
+      }
+      li = li + 1
+    }
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+test "F4-1-1: Stage B content-versioned cache is byte-identical to uncached across rounds & file orders" {
+  let file_a = GeneratedFile::{
+    rel_path: "a.pion",
+    content: "struct Box {\n  priv items : Array[Int]\n  priv aux : Array[Int]\n}\n" +
+    "pub fn Box::new() -> Box {\n  Box::{ items: [], aux: [] }\n}\n" +
+    "pub fn Box::reset(self : Box) -> Unit {\n  self.items.clear()\n  self.items.shrink_to_fit()\n  self.aux.clear()\n  self.aux.shrink_to_fit()\n}\n",
+    source_file: "a.mbt",
+    anchors: [],
+  }
+  let file_b = GeneratedFile::{
+    rel_path: "b.pion",
+    content: "pub fn find_two(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { x == 2 })\n}\n" +
+    "pub fn sum_it(xs : Array[Int]) -> Int {\n  xs.iter().count()\n}\n",
+    source_file: "b.mbt",
+    anchors: [],
+  }
+  let file_c = GeneratedFile::{
+    rel_path: "c.pion",
+    content: "pub fn untouched(n : Int) -> Int {\n  n + 1\n}\n",
+    source_file: "c.mbt",
+    anchors: [],
+  }
+
+  // Order 1: [A, B, C]
+  let files1 = [file_a, file_b, file_c]
+  stage_b_set_cache_enabled(false)
+  stage_b_reset_perf_counters()
+  let d_off1 : Array[Diag] = []
+  let l_off1 : Array[DriftEntry] = []
+  let (out_off1, it_off1, _) = run_stage_b_with_ops(files1, empty_api_map(), Map(), f4_1_mock_check, d_off1, l_off1)
+  let stats_off = stage_b_get_perf_counters()
+
+  stage_b_set_cache_enabled(true)
+  stage_b_reset_perf_counters()
+  let d_on1 : Array[Diag] = []
+  let l_on1 : Array[DriftEntry] = []
+  let (out_on1, it_on1, _) = run_stage_b_with_ops(files1, empty_api_map(), Map(), f4_1_mock_check, d_on1, l_on1)
+  let stats_on = stage_b_get_perf_counters()
+
+  assert_eq(it_on1, it_off1)
+  assert_true(f4_1_same_files(out_on1, out_off1), "cached vs uncached files must be byte-identical")
+  assert_true(f4_1_same_diags(d_on1, d_off1), "cached vs uncached diagnostics must be identical")
+  assert_true(stats_on.1 < stats_off.1, "cached shrink_pkg_builds must be strictly fewer than uncached")
+  assert_true(stats_on.0 < stats_off.0, "cached lex_calls must be strictly fewer than uncached")
+  assert_true(str_has(out_on1[0].content, "mbt_compat::arr_shrink_to_fit(self.items)"), "confined field shrink_to_fit lowered")
+  assert_true(str_has(out_on1[1].content, "mbt_compat::arr_search_by(xs"), "pure search_by lowered")
+
+  // Order 2: Reversed file order [C, B, A]
+  let files2 = [file_c, file_b, file_a]
+  stage_b_set_cache_enabled(false)
+  let d_off2 : Array[Diag] = []
+  let l_off2 : Array[DriftEntry] = []
+  let (out_off2, _, _) = run_stage_b_with_ops(files2, empty_api_map(), Map(), f4_1_mock_check, d_off2, l_off2)
+
+  stage_b_set_cache_enabled(true)
+  let d_on2 : Array[Diag] = []
+  let l_on2 : Array[DriftEntry] = []
+  let (out_on2, _, _) = run_stage_b_with_ops(files2, empty_api_map(), Map(), f4_1_mock_check, d_on2, l_on2)
+
+  assert_true(f4_1_same_files(out_on2, out_off2), "reversed file order cached vs uncached must be byte-identical")
+  assert_true(f4_1_same_diags(d_on2, d_off2), "reversed file order diags must be identical")
+
+  // Order 3: Mid-pass `xs.iter()` lowered to `mbt_compat::arr_iter(xs)` must still be recognized by `collect_shrink_pkg`
+  let mid_src = "fn f(xs : Array[Int]) -> Array[Int] {\n  let it = mbt_compat::arr_iter(xs)\n  trim(xs)\n  it.collect()\n}\n" +
+  "fn trim(ys : Array[Int]) -> Unit {\n  ys.shrink_to_fit()\n}\n"
+  let mid_pkg = collect_shrink_pkg([mid_src])
+  assert_true(mid_pkg.iterated_tails.contains("xs"), "kept mbt_compat::arr_iter(xs) must remain visible in iterated_tails")
+  stage_b_set_cache_enabled(true)
+}
+
+test "F4-1-2: Exact MoonBit (buf, init_len) slot-stability on search_by, iter, and for .. in" {
+  // 1. Single compound shifting op `xs.insert(0, 9)` in `search_by` MUST fail closed!
+  let ins_src = "pub fn bad_insert(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { if x == 1 { xs.insert(0, 9) }; x == 2 })\n}\n"
+  let ins_toks = lex_moonbit(ins_src)
+  let ins_sum = collect_cap_pkg_summary([ins_toks], Map())
+  let ins_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(ins_toks, ins_sum, "ins.pion", 2, 6, ins_diags), "insert in search_by must block")
+  assert_true(f4_1_has_diag(ins_diags, "MBT2PION_ARRAY_ITER_MUTATION", ".insert(..)"), "insert diag")
+
+  // 2. `splice` and `resize` in `search_by` and `kept_iter` MUST fail closed!
+  let spl_src = "pub fn bad_splice(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { xs.splice(0, 1, []); x == 2 })\n}\n"
+  let spl_toks = lex_moonbit(spl_src)
+  let spl_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(spl_toks, collect_cap_pkg_summary([spl_toks], Map()), "spl.pion", 2, 6, spl_diags), "splice in search_by must block")
+
+  let ki_spl = "fn f(xs : Array[Int]) -> Int {\n  let it = xs.iter()\n  xs.splice(0, 1, [])\n  it.count()\n}\n"
+  let ki_ts = lex_moonbit(ki_spl)
+  let mut ki_hit = ""
+  for i, t in ki_ts {
+    if t.kind == TokenKind::Dot && i + 1 < ki_ts.length() && ki_ts[i + 1].raw == "iter" {
+      ki_hit = kept_iter_hazard(ki_ts, i)
+    }
+  }
+  assert_true(str_has(ki_hit, ".splice(..)"), "splice in kept iter must block: " + ki_hit)
+
+  // 3. In-place write ONLY in `search_by` is allowed; growth + write is blocked!
+  let wr_only = "pub fn ok_write(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { xs[1] = 9; x == 9 })\n}\n"
+  let wr_toks = lex_moonbit(wr_only)
+  let wr_diags : Array[Diag] = []
+  assert_true(stage_b_check_search_by_cached(wr_toks, collect_cap_pkg_summary([wr_toks], Map()), "wr.pion", 2, 6, wr_diags), "in-place write only in search_by is exact")
+
+  let gw_src = "pub fn bad_grow_write(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { if x == 1 { xs.push(4); xs[1] = 9 }; x == 9 })\n}\n"
+  let gw_toks = lex_moonbit(gw_src)
+  let gw_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(gw_toks, collect_cap_pkg_summary([gw_toks], Map()), "gw.pion", 2, 6, gw_diags), "push + write in search_by must block")
+  assert_true(f4_1_has_diag(gw_diags, "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"), "grow+write diag")
+
+  // 4. Opus P1-3: `for x in f2 { if x == 1 { f2.clear() }; s += x }` MUST fail closed!
+  let f2_src = "pub fn opus_f2() -> Int {\n  let f2 = [1, 2, 3]\n  let mut s = 0\n  for x in f2 {\n    if x == 1 { f2.clear() }\n    s = s + x\n  }\n  s\n}\n"
+  let f2_diags : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "f2.pion", content: f2_src, source_file: "f2.mbt", anchors: [] }], f2_diags)
+  assert_true(f4_1_has_diag(f2_diags, "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"), "for-in clear must block")
+
+  // 5. `for i, e in self.entries { if e.id == id { self.entries.remove(i); break } }` exits immediately -> allowed!
+  let brk_src = "fn drop(self : Stack, id : Int) -> Unit {\n  for i, e in self.entries {\n    if e.id == id {\n      let _ = self.entries.remove(i)\n      break\n    }\n  }\n}\n"
+  let brk_diags : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "brk.pion", content: brk_src, source_file: "brk.mbt", anchors: [] }], brk_diags)
+  assert_true(brk_diags.length() == 0, "for-in remove immediately followed by break must be allowed")
+
+  // 6. `for x in a { b.clear() }` where both `a` and `b` are array parameters -> may alias -> blocked!
+  let al_src = "pub fn alias_for(a : Array[Int], b : Array[Int]) -> Int {\n  let mut s = 0\n  for x in a {\n    b.clear()\n    s = s + x\n  }\n  s\n}\n"
+  let al_diags : Array[Diag] = []
+  stage_b_audit_for_in_arrays([GeneratedFile::{ rel_path: "al.pion", content: al_src, source_file: "al.mbt", anchors: [] }], al_diags)
+  assert_true(f4_1_has_diag(al_diags, "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"), "aliased param clear in for-in must block")
+}
+
+test "F4-1-3: Strict escape rules, mutual-recursion effect summaries, struct closure fields & combobox negative" {
+  // 1. Private field initialized from caller param is NOT package-confined -> pub fn shrink_to_fit blocks!
+  let caller_init = "struct S {\n  priv xs : Array[Int]\n}\n" +
+  "pub fn S::wrap(xs : Array[Int]) -> S {\n  S::{ xs: xs }\n}\n" +
+  "pub fn S::trim(self : S) -> Unit {\n  self.xs.shrink_to_fit()\n}\n"
+  let ci_pkg = collect_shrink_pkg([caller_init])
+  let ci_ts = lex_moonbit(caller_init)
+  let mut ci_hit = ""
+  for i, t in ci_ts {
+    if t.raw == "shrink_to_fit" {
+      ci_hit = shrink_snapshot_hazard(ci_ts, i, ci_pkg)
+    }
+  }
+  assert_true(str_has(ci_hit, "is `pub`"), "private field initialized from param must NOT be confined: " + ci_hit)
+
+  // 2. Private field returned from pub fn is NOT confined -> blocks!
+  let ret_esc = "struct S {\n  priv xs : Array[Int]\n}\n" +
+  "pub fn S::new() -> S {\n  S::{ xs: [] }\n}\n" +
+  "pub fn S::leak(self : S) -> Array[Int] {\n  self.xs\n}\n" +
+  "pub fn S::trim(self : S) -> Unit {\n  self.xs.shrink_to_fit()\n}\n"
+  let re_pkg = collect_shrink_pkg([ret_esc])
+  assert_true(!re_pkg.visible_fields.contains(" confined_field:xs"), "returned private field must NOT be confined")
+
+  // 3. Mutual recursion in package effect summary: `a` calls `b`, `b` calls `a` and `clear()`
+  let mrec_src = "fn a(xs : Array[Int]) -> Bool {\n  b(xs)\n}\n" +
+  "fn b(xs : Array[Int]) -> Bool {\n  if xs.length() > 1 { xs.clear(); a(xs) } else { false }\n}\n" +
+  "pub fn run(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { a(xs) && x == 1 })\n}\n"
+  let mr_toks = lex_moonbit(mrec_src)
+  let mr_sum = collect_cap_pkg_summary([mr_toks], Map())
+  let mr_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(mr_toks, mr_sum, "mrec.pion", 8, 6, mr_diags), "mutually recursive mutator in search_by must block")
+
+  // 4. Private struct closure field `(e.off)()`: pure init allowed, pub field or param init blocked!
+  let priv_cb_ok = "struct Entry {\n  off : () -> Bool\n}\n" +
+  "fn mk() -> Entry {\n  Entry::{ off: fn() { true } }\n}\n" +
+  "pub fn find_on(es : Array[Entry]) -> Option[Int] {\n  es.search_by(fn(e) { !(e.off)() })\n}\n"
+  let pc_toks = lex_moonbit(priv_cb_ok)
+  let pc_sum = collect_cap_pkg_summary([pc_toks], Map())
+  let pc_diags : Array[Diag] = []
+  assert_true(stage_b_check_search_by_cached(pc_toks, pc_sum, "pc.pion", 8, 6, pc_diags), "priv struct closure field with all-pure inits allowed")
+
+  let pub_cb_bad = "pub struct Entry {\n  off : () -> Bool\n}\n" +
+  "fn mk() -> Entry {\n  Entry::{ off: fn() { true } }\n}\n" +
+  "pub fn find_on(es : Array[Entry]) -> Option[Int] {\n  es.search_by(fn(e) { !(e.off)() })\n}\n"
+  let pb_toks = lex_moonbit(pub_cb_bad)
+  let pb_sum = collect_cap_pkg_summary([pb_toks], Map())
+  let pb_diags : Array[Diag] = []
+  assert_true(!stage_b_check_search_by_cached(pb_toks, pb_sum, "pb.pion", 8, 6, pb_diags), "pub struct closure field must block")
+
+  // 5. `combobox`-style negative: `active_of(keys, off)` with closure parameter `off` MUST block!
+  let combo_src = "fn active_of(keys : Array[Int], off : (Int) -> Bool) -> Option[Int] {\n  keys.iter().find_first(fn(k) { !off(k) })\n}\n"
+  let cb_ts = lex_moonbit(combo_src)
+  let mut cb_hit = ""
+  for i, t in cb_ts {
+    if t.kind == TokenKind::Dot && i + 1 < cb_ts.length() && cb_ts[i + 1].raw == "iter" {
+      cb_hit = kept_iter_hazard(cb_ts, i)
+    }
+  }
+  assert_true(str_has(cb_hit, "a call to `off(..)`"), "combobox-style opaque callback must block: " + cb_hit)
+}
+
+test "F4-1-4: Dep-only dangerous same-name method rejection (sort_key_env_of_with_deps & global handoff)" {
+  let src = "pub fn f(xs : Array[Int], h : dep::Hook, arr : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { h.length() + x })\n  xs.sort_by_key(fn(x) { arr.length() + x })\n}\n"
+  let ts = lex_moonbit(src)
+  let dep_m : Map[String, Bool] = Map()
+  dep_m["length"] = true
+
+  // 1. Explicit context interface (`sort_key_env_of_with_deps`)
+  let env_explicit = sort_key_env_of_with_deps([ts], dep_m)
+  let mut hits_exp : Array[String] = []
+  for i, t in ts {
+    if t.raw == "sort_by_key" {
+      hits_exp.push(sort_key_closure_opacity(ts, i + 1, env_explicit))
+    }
+  }
+  assert_eq(hits_exp.length(), 2)
+  assert_true(str_has(hits_exp[0], "not proven built-in"), "dep-only method `length` must reject h.length(): " + hits_exp[0])
+  assert_true(hits_exp[1] == "", "proven built-in Array[Int] arr.length() still allowed: " + hits_exp[1])
+
+  // 2. Backward-compatible global setter (`sort_key_set_dep_methods`)
+  sort_key_set_dep_methods(dep_m)
+  let env_global = sort_key_env_of([ts])
+  let mut hits_glob : Array[String] = []
+  for i, t in ts {
+    if t.raw == "sort_by_key" {
+      hits_glob.push(sort_key_closure_opacity(ts, i + 1, env_global))
+    }
+  }
+  sort_key_set_dep_methods(Map())
+  assert_true(str_has(hits_glob[0], "not proven built-in"), "global dep methods must reject h.length()")
+  assert_true(hits_glob[1] == "", "global dep methods still allow arr.length()")
+}

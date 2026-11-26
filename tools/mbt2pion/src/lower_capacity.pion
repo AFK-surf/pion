@@ -270,7 +270,8 @@ pub struct ShrinkPkg {
   // Functions / methods a snapshot of the package could be live around: called inside an iteration scope or used as
   // a value, and (transitively) everything they call.
   iter_fns : Map[String, String]
-  // Fields readable outside the package (a `pub struct` field without `priv`).
+  // Fields readable outside the package (a `pub struct` field without `priv`), plus internal
+  // `" confined_field:<f>"` / `" confined_global:<g>"` proofs for package-confined private arrays.
   visible_fields : Map[String, Bool]
 }
 
@@ -319,13 +320,18 @@ fn calls_package_fn(ts : Array[Token], s : Int, e : Int, fns : Map[String, Bool]
   false
 }
 
-///| Builds `ShrinkPkg` from the package's generated files.
+///| Builds `ShrinkPkg` from the package's generated files (lexes each file once).
 pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
-  let pkg = ShrinkPkg::empty()
   let all_tokens : Array[Array[Token]] = []
   for c in contents {
     all_tokens.push(lex_moonbit(c))
   }
+  collect_shrink_pkg_from_tokens(all_tokens)
+}
+
+///| Builds `ShrinkPkg` directly from pre-lexed package token streams (zero re-lexing).
+pub fn collect_shrink_pkg_from_tokens(all_tokens : Array[Array[Token]]) -> ShrinkPkg {
+  let pkg = ShrinkPkg::empty()
   let fns : Map[String, Bool] = Map()
   for ts in all_tokens {
     declared_fns(ts, fns)
@@ -335,15 +341,14 @@ pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
       pkg.risky_fns[k] = "it is `pub` (a caller outside the package may iterate the array)"
     }
   }
-  let afs = collect_array_fields(contents)
+  let afs = collect_array_fields_from_tokens(all_tokens)
   for k in afs.keys() {
     match afs.get(k) {
       Some(v) => pkg.array_fields[k] = v
       None => ()
     }
   }
-  for c in contents {
-    let ts = lex_moonbit(c)
+  for ts in all_tokens {
     let n = ts.length()
     // Visible fields: `pub struct S { f : T }` without `priv`.
     let mut i = 0
@@ -442,12 +447,23 @@ pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
       ts[t + 2].raw.starts_with("arr_") && ts[t + 3].kind == TokenKind::LParen &&
       (is_iteration_callee(ts[t + 2].raw.slice(4, ts[t + 2].raw.length())) || ts[t + 2].raw == "arr_iter") {
         let close = find_matching_delim(ts, t + 3)
+        let mut chain_end = close
+        while chain_end + 3 < n && ts[chain_end + 1].kind == TokenKind::Dot && ts[chain_end + 3].kind == TokenKind::LParen {
+          chain_end = find_matching_delim(ts, chain_end + 3)
+        }
         let mut a = t + 4
         while a + 1 < close && ts[a + 1].kind != TokenKind::Comma && ts[a + 1].kind != TokenKind::RParen {
           a = a + 1
         }
         let tail = path_tail(ts, a)
-        if tail.length() > 0 && calls_package_fn(ts, t + 3, close, fns) {
+        let kept = ts[t + 2].raw == "arr_iter" && !iter_chain_is_consumed(ts, close)
+        let scope_end = if kept {
+          let bo = outermost_body_open(ts, t)
+          if bo >= 0 { find_matching_delim(ts, bo) } else { chain_end }
+        } else {
+          chain_end
+        }
+        if tail.length() > 0 && chain_end > t && calls_package_fn(ts, t + 3, scope_end, fns) {
           pkg.iterated_tails[tail] = "line " + tk.line.to_string()
         }
       }
@@ -517,6 +533,7 @@ pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
       }
     }
   }
+  collect_package_confined_arrays(all_tokens, pkg)
   pkg
 }
 
@@ -633,10 +650,17 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
     None => ()
   }
   if non_local {
-    match pkg.risky_fns.get(fname) {
-      Some(why) =>
-      return "its receiver comes from a caller and `" + fname + "` may run inside a caller's iteration: " + why
-      None => ()
+    // A package-confined private field or private module-level array is strictly proven never to leave the
+    // package and always initialized with a fresh array, so an external caller of a `pub fn` cannot hold a
+    // buffer snapshot of it.
+    let pkg_confined = (is_field && pkg.visible_fields.contains(" confined_field:" + tail)) ||
+    (!is_field && pkg.visible_fields.contains(" confined_global:" + head))
+    if !pkg_confined {
+      match pkg.risky_fns.get(fname) {
+        Some(why) =>
+        return "its receiver comes from a caller and `" + fname + "` may run inside a caller's iteration: " + why
+        None => ()
+      }
     }
   }
   ""
@@ -790,9 +814,17 @@ fn lower_array_ctor_as_buf(
 ///| Struct fields declared in `contents` whose type is an `Array[..]` (true) or something else under the same name
 ///| (false): `x.field.copy()` is the built-in `Array::copy` (a fresh array) only when every such field is an array.
 pub fn collect_array_fields(contents : Array[String]) -> Map[String, Bool] {
-  let out : Map[String, Bool] = Map()
+  let all_tokens : Array[Array[Token]] = []
   for c in contents {
-    let ts = lex_moonbit(c)
+    all_tokens.push(lex_moonbit(c))
+  }
+  collect_array_fields_from_tokens(all_tokens)
+}
+
+///| Same as `collect_array_fields`, operating on pre-lexed token streams (zero re-lexing).
+pub fn collect_array_fields_from_tokens(all_tokens : Array[Array[Token]]) -> Map[String, Bool] {
+  let out : Map[String, Bool] = Map()
+  for ts in all_tokens {
     let n = ts.length()
     let mut i = 0
     while i < n {
@@ -812,7 +844,7 @@ pub fn collect_array_fields(contents : Array[String]) -> Map[String, Bool] {
             } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
               d = d - 1
             } else if d == 0 && kk == TokenKind::Ident && k + 2 < close && ts[k + 1].kind == TokenKind::Colon &&
-            (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].kind == TokenKind::Comma) {
+            (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].raw == "priv" || ts[k - 1].kind == TokenKind::Comma) {
               let is_arr = ts[k + 2].raw == "Array" && k + 3 < close && ts[k + 3].kind == TokenKind::LBracket
               let prev = match out.get(ts[k].raw) {
                 Some(v) => v
@@ -1118,20 +1150,22 @@ fn kept_iter_mutations(
       if tk.kind == TokenKind::Dot && t + 2 < e && tokens[t + 1].kind == TokenKind::Ident &&
       tokens[t + 2].kind == TokenKind::LParen {
         let m = tokens[t + 1].raw
-        if m == "push" {
+        if is_cap_arr_growth_method(m) {
           flags[0] = true
-        } else if m == "set" || m == "unsafe_set" {
+        } else if is_cap_arr_write_method(m) {
           flags[1] = true
-        } else if m != "iter" && is_array_mutating_method(m) {
+        } else if m != "iter" && (is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit") {
           return "`." + m + "(..)` runs while an iterator of a computed array is kept"
         } else if !is_read_only_array_method(m) && head.length() > 0 && receiver_root(tokens, t - 1) == head {
           return "`." + m + "(..)` on `" + head + "` may change the array of a kept iterator over a non-local array"
         }
       } else if tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
       tokens[t - 2].raw == "mbt_compat" && t + 1 < e && tokens[t + 1].kind == TokenKind::LParen {
-        if tk.raw == "arr_push" || tk.raw == "arr_push_iter" {
+        if is_cap_compat_growth_fn(tk.raw) {
           flags[0] = true
-        } else if is_mbt_compat_arr_mutating(tk.raw) {
+        } else if is_cap_compat_write_fn(tk.raw) {
+          flags[1] = true
+        } else if is_cap_compat_shrink_or_shift_fn(tk.raw) || tk.raw == "arr_shrink_to_fit" {
           return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
         }
       } else if head.length() > 0 && tk.kind == TokenKind::Ident && tk.raw == head && !qualified &&
@@ -1139,7 +1173,7 @@ fn kept_iter_mutations(
       kept_iter_path_is_whole_arg(tokens, t, e) {
         let o = enclosing_open(tokens, t, body_open, TokenKind::LParen)
         let callee = if o > 0 { tokens[o - 1].raw } else { "" }
-        if callee != "arr_iter" && callee != "length" && callee != "arr_push" && callee != "arr_push_iter" {
+        if callee != "arr_iter" && callee != "length" && !is_cap_compat_growth_fn(callee) {
           return "`" + head + "` is passed to `" + callee + "(..)` while it is kept"
         }
       } else if is_opaque_call_at(tokens, t, e, callables) {
@@ -1161,11 +1195,11 @@ fn kept_iter_mutations(
       if p + 3 < e && tokens[p + 1].kind == TokenKind::Dot && tokens[p + 2].kind == TokenKind::Ident &&
       tokens[p + 3].kind == TokenKind::LParen {
         let m = tokens[p + 2].raw
-        if m == "push" {
+        if is_cap_arr_growth_method(m) {
           flags[0] = true
-        } else if m == "set" || m == "unsafe_set" {
+        } else if is_cap_arr_write_method(m) {
           flags[1] = true
-        } else if is_array_mutating_method(m) {
+        } else if is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit" {
           return "`" + nm + "." + m + "(..)` runs while it is kept"
         } else if !is_read_only_array_method(m) {
           return "`" + nm + "." + m + "(..)` may change it while it is kept"
@@ -1181,8 +1215,10 @@ fn kept_iter_mutations(
       p + 1 < e && (tokens[p + 1].kind == TokenKind::RParen || tokens[p + 1].kind == TokenKind::Comma) {
         let o = enclosing_open(tokens, t, body_open, TokenKind::LParen)
         let callee = if o > 0 { tokens[o - 1].raw } else { "" }
-        if callee == "arr_push" || callee == "arr_push_iter" {
+        if is_cap_compat_growth_fn(callee) {
           flags[0] = true
+        } else if is_cap_compat_write_fn(callee) {
+          flags[1] = true
         } else if callee != "arr_iter" && callee != "length" {
           return "`" + nm + "` is passed to `" + callee + "(..)` while it is kept"
         }
@@ -1813,8 +1849,13 @@ pub fn sort_key_set_dep_methods(names : Map[String, Bool]) -> Unit {
 
 ///| `SortKeyEnv` of generated sources (`fn T::m(`, methods of `impl .. for T { .. }`, `impl Eq`) plus dependencies'.
 pub fn sort_key_env_of(files : Array[Array[Token]]) -> SortKeyEnv {
+  sort_key_env_of_with_deps(files, sort_key_dep_methods)
+}
+
+///| Explicit-context `SortKeyEnv` builder (avoids reading global `sort_key_dep_methods` once `pipeline.pion` hands off).
+pub fn sort_key_env_of_with_deps(files : Array[Array[Token]], dep_methods : Map[String, Bool]) -> SortKeyEnv {
   let methods : Map[String, Bool] = Map()
-  for k in sort_key_dep_methods.keys() {
+  for k in dep_methods.keys() {
     methods[k] = true
   }
   for ts in files {
@@ -2587,6 +2628,1280 @@ fn chain_callbacks_opacity(
       }
     }
     c = ac
+  }
+  ""
+}
+
+// =============================================================================
+// Wave M2-F4 Track F4-1: Complete Slot-Stability Taxonomy, Package-Confined
+// Escape Analysis, Declaration-Bound Effect Summaries, Sound `search_by`, and
+// `for .. in` Array Hazard Analysis.
+// =============================================================================
+
+///| Array methods that may grow/reallocate the buffer without shifting/shrinking `0..init_len-1`.
+pub fn is_cap_arr_growth_method(m : String) -> Bool {
+  m == "push" || m == "append" || m == "reserve" || m == "push_iter"
+}
+
+///| Array methods that overwrite an existing slot in place without reallocating or shifting.
+pub fn is_cap_arr_write_method(m : String) -> Bool {
+  m == "set" || m == "unsafe_set"
+}
+
+///| Array methods that shrink length OR shift/reorder slots in a single call (unconditionally hazardous
+///| during any `(buf, init_len)` snapshot iteration: `Array::iter`, `Array::search_by`, `for .. in`).
+pub fn is_cap_arr_shrink_or_shift_method(m : String) -> Bool {
+  m == "pop" || m == "pop_exn" || m == "unsafe_pop" || m == "clear" || m == "truncate" || m == "remove" ||
+  m == "drain" || m == "retain" || m == "insert" || m == "splice" || m == "resize" || m == "swap" ||
+  m == "sort" || m == "sort_by" || m == "sort_by_key" || m == "rev_in_place" || m == "map_in_place" ||
+  m == "dedup"
+}
+
+pub fn is_cap_compat_growth_fn(m : String) -> Bool {
+  m == "arr_push" || m == "arr_append" || m == "arr_push_iter"
+}
+
+pub fn is_cap_compat_write_fn(m : String) -> Bool {
+  m == "arr_set" || m == "arr_unsafe_set"
+}
+
+pub fn is_cap_compat_shrink_or_shift_fn(m : String) -> Bool {
+  m == "arr_pop" || m == "arr_clear" || m == "arr_truncate" || m == "arr_remove" || m == "arr_drain" ||
+  m == "arr_retain" || m == "arr_insert" || m == "arr_splice" || m == "arr_resize" || m == "arr_swap" ||
+  m == "arr_sort" || m == "arr_sort_by" || m == "arr_sort_by_key" || m == "arr_rev_in_place" ||
+  m == "arr_map_in_place" || m == "arr_dedup"
+}
+
+///| True iff outermost `{` at `bo` opens a `struct` / `enum` / `trait` type declaration (not a `fn`/`test` body).
+fn is_type_decl_brace(ts : Array[Token], bo : Int) -> Bool {
+  if bo <= 0 {
+    return false
+  }
+  let mut h = bo - 1
+  let mut d = 0
+  while h >= 0 {
+    let hk = ts[h].kind
+    if hk == TokenKind::RParen || hk == TokenKind::RBracket || hk == TokenKind::RBrace {
+      d = d + 1
+    } else if hk == TokenKind::LParen || hk == TokenKind::LBracket || hk == TokenKind::LBrace {
+      if d == 0 {
+        return false
+      }
+      d = d - 1
+    } else if d == 0 {
+      let r = ts[h].raw
+      if r == "struct" || r == "enum" || r == "trait" {
+        return true
+      }
+      if r == "fn" || r == "test" || r == "impl" {
+        return false
+      }
+    }
+    h = h - 1
+  }
+  false
+}
+
+///| Strictly prove which private array fields and private module-level arrays never escape the package:
+///| 1. Field is not in `visible_fields` (private struct or `priv` field) and every declaration of that field
+///|    name is `Array[..]`; module-level `let name [: Array[..]] = <fresh>` is non-`pub`.
+///| 2. Every struct-literal initializer (`f: <rhs>`) and field assignment (`.f = <rhs>`) in the package
+///|    assigns a freshly allocated array (`is_fresh_array_rhs`), ruling out caller-provided arrays that may
+///|    already have an active iterator before being stored.
+///| 3. Every use of `.f` (or the module-level `name`) in the package is a non-escaping array operation
+///|    (index read/write, `.length()`/`.is_empty()`/`.push()`/`.pop()`/`.clear()`/`.shrink_to_fit()`/etc.,
+///|    `mbt_compat::arr_*` non-escaping call, or `for .. in` / consumed `.iter()`): NEVER returned, NEVER
+///|    passed to another function/closure, NEVER stored into another field/`Ref`/global/alias, NEVER sliced
+///|    (`[:]`), NEVER kept as an escaping iterator.
+fn collect_package_confined_arrays(all_tokens : Array[Array[Token]], pkg : ShrinkPkg) -> Unit {
+  // Candidate private array fields: declared as Array[..] everywhere and not in visible_fields.
+  let cand_fields : Map[String, Bool] = Map()
+  for f in pkg.array_fields.keys() {
+    if pkg.array_fields.get(f) == Some(true) && !pkg.visible_fields.contains(f) {
+      cand_fields[f] = true
+    }
+  }
+  // Candidate private module-level arrays: top-level `let [mut] name [: Array[..]] = <fresh>` without `pub`.
+  let cand_globals : Map[String, Bool] = Map()
+  let global_counts : Map[String, Int] = Map()
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    let mut d = 0
+    while i < n {
+      let tk = ts[i]
+      if tk.kind == TokenKind::LBrace {
+        d = d + 1
+      } else if tk.kind == TokenKind::RBrace {
+        if d > 0 { d = d - 1 }
+      } else if d == 0 && tk.raw == "let" && !(i > 0 && ts[i - 1].raw == "pub") {
+        let mut ni = i + 1
+        if ni < n && ts[ni].raw == "mut" { ni = ni + 1 }
+        if ni < n && ts[ni].kind == TokenKind::Ident {
+          let gname = ts[ni].raw
+          let prev_c = match global_counts.get(gname) { Some(c) => c, None => 0 }
+          global_counts[gname] = prev_c + 1
+          let eq_i = let_eq_index(ts, ni, n)
+          if eq_i > 0 && eq_i + 1 < n {
+            let re = let_init_end(ts, eq_i + 1, n)
+            if prev_c == 0 && is_fresh_array_rhs(ts, eq_i + 1, re) {
+              cand_globals[gname] = true
+            } else {
+              cand_globals.remove(gname)
+            }
+          } else {
+            cand_globals.remove(gname)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // Helper: check if a field/global use ending at token `p` is strictly non-escaping.
+  let use_is_non_escaping = fn(ts : Array[Token], start_i : Int, p : Int, n : Int) -> Bool {
+    if p + 1 >= n {
+      return false
+    }
+    let nx = ts[p + 1]
+    // 1. Direct indexing `x.f[i]` (NOT slice `x.f[a:b]` / `x.f[:]`)
+    if nx.kind == TokenKind::LBracket {
+      let cb = find_matching_delim(ts, p + 1)
+      if cb < 0 {
+        return false
+      }
+      let mut s = p + 2
+      let mut bd = 0
+      while s < cb {
+        let sk = ts[s].kind
+        if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { bd = bd + 1 }
+        else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { bd = bd - 1 }
+        else if bd == 0 && sk == TokenKind::Colon {
+          // Slice `[:]` creates an ArrayView borrowing the buffer!
+          return false
+        }
+        s = s + 1
+      }
+      return true
+    }
+    // 2. Method call `x.f.m(...)`
+    if nx.kind == TokenKind::Dot && p + 3 < n && ts[p + 2].kind == TokenKind::Ident &&
+    ts[p + 3].kind == TokenKind::LParen {
+      let m = ts[p + 2].raw
+      if m == "iter" {
+        let cp = find_matching_delim(ts, p + 3)
+        return cp > 0 && iter_chain_is_consumed(ts, cp)
+      }
+      return is_read_only_array_method(m) || is_cap_arr_growth_method(m) ||
+      is_cap_arr_write_method(m) || is_cap_arr_shrink_or_shift_method(m) ||
+      m == "shrink_to_fit" || m == "release_unused"
+    }
+    // 3. `for .. in x.f {`
+    if nx.kind == TokenKind::LBrace {
+      let mut h = start_i - 1
+      while h >= 0 && !ts[h].newline_before {
+        if ts[h].raw == "in" {
+          return true
+        }
+        h = h - 1
+      }
+    }
+    // 4. First argument of a non-escaping `mbt_compat::arr_*` helper
+    if start_i >= 4 && ts[start_i - 1].kind == TokenKind::LParen &&
+    ts[start_i - 2].kind == TokenKind::Ident && ts[start_i - 2].raw.starts_with("arr_") &&
+    ts[start_i - 3].kind == TokenKind::ColonColon && ts[start_i - 4].raw == "mbt_compat" &&
+    (nx.kind == TokenKind::Comma || nx.kind == TokenKind::RParen) {
+      let cname = ts[start_i - 2].raw
+      if cname == "arr_iter" {
+        let cp = find_matching_delim(ts, start_i - 1)
+        return cp > 0 && iter_chain_is_consumed(ts, cp)
+      }
+      return cname != "arr_to_array"
+    }
+    // 5. Reassignment `x.f = <fresh>`
+    if nx.kind == TokenKind::Eq && p + 2 < n {
+      let re = let_init_end(ts, p + 2, n)
+      return is_fresh_array_rhs(ts, p + 2, re)
+    }
+    false
+  }
+
+  // Verify every occurrence of every candidate field & global across all files.
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    while i < n {
+      let tk = ts[i]
+      // Check struct literal field init `f: <rhs>` (outside struct type declarations).
+      if tk.kind == TokenKind::Ident && cand_fields.contains(tk.raw) && i + 1 < n && ts[i + 1].kind == TokenKind::Colon {
+        // Skip struct definition `struct S { f : Array[T] }`
+        let bo = outermost_body_open(ts, i)
+        if bo >= 0 && !is_type_decl_brace(ts, bo) {
+          // Inside a function/test body: this is a struct literal field init `f: <rhs>` or pattern.
+          // Find end of field initializer at depth 0 (`,` or `}`).
+          let rhs_s = i + 2
+          let mut rhs_e = rhs_s
+          let mut fd = 0
+          while rhs_e < n {
+            let rk = ts[rhs_e].kind
+            if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { fd = fd + 1 }
+            else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace {
+              if fd == 0 { break }
+              fd = fd - 1
+            } else if fd == 0 && rk == TokenKind::Comma {
+              break
+            }
+            rhs_e = rhs_e + 1
+          }
+          if !is_fresh_array_rhs(ts, rhs_s, rhs_e) {
+            cand_fields.remove(tk.raw)
+          }
+        }
+      }
+      // Check struct literal punning `{ .., f, .. }` inside a function body (could store a caller array!).
+      if tk.kind == TokenKind::Ident && cand_fields.contains(tk.raw) && i > 0 && i + 1 < n &&
+      (ts[i - 1].kind == TokenKind::LBrace || ts[i - 1].kind == TokenKind::Comma) &&
+      (ts[i + 1].kind == TokenKind::Comma || ts[i + 1].kind == TokenKind::RBrace) {
+        let bo = outermost_body_open(ts, i)
+        if bo >= 0 {
+          cand_fields.remove(tk.raw)
+        }
+      }
+      // Check field access `<recv>.f`
+      if tk.kind == TokenKind::Ident && cand_fields.contains(tk.raw) && i > 0 && ts[i - 1].kind == TokenKind::Dot {
+        // Walk back to start of receiver path `a.b.f`
+        let mut s = i - 2
+        while s >= 2 && ts[s - 1].kind == TokenKind::Dot && ts[s - 2].kind == TokenKind::Ident {
+          s = s - 2
+        }
+        if s < 0 { s = 0 }
+        if !use_is_non_escaping(ts, s, i, n) {
+          cand_fields.remove(tk.raw)
+        }
+      }
+      // Check global array use inside function bodies
+      if tk.kind == TokenKind::Ident && cand_globals.contains(tk.raw) &&
+      !(i > 0 && (ts[i - 1].kind == TokenKind::Dot || ts[i - 1].kind == TokenKind::ColonColon)) {
+        let bo = outermost_body_open(ts, i)
+        if bo >= 0 {
+          if !use_is_non_escaping(ts, i, i, n) {
+            cand_globals.remove(tk.raw)
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  for f in cand_fields.keys() {
+    pkg.visible_fields[" confined_field:" + f] = true
+  }
+  for g in cand_globals.keys() {
+    pkg.visible_fields[" confined_global:" + g] = true
+  }
+}
+
+///| Declaration-bound effect summary for one package function or method.
+pub struct CapFnEffect {
+  decl_key : String
+  is_pub : Bool
+  mut may_shrink_or_shift : Bool
+  mut may_grow : Bool
+  mut may_write : Bool
+  mut may_shrink_to_fit : Bool
+  mut may_call_unknown : Bool
+}
+
+pub fn CapFnEffect::is_pure_read_only(self : CapFnEffect) -> Bool {
+  !self.may_shrink_or_shift && !self.may_grow && !self.may_write &&
+  !self.may_shrink_to_fit && !self.may_call_unknown
+}
+
+///| Declaration-bound package effect summary for sound `search_by`, `kept_iter`, and `for .. in` analysis.
+pub struct CapPkgSummary {
+  // Keyed by canonical `recv_type + "::" + method_name` (or `"::" + fn_name` for free functions).
+  effects : Map[String, CapFnEffect]
+  // Bare method/fn name -> list of canonical decl_keys declaring it.
+  by_name : Map[String, Array[String]]
+  // User-defined methods + dependency methods (for built-in method shadowing / `impl Eq` checks).
+  sort_env : SortKeyEnv
+  // True iff any user type in this package or its deps defines `impl Eq`.
+  has_custom_eq : Bool
+  // Struct closure fields `(e.f)()` proven safe: struct is non-pub or field is `priv`, and every
+  // construction/assignment in the package assigns a pure closure literal.
+  safe_closure_fields : Map[String, Bool]
+  // Array-typed fields map (from `collect_array_fields_from_tokens`).
+  array_fields : Map[String, Bool]
+}
+
+pub fn CapPkgSummary::empty() -> CapPkgSummary {
+  CapPkgSummary::{
+    effects: Map(),
+    by_name: Map(),
+    sort_env: SortKeyEnv::{ methods: Map() },
+    has_custom_eq: false,
+    safe_closure_fields: Map(),
+    array_fields: Map(),
+  }
+}
+
+///| Check whether a bare method or free function name is proven pure read-only across ALL package declarations
+///| of that name (returns false if undeclared, shadowed by a dep method, or any declaration has effects).
+fn summary_fn_is_pure_read_only(summary : CapPkgSummary, name : String, is_method : Bool) -> Bool {
+  if is_method {
+    match summary.by_name.get(name) {
+      Some(keys) => {
+        if keys.length() == 0 {
+          return false
+        }
+        // If a dependency also defines a method of this name, we lack its body -> fail closed.
+        if sort_key_dep_methods.contains(name) {
+          return false
+        }
+        for dk in keys {
+          match summary.effects.get(dk) {
+            Some(ef) => if !ef.is_pure_read_only() { return false }
+            None => return false
+          }
+        }
+        true
+      }
+      None => false
+    }
+  } else {
+    let dk = "::" + name
+    match summary.effects.get(dk) {
+      Some(ef) => ef.is_pure_read_only()
+      None => false
+    }
+  }
+}
+
+///| Check whether a package function/method may perform a hazardous array op (shrink/shift/shrink_to_fit or grow+write).
+fn summary_fn_may_hazard_array(summary : CapPkgSummary, name : String) -> Bool {
+  match summary.by_name.get(name) {
+    Some(keys) => {
+      for dk in keys {
+        match summary.effects.get(dk) {
+          Some(ef) =>
+          if ef.may_shrink_or_shift || ef.may_shrink_to_fit || (ef.may_grow && ef.may_write) {
+            return true
+          }
+          None => ()
+        }
+      }
+      false
+    }
+    None => false
+  }
+}
+
+///| Build declaration-bound `CapPkgSummary` from pre-lexed package tokens (zero re-lexing).
+pub fn collect_cap_pkg_summary(
+  all_tokens : Array[Array[Token]],
+  dep_methods : Map[String, Bool],
+) -> CapPkgSummary {
+  let sort_env = sort_key_env_of_with_deps(all_tokens, dep_methods)
+  let has_custom_eq = sort_env.methods.contains(" eq")
+  let array_fields = collect_array_fields_from_tokens(all_tokens)
+  let effects : Map[String, CapFnEffect] = Map()
+  let by_name : Map[String, Array[String]] = Map()
+  let call_edges : Map[String, Array[String]] = Map()
+
+  let register_decl = fn(
+    decl_key : String,
+    bare_name : String,
+    is_pub : Bool,
+    ts : Array[Token],
+    body_open : Int,
+    body_close : Int,
+  ) {
+    let ef = CapFnEffect::{
+      decl_key: decl_key,
+      is_pub: is_pub,
+      may_shrink_or_shift: false,
+      may_grow: false,
+      may_write: false,
+      may_shrink_to_fit: false,
+      may_call_unknown: false,
+    }
+    let edges : Array[String] = []
+    let local_fresh = fresh_locals_before(ts, body_open, body_close)
+    let mut k = body_open + 1
+    while k < body_close {
+      let tk = ts[k]
+      if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline || tk.kind == TokenKind::PipeGt {
+        ef.may_call_unknown = true
+      } else if tk.kind == TokenKind::Dot && k + 2 < body_close && ts[k + 1].kind == TokenKind::Ident &&
+      ts[k + 2].kind == TokenKind::LParen {
+        let m = ts[k + 1].raw
+        let recv_r = receiver_root(ts, k - 1)
+        let recv_is_field = k - 1 >= 2 && ts[k - 2].kind == TokenKind::Dot
+        let is_own_fresh = !recv_is_field && recv_r.length() > 0 && local_fresh.contains(recv_r)
+        if is_cap_arr_shrink_or_shift_method(m) {
+          if !is_own_fresh { ef.may_shrink_or_shift = true }
+        } else if is_cap_arr_growth_method(m) {
+          if !is_own_fresh { ef.may_grow = true }
+        } else if is_cap_arr_write_method(m) {
+          if !is_own_fresh { ef.may_write = true }
+        } else if m == "shrink_to_fit" {
+          if !is_own_fresh { ef.may_shrink_to_fit = true }
+        } else if !is_pure_key_method(m) || sort_env.methods.contains(m) {
+          edges.push("M:" + m)
+        }
+      } else if tk.kind == TokenKind::RBracket && k + 1 < body_close &&
+      (ts[k + 1].kind == TokenKind::Eq || ts[k + 1].kind == TokenKind::AssignOp) {
+        let lb = find_open_before(ts, k, body_open)
+        let wr_r = if lb > body_open { receiver_root(ts, lb - 1) } else { "" }
+        let wr_is_field = lb - 1 >= 2 && ts[lb - 2].kind == TokenKind::Dot
+        let is_own_fresh = !wr_is_field && wr_r.length() > 0 && local_fresh.contains(wr_r)
+        if !is_own_fresh {
+          ef.may_write = true
+        }
+      } else if (tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket) &&
+      k + 1 < body_close && ts[k + 1].kind == TokenKind::LParen && !ts[k + 1].newline_before {
+        ef.may_call_unknown = true
+      } else if tk.kind == TokenKind::Ident && k + 1 < body_close && ts[k + 1].kind == TokenKind::LParen &&
+      !ts[k + 1].newline_before && !is_call_keyword(tk.raw) && !(k > 0 && ts[k - 1].raw == "fn") {
+        if k >= 2 && ts[k - 1].kind == TokenKind::ColonColon {
+          let q = ts[k - 2].raw
+          if q == "mbt_compat" {
+            let cp = find_matching_delim(ts, k + 1)
+            let a0_r = if k + 2 < cp { receiver_root(ts, k + 2) } else { "" }
+            let a0_fresh = a0_r.length() > 0 && local_fresh.contains(a0_r) &&
+            (k + 3 >= cp || ts[k + 3].kind == TokenKind::Comma || ts[k + 3].kind == TokenKind::RParen)
+            if is_cap_compat_shrink_or_shift_fn(tk.raw) {
+              if !a0_fresh { ef.may_shrink_or_shift = true }
+            } else if is_cap_compat_growth_fn(tk.raw) {
+              if !a0_fresh { ef.may_grow = true }
+            } else if is_cap_compat_write_fn(tk.raw) {
+              if !a0_fresh { ef.may_write = true }
+            } else if tk.raw == "arr_shrink_to_fit" {
+              if !a0_fresh { ef.may_shrink_to_fit = true }
+            } else if !is_pure_key_compat_helper(tk.raw) {
+              ef.may_call_unknown = true
+            }
+          } else if is_ctor_name(tk.raw) {
+            ()
+          } else {
+            edges.push("Q:" + q + "::" + tk.raw)
+          }
+        } else if !(k > 0 && ts[k - 1].kind == TokenKind::Dot) && !is_ctor_name(tk.raw) &&
+        !is_pure_builtin_free_fn(tk.raw) {
+          edges.push("F:" + tk.raw)
+        }
+      }
+      k = k + 1
+    }
+    effects[decl_key] = ef
+    let prev_list = match by_name.get(bare_name) {
+      Some(l) => l
+      None => []
+    }
+    prev_list.push(decl_key)
+    by_name[bare_name] = prev_list
+    call_edges[decl_key] = edges
+  }
+
+  // Pass 1: Scan every top-level `fn`, `fn T::m`, and `impl Trait for T { fn m }` declaration.
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    let mut d = 0
+    while i < n {
+      let tk = ts[i]
+      if tk.kind == TokenKind::LBrace {
+        d = d + 1
+      } else if tk.kind == TokenKind::RBrace {
+        if d > 0 { d = d - 1 }
+      } else if d == 0 && tk.raw == "fn" && i + 1 < n && ts[i + 1].kind != TokenKind::LParen {
+        let is_pub = i > 0 && ts[i - 1].raw == "pub"
+        let mut ni = i + 1
+        if ni < n && ts[ni].kind == TokenKind::LBracket {
+          ni = find_matching_delim(ts, ni) + 1
+        }
+        let mut decl_key = ""
+        let mut bare_name = ""
+        let mut pi = ni + 1
+        if ni + 2 < n && ts[ni].kind == TokenKind::UpperIdent && ts[ni + 1].kind == TokenKind::ColonColon &&
+        ts[ni + 2].kind == TokenKind::Ident {
+          decl_key = ts[ni].raw + "::" + ts[ni + 2].raw
+          bare_name = ts[ni + 2].raw
+          pi = ni + 3
+        } else if ni < n && ts[ni].kind == TokenKind::Ident {
+          decl_key = "::" + ts[ni].raw
+          bare_name = ts[ni].raw
+          pi = ni + 1
+        }
+        if decl_key.length() > 0 {
+          let mut lb = pi
+          let mut pd = 0
+          while lb < n {
+            let lk = ts[lb].kind
+            if lk == TokenKind::LParen || lk == TokenKind::LBracket { pd = pd + 1 }
+            else if lk == TokenKind::RParen || lk == TokenKind::RBracket { pd = pd - 1 }
+            else if pd == 0 && lk == TokenKind::LBrace { break }
+            lb = lb + 1
+          }
+          if lb < n && ts[lb].kind == TokenKind::LBrace {
+            let rb = find_matching_delim(ts, lb)
+            if rb > lb {
+              register_decl(decl_key, bare_name, is_pub, ts, lb, rb)
+              i = rb + 1
+              continue
+            }
+          }
+        }
+      } else if d == 0 && tk.raw == "impl" {
+        let mut ti = i + 1
+        if ti < n && ts[ti].kind == TokenKind::LBracket {
+          ti = find_matching_delim(ts, ti) + 1
+        }
+        let mut ty_name = ""
+        while ti < n && ts[ti].kind != TokenKind::LBrace {
+          if ts[ti].kind == TokenKind::UpperIdent {
+            ty_name = ts[ti].raw
+          }
+          ti = ti + 1
+        }
+        if ty_name.length() > 0 && ti < n && ts[ti].kind == TokenKind::LBrace {
+          let impl_rb = find_matching_delim(ts, ti)
+          let mut mi = ti + 1
+          let mut md = 0
+          while mi < impl_rb {
+            let mtk = ts[mi]
+            if mtk.kind == TokenKind::LBrace { md = md + 1 }
+            else if mtk.kind == TokenKind::RBrace { if md > 0 { md = md - 1 } }
+            else if md == 0 && mtk.raw == "fn" && mi + 1 < impl_rb {
+              let mut mni = mi + 1
+              if mni < impl_rb && ts[mni].kind == TokenKind::LBracket {
+                mni = find_matching_delim(ts, mni) + 1
+              }
+              if mni < impl_rb && ts[mni].kind == TokenKind::Ident {
+                let mname = ts[mni].raw
+                let mut mlb = mni + 1
+                let mut mpd = 0
+                while mlb < impl_rb {
+                  let mlk = ts[mlb].kind
+                  if mlk == TokenKind::LParen || mlk == TokenKind::LBracket { mpd = mpd + 1 }
+                  else if mlk == TokenKind::RParen || mlk == TokenKind::RBracket { mpd = mpd - 1 }
+                  else if mpd == 0 && mlk == TokenKind::LBrace { break }
+                  mlb = mlb + 1
+                }
+                if mlb < impl_rb && ts[mlb].kind == TokenKind::LBrace {
+                  let mrb = find_matching_delim(ts, mlb)
+                  if mrb > mlb {
+                    register_decl(ty_name + "::" + mname, mname, true, ts, mlb, mrb)
+                    mi = mrb + 1
+                    continue
+                  }
+                }
+              }
+            }
+            mi = mi + 1
+          }
+          i = impl_rb + 1
+          continue
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // Pass 2: Monotone conservative fixpoint over call edges (handles mutual recursion cleanly).
+  let mut changed = true
+  while changed {
+    changed = false
+    for dk in effects.keys() {
+      match effects.get(dk) {
+        Some(ef) => {
+          let edges = match call_edges.get(dk) {
+            Some(es) => es
+            None => []
+          }
+          for edge in edges {
+            if edge.starts_with("F:") {
+              let fnm = edge.slice(2, edge.length())
+              match effects.get("::" + fnm) {
+                Some(cef) => {
+                  if cef.may_shrink_or_shift && !ef.may_shrink_or_shift { ef.may_shrink_or_shift = true; changed = true }
+                  if cef.may_grow && !ef.may_grow { ef.may_grow = true; changed = true }
+                  if cef.may_write && !ef.may_write { ef.may_write = true; changed = true }
+                  if cef.may_shrink_to_fit && !ef.may_shrink_to_fit { ef.may_shrink_to_fit = true; changed = true }
+                  if cef.may_call_unknown && !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
+                }
+                None =>
+                if !ef.may_call_unknown {
+                  ef.may_call_unknown = true
+                  changed = true
+                }
+              }
+            } else if edge.starts_with("Q:") {
+              let qk = edge.slice(2, edge.length())
+              match effects.get(qk) {
+                Some(cef) => {
+                  if cef.may_shrink_or_shift && !ef.may_shrink_or_shift { ef.may_shrink_or_shift = true; changed = true }
+                  if cef.may_grow && !ef.may_grow { ef.may_grow = true; changed = true }
+                  if cef.may_write && !ef.may_write { ef.may_write = true; changed = true }
+                  if cef.may_shrink_to_fit && !ef.may_shrink_to_fit { ef.may_shrink_to_fit = true; changed = true }
+                  if cef.may_call_unknown && !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
+                }
+                None =>
+                if !ef.may_call_unknown {
+                  ef.may_call_unknown = true
+                  changed = true
+                }
+              }
+            } else if edge.starts_with("M:") {
+              let mn = edge.slice(2, edge.length())
+              let targets = match by_name.get(mn) {
+                Some(l) => l
+                None => []
+              }
+              if targets.length() == 0 || dep_methods.contains(mn) {
+                if !ef.may_call_unknown {
+                  ef.may_call_unknown = true
+                  changed = true
+                }
+              } else {
+                for tdk in targets {
+                  match effects.get(tdk) {
+                    Some(cef) => {
+                      if cef.may_shrink_or_shift && !ef.may_shrink_or_shift { ef.may_shrink_or_shift = true; changed = true }
+                      if cef.may_grow && !ef.may_grow { ef.may_grow = true; changed = true }
+                      if cef.may_write && !ef.may_write { ef.may_write = true; changed = true }
+                      if cef.may_shrink_to_fit && !ef.may_shrink_to_fit { ef.may_shrink_to_fit = true; changed = true }
+                      if cef.may_call_unknown && !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
+                    }
+                    None => ()
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => ()
+      }
+    }
+  }
+
+  // Pass 3: Private struct closure fields `(e.f)()`:
+  // Safe ONLY if struct is non-pub (or field `priv`) AND every construction/assignment in the package assigns
+  // a closure literal whose body has no mutations/unknown calls.
+  let safe_closure_fields : Map[String, Bool] = Map()
+  let pub_closure_fields : Map[String, Bool] = Map()
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    while i < n {
+      if ts[i].raw == "struct" {
+        let is_pub_struct = i > 0 && ts[i - 1].raw == "pub"
+        let mut o = i + 1
+        while o < n && ts[o].kind != TokenKind::LBrace && ts[o].kind != TokenKind::LParen && ts[o].kind != TokenKind::Eof {
+          o = o + 1
+        }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          let mut k = o + 1
+          let mut fd = 0
+          while k > 0 && k + 2 < close {
+            let kk = ts[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { fd = fd + 1 }
+            else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { fd = fd - 1 }
+            else if fd == 0 && kk == TokenKind::Ident && ts[k + 1].kind == TokenKind::Colon &&
+            (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].raw == "priv" || ts[k - 1].kind == TokenKind::Comma) {
+              // Check if field type contains `->` (function/closure type)
+              let mut q = k + 2
+              let mut is_fn_ty = false
+              let mut td = 0
+              while q < close {
+                let qk = ts[q].kind
+                if td == 0 && (ts[q].newline_before || qk == TokenKind::Comma) { break }
+                if qk == TokenKind::LParen || qk == TokenKind::LBracket { td = td + 1 }
+                else if qk == TokenKind::RParen || qk == TokenKind::RBracket { td = td - 1 }
+                else if ts[q].raw == "->" { is_fn_ty = true }
+                q = q + 1
+              }
+              if is_fn_ty {
+                let is_priv_field = ts[k - 1].raw == "priv" || (k >= 2 && ts[k - 1].raw == "mut" && ts[k - 2].raw == "priv")
+                if is_pub_struct && !is_priv_field {
+                  pub_closure_fields[ts[k].raw] = true
+                } else {
+                  safe_closure_fields[ts[k].raw] = true
+                }
+              }
+            }
+            k = k + 1
+          }
+          i = if close > i { close } else { i + 1 }
+          continue
+        }
+      }
+      i = i + 1
+    }
+  }
+  for pf in pub_closure_fields.keys() {
+    safe_closure_fields.remove(pf)
+  }
+  if safe_closure_fields.length() > 0 {
+    // Audit every struct literal field init `f: <rhs>`, punning `{ f }`, and assignment `.f = <rhs>` in the package.
+    let seen_init : Map[String, Bool] = Map()
+    for ts in all_tokens {
+      let n = ts.length()
+      let mut i = 0
+      while i < n {
+        let tk = ts[i]
+        if tk.kind == TokenKind::Ident && safe_closure_fields.contains(tk.raw) {
+          let bo = outermost_body_open(ts, i)
+          if bo >= 0 && !is_type_decl_brace(ts, bo) {
+            if i + 1 < n && ts[i + 1].kind == TokenKind::Colon {
+              seen_init[tk.raw] = true
+              let rhs_s = i + 2
+              let mut rhs_e = rhs_s
+              let mut fd = 0
+              while rhs_e < n {
+                let rk = ts[rhs_e].kind
+                if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { fd = fd + 1 }
+                else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace {
+                  if fd == 0 { break }
+                  fd = fd - 1
+                } else if fd == 0 && rk == TokenKind::Comma {
+                  break
+                }
+                rhs_e = rhs_e + 1
+              }
+              if !(rhs_s + 1 < rhs_e && ts[rhs_s].raw == "fn" && ts[rhs_s + 1].kind == TokenKind::LParen) {
+                safe_closure_fields.remove(tk.raw)
+              } else {
+                let cp = find_matching_delim(ts, rhs_s + 1)
+                let mut lb = cp + 1
+                while lb < rhs_e && ts[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+                if lb >= rhs_e || ts[lb].kind != TokenKind::LBrace {
+                  safe_closure_fields.remove(tk.raw)
+                } else {
+                  let rb = find_matching_delim(ts, lb)
+                  let dummy_flags = [false, false]
+                  let cs = callable_locals(ts, bo)
+                  if closure_body_opacity(ts, lb, rb, cs).length() > 0 ||
+                  kept_iter_mutations(ts, Map(), true, lb + 1, rb, bo, "", cs, dummy_flags).length() > 0 ||
+                  dummy_flags[0] || dummy_flags[1] {
+                    safe_closure_fields.remove(tk.raw)
+                  }
+                }
+              }
+            } else if i > 0 && ts[i - 1].kind == TokenKind::Dot && i + 1 < n && ts[i + 1].kind == TokenKind::Eq {
+              // Assignment `.f = rhs`
+              safe_closure_fields.remove(tk.raw)
+            } else if i > 0 && (ts[i - 1].kind == TokenKind::LBrace || ts[i - 1].kind == TokenKind::Comma) &&
+            i + 1 < n && (ts[i + 1].kind == TokenKind::Comma || ts[i + 1].kind == TokenKind::RBrace) {
+              // Punning `{ f }` passes a variable/parameter
+              safe_closure_fields.remove(tk.raw)
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    let to_drop : Array[String] = []
+    for f in safe_closure_fields.keys() {
+      if !seen_init.contains(f) {
+        to_drop.push(f)
+      }
+    }
+    for f in to_drop {
+      safe_closure_fields.remove(f)
+    }
+  }
+
+  CapPkgSummary::{
+    effects: effects,
+    by_name: by_name,
+    sort_env: sort_env,
+    has_custom_eq: has_custom_eq,
+    safe_closure_fields: safe_closure_fields,
+    array_fields: array_fields,
+  }
+}
+
+///| Sound `Array::search_by(pred)` hazard checker enforcing MoonBit's `(buf, init_len)` slot-stability invariant.
+///| Returns "" when live-array `mbt_compat::arr_search_by` is proven 100% semantically identical to MoonBit,
+///| or a concrete diagnostic reason otherwise (fail-closed).
+pub fn search_by_hazard(tokens : Array[Token], dot_i : Int, summary : CapPkgSummary) -> String {
+  if dot_i <= 0 || dot_i + 2 >= tokens.length() || tokens[dot_i + 2].kind != TokenKind::LParen {
+    return "malformed `.search_by(` call"
+  }
+  let close_p = find_matching_delim(tokens, dot_i + 2)
+  if close_p < 0 || dot_i + 3 >= close_p {
+    return "unbalanced `.search_by(` call"
+  }
+  let body_open = outermost_body_open(tokens, dot_i)
+  if body_open < 0 {
+    return "search_by outside function body"
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  let root = receiver_root(tokens, dot_i - 1)
+  let fresh_root = is_array_literal_end(tokens, dot_i - 1) ||
+  (root.length() > 0 && fresh_local_binding(tokens, root, body_open, dot_i, true))
+  let names : Map[String, Bool] = if fresh_root && root.length() > 0 {
+    array_aliases(tokens, root, body_open, body_close)
+  } else {
+    Map()
+  }
+  let computed = !fresh_root
+  let callables = callable_locals(tokens, body_open)
+  let arg_s = dot_i + 3
+  let arg_e = close_p
+
+  // Callback must be an inline closure literal `fn(...) { ... }`, a single-binding local closure literal,
+  // or a pure package-local free function (not shadowed by a local/param).
+  let mut cb_open = -1
+  let mut cb_close = -1
+  let mut cb_tokens = tokens
+  let mut cb_body_open = body_open
+  if tokens[arg_s].raw == "fn" && arg_s + 1 < arg_e && tokens[arg_s + 1].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, arg_s + 1)
+    let mut lb = cp + 1
+    while lb < arg_e && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+    if lb < arg_e && tokens[lb].kind == TokenKind::LBrace {
+      cb_open = lb
+      cb_close = find_matching_delim(tokens, lb)
+    } else {
+      return "`search_by` closure has no body"
+    }
+  } else if arg_e == arg_s + 1 && tokens[arg_s].kind == TokenKind::Ident {
+    let cname = tokens[arg_s].raw
+    let lb = local_closure_body(tokens, arg_s, cname)
+    if lb >= 0 {
+      cb_open = lb
+      cb_close = find_matching_delim(tokens, lb)
+    } else if !callables.contains(cname) && summary_fn_is_pure_read_only(summary, cname, false) {
+      return ""
+    } else {
+      return "`search_by` takes an opaque callback `" + cname + "`"
+    }
+  } else {
+    return "`search_by` takes a non-literal callback expression"
+  }
+
+  let flags = [false, false]
+  let why = search_by_body_hazard(cb_tokens, cb_open + 1, cb_close, cb_body_open, dot_i, root, names, computed, callables, summary, flags, 0)
+  if why.length() > 0 {
+    return why
+  }
+  appends_and_writes(flags)
+}
+
+fn search_by_body_hazard(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  body_open : Int,
+  site_i : Int,
+  root : String,
+  names : Map[String, Bool],
+  computed : Bool,
+  callables : Map[String, Bool],
+  summary : CapPkgSummary,
+  flags : Array[Bool],
+  depth : Int,
+) -> String {
+  let mut k = s
+  while k < e {
+    let tk = tokens[k]
+    let kk = tk.kind
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline {
+      return "the callback interpolates a string (may run arbitrary `Show` code)"
+    }
+    if kk == TokenKind::PipeGt {
+      return "the callback uses `|>` pipe"
+    }
+    if (kk == TokenKind::EqEq || tk.raw == "!=") && summary.has_custom_eq {
+      // Allow `==`/`!=` on literals (`""`, `0`, `true`, `false`, `'a'`), or when one side is a literal/builtin.
+      let lhs_lit = k > s && (tokens[k - 1].kind == TokenKind::IntLit || tokens[k - 1].kind == TokenKind::FloatLit ||
+        tokens[k - 1].kind == TokenKind::StringLit || tokens[k - 1].kind == TokenKind::CharLit ||
+        tokens[k - 1].raw == "true" || tokens[k - 1].raw == "false")
+      let rhs_lit = k + 1 < e && (tokens[k + 1].kind == TokenKind::IntLit || tokens[k + 1].kind == TokenKind::FloatLit ||
+        tokens[k + 1].kind == TokenKind::StringLit || tokens[k + 1].kind == TokenKind::CharLit ||
+        tokens[k + 1].raw == "true" || tokens[k + 1].raw == "false")
+      let lhs_bi = lhs_lit || (k > s && receiver_is_builtin(tokens, k - 1, body_open, site_i, summary.sort_env))
+      let rhs_bi = rhs_lit || (k + 1 < e && receiver_is_builtin(tokens, k + 1, body_open, site_i, summary.sort_env))
+      if !(lhs_bi || rhs_bi) {
+        return "the callback compares with `" + tk.raw + "` while a user type has an `impl Eq`"
+      }
+    }
+    // Index write `arr[i] = v`
+    if kk == TokenKind::RBracket && k + 1 < e &&
+    (tokens[k + 1].kind == TokenKind::Eq || tokens[k + 1].kind == TokenKind::AssignOp) {
+      let lb = find_open_before(tokens, k, s)
+      let wr_root = if lb > s { receiver_root(tokens, lb - 1) } else { "" }
+      let is_disjoint = !computed && wr_root.length() > 0 && !names.contains(wr_root)
+      if !is_disjoint {
+        flags[1] = true
+      }
+    }
+    // Indirect call `(...)(...)` or `arr[0](...)`
+    if (kk == TokenKind::RParen || kk == TokenKind::RBracket) && k + 1 < e &&
+    tokens[k + 1].kind == TokenKind::LParen && !tokens[k + 1].newline_before {
+      // Check proven-safe private struct closure field `(e.off)()`
+      let mut safe_field_call = false
+      if kk == TokenKind::RParen {
+        let op = find_open_before(tokens, k, s)
+        if op >= s && k - op >= 3 && tokens[k - 1].kind == TokenKind::Ident &&
+        tokens[k - 2].kind == TokenKind::Dot && summary.safe_closure_fields.contains(tokens[k - 1].raw) {
+          safe_field_call = true
+        }
+      }
+      if !safe_field_call {
+        return "the callback makes an indirect call"
+      }
+    }
+    // Method call `recv.m(...)`
+    if kk == TokenKind::Dot && k + 2 < e && tokens[k + 1].kind == TokenKind::Ident &&
+    tokens[k + 2].kind == TokenKind::LParen {
+      let m = tokens[k + 1].raw
+      let recv_r = receiver_root(tokens, k - 1)
+      let is_disjoint = !computed && recv_r.length() > 0 && !names.contains(recv_r)
+      if is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit" {
+        if !is_disjoint {
+          return "`." + m + "(..)` mutates the array during `search_by`"
+        }
+      } else if is_cap_arr_growth_method(m) {
+        if !is_disjoint {
+          flags[0] = true
+        }
+      } else if is_cap_arr_write_method(m) {
+        if !is_disjoint {
+          flags[1] = true
+        }
+      } else if m == "capacity" {
+        return "`.capacity()` may observe buffer reallocation during `search_by`"
+      } else {
+        // Check if method is proven pure built-in or proven pure package method
+        let pure_bi = (is_pure_key_method(m) || m == "has_prefix" || m == "has_suffix" || m == "starts_with" ||
+          m == "ends_with" || m == "trim" || m == "trim_end" || m == "to_lower" || m == "to_upper") &&
+        (!summary.sort_env.methods.contains(m) || receiver_is_builtin(tokens, k - 1, body_open, site_i, summary.sort_env))
+        let pure_iter_chain = m == "iter" && iter_chain_is_consumed(tokens, find_matching_delim(tokens, k + 2))
+        let pure_iter_term = (m == "any" || m == "all" || m == "count" || m == "find_first") &&
+        !summary.sort_env.methods.contains(m)
+        if !pure_bi && !pure_iter_chain && !pure_iter_term && !summary_fn_is_pure_read_only(summary, m, true) {
+          return "the callback calls `." + m + "(..)`, which is not proven mutation-free"
+        }
+      }
+    }
+    // Free or qualified call
+    if kk == TokenKind::Ident && k + 1 < e && tokens[k + 1].kind == TokenKind::LParen &&
+    !tokens[k + 1].newline_before && !is_call_keyword(tk.raw) && !(k > 0 && tokens[k - 1].raw == "fn") &&
+    !(k > 0 && tokens[k - 1].kind == TokenKind::Dot) {
+      if k >= 2 && tokens[k - 1].kind == TokenKind::ColonColon {
+        let q = tokens[k - 2].raw
+        if q == "mbt_compat" {
+          if is_cap_compat_shrink_or_shift_fn(tk.raw) || tk.raw == "arr_shrink_to_fit" {
+            return "`mbt_compat::" + tk.raw + "(..)` mutates the array during `search_by`"
+          } else if is_cap_compat_growth_fn(tk.raw) {
+            flags[0] = true
+          } else if is_cap_compat_write_fn(tk.raw) {
+            flags[1] = true
+          } else if !is_pure_key_compat_helper(tk.raw) && !is_pure_first_order_mbt_compat_fn(tk.raw) {
+            return "the callback calls `mbt_compat::" + tk.raw + "(..)`"
+          }
+        } else if is_ctor_name(tk.raw) {
+          ()
+        } else if !(k >= 3 && tokens[k - 3].kind == TokenKind::ColonColon) {
+          // 2-segment `Type::method(...)` in same package
+          match summary.effects.get(q + "::" + tk.raw) {
+            Some(ef) => if !ef.is_pure_read_only() {
+              return "the callback calls `" + q + "::" + tk.raw + "(..)`, which may mutate arrays"
+            }
+            None => return "the callback calls unknown `" + q + "::" + tk.raw + "(..)`"
+          }
+        } else {
+          return "the callback makes a cross-package call to `" + q + "::" + tk.raw + "(..)`"
+        }
+      } else if is_ctor_name(tk.raw) || is_pure_builtin_free_fn(tk.raw) {
+        if callables.contains(tk.raw) {
+          return "the callback calls shadowed `" + tk.raw + "(..)`"
+        }
+      } else {
+        // Local closure literal or package free function
+        let lb = local_closure_body(tokens, k, tk.raw)
+        if lb >= 0 && !(lb < k && k < find_matching_delim(tokens, lb)) {
+          if depth >= 8 {
+            return "the callback nests local closures too deeply"
+          }
+          let why = search_by_body_hazard(tokens, lb + 1, find_matching_delim(tokens, lb), body_open, site_i, root, names, computed, callables, summary, flags, depth + 1)
+          if why.length() > 0 {
+            return why + " (through `" + tk.raw + "`)"
+          }
+        } else if callables.contains(tk.raw) {
+          return "the callback calls opaque closure `" + tk.raw + "(..)`"
+        } else if !summary_fn_is_pure_read_only(summary, tk.raw, false) {
+          return "the callback calls `" + tk.raw + "(..)`, which is not proven mutation-free"
+        }
+      }
+    }
+    k = k + 1
+  }
+  ""
+}
+
+///| True iff the statement starting at `stmt_i` inside block `(block_open, block_close)` is immediately
+///| followed by an unconditional `break` or `return` before any loop iteration can continue (e.g.
+///| `if e.id == id { self.entries.remove(i); break }`).
+fn stmt_immediately_exits_loop(tokens : Array[Token], stmt_i : Int, block_close : Int) -> Bool {
+  // Walk to end of current statement, then check the next statement in the same block.
+  let se = statement_end(tokens, stmt_i, block_close)
+  let mut k = se
+  while k < block_close && tokens[k].kind == TokenKind::Semi {
+    k = k + 1
+  }
+  if k >= block_close {
+    return false
+  }
+  if tokens[k].raw == "break" || tokens[k].raw == "return" {
+    return true
+  }
+  // Allow up to 3 simple non-looping statements before `break`/`return` (e.g. `push`; `changed.set(...)`; `break`)
+  // as long as none of them contain a nested loop or branch that could skip the `break`.
+  let mut steps = 0
+  let mut cur = k
+  while cur < block_close && steps < 4 {
+    let r = tokens[cur].raw
+    if r == "break" || r == "return" {
+      return true
+    }
+    if r == "if" || r == "while" || r == "for" || r == "match" || r == "continue" {
+      return false
+    }
+    let nxt = statement_end(tokens, cur, block_close)
+    cur = nxt
+    while cur < block_close && tokens[cur].kind == TokenKind::Semi {
+      cur = cur + 1
+    }
+    steps = steps + 1
+  }
+  false
+}
+
+///| Sound `for x in xs { ... }` / `for i, x in xs { ... }` hazard checker (Opus P1-3).
+///| Catches any shrink (`clear`/`pop`/`remove`/`truncate`/`drain`/`retain`), compound shift
+///| (`insert`/`splice`/`resize`/etc.), `shrink_to_fit`, or grow+write on `xs` or its aliases
+///| (including via local closures or package functions called in the loop body) when another
+///| iteration may still read a slot of `xs`. Returns "" if safe, or a diagnostic reason.
+pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgSummary) -> String {
+  let n = tokens.length()
+  // Find `in` and `{` of this `for ... in <iter> {`
+  let mut j = for_i + 1
+  let mut in_i = -1
+  let mut hd = 0
+  while j < n {
+    let jk = tokens[j].kind
+    if hd == 0 && jk == TokenKind::LBrace {
+      break
+    }
+    if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { hd = hd + 1 }
+    else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { hd = hd - 1 }
+    else if hd == 0 && tokens[j].raw == "in" {
+      in_i = j
+    } else if hd == 0 && in_i > 0 && (tokens[j].raw == "..<" || tokens[j].raw == "..=") {
+      // Range loop `for i in a..<b` — not an array iteration
+      return ""
+    }
+    j = j + 1
+  }
+  if in_i < 0 || j >= n || tokens[j].kind != TokenKind::LBrace {
+    return ""
+  }
+  let loop_open = j
+  let loop_close = find_matching_delim(tokens, loop_open)
+  if loop_close <= loop_open {
+    return ""
+  }
+  // Array literal `for x in [1, 2, 3]` or private copy `for x in copy`: cannot be mutated through any name.
+  if is_array_literal_end(tokens, loop_open - 1) {
+    return ""
+  }
+  let body_open = outermost_body_open(tokens, for_i)
+  if body_open < 0 {
+    return ""
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  if loop_iterable_private_copy(tokens, body_open, body_close, in_i, loop_open, summary.array_fields) == 1 {
+    return ""
+  }
+  let root = receiver_root(tokens, loop_open - 1)
+  let tail = path_tail(tokens, loop_open - 1)
+  let is_field_iter = loop_open - 1 >= 2 && tokens[loop_open - 2].kind == TokenKind::Dot
+  let fresh_root = !is_field_iter && root.length() > 0 && fresh_local_binding(tokens, root, body_open, for_i, true)
+  let names : Map[String, Bool] = if !is_field_iter && root.length() > 0 {
+    array_aliases(tokens, root, body_open, body_close)
+  } else {
+    Map()
+  }
+  // Collect parameter names of the enclosing function whose type is `Array[..]` (potential aliases of a param array).
+  let arr_params : Map[String, Bool] = Map()
+  let fs = fn_start_of(tokens, body_open)
+  if fs >= 0 {
+    let mut pk = fs + 1
+    let mut pd = 0
+    while pk + 2 < body_open {
+      let pkk = tokens[pk].kind
+      if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
+      else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
+      else if pd == 1 && pkk == TokenKind::Ident && tokens[pk + 1].kind == TokenKind::Colon {
+        if tokens[pk + 2].raw == "Array" {
+          arr_params[tokens[pk].raw] = true
+        }
+      }
+      pk = pk + 1
+    }
+  }
+  let fresh_before = fresh_locals_before(tokens, body_open, loop_open)
+  let callables = callable_locals(tokens, body_open)
+  let flags = [false, false]
+  let why = for_in_body_hazard(tokens, loop_open + 1, loop_close, body_open, root, tail, is_field_iter, fresh_root, names, arr_params, fresh_before, callables, summary, flags, 0)
+  if why.length() > 0 {
+    return why
+  }
+  appends_and_writes(flags)
+}
+
+fn for_in_body_hazard(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  body_open : Int,
+  root : String,
+  tail : String,
+  is_field_iter : Bool,
+  fresh_root : Bool,
+  names : Map[String, Bool],
+  arr_params : Map[String, Bool],
+  fresh_before : Map[String, Bool],
+  callables : Map[String, Bool],
+  summary : CapPkgSummary,
+  flags : Array[Bool],
+  depth : Int,
+) -> String {
+  let mut k = s
+  while k < e {
+    let tk = tokens[k]
+    let kk = tk.kind
+    // Interpolation holes run code too
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
+      for sub in interp_holes(tk.raw) {
+        let why = for_in_body_hazard(sub, 0, sub.length() - 1, 0, root, tail, is_field_iter, fresh_root, names, arr_params, fresh_before, callables, summary, flags, depth + 1)
+        if why.length() > 0 {
+          return why + " (in a string interpolation)"
+        }
+      }
+    }
+    // Check method call `<recv>.m(...)`
+    if kk == TokenKind::Dot && k + 2 < e && tokens[k + 1].kind == TokenKind::Ident &&
+    tokens[k + 2].kind == TokenKind::LParen {
+      let m = tokens[k + 1].raw
+      let recv_r = receiver_root(tokens, k - 1)
+      let recv_tail = path_tail(tokens, k - 1)
+      let recv_is_field = k - 1 >= 2 && tokens[k - 2].kind == TokenKind::Dot
+      let may_alias = if fresh_root {
+        !recv_is_field && names.contains(recv_r)
+      } else if is_field_iter {
+        (recv_is_field && recv_tail == tail) || (!recv_is_field && names.contains(recv_r))
+      } else {
+        (!recv_is_field && (names.contains(recv_r) || (arr_params.contains(recv_r) && !fresh_before.contains(recv_r)))) ||
+        (recv_is_field && recv_tail == tail)
+      }
+      if may_alias {
+        if is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit" {
+          let blk_open = enclosing_open(tokens, k, s - 1, TokenKind::LBrace)
+          let blk_close = if blk_open >= 0 { find_matching_delim(tokens, blk_open) } else { e }
+          if !stmt_immediately_exits_loop(tokens, k, blk_close) {
+            return "`." + m + "(..)` mutates the array during `for .. in` (MoonBit snapshots `(buf, init_len)`)"
+          }
+        } else if is_cap_arr_growth_method(m) {
+          flags[0] = true
+        } else if is_cap_arr_write_method(m) {
+          flags[1] = true
+        }
+      } else if recv_r == root && !is_read_only_array_method(m) && summary_fn_may_hazard_array(summary, m) {
+        return "`" + root + "." + m + "(..)` may shrink/shift the array during `for .. in`"
+      }
+    }
+    // Check index write `<recv>[i] = v`
+    if kk == TokenKind::RBracket && k + 1 < e &&
+    (tokens[k + 1].kind == TokenKind::Eq || tokens[k + 1].kind == TokenKind::AssignOp) {
+      let lb = find_open_before(tokens, k, s)
+      let wr_r = if lb > s { receiver_root(tokens, lb - 1) } else { "" }
+      let wr_tail = if lb > s { path_tail(tokens, lb - 1) } else { "" }
+      let wr_is_field = lb - 1 >= 2 && tokens[lb - 2].kind == TokenKind::Dot
+      let may_alias = if fresh_root {
+        !wr_is_field && names.contains(wr_r)
+      } else if is_field_iter {
+        wr_is_field && wr_tail == tail
+      } else {
+        !wr_is_field && (names.contains(wr_r) || (arr_params.contains(wr_r) && !fresh_before.contains(wr_r)))
+      }
+      if may_alias {
+        flags[1] = true
+      }
+    }
+    // Check `mbt_compat::arr_*` calls
+    if kk == TokenKind::Ident && k >= 2 && tokens[k - 1].kind == TokenKind::ColonColon &&
+    tokens[k - 2].raw == "mbt_compat" && k + 1 < e && tokens[k + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, k + 1)
+      let arg0_r = if k + 2 < cp { receiver_root(tokens, k + 2) } else { "" }
+      let may_alias = if fresh_root {
+        names.contains(arg0_r)
+      } else {
+        names.contains(arg0_r) || (arr_params.contains(arg0_r) && !fresh_before.contains(arg0_r))
+      }
+      if may_alias {
+        if is_cap_compat_shrink_or_shift_fn(tk.raw) || tk.raw == "arr_shrink_to_fit" {
+          let blk_open = enclosing_open(tokens, k, s - 1, TokenKind::LBrace)
+          let blk_close = if blk_open >= 0 { find_matching_delim(tokens, blk_open) } else { e }
+          if !stmt_immediately_exits_loop(tokens, k, blk_close) {
+            return "`mbt_compat::" + tk.raw + "(..)` mutates the array during `for .. in`"
+          }
+        } else if is_cap_compat_growth_fn(tk.raw) {
+          flags[0] = true
+        } else if is_cap_compat_write_fn(tk.raw) {
+          flags[1] = true
+        }
+      }
+    }
+    // Check local closure call or package function call passing `root`/alias
+    if kk == TokenKind::Ident && k + 1 < e && tokens[k + 1].kind == TokenKind::LParen &&
+    !tokens[k + 1].newline_before && !is_call_keyword(tk.raw) && !(k > 0 && (tokens[k - 1].kind == TokenKind::Dot ||
+      tokens[k - 1].kind == TokenKind::ColonColon || tokens[k - 1].raw == "fn")) {
+      let lb = if body_open >= 0 { local_closure_body(tokens, k, tk.raw) } else { -1 }
+      if lb >= 0 && depth < 8 && !(lb < k && k < find_matching_delim(tokens, lb)) {
+        let why = for_in_body_hazard(tokens, lb + 1, find_matching_delim(tokens, lb), body_open, root, tail, is_field_iter, fresh_root, names, arr_params, fresh_before, callables, summary, flags, depth + 1)
+        if why.length() > 0 {
+          return why + " (through `" + tk.raw + "`)"
+        }
+      } else if summary_fn_may_hazard_array(summary, tk.raw) {
+        let cp = find_matching_delim(tokens, k + 1)
+        let passes_arr = if !is_field_iter {
+          span_mentions(tokens, k + 2, cp, names)
+        } else {
+          // Field iteration `for x in obj.tail`: check if `obj.tail` itself is passed to `tk.raw(...)`.
+          let mut hit_f = false
+          let mut fi = k + 2
+          while fi + 2 < cp {
+            if tokens[fi].kind == TokenKind::Ident && tokens[fi].raw == root &&
+            tokens[fi + 1].kind == TokenKind::Dot && tokens[fi + 2].raw == tail {
+              hit_f = true
+              break
+            }
+            fi = fi + 1
+          }
+          hit_f
+        }
+        if passes_arr {
+          return "call to `" + tk.raw + "(..)` may shrink/shift the array during `for .. in`"
+        }
+      }
+    }
+    k = k + 1
   }
   ""
 }
