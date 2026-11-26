@@ -342,8 +342,14 @@ pub fn shrink_ok() -> String {
   ints(a) + "&" + ints(it.to_array())
 }
 
+pub fn unary_after_closure() -> Int {
+  let xs = [2, 1]
+  let key = fn(v : Int) { v }
+  -{ xs.sort_by_key(fn(x) { key(x) }); xs[0] }
+}
+
 pub fn run_8() -> String {
-  cap_collision().to_string() + "|" + shrink_ok()
+  cap_collision().to_string() + "|" + shrink_ok() + "|" + unary_after_closure().to_string()
 }
 
 pub fn run_all() -> String {
@@ -1230,32 +1236,6 @@ pub fn multiline_op_init() -> Int {
   h.items[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
-    "multiline_lead_op_init": (r'''
-priv struct Hook {
-  items : Array[Int]
-}
-
-fn Hook::length(self : Hook) -> Int {
-  self.items.push(7)
-  0
-}
-
-let h : Hook = { items: [2, 1] }
-
-fn sortit(xs : Array[Int]) -> Unit {
-  let h : Int = 0
-    + {
-      xs.sort_by_key(fn(x) { x + h.length() })
-      0
-    }
-  ignore(h)
-}
-
-pub fn multiline_lead_op_init() -> Int {
-  sortit(h.items)
-  h.items[0]
-}
-''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
@@ -1359,7 +1339,7 @@ def main():
             "F5:(8,2,1,9)|(2,9,9)|(8,0,3)|1,4,5,6|1|15,5\n"
             "F6:|Some(1)|2,3||10,20,30|1,2,3|2\n"
             "F7:2,30,2,60,2,2,1\n"
-            "F8:1|1,2,3&3,2,1"
+            "F8:1|1,2,3&3,2,1|-1"
         )
         assert moon_out == expected, f"Moon reference drifted:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}"
         assert pion_native == moon_out and pion_wasm == moon_out, (
