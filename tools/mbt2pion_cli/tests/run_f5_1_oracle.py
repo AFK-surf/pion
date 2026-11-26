@@ -34,6 +34,7 @@ pub fn run_code_unit_at() -> String {
   let eq_ok = if s_ascii.code_unit_at(0) == s_mix.code_unit_at(0) { 1 } else { 0 }
   let peq_ok = if physical_equal("zz".code_unit_at(0), "zz".code_unit_at(1)) { 1 } else { 0 }
   let idx_eq = if s_emoji[1] == s_emoji.code_unit_at(1) { 1 } else { 0 }
+  let lit_idx_eq = if "ab"[1] == "ab".code_unit_at(1) { 1 } else { 0 }
   let lit_eq = if "a".code_unit_at(0) == 97 { 1 } else { 0 }
   let cmp_v = "a".code_unit_at(0).compare("z".code_unit_at(0))
   let parts : Array[Int] = [
@@ -49,6 +50,7 @@ pub fn run_code_unit_at() -> String {
     eq_ok,
     peq_ok,
     idx_eq,
+    lit_idx_eq,
     lit_eq,
     cmp_v,
     s_mix.length(),
@@ -203,6 +205,7 @@ pub fn run_all() -> String {
   let s5 = classify_code(0).to_string() + "," + classify_code(100).to_string() + "," + classify_code(255).to_string() + "," + classify_code(300).to_string() + "," + is_hex_char('7').to_string() + "," + is_hex_char('e').to_string() + "," + is_hex_char('g').to_string()
   let b = Badge::{ label: "ok", rank: 7 }
   let _ = Debug::to_repr(b)
+  let _ = Debug::to_repr(b,)
   let s6 = Show::to_string(b)
   "F51-CU:" + s1 + "\nF51-CTOR:" + s2 + "\nF51-SU:" + s3 + "\nF51-JSON:" + s4 + "\nF51-RNG:" + s5 + "\nF51-DBG:" + s6
 }
@@ -299,7 +302,7 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_app])
 
         expected = (
-            "F51-CU:97,8216,8217,65279,20013,2,55357,56832,56832,1,1,1,1,-1,5,97,8216,55357,56832,122\n"
+            "F51-CU:97,8216,8217,65279,20013,2,55357,56832,56832,1,1,1,1,1,-1,5,97,8216,55357,56832,122\n"
             "F51-CTOR:2,4,3\n"
             "F51-SU:1,20,3,8\n"
             "F51-JSON:13\n"
@@ -341,6 +344,45 @@ def main():
         assert_publish_blocked(
             bin_path, args.pionc, work, "u16_compare_wrap_recv",
             'pub fn bad_compare_recv() -> Int { (65535 + 98).compare("a".code_unit_at(0)) }\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_shadowed_physical_equal",
+            'fn[T] physical_equal(x : T, y : T) -> T { ignore(y); x }\n'
+            'pub fn probe() -> Int {\n'
+            '  let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '  (n + n).to_int()\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_array_elem_eq",
+            'pub fn probe() -> Int {\n'
+            '  let t = "\\u{8001}"\n'
+            '  let a = [t[0] + t[0]]\n'
+            '  let s = "\\u{2}"\n'
+            '  if s.code_unit_at(0) == a[0] { 1 } else { 0 }\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_array_elem_compare",
+            'pub fn probe() -> Int {\n'
+            '  let t = "\\u{8001}"\n'
+            '  let a = [t[0] + t[0]]\n'
+            '  let s = "\\u{2}"\n'
+            '  s.code_unit_at(0).compare(a[0])\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_array_elem_peq",
+            'pub fn probe() -> Int {\n'
+            '  let t = "\\u{8001}"\n'
+            '  let a = [t[0] + t[0]]\n'
+            '  let s = "\\u{2}"\n'
+            '  if physical_equal(s.code_unit_at(0), a[0]) { 1 } else { 0 }\n'
+            '}\n',
             "MBT2PION_UINT16_ESCAPE",
         )
 
