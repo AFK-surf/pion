@@ -106,6 +106,15 @@ pub fn run_gate_c() -> String {
   has_any.to_string() + "|" + all_alive.to_string() + "|" + first_id.to_string() + "|" + xs.length().to_string()
 }
 
+fn run_slice_len_rebind(init : Array[Int]) -> Int {
+  let mut xs : Array[Int] = init
+  let get_lo = fn() -> Int {
+    xs = [8]
+    0
+  }
+  xs[get_lo():].length()
+}
+
 // Gate D: borrowed slice loops with exact eval order, clamping, empty array, and multiple breaks
 pub fn run_gate_d() -> String {
   let trace : Array[String] = []
@@ -183,10 +192,36 @@ pub fn run_gate_d() -> String {
     seen7.push(x.to_string())
   }
 
+  let mut xs_rebind3 : Array[Int] = [1, 2, 3]
+  let get_lo_rebind3 = fn() -> Int {
+    xs_rebind3 = [8]
+    0
+  }
+  let seen8 : Array[String] = []
+  for x in xs_rebind3[get_lo_rebind3():].to_array() {
+    seen8.push(x.to_string())
+  }
+
+  let len_rebind4 = run_slice_len_rebind([1, 2, 3])
+
+  let lo_paren = fn(s : String) -> Int {
+    s.length()
+  }
+  let seen9 : Array[String] = []
+  for x in base[lo_paren(")"):3] {
+    seen9.push(x.to_string())
+  }
+  let seen10 : Array[String] = []
+  for x in base[0:lo_paren(")")] {
+    seen10.push(x.to_string())
+  }
+
   trace.join(">") + ":" + seen1.join(",") + "|" +
     seen2.join(",") + "|" + seen3.join(",") + "|" + seen4.join(",") + "|" +
     seen5.join(",") + ":" + stop_id.to_string() + "|" +
-    seen6.join(",") + "|" + seen7.join(",")
+    seen6.join(",") + "|" + seen7.join(",") + "|" +
+    seen8.join(",") + "|" + len_rebind4.to_string() + "|" +
+    seen9.join(",") + "|" + seen10.join(",")
 }
 
 pub fn run_all() -> String {
@@ -439,20 +474,17 @@ pub fn run() -> Bool {
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
-        "neg_gate_d_labeled_for_slice",
+        "neg_gate_d_opaque_cb_slice",
         r'''
-pub fn run(xs : Array[Int]) -> Int {
+pub fn run(xs : Array[Int], cb : (Int) -> Int) -> Int {
   let mut acc = 0
-  outer~: for x in xs[1:] {
-    acc = acc + x
-    if x > 10 {
-      break outer~
-    }
+  for x in xs[1:] {
+    acc = acc + cb(x)
   }
   acc
 }
 ''',
-        "NO_ALLOW_D",
+        "MBT2PION_BORROWED_ARRAY_SLICE",
     ),
     (
         "neg_gate_a_kept_iter2_shrink",
@@ -715,15 +747,14 @@ def main():
                 raise RuntimeError(
                     f"SOUNDNESS FAILURE: negative case `{name}` was NOT fail-closed! rc={p.returncode}, out_exists={os.path.exists(nout)}\n{combined_err}"
                 )
-            if expected_diag != "NO_ALLOW_D":
-                if "E_PARSE" in combined_err:
-                    raise RuntimeError(
-                        f"NEGATIVE CASE `{name}` failed with accidental E_PARSE instead of gate `{expected_diag}`:\n{combined_err}"
-                    )
-                if expected_diag and expected_diag not in combined_err:
-                    raise RuntimeError(
-                        f"NEGATIVE CASE `{name}` did not emit expected diagnostic `{expected_diag}`:\n{combined_err}"
-                    )
+            if "E_PARSE" in combined_err:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` failed with accidental E_PARSE instead of gate `{expected_diag}`:\n{combined_err}"
+                )
+            if expected_diag and expected_diag not in combined_err:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` did not emit expected diagnostic `{expected_diag}`:\n{combined_err}"
+                )
             if os.path.exists(nrep):
                 with open(nrep) as rf:
                     nledger = json.load(rf)
@@ -791,10 +822,19 @@ def main():
             "--mode", "publish",
         ], cwd=REPO_ROOT, check=False)
         xp_err = p_xp.stdout + "\n" + p_xp.stderr
-        if p_xp.returncode == 0 or os.path.exists(xp_app_out) or "MBT2PION_ARRAY_ITER_MUTATION" not in xp_err:
+        if p_xp.returncode == 0 or os.path.exists(xp_app_out) or "E_PARSE" in xp_err or "MBT2PION_ARRAY_ITER_MUTATION" not in xp_err:
             raise RuntimeError(
                 f"SOUNDNESS FAILURE: cross-package dep mutation was NOT fail-closed with MBT2PION_ARRAY_ITER_MUTATION! rc={p_xp.returncode}\n{xp_err}"
             )
+        if os.path.exists(xp_app_rep):
+            with open(xp_app_rep) as rf:
+                xp_ledger = json.load(rf)
+            xp_cats = [e.get("category", "") for e in xp_ledger.get("entries", [])]
+            xp_allow = [c for c in xp_cats if c.startswith("mutation_summary_allow_")]
+            if xp_allow:
+                raise RuntimeError(
+                    f"SOUNDNESS FAILURE: cross-package dep mutation unexpectedly logged allow categories {xp_allow}"
+                )
         print(f"[NEG PASS] neg_class4_cross_pkg_dep_mut: moon check OK, fail-closed with MBT2PION_ARRAY_ITER_MUTATION (rc={p_xp.returncode})")
 
     print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases: ALL OK")
