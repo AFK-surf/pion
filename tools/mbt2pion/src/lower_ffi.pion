@@ -1,0 +1,386 @@
+///| Generic C-ABI FFI lowering for MoonBit `extern "C" fn` declarations.
+///|
+///| Handles:
+///| - Direct scalar/pointer C-ABI declarations (`Int`, `Int64`, `UInt`, `UInt64`,
+///|   `Byte`, `Bool`, `Double`, `Float`, `Ptr`, `Unit`) with zero wrapper overhead.
+///| - Bridged C-ABI declarations using `#borrow(...)` / `#owned(...)` attributes
+///|   and `String` / `Bytes` parameters or return types:
+///|   - `String` param -> `(ptr : Ptr, len : Int)` via `s.as_cstr(), s.length()` (zero-copy)
+///|   - `Bytes` param -> `(ptr : Ptr, len : Int)` via `ptr_alloc` + `bytes_copy_to_ptr` + `ptr_free`
+///|   - `String` return -> `Ptr` converted via `cstr_to_str(ptr)`
+///|   - `Bytes` return -> trailing out-length `Ptr` + `Ptr` return converted via `bytes_from_ptr(ptr, len)`
+///| - Fail-closed rejection (`ok: false`) for unknown FFI attributes, invalid `#borrow`/`#owned`
+///|   parameter references, conflicting attributes, or unsupported non-C-ABI types.
+
+pub enum FfiParamKind {
+  Direct
+  Str
+  Bytes
+}
+
+pub enum FfiRetKind {
+  Unit
+  Direct
+  Str
+  Bytes
+}
+
+pub struct FfiParamSpec {
+  name : String
+  ty : String
+  kind : FfiParamKind
+}
+
+pub struct FfiAttrInfo {
+  borrowed : Map[String, Bool]
+  owned : Map[String, Bool]
+}
+
+pub struct FfiLowerResult {
+  ok : Bool
+  needs_bridge : Bool
+  code : String
+  c_symbol : String
+  error_msg : String
+}
+
+///| Classify a Pion parameter type for C-ABI FFI lowering.
+pub fn classify_ffi_param_type(ty : String) -> Option[FfiParamKind] {
+  let t = ty.trim()
+  if t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" ||
+  t == "Byte" || t == "Bool" || t == "Double" || t == "Float" || t == "Ptr" {
+    Some(FfiParamKind::Direct)
+  } else if t == "String" {
+    Some(FfiParamKind::Str)
+  } else if t == "Bytes" {
+    Some(FfiParamKind::Bytes)
+  } else {
+    None
+  }
+}
+
+///| Classify a Pion return type for C-ABI FFI lowering.
+pub fn classify_ffi_ret_type(ty : String) -> Option[FfiRetKind] {
+  let t = ty.trim()
+  if t.length() == 0 || t == "Unit" {
+    Some(FfiRetKind::Unit)
+  } else if t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" ||
+  t == "Byte" || t == "Bool" || t == "Double" || t == "Float" || t == "Ptr" {
+    Some(FfiRetKind::Direct)
+  } else if t == "String" {
+    Some(FfiRetKind::Str)
+  } else if t == "Bytes" {
+    Some(FfiRetKind::Bytes)
+  } else {
+    None
+  }
+}
+
+///| Parse `#borrow(a, b)` and `#owned(c)` FFI attributes into validated parameter sets.
+///| Rejects unknown attributes, malformed syntax, empty lists, or conflicting borrow/owned markers.
+pub fn parse_ffi_attr_params(attrs : Array[String]) -> Result[FfiAttrInfo, String] {
+  let borrowed : Map[String, Bool] = Map()
+  let owned : Map[String, Bool] = Map()
+  for raw in attrs {
+    let s = raw.trim()
+    let is_borrow = s.starts_with("#borrow(") && s.ends_with(")")
+    let is_owned = s.starts_with("#owned(") && s.ends_with(")")
+    if !is_borrow && !is_owned {
+      return Err("unsupported MoonBit FFI attribute `" + s + "`")
+    }
+    let prefix_len = if is_borrow { 8 } else { 7 }
+    let inner = s.slice(prefix_len, s.length() - 1).trim()
+    if inner.length() == 0 {
+      return Err("empty parameter list in FFI attribute `" + s + "`")
+    }
+    let parts = inner.split(",")
+    for part in parts {
+      let pname = part.trim()
+      if pname.length() == 0 {
+        return Err("malformed parameter list in FFI attribute `" + s + "`")
+      }
+      if is_borrow {
+        if owned.contains(pname) {
+          return Err("parameter `" + pname + "` cannot be both `#borrow` and `#owned`")
+        }
+        borrowed[pname] = true
+      } else {
+        if borrowed.contains(pname) {
+          return Err("parameter `" + pname + "` cannot be both `#borrow` and `#owned`")
+        }
+        owned[pname] = true
+      }
+    }
+  }
+  Ok(FfiAttrInfo::{ borrowed, owned })
+}
+
+///| Parse a Pion parameter list string `a : T1, b : T2` into `Array[FfiParamSpec]`.
+pub fn parse_ffi_params(p_str : String) -> Result[Array[FfiParamSpec], String] {
+  let out : Array[FfiParamSpec] = []
+  let s = p_str.trim()
+  if s.length() == 0 {
+    return Ok(out)
+  }
+  let mut start = 0
+  let mut depth = 0
+  let mut i = 0
+  while i <= s.length() {
+    let at_end = i == s.length()
+    let c = if at_end { 44 } else { s.code_unit_at(i) }
+    if !at_end && (c == 40 || c == 91 || c == 123) {
+      depth = depth + 1
+    } else if !at_end && (c == 41 || c == 93 || c == 125) {
+      if depth > 0 { depth = depth - 1 }
+    } else if depth == 0 && c == 44 {
+      let part = s.slice(start, i).trim()
+      if part.length() > 0 {
+        let ci = part.index_of(":")
+        if ci <= 0 {
+          return Err("FFI parameter `" + part + "` requires explicit `name : Type` annotation")
+        }
+        let raw_name = part.slice(0, ci).trim()
+        let raw_ty = part.slice(ci + 1, part.length()).trim()
+        match classify_ffi_param_type(raw_ty) {
+          Some(kind) => out.push(FfiParamSpec::{ name: raw_name, ty: raw_ty, kind })
+          None => return Err("unsupported FFI parameter type `" + raw_ty + "` on parameter `" + raw_name + "`")
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+fn ffi_fresh_ident(used : Map[String, Bool], base : String) -> String {
+  if !used.contains(base) {
+    used[base] = true
+    return base
+  }
+  let mut k = 1
+  while true {
+    let cand = base + "_" + k.to_string()
+    if !used.contains(cand) {
+      used[cand] = true
+      return cand
+    }
+    k = k + 1
+  }
+  base
+}
+
+///| Lower a MoonBit `extern "C" fn` declaration (optionally with `#borrow`/`#owned` attributes
+///| and `String`/`Bytes` parameters or return types) into valid Pion C-ABI declarations + wrapper.
+pub fn try_lower_extern_c_fn(
+  vis : String,
+  fn_name : String,
+  p_str : String,
+  ret_str : String,
+  c_sym_lit : String,
+  pending_ffi_attrs : Array[String],
+  used_idents : Map[String, Bool],
+) -> FfiLowerResult {
+  let attr_info = match parse_ffi_attr_params(pending_ffi_attrs) {
+    Ok(info) => info
+    Err(msg) => return FfiLowerResult::{
+      ok: false,
+      needs_bridge: false,
+      code: "",
+      c_symbol: c_sym_lit,
+      error_msg: msg,
+    }
+  }
+  let params = match parse_ffi_params(p_str) {
+    Ok(ps) => ps
+    Err(msg) => return FfiLowerResult::{
+      ok: false,
+      needs_bridge: false,
+      code: "",
+      c_symbol: c_sym_lit,
+      error_msg: msg,
+    }
+  }
+  let ret_ty = if ret_str.starts_with(" -> ") {
+    ret_str.slice(4, ret_str.length()).trim()
+  } else {
+    "Unit"
+  }
+  let ret_kind = match classify_ffi_ret_type(ret_ty) {
+    Some(rk) => rk
+    None => return FfiLowerResult::{
+      ok: false,
+      needs_bridge: false,
+      code: "",
+      c_symbol: c_sym_lit,
+      error_msg: "unsupported FFI return type `" + ret_ty + "` on `" + fn_name + "`",
+    }
+  }
+  // Validate that every `#borrow` / `#owned` name refers to an existing `String`/`Bytes` param.
+  let param_kinds : Map[String, FfiParamKind] = Map()
+  let mut needs_bridge = false
+  for p in params {
+    param_kinds[p.name] = p.kind
+    match p.kind {
+      FfiParamKind::Direct => ()
+      FfiParamKind::Str | FfiParamKind::Bytes => needs_bridge = true
+    }
+  }
+  match ret_kind {
+    FfiRetKind::Unit | FfiRetKind::Direct => ()
+    FfiRetKind::Str | FfiRetKind::Bytes => needs_bridge = true
+  }
+  for bname in attr_info.borrowed.keys() {
+    match param_kinds.get(bname) {
+      Some(FfiParamKind::Str) | Some(FfiParamKind::Bytes) => ()
+      Some(FfiParamKind::Direct) => return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        error_msg: "`#borrow(" + bname + ")` is only valid on `String` or `Bytes` parameters",
+      }
+      None => return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        error_msg: "`#borrow(" + bname + ")` references unknown parameter `" + bname + "`",
+      }
+    }
+  }
+  for oname in attr_info.owned.keys() {
+    match param_kinds.get(oname) {
+      Some(FfiParamKind::Str) | Some(FfiParamKind::Bytes) => ()
+      Some(FfiParamKind::Direct) => return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        error_msg: "`#owned(" + oname + ")` is only valid on `String` or `Bytes` parameters",
+      }
+      None => return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        error_msg: "`#owned(" + oname + ")` references unknown parameter `" + oname + "`",
+      }
+    }
+  }
+  if !needs_bridge {
+    let direct_code = vis + "extern \"C\" fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + c_sym_lit
+    return FfiLowerResult::{
+      ok: true,
+      needs_bridge: false,
+      code: direct_code,
+      c_symbol: c_sym_lit,
+      error_msg: "",
+    }
+  }
+
+  // Build underlying C-ABI extern declaration + safe Pion wrapper.
+  let c_fn_name = ffi_fresh_ident(used_idents, "__mbt_c_ffi_" + fn_name)
+  let c_params : Array[String] = []
+  let call_args : Array[String] = []
+  let pre_stmts : Array[String] = []
+  let post_frees : Array[String] = []
+
+  for p in params {
+    match p.kind {
+      FfiParamKind::Direct => {
+        c_params.push(p.name + " : " + p.ty)
+        call_args.push(p.name)
+      }
+      FfiParamKind::Str => {
+        c_params.push(p.name + "_ptr : Ptr")
+        c_params.push(p.name + "_len : Int")
+        call_args.push(p.name + ".as_cstr()")
+        call_args.push(p.name + ".length()")
+      }
+      FfiParamKind::Bytes => {
+        let len_var = ffi_fresh_ident(used_idents, "__ffi_" + p.name + "_len")
+        let buf_var = ffi_fresh_ident(used_idents, "__ffi_" + p.name + "_buf")
+        c_params.push(p.name + "_ptr : Ptr")
+        c_params.push(p.name + "_len : Int")
+        pre_stmts.push("  let " + len_var + " = " + p.name + ".length()")
+        pre_stmts.push("  let " + buf_var + " = ptr_alloc(if " + len_var + " > 0 { " + len_var + ".to_int64() } else { 1L })")
+        pre_stmts.push("  if " + len_var + " > 0 { bytes_copy_to_ptr(" + p.name + ", 0, " + buf_var + ", " + len_var + ") }")
+        post_frees.push("  ptr_free(" + buf_var + ")")
+        call_args.push(buf_var)
+        call_args.push(len_var)
+      }
+    }
+  }
+
+  let mut out_len_box = ""
+  let c_ret_str = match ret_kind {
+    FfiRetKind::Unit => " -> Unit"
+    FfiRetKind::Direct => " -> " + ret_ty
+    FfiRetKind::Str => " -> Ptr"
+    FfiRetKind::Bytes => {
+      out_len_box = ffi_fresh_ident(used_idents, "__ffi_out_len")
+      c_params.push("__out_len : Ptr")
+      pre_stmts.push("  let " + out_len_box + " = ptr_alloc(4L)")
+      pre_stmts.push("  ptr_write_i32(" + out_len_box + ", 0L, 0)")
+      call_args.push(out_len_box)
+      " -> Ptr"
+    }
+  }
+
+  let sb = StringBuilder()
+  sb.write_string("extern \"C\" fn " + c_fn_name + "(" + c_params.join(", ") + ")" + c_ret_str + " = " + c_sym_lit + "\n")
+  let wrap_ret = if ret_str.length() > 0 { ret_str } else { " -> Unit" }
+  sb.write_string(vis + "fn " + fn_name + "(" + p_str + ")" + wrap_ret + " {\n")
+  for st in pre_stmts {
+    sb.write_string(st + "\n")
+  }
+  let call_expr = c_fn_name + "(" + call_args.join(", ") + ")"
+  match ret_kind {
+    FfiRetKind::Unit => {
+      sb.write_string("  " + call_expr + "\n")
+      for pf in post_frees {
+        sb.write_string(pf + "\n")
+      }
+    }
+    FfiRetKind::Direct => {
+      let res_var = ffi_fresh_ident(used_idents, "__ffi_res")
+      sb.write_string("  let " + res_var + " = " + call_expr + "\n")
+      for pf in post_frees {
+        sb.write_string(pf + "\n")
+      }
+      sb.write_string("  " + res_var + "\n")
+    }
+    FfiRetKind::Str => {
+      let ptr_var = ffi_fresh_ident(used_idents, "__ffi_ret_ptr")
+      let str_var = ffi_fresh_ident(used_idents, "__ffi_ret_str")
+      sb.write_string("  let " + ptr_var + " = " + call_expr + "\n")
+      sb.write_string("  let " + str_var + " = cstr_to_str(" + ptr_var + ")\n")
+      for pf in post_frees {
+        sb.write_string(pf + "\n")
+      }
+      sb.write_string("  " + str_var + "\n")
+    }
+    FfiRetKind::Bytes => {
+      let ptr_var = ffi_fresh_ident(used_idents, "__ffi_ret_ptr")
+      let rlen_var = ffi_fresh_ident(used_idents, "__ffi_ret_len")
+      let bytes_var = ffi_fresh_ident(used_idents, "__ffi_ret_bytes")
+      sb.write_string("  let " + ptr_var + " = " + call_expr + "\n")
+      sb.write_string("  let " + rlen_var + " = ptr_read_i32(" + out_len_box + ", 0L)\n")
+      sb.write_string("  ptr_free(" + out_len_box + ")\n")
+      sb.write_string("  let " + bytes_var + " = bytes_from_ptr(" + ptr_var + ", " + rlen_var + ")\n")
+      for pf in post_frees {
+        sb.write_string(pf + "\n")
+      }
+      sb.write_string("  " + bytes_var + "\n")
+    }
+  }
+  sb.write_string("}")
+  FfiLowerResult::{
+    ok: true,
+    needs_bridge: true,
+    code: sb.to_string(),
+    c_symbol: c_sym_lit,
+    error_msg: "",
+  }
+}

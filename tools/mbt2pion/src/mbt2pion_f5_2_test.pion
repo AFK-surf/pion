@@ -1,0 +1,186 @@
+///| Unit tests for generic C-ABI FFI bridge lowering, application-pattern lowerings,
+///| string-keyed map patterns in `if`/`guard ... is` chains, and builtin compat ABI schemas.
+
+test "lower_ffi: direct scalar extern C passes through unchanged" {
+  let used : Map[String, Bool] = Map()
+  let r = try_lower_extern_c_fn(
+    "pub ",
+    "host_now",
+    "a : Int, b : Double",
+    " -> Double",
+    "\"c_host_now\"",
+    [],
+    used,
+  )
+  assert_true(r.ok, "scalar C FFI must succeed")
+  assert_true(!r.needs_bridge, "scalar C FFI must not emit wrapper")
+  assert_true(
+    r.code == "pub extern \"C\" fn host_now(a : Int, b : Double) -> Double = \"c_host_now\"",
+    "scalar C FFI code mismatch",
+  )
+}
+
+test "lower_ffi: borrowed String and Bytes params lower to Ptr+Int bridge with zero leaks" {
+  let used : Map[String, Bool] = Map()
+  let r1 = try_lower_extern_c_fn(
+    "",
+    "ffi_start",
+    "data_dir : String, cloud : String, beta : Int",
+    " -> Int",
+    "\"c_start\"",
+    ["#borrow(data_dir, cloud)"],
+    used,
+  )
+  assert_true(r1.ok, "String borrow bridge must succeed")
+  assert_true(r1.needs_bridge, "String param must emit bridge")
+  assert_true(
+    str_has(
+      r1.code,
+      "extern \"C\" fn __mbt_c_ffi_ffi_start(data_dir_ptr : Ptr, data_dir_len : Int, cloud_ptr : Ptr, cloud_len : Int, beta : Int) -> Int = \"c_start\"",
+    ),
+    "must emit C-ABI extern decl",
+  )
+  assert_true(
+    str_has(r1.code, "data_dir.as_cstr(), data_dir.length(), cloud.as_cstr(), cloud.length(), beta"),
+    "must pass as_cstr + length",
+  )
+
+  let r2 = try_lower_extern_c_fn(
+    "",
+    "ffi_send_bytes",
+    "payload : String, data : Bytes",
+    " -> Unit",
+    "\"c_send_bytes\"",
+    ["#borrow(payload, data)"],
+    used,
+  )
+  assert_true(r2.ok, "String+Bytes borrow bridge must succeed")
+  assert_true(str_has(r2.code, "bytes_copy_to_ptr(data, 0,"), "must copy Bytes to raw buffer")
+  assert_true(str_has(r2.code, "ptr_free("), "must free temporary Bytes buffer")
+}
+
+test "lower_ffi: String and Bytes return types lower to cstr_to_str and bytes_from_ptr" {
+  let used : Map[String, Bool] = Map()
+  let rs = try_lower_extern_c_fn(
+    "pub ",
+    "ffi_scheme",
+    "",
+    " -> String",
+    "\"c_scheme\"",
+    [],
+    used,
+  )
+  assert_true(rs.ok, "String return bridge must succeed")
+  assert_true(str_has(rs.code, "-> Ptr = \"c_scheme\""), "underlying extern returns Ptr")
+  assert_true(str_has(rs.code, "cstr_to_str("), "wrapper converts Ptr via cstr_to_str")
+
+  let rb = try_lower_extern_c_fn(
+    "",
+    "ffi_read_buf",
+    "tag : String",
+    " -> Bytes",
+    "\"c_read_buf\"",
+    ["#borrow(tag)"],
+    used,
+  )
+  assert_true(rb.ok, "Bytes return bridge must succeed")
+  assert_true(str_has(rb.code, "__out_len : Ptr) -> Ptr = \"c_read_buf\""), "Bytes return appends out_len Ptr")
+  assert_true(str_has(rb.code, "ptr_read_i32("), "wrapper reads out_len")
+  assert_true(str_has(rb.code, "bytes_from_ptr("), "wrapper builds Bytes via bytes_from_ptr")
+  assert_true(str_has(rb.code, "ptr_free("), "wrapper frees out_len box")
+}
+
+test "lower_ffi: fail-closed on invalid attributes, unknown borrow params, or unsupported types" {
+  let used : Map[String, Bool] = Map()
+  let bad_attr = try_lower_extern_c_fn("", "f1", "x : Int", " -> Int", "\"c_f1\"", ["#unknown(x)"], used)
+  assert_true(!bad_attr.ok, "unknown FFI attribute must fail closed")
+
+  let bad_param = try_lower_extern_c_fn("", "f2", "x : String", " -> Int", "\"c_f2\"", ["#borrow(missing)"], used)
+  assert_true(!bad_param.ok, "borrow referencing unknown param must fail closed")
+
+  let bad_scalar = try_lower_extern_c_fn("", "f3", "x : Int", " -> Int", "\"c_f3\"", ["#borrow(x)"], used)
+  assert_true(!bad_scalar.ok, "borrow on scalar Int must fail closed")
+
+  let bad_conflict = try_lower_extern_c_fn("", "f4", "s : String", " -> Int", "\"c_f4\"", ["#borrow(s)", "#owned(s)"], used)
+  assert_true(!bad_conflict.ok, "conflicting borrow+owned must fail closed")
+
+  let bad_ty = try_lower_extern_c_fn("", "f5", "xs : Array[Int]", " -> Int", "\"c_f5\"", [], used)
+  assert_true(!bad_ty.ok, "unsupported Array param must fail closed")
+
+  let bad_ret = try_lower_extern_c_fn("", "f6", "x : Int", " -> Option[Int]", "\"c_f6\"", [], used)
+  assert_true(!bad_ret.ok, "unsupported Option return must fail closed")
+}
+
+test "lower_apps: builtin ctor rest arity, char ranges, split-next, array-concat, and map patterns" {
+  assert_true(expand_builtin_ctor_rest("Number", 1) is Some(1), "Number(d, ..) needs 1 wildcard")
+  assert_true(expand_builtin_ctor_rest("Json::Number", 2) is Some(0), "Json::Number(d, r, ..) needs 0 wildcards")
+  assert_true(expand_builtin_ctor_rest("Number", 3) is None, "over-arity Number must fail closed")
+  assert_true(expand_builtin_ctor_rest("UnknownCtor", 1) is None, "unknown ctor must fail closed")
+
+  let toks = lex_moonbit("'0'..='9' | 'a'..<'g' | '_'")
+  match lower_char_range_arm_pat(toks, 0, toks.length() - 1, "__ch") {
+    Some((bv, cond)) => {
+      assert_true(bv == "__ch", "bind_var mismatch")
+      assert_true(
+        cond == "(__ch >= '0' && __ch <= '9') || (__ch >= 'a' && __ch < 'g') || (__ch == '_')",
+        "char range cond mismatch",
+      )
+    }
+    None => assert_true(false, "char range pattern must lower")
+  }
+
+  let non_range = lex_moonbit("'x'")
+  assert_true(
+    lower_char_range_arm_pat(non_range, 0, non_range.length() - 1, "__ch") is None,
+    "plain char literal without range must return None",
+  )
+
+  let sn = lower_string_split_next("key", "\"/\"", "__sp")
+  assert_true(str_has(sn, "if __sp.length() > 0 { Some(__sp[0]) } else { None }"), "split().next() must lower safely")
+
+  let ac = lower_array_concat_expr("xs", "ys", "__ac")
+  assert_true(str_has(ac, "(xs).copy(); __ac.append(ys); __ac"), "Array concat must copy and append")
+
+  assert_true(is_string_to_owned_method("to_owned", "String"), "String::to_owned recognized")
+  assert_true(is_string_to_owned_method("to_owned", "StrView"), "StrView::to_owned recognized")
+  assert_true(!is_string_to_owned_method("to_owned", "Bytes"), "non-String to_owned rejected")
+
+  let mp = lower_string_map_pattern_chain(
+    "obj",
+    [("\"a\"", "x", false), ("\"b\"", "opt_y", true)],
+    "x",
+    "0",
+  )
+  assert_true(
+    str_has(mp, "match obj.get(\"a\") { Some(x) => { let opt_y = obj.get(\"b\"); x }, _ => 0 }"),
+    "map pattern chain must nest deterministically",
+  )
+}
+
+test "lower_is_chain: string-keyed map patterns inside if/guard is chains" {
+  let src = "pub fn lookup_pair(m : Map[String, Int]) -> Int {\n  if m is { \"x\": a, \"y\": b, .. } && a > 0 {\n    a + b\n  } else {\n    -1\n  }\n}\n\npub fn guard_opt_key(m : Map[String, Int]) -> Int {\n  guard m is { \"k\": v, \"opt\"?: ov, .. } else {\n    return 0\n  }\n  match ov {\n    Some(w) => v + w\n    None => v\n  }\n}\n"
+  let sf = SourceFile::{ rel_path: "map_is.mbt", content: src, is_test: false }
+  let res = transpile_package([sf], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_eq(res.blockers, 0)
+  assert_true(res.files.length() == 1, "expected 1 output file")
+  let out = res.files[0].content
+  assert_true(str_has(out, ".get(\"x\")"), "must lower string key x via .get(\"x\")")
+  assert_true(str_has(out, ".get(\"y\")"), "must lower string key y via .get(\"y\")")
+  assert_true(str_has(out, ".get(\"opt\")"), "must lower optional string key via .get(\"opt\")")
+}
+
+test "abi: builtin_mbt_compat_enum_schemas exposes canonical MbtJson::Number arity 2" {
+  let schemas = builtin_mbt_compat_enum_schemas()
+  assert_eq(schemas.length(), 1)
+  assert_true(schemas[0].pkg == "mbt_compat", "pkg mismatch")
+  assert_true(schemas[0].name == "MbtJson", "name mismatch")
+  let mut num_arity = -1
+  for v in schemas[0].variants {
+    if v.name == "Number" {
+      num_arity = v.fields.length()
+    }
+  }
+  assert_eq(num_arity, 2)
+}

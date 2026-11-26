@@ -1,0 +1,129 @@
+///| Generic lowering helpers for high-frequency MoonBit application patterns:
+///| 1. Builtin/stdlib enum constructor arity expansion for rest patterns (`Number(d, ..)` -> `Number(d, _)`).
+///| 2. Character range patterns in `match` arms (`'0'..='9'`, `'a'..<'z'`, and `|`-joined ranges).
+///| 3. `String::split(sep).next()` lowering (Pion `String::split` returns `Array[String]`).
+///| 4. `Array[T] + Array[T]` concatenation lowering.
+///| 5. `String::to_owned()` / `StrView::to_owned()` identity/conversion classification.
+///| 6. JSON/Map string-keyed object pattern lowering (`{ "k1": Pat1, "k2": Pat2, .. }`).
+
+///| Return the exact Pion positional payload arity for known stdlib/compat enum constructors
+///| whose MoonBit declaration may carry trailing labeled/optional fields (such as
+///| `Json::Number(Double, repr~ : String?)` lowered to `MbtJson::Number(Double, Option[String])`).
+pub fn lookup_builtin_ctor_arity(ctor_name : String) -> Option[Int] {
+  let c = ctor_name.trim()
+  if c == "Number" || c == "Json::Number" || c == "MbtJson::Number" || c == "mbt_compat::MbtJson::Number" {
+    Some(2)
+  } else if c == "Some" || c == "Ok" || c == "Err" ||
+  c == "String" || c == "Array" || c == "Object" ||
+  c == "Json::String" || c == "Json::Array" || c == "Json::Object" ||
+  c == "MbtJson::String" || c == "MbtJson::Array" || c == "MbtJson::Object" {
+    Some(1)
+  } else if c == "None" || c == "Null" || c == "True" || c == "False" {
+    Some(0)
+  } else {
+    None
+  }
+}
+
+///| Given a constructor rest pattern `Ctor(p1, ..., pk, ..)` with `explicit_pos` positional
+///| sub-patterns, return the exact number of `_` wildcards to append, or `None` if unknown
+///| or `explicit_pos` exceeds the known arity (fail-closed).
+pub fn expand_builtin_ctor_rest(ctor_name : String, explicit_pos : Int) -> Option[Int] {
+  if explicit_pos < 0 {
+    return None
+  }
+  match lookup_builtin_ctor_arity(ctor_name) {
+    Some(arity) => if explicit_pos <= arity { Some(arity - explicit_pos) } else { None }
+    None => None
+  }
+}
+
+///| Lower a `match` arm pattern `[start, end)` consisting of one or more `|`-separated
+///| character range patterns (`'0'..='9'`, `'a'..<'z'`, or single char literals `'_'`)
+///| into `(bind_var, guard_expr)`. Returns `None` if the pattern contains no char range
+///| or contains non-char-literal / non-range syntax (fail-closed).
+pub fn lower_char_range_arm_pat(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  bind_var : String,
+) -> Option[(String, String)] {
+  if start >= end {
+    return None
+  }
+  let conds : Array[String] = []
+  let mut has_range = false
+  let mut i = start
+  while i < end {
+    // Find next top-level `|`
+    let mut seg_e = i
+    while seg_e < end && tokens[seg_e].kind != TokenKind::Pipe {
+      seg_e = seg_e + 1
+    }
+    let seg_len = seg_e - i
+    if seg_len == 3 && tokens[i].kind == TokenKind::CharLit && tokens[i + 2].kind == TokenKind::CharLit &&
+    (tokens[i + 1].kind == TokenKind::DotDotEq || tokens[i + 1].kind == TokenKind::DotDotLt) {
+      has_range = true
+      let op_hi = if tokens[i + 1].kind == TokenKind::DotDotEq { "<=" } else { "<" }
+      conds.push("(" + bind_var + " >= " + tokens[i].raw + " && " + bind_var + " " + op_hi + " " + tokens[i + 2].raw + ")")
+    } else if seg_len == 1 && tokens[i].kind == TokenKind::CharLit {
+      conds.push("(" + bind_var + " == " + tokens[i].raw + ")")
+    } else {
+      return None
+    }
+    i = seg_e + 1
+  }
+  if !has_range || conds.length() == 0 {
+    return None
+  }
+  Some((bind_var, conds.join(" || ")))
+}
+
+///| Lower `recv.split(sep).next()` to an `Option[String]` block expression over Pion's `Array[String]`.
+pub fn lower_string_split_next(recv_expr : String, sep_expr : String, tmp_var : String) -> String {
+  "{ let " + tmp_var + " = (" + recv_expr + ").split(" + sep_expr + "); if " + tmp_var + ".length() > 0 { Some(" + tmp_var + "[0]) } else { None } }"
+}
+
+///| Lower `lhs + rhs` on `Array[T]` to a non-mutating copy + append expression.
+pub fn lower_array_concat_expr(lhs : String, rhs : String, tmp_var : String) -> String {
+  "{ let " + tmp_var + " = (" + lhs + ").copy(); " + tmp_var + ".append(" + rhs + "); " + tmp_var + " }"
+}
+
+///| Return true when `.to_owned()` is a no-op identity on Pion `String` (or `.to_string()` on `StrView`).
+pub fn is_string_to_owned_method(method_name : String, recv_ty : String) -> Bool {
+  if method_name != "to_owned" {
+    return false
+  }
+  let t = recv_ty.trim()
+  t == "String" || t == "StrView"
+}
+
+///| Lower a string-keyed map/object pattern `{ "k1": Pat1, "k2": Pat2, .. }` over `obj_var`
+///| into nested `match (<obj_var>).get(<key>) { Some(<pat>) => ..., _ => <fail_expr> }`.
+///| Entries are `(key_literal, value_pat, is_optional_key)` where `is_optional_key` is true
+///| for MoonBit `"k":? opt_pat` (binds `Option[V]` directly without `Some(...)` unwrapping).
+pub fn lower_string_map_pattern_chain(
+  obj_var : String,
+  entries : Array[(String, String, Bool)],
+  body_expr : String,
+  fail_expr : String,
+) -> String {
+  let mut cur = body_expr
+  let mut idx = entries.length() - 1
+  while idx >= 0 {
+    let (key_lit, val_pat, is_opt) = entries[idx]
+    let get_expr = obj_var + ".get(" + key_lit + ")"
+    if is_opt {
+      let vp = val_pat.trim()
+      if is_irrefutable_simple_pat(vp) {
+        cur = "{ let " + vp + " = " + get_expr + "; " + cur + " }"
+      } else {
+        cur = "match " + get_expr + " { " + vp + " => " + cur + ", _ => " + fail_expr + " }"
+      }
+    } else {
+      cur = "match " + get_expr + " { Some(" + val_pat.trim() + ") => " + cur + ", _ => " + fail_expr + " }"
+    }
+    idx = idx - 1
+  }
+  cur
+}
