@@ -187,8 +187,9 @@ TMP_DIR="$(mktemp -d)"
 P98_PID=""
 FP_ASM_PID=""
 CORE_PID=""
+SAN_BG_PID=""
 cleanup() {
-  bg_kill "$P98_PID" "$FP_ASM_PID" "$CORE_PID"
+  bg_kill "$P98_PID" "$FP_ASM_PID" "$CORE_PID" "$SAN_BG_PID"
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -274,13 +275,19 @@ if [ "$BENCH_RC" -ne 0 ]; then
 fi
 
 # One ASan/TSan build of the runtime + ASan+UBSan QBE for all E2E suites (see scripts/san-rt.sh),
-# while `as` is still reachable.
-. "$ROOT_DIR/scripts/san-rt-env.sh"
-if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
-  _tq0="$(now_ms)"
-  ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:${PION_ASAN_FAST_OPTS}" "$PION_QBE_SAN" -h >/dev/null 2>&1 || true
-  _tq1="$(now_ms)"
-  echo "qbe-san probe (cc=$(cat "${PION_QBE_SAN}.cc" 2>/dev/null || echo unknown)): $((_tq1 - _tq0))ms"
+# while `as` is still reachable. In --bootstrap-only mode, overlap it with Stage 0/3/4!
+if [ "$MODE" = "bootstrap" ]; then
+  bg_start "$TMP_DIR/san_rt.log" env ROOT_DIR="$ROOT_DIR" OUT_DIR="$OUT_DIR" CC="$CC" PION_REQUIRE_SANITIZERS="${PION_REQUIRE_SANITIZERS:-0}" \
+    sh -euc '. "$ROOT_DIR/scripts/san-rt-env.sh"'
+  SAN_BG_PID="$BG_PID"
+else
+  . "$ROOT_DIR/scripts/san-rt-env.sh"
+  if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+    _tq0="$(now_ms)"
+    ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:${PION_ASAN_FAST_OPTS}" "$PION_QBE_SAN" -h >/dev/null 2>&1 || true
+    _tq1="$(now_ms)"
+    echo "qbe-san probe (cc=$(cat "${PION_QBE_SAN}.cc" 2>/dev/null || echo unknown)): $((_tq1 - _tq0))ms"
+  fi
 fi
 
 # The KV load client is plain C: build it while `as` is still reachable.
@@ -501,10 +508,12 @@ if [ "$MODE" = "full" ]; then
 fi
 
 echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
-# One long single-threaded build: overlapped, joined after the E2E pool.
-bg_start "$TMP_DIR/core_test.log" env PION_CACHE_DIR="$TMP_DIR/cas_core" \
-  sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"
-CORE_PID="$BG_PID"
+if [ "$MODE" = "full" ]; then
+  # One long single-threaded build: overlapped, joined after the E2E pool.
+  bg_start "$TMP_DIR/core_test.log" env PION_CACHE_DIR="$TMP_DIR/cas_core" \
+    sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"
+  CORE_PID="$BG_PID"
+fi
 
 # POSIX TCP + FFI runtime primitives from Pion, over real 127.0.0.1 TCP
 NET_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/net_ffi.pion" --loopback)"
@@ -576,11 +585,20 @@ if [ "$FIXED_CHK" != '{"ok":true,"unformatted":[]}' ]; then
 fi
 
 if [ "$MODE" = "bootstrap" ]; then
-  if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
-    CORE_PID=""
-  else
-    CORE_PID=""
-    exit 1
+  if [ -n "$SAN_BG_PID" ]; then
+    if bg_join "$SAN_BG_PID" "$TMP_DIR/san_rt.log"; then
+      SAN_BG_PID=""
+    else
+      SAN_BG_PID=""
+      echo "FAIL: sanitizer runtime / QBE prebuild" >&2
+      exit 1
+    fi
+  fi
+  if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
+    _tq0="$(now_ms)"
+    ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:${PION_ASAN_FAST_OPTS}" "$OUT_DIR/qbe-san/qbe" -h >/dev/null 2>&1 || true
+    _tq1="$(now_ms)"
+    echo "qbe-san probe (cc=$(cat "$OUT_DIR/qbe-san/qbe.cc" 2>/dev/null || echo unknown)): $((_tq1 - _tq0))ms"
   fi
   if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
     FP_ASM_PID=""
@@ -635,6 +653,11 @@ fi
 # Lines without PATH="$ORIG_PATH" keep the failing-`as` PATH of this gate.
 E2E_CMDS="$TMP_DIR/e2e_cmds.txt"
 : > "$E2E_CMDS"
+if [ "$MODE" = "e2e" ]; then
+  # core-test.sh and p98 run inside the sharded E2E pool when split from --bootstrap-only.
+  printf '%s\n' 'PION_CACHE_DIR="$OUT_DIR/cas_core_e2e" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"; RC=$?; rm -rf "$OUT_DIR/cas_core_e2e"; exit $RC' >> "$E2E_CMDS"
+  printf '%s\n' 'PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"' >> "$E2E_CMDS"
+fi
 STATION_LIB_PATH="${LIBRARY_PATH:-}"
 if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null; then
   printf '%s\n' 'sh "$ROOT_DIR/scripts/test-linux.sh" --group tls_client' >> "$E2E_CMDS"
@@ -838,9 +861,6 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # assembly (and cc compiles their C driver) besides `--obj`.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
 E2E
-if [ "$MODE" = "e2e" ]; then
-  printf '%s\n' 'PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"' >> "$E2E_CMDS"
-fi
 export ROOT_DIR PIONC ORIG_PATH OUT_DIR STATION_LIB_PATH
 if [ -n "$E2E_SHARD" ]; then
   sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" --shard "$E2E_SHARD" < "$E2E_CMDS"
