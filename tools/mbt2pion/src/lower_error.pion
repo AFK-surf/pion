@@ -185,6 +185,9 @@ pub fn build_external_error_env(
     dep_pkg_names[k] = true
   }
   let dep_alias_names : Map[String, Bool] = Map()
+  for k in symtab.dep_alias_names.keys() {
+    dep_alias_names[k] = true
+  }
   let dep_raising_fns_by_alias : Map[String, String] = Map()
   let dep_raising_fns_by_canon : Map[String, String] = Map()
   let dep_raising_fns_canon_ambig : Map[String, Bool] = Map()
@@ -399,18 +402,7 @@ fn le_base_type_ident(ty : String) -> String {
 }
 
 fn le_resolve_dep_pkg(env : ExternalErrorEnv, raw_pkg : String) -> String {
-  match env.pkg_aliases.get(raw_pkg) {
-    Some(p) => return p
-    None => ()
-  }
-  match env.moon_import_paths.get(raw_pkg) {
-    Some(fp) => {
-      let d = moon_import_default_alias(fp)
-      if d.length() > 0 { return d }
-    }
-    None => ()
-  }
-  raw_pkg
+  resolve_dep_pkg_identity(env.pkg_aliases, env.moon_import_paths, env.dep_pkg_names, env.dep_alias_names, raw_pkg)
 }
 
 fn le_canon_err_ty(st : LeState, raw_et : String) -> String {
@@ -849,9 +841,36 @@ fn le_looks_like_arrow_params(tokens : Array[Token], lp : Int, rp : Int) -> Bool
   true
 }
 
-///| Lower an `if`/`while` condition `[cs, ce)`.
-///| Only top-level (depth 0, no top-level `||`, unnegated) `&&`-chain `is <pat>` expressions
-///| inject pattern bindings into the enclosing `if`/`while` lexical scope.
+fn le_is_pat_stop_op(t : Token) -> Bool {
+  t.raw == "&&" || t.raw == "||" || t.raw == "==" || t.raw == "!=" ||
+  t.raw == "<" || t.raw == "<=" || t.raw == ">" || t.raw == ">=" ||
+  t.raw == "|>" || t.raw == "=" || t.raw == "+" || t.raw == "-" ||
+  t.raw == "*" || t.raw == "/" || t.raw == "%"
+}
+
+///| Find end of `<pat>` after `is` starting at `pat_s`, stopping at depth-0 operators/delimiters.
+fn le_find_is_pat_end(tokens : Array[Token], pat_s : Int, limit : Int) -> Int {
+  let mut pe = pat_s
+  let mut pd = 0
+  while pe < limit {
+    let pt = tokens[pe]
+    let is_body_lbrace = pt.kind == TokenKind::LBrace && pe > pat_s && tokens[pe - 1].kind != TokenKind::ColonColon
+    if pd == 0 && (le_is_pat_stop_op(pt) || is_body_lbrace ||
+      pt.kind == TokenKind::RParen || pt.kind == TokenKind::RBracket || pt.kind == TokenKind::RBrace ||
+      pt.kind == TokenKind::Semi || pt.kind == TokenKind::Comma ||
+      (pt.kind == TokenKind::Keyword && pt.raw == "else") ||
+      (pe > pat_s && pt.newline_before)) {
+      break
+    }
+    pd = le_step_depth(pt.kind, pd)
+    pe = pe + 1
+  }
+  pe
+}
+
+///| Lower an `if`/`while`/`guard` condition `[cs, ce)`.
+///| Only top-level (depth 0, no top-level `||`, unnegated, unwrapping paired `(...)`) `&&`-chain
+///| `is <pat>` expressions inject pattern bindings into the enclosing lexical scope.
 fn le_lower_cond_with_is(
   st : LeState,
   src : String,
@@ -880,23 +899,30 @@ fn le_lower_cond_with_is(
   while k <= ce {
     if k == ce || (d == 0 && tokens[k].raw == "&&") {
       if seg_s < k {
-        sb.write_string(le_lower_range(st, src, tokens, seg_s, k))
-        // Inject `is <pat>` binders into `if`/`while` scope only if segment is unnegated
-        if tokens[seg_s].raw != "!" {
-          let mut si = seg_s
-          let mut sd = 0
-          let mut is_i = -1
-          while si < k {
-            if sd == 0 && le_is_kw(tokens[si], "is") {
-              is_i = si
-              break
+        if tokens[seg_s].kind == TokenKind::LParen && find_matching_delim(tokens, seg_s) == k - 1 {
+          sb.write_string(tokens[seg_s].leading_trivia + "(" + le_lower_cond_with_is(st, src, tokens, seg_s + 1, k - 1) + tokens[k - 1].leading_trivia + ")")
+        } else {
+          sb.write_string(le_lower_range(st, src, tokens, seg_s, k))
+          // Inject `is <pat>` binders into scope only if segment is unnegated and `<pat>` spans to segment end
+          if tokens[seg_s].raw != "!" {
+            let mut si = seg_s
+            let mut sd = 0
+            let mut is_i = -1
+            while si < k {
+              if sd == 0 && le_is_kw(tokens[si], "is") {
+                is_i = si
+                break
+              }
+              sd = le_step_depth(tokens[si].kind, sd)
+              si = si + 1
             }
-            sd = le_step_depth(tokens[si].kind, sd)
-            si = si + 1
-          }
-          if is_i >= seg_s && is_i + 1 < k {
-            let top = st.lex_var_types.length() - 1
-            le_shadow_pat_idents(tokens, is_i + 1, k, st.lex_var_types[top], st.lex_raise_closures[top])
+            if is_i >= seg_s && is_i + 1 < k {
+              let pat_e = le_find_is_pat_end(tokens, is_i + 1, k)
+              if pat_e == k {
+                let top = st.lex_var_types.length() - 1
+                le_shadow_pat_idents(tokens, is_i + 1, pat_e, st.lex_var_types[top], st.lex_raise_closures[top])
+              }
+            }
           }
         }
       }
@@ -1919,6 +1945,9 @@ fn le_is_irrefutable_ctor_args(tokens : Array[Token], lp : Int, rp : Int) -> Boo
 fn le_ctor_single_bool_lit(tokens : Array[Token], lp : Int, rp : Int) -> String {
   let mut s = lp + 1
   let mut e = rp
+  if e > s && tokens[e - 1].kind == TokenKind::Comma {
+    e = e - 1
+  }
   while s < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) + 1 == e {
     s = s + 1
     e = e - 1
@@ -2779,24 +2808,48 @@ fn le_lower_range(
         continue
       }
     }
-    // `is <pat>` outside `if`/`while` top-level `&&`: never leaks into outer scope;
-    // only scopes binders to an immediately following `&&` chain.
-    if le_is_kw(t, "is") && i + 1 < end {
-      let mut pe = i + 1
-      let mut pd = 0
-      while pe < end {
-        let pt = tokens[pe]
-        let is_body_lbrace = pt.kind == TokenKind::LBrace && pe > i + 1 && tokens[pe - 1].kind != TokenKind::ColonColon
-        if pd == 0 && (pt.raw == "&&" || pt.raw == "||" || is_body_lbrace ||
-          pt.kind == TokenKind::RParen || pt.kind == TokenKind::RBracket || pt.kind == TokenKind::RBrace ||
-          pt.kind == TokenKind::Semi || pt.kind == TokenKind::Comma ||
-          (pt.kind == TokenKind::Keyword && pt.raw == "else") ||
-          (pe > i + 1 && pt.newline_before)) {
+    // `guard <cond> else { ... }`: binders from unnegated `is <pat>` apply to subsequent `&&` and
+    // statements AFTER the `else { ... }` block, never inside `else { ... }`.
+    if le_is_kw(t, "guard") {
+      let mut else_i = -1
+      let mut gd = 0
+      let mut gk = i + 1
+      while gk < end {
+        if gd == 0 && tokens[gk].kind == TokenKind::Keyword && tokens[gk].raw == "else" {
+          else_i = gk
           break
         }
-        pd = le_step_depth(pt.kind, pd)
-        pe = pe + 1
+        if gd == 0 && (tokens[gk].kind == TokenKind::Semi || tokens[gk].kind == TokenKind::RBrace) {
+          break
+        }
+        gd = le_step_depth(tokens[gk].kind, gd)
+        gk = gk + 1
       }
+      if else_i > i && else_i + 1 < end && tokens[else_i + 1].kind == TokenKind::LBrace {
+        let elb = else_i + 1
+        let erb = find_matching_delim(tokens, elb)
+        let g_vm : Map[String, String] = Map()
+        let g_cm : Map[String, String] = Map()
+        st.lex_var_types.push(g_vm)
+        st.lex_raise_closures.push(g_cm)
+        st.lex_err_vars.push(Map())
+        let cond_str = le_lower_cond_with_is(st, src, tokens, i + 1, else_i)
+        let _ = st.lex_err_vars.pop()
+        let _ = st.lex_raise_closures.pop()
+        let _ = st.lex_var_types.pop()
+        let else_str = le_lower_range(st, src, tokens, elb + 1, erb)
+        let top = st.lex_var_types.length() - 1
+        for k in g_vm.keys() { st.lex_var_types[top][k] = "" }
+        for k in g_cm.keys() { st.lex_raise_closures[top][k] = "" }
+        sb.write_string(t.leading_trivia + t.raw + cond_str + tokens[else_i].leading_trivia + "else" + tokens[elb].leading_trivia + "{" + else_str + tokens[erb].leading_trivia + "}")
+        i = erb + 1
+        continue
+      }
+    }
+    // `is <pat>` outside `if`/`while`/`guard` top-level `&&`: never leaks into outer scope;
+    // only scopes binders to an immediately following `&&` chain.
+    if le_is_kw(t, "is") && i + 1 < end {
+      let pe = le_find_is_pat_end(tokens, i + 1, end)
       if pe > i + 1 {
         sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[pe - 1].end_byte))
         if pe < end && tokens[pe].raw == "&&" {
@@ -3786,7 +3839,7 @@ pub fn lower_checked_errors_with_env(
           continue
         }
       }
-      // Top-level `let`/`const`: skip type annotations, then fail-closed on raising fn/method values or error keywords on RHS
+      // Top-level `let`/`const`: skip type annotations, then run lexically-scoped RHS validation
       if depth == 0 && t.kind == TokenKind::Keyword && (t.raw == "let" || t.raw == "const") {
         let mut eq_i = i + 1
         let mut td = 0
@@ -3796,37 +3849,28 @@ pub fn lower_checked_errors_with_env(
         }
         if eq_i < n && toks[eq_i].kind == TokenKind::Eq {
           let rhs_end = le_find_stmt_expr_end(toks, eq_i + 1, n)
+          let mut has_err_kw = false
           let mut rk = eq_i + 1
           while rk < rhs_end {
             let rt = toks[rk]
             if le_is_kw(rt, "raise") || le_is_kw(rt, "try") || le_is_kw(rt, "catch") {
               le_unsup(st, rt.line, rt.col, "unsupported `" + rt.raw + "` in top-level `let`/`const` initializer")
+              has_err_kw = true
             } else if rt.kind == TokenKind::InterpString || rt.kind == TokenKind::InterpMultiline {
               le_scan_residual_err_in_interp(st, rt)
-            } else if rt.kind == TokenKind::PkgRef && rk + 2 < rhs_end && toks[rk + 1].kind == TokenKind::Dot &&
-            (toks[rk + 2].kind == TokenKind::Ident || toks[rk + 2].kind == TokenKind::UpperIdent) {
-              let rp = rt.raw.slice(1, rt.raw.length())
-              match le_resolve_external_call(st, rp, toks[rk + 2].raw) {
-                Some(_) => le_unsup(st, rt.line, rt.col, "raising function `" + rt.raw + "." + toks[rk + 2].raw + "` cannot be used in top-level `let`/`const` initializer")
-                None => ()
-              }
-              rk = rk + 3
-              continue
-            } else if rt.kind == TokenKind::UpperIdent && rk + 2 < rhs_end &&
-            toks[rk + 1].kind == TokenKind::ColonColon && toks[rk + 2].kind == TokenKind::Ident {
-              let qk = rt.raw + "::" + toks[rk + 2].raw
-              if st.pkg_raise_methods.contains(qk) {
-                le_unsup(st, rt.line, rt.col, "raising method `" + qk + "` cannot be used in top-level `let`/`const` initializer")
-              }
-              rk = rk + 3
-              continue
-            } else if rt.kind == TokenKind::Ident &&
-            !(rk > eq_i + 1 && (toks[rk - 1].kind == TokenKind::Dot || toks[rk - 1].kind == TokenKind::ColonColon)) &&
-            !(rk + 1 < rhs_end && toks[rk + 1].kind == TokenKind::Colon) &&
-            st.pkg_raise_fns.contains(rt.raw) {
-              le_unsup(st, rt.line, rt.col, "raising function `" + rt.raw + "` cannot be used in top-level `let`/`const` initializer")
             }
             rk = rk + 1
+          }
+          if !has_err_kw {
+            st.lex_var_types.push(Map())
+            st.lex_raise_closures.push(Map())
+            st.lex_err_vars.push(Map())
+            st.frames.push(LeFrame::PlainFn(""))
+            let _ = le_lower_range(st, src, toks, eq_i + 1, rhs_end)
+            let _ = st.frames.pop()
+            let _ = st.lex_err_vars.pop()
+            let _ = st.lex_raise_closures.pop()
+            let _ = st.lex_var_types.pop()
           }
           i = rhs_end
           continue

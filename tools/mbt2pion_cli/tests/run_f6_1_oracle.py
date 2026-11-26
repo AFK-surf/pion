@@ -277,6 +277,48 @@ fn good_or_fail(b : Bool) -> Int raise LocalErr {
   0
 }
 
+fn yes_helper(_x : Int) -> Bool {
+  true
+}
+
+let top_shadow_block : Int = {
+  let always_fail_g = 41
+  always_fail_g + 1
+}
+
+let top_shadow_match : Int = match Some(41) {
+  Some(always_fail_g) => always_fail_g + 1
+  None => 0
+}
+
+fn case_r5_paren_and_guard() -> String {
+  let local_fn : () -> Int = fn() { 42 }
+  let p1 = try {
+    if (Some(local_fn) is Some(always_fail_g)) {
+      let v = always_fail_g()
+      v
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p2 = try {
+    guard Some(local_fn) is Some(always_fail_g) else { return "0" }
+    let v = always_fail_g()
+    v
+  } catch {
+    _ => 7
+  }
+  let p3 = try {
+    let _ = Some(1) is Some(_) == yes_helper(always_fail_g())
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string()
+}
+
 pub fn case_r4_semantics() -> String {
   // P1-1: `is` scope isolation
   let s1 = try {
@@ -308,12 +350,12 @@ pub fn case_r4_semantics() -> String {
     Ok(v) => v
     Err(@u.PubErr::PubBad) => 55
   }
-  // P2-5: exhaustive Bool payload catch
+  // P2-5: exhaustive Bool payload catch (with trailing commas)
   let s5 = raise_flag(false) catch {
-    Flag(true) => 1
-    Flag(false) => 2
+    Flag(true,) => 1
+    Flag(false,) => 2
   }
-  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string()
+  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string() + "|" + case_r5_paren_and_guard()
 }
 
 pub fn run_all() -> String {
@@ -449,7 +491,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -543,6 +585,52 @@ def main():
             sw_pw = run_cmd([args.pionc, "run", "--target", "wasm32", sw_pd]).stdout.strip()
             assert sw_pn == "42" and sw_pw == "42", f"Swapped alias Pion ({ord_name}) mismatch: nat={sw_pn!r} wasm={sw_pw!r}"
         print("[f6-1-oracle] PASS P1-3 swapped aliases (a @b, b @a) in both --dep orders: 4-target == 42")
+
+        # 3a-3. R5 P1-1 4-target check: distinct full paths sharing trailing segment (`left/cache @cache`, `right/cache @other`)
+        cs_m = os.path.join(work, "cs_moon")
+        for sub in ("left/cache", "right/cache", "down", "cmd"):
+            os.makedirs(os.path.join(cs_m, sub))
+        cs_files = [
+            ("moon.mod", 'name = "f6/cs"\n'),
+            ("left/cache/moon.pkg", "\n"),
+            ("left/cache/c.mbt", "pub fn get() -> Int { 1 }\n"),
+            ("right/cache/moon.pkg", "\n"),
+            ("right/cache/c.mbt", "pub fn get() -> Int { 2 }\n"),
+            ("down/moon.pkg", 'import { "f6/cs/left/cache" @cache, "f6/cs/right/cache" @other }\n'),
+            ("down/down.mbt", "pub fn run_cs() -> Int { @cache.get() * 10 + @other.get() }\n"),
+            ("cmd/moon.pkg", 'import { "f6/cs/down" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@down.run_cs().to_string()) }\n"),
+        ]
+        for rel, txt in cs_files:
+            with open(os.path.join(cs_m, rel), "w") as f:
+                f.write(txt)
+        cs_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=cs_m).stdout.strip()
+        cs_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=cs_m).stdout.strip()
+        assert cs_mn == "12" and cs_mw == "12", f"Same-tail Moon mismatch: nat={cs_mn!r} wgc={cs_mw!r}"
+
+        cs_pc = os.path.join(work, "cs_pc")
+        cs_po = os.path.join(work, "cs_po")
+        for nm, src_sub, pd in [("cache", "left/cache", cs_pc), ("other", "right/cache", cs_po)]:
+            os.makedirs(os.path.join(pd, "src"))
+            with open(os.path.join(pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "{nm}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+            run_cmd([bin_path, "--src", os.path.join(cs_m, src_sub), "--out", os.path.join(pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+
+        for ord_name, dep_flags in [
+            ("co", ["--dep", f"cache={cs_pc}", "--dep", f"other={cs_po}"]),
+            ("oc", ["--dep", f"other={cs_po}", "--dep", f"cache={cs_pc}"]),
+        ]:
+            cs_pd = os.path.join(work, f"cs_pd_{ord_name}")
+            os.makedirs(os.path.join(cs_pd, "src"))
+            with open(os.path.join(cs_pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "cs_down_{ord_name}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\ncache = {{ path = "{cs_pc}" }}\nother = {{ path = "{cs_po}" }}\n')
+            run_cmd([bin_path, "--src", os.path.join(cs_m, "down"), "--out", os.path.join(cs_pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc])
+            with open(os.path.join(cs_pd, "src", "main.pion"), "w") as f:
+                f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_cs().to_string())\n  0\n}\n")
+            cs_pn = run_cmd([args.pionc, "run", cs_pd]).stdout.strip()
+            cs_pw = run_cmd([args.pionc, "run", "--target", "wasm32", cs_pd]).stdout.strip()
+            assert cs_pn == "12" and cs_pw == "12", f"Same-tail Pion ({ord_name}) mismatch: nat={cs_pn!r} wasm={cs_pw!r}"
+        print("[f6-1-oracle] PASS R5 P1-1 same-tail distinct paths (left/cache @cache, right/cache @other): 4-target == 12")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
