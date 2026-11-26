@@ -62,8 +62,54 @@ pub fn run_map_is_shadow() -> String {
   hit.to_string() + "|" + miss.to_string() + "|" + x.to_string()
 }
 
+pub struct Bag {
+  mut gets : Int
+  log : Array[String]
+  data : Map[String, Int]
+}
+
+pub fn Bag::get(self : Bag, k : String) -> Int? {
+  self.gets = self.gets + 1
+  self.log.push(k)
+  self.data.get(k)
+}
+
+pub fn run_map_short_circuit() -> String {
+  // 1. if: first key missing -> second key must NEVER be queried
+  let b1 : Bag = { gets: 0, log: [], data: { "b": 2 } }
+  let r1 = if b1 is { "a": _, "b": _, .. } { 1 } else { 0 }
+
+  // 2. guard: first key missing -> second key must NEVER be queried
+  let b2 : Bag = { gets: 0, log: [], data: { "b": 2 } }
+  let fg = fn(b : Bag) -> Int {
+    guard b is { "a": _, "b": _, .. } else {
+      return 0
+    }
+    1
+  }
+  let r2 = fg(b2)
+
+  // 3. first key present but value pattern fails -> second key must NEVER be queried
+  let b3 : Bag = { gets: 0, log: [], data: { "a": 1, "b": 2 } }
+  let r3 = if b3 is { "a": 99, "b": _, .. } { 1 } else { 0 }
+
+  // 4. both keys match -> strict left-to-right order ("a" then "b")
+  let b4 : Bag = { gets: 0, log: [], data: { "a": 1, "b": 2 } }
+  let r4 = if b4 is { "a": x, "b": y, .. } { x * 10 + y } else { 0 }
+
+  // 5. bare map pattern followed by `&& { block }` condition
+  let m5 : Map[String, Int] = { "k": 4 }
+  let r5 = if m5 is { "k": v, .. } && { let n = 2; v > n } { v } else { 0 }
+
+  r1.to_string() + ":" + b1.gets.to_string() + "|" +
+    r2.to_string() + ":" + b2.gets.to_string() + "|" +
+    r3.to_string() + ":" + b3.gets.to_string() + "|" +
+    r4.to_string() + ":" + b4.gets.to_string() + ":" + b4.log.join(",") + "|" +
+    r5.to_string()
+}
+
 pub fn run_all() -> String {
-  run_map_is_1() + " :: " + run_map_is_guard() + " :: " + run_map_is_shadow()
+  run_map_is_1() + " :: " + run_map_is_guard() + " :: " + run_map_is_shadow() + " :: " + run_map_short_circuit()
 }
 '''
 
@@ -74,14 +120,14 @@ FFI_BRIDGE_C = r'''
 static uint8_t g_buf[64];
 static int32_t g_buf_len = 0;
 
-int32_t demo_start(const char *dir_ptr, int32_t dir_len, const char *url_ptr, int32_t url_len, int32_t beta) {
+int32_t pion_demo_start(const char *dir_ptr, int32_t dir_len, const char *url_ptr, int32_t url_len, int32_t beta) {
   int32_t sum = dir_len * 100 + url_len * 10 + beta;
   if (dir_len > 0 && dir_ptr[0] == '/') sum += 1;
   if (url_len > 0 && url_ptr[0] == 'h') sum += 2;
   return sum;
 }
 
-void demo_send_bytes(const char *msg_ptr, int32_t msg_len, const uint8_t *data_ptr, int32_t data_len) {
+void pion_demo_send_bytes(const char *msg_ptr, int32_t msg_len, const uint8_t *data_ptr, int32_t data_len) {
   int32_t n = data_len < 64 ? data_len : 64;
   for (int32_t i = 0; i < n; i++) {
     g_buf[i] = (uint8_t)(data_ptr[i] ^ (uint8_t)(msg_len & 0xff));
@@ -89,15 +135,15 @@ void demo_send_bytes(const char *msg_ptr, int32_t msg_len, const uint8_t *data_p
   g_buf_len = n;
 }
 
-const char *demo_scheme(void) {
+const char *pion_demo_scheme(void) {
   return "pion-scheme";
 }
 
-const char *demo_null_str(void) {
+const char *pion_demo_null_str(void) {
   return NULL;
 }
 
-const uint8_t *demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_len) {
+const uint8_t *pion_demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_len) {
   (void)tag_ptr;
   if (tag_len <= 0) {
     *out_len = 0;
@@ -109,13 +155,13 @@ const uint8_t *demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_
 '''
 
 FFI_BRIDGE_PION = r'''
-extern "C" fn __mbt_c_ffi_ffi_start(data_dir_ptr : Ptr, data_dir_len : Int, cloud_ptr : Ptr, cloud_len : Int, beta : Int) -> Int = "demo_start"
+extern "C" fn __mbt_c_ffi_ffi_start(data_dir_ptr : Ptr, data_dir_len : Int, cloud_ptr : Ptr, cloud_len : Int, beta : Int) -> Int = "pion_demo_start"
 fn ffi_start(data_dir : String, cloud : String, beta : Int) -> Int {
   let __ffi_res = __mbt_c_ffi_ffi_start(data_dir.as_cstr(), data_dir.to_bytes().length(), cloud.as_cstr(), cloud.to_bytes().length(), beta)
   __ffi_res
 }
 
-extern "C" fn __mbt_c_ffi_ffi_send_bytes(msg_ptr : Ptr, msg_len : Int, data_ptr : Ptr, data_len : Int) -> Unit = "demo_send_bytes"
+extern "C" fn __mbt_c_ffi_ffi_send_bytes(msg_ptr : Ptr, msg_len : Int, data_ptr : Ptr, data_len : Int) -> Unit = "pion_demo_send_bytes"
 fn ffi_send_bytes(msg : String, data : Bytes) -> Unit {
   let __ffi_data_len = data.length()
   let __ffi_data_buf = ptr_alloc(if __ffi_data_len > 0 { __ffi_data_len.to_int64() } else { 1L })
@@ -124,21 +170,21 @@ fn ffi_send_bytes(msg : String, data : Bytes) -> Unit {
   ptr_free(__ffi_data_buf)
 }
 
-extern "C" fn __mbt_c_ffi_ffi_scheme() -> Ptr = "demo_scheme"
+extern "C" fn __mbt_c_ffi_ffi_scheme() -> Ptr = "pion_demo_scheme"
 fn ffi_scheme() -> String {
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_scheme()
   let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
   __ffi_ret_str
 }
 
-extern "C" fn __mbt_c_ffi_ffi_null_str() -> Ptr = "demo_null_str"
+extern "C" fn __mbt_c_ffi_ffi_null_str() -> Ptr = "pion_demo_null_str"
 fn ffi_null_str() -> String {
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_null_str()
   let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
   __ffi_ret_str
 }
 
-extern "C" fn __mbt_c_ffi_ffi_read_buf(tag_ptr : Ptr, tag_len : Int, __out_len : Ptr) -> Ptr = "demo_read_buf"
+extern "C" fn __mbt_c_ffi_ffi_read_buf(tag_ptr : Ptr, tag_len : Int, __out_len : Ptr) -> Ptr = "pion_demo_read_buf"
 fn ffi_read_buf(tag : String) -> Bytes {
   let __ffi_out_len = ptr_alloc(4L)
   ptr_write_i32(__ffi_out_len, 0L, 0)
@@ -176,13 +222,18 @@ def run_cmd(cmd, cwd=None, env=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pionc", required=True)
-    ap.add_argument("--mbt2pion", required=True)
+    ap.add_argument("--mbt2pion", default="")
     ap.add_argument("--wasm-rt", default=os.path.join(REPO_ROOT, "runtime", "pion_wasm_rt.mjs"))
     ap.add_argument("--moon", default=shutil.which("moon") or "")
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="mbt2pion_f5_2_oracle_")
     try:
+        mbt2pion_bin = args.mbt2pion
+        if not mbt2pion_bin:
+            mbt2pion_bin = os.path.join(tmp, "mbt2pion_cli")
+            run_cmd([args.pionc, "build", "-o", mbt2pion_bin, os.path.join(REPO_ROOT, "tools", "mbt2pion_cli")])
+
         # 1. Transpile MAP_IS_MBT via mbt2pion in --mode publish
         mbt_src = os.path.join(tmp, "mbt_pkg")
         os.makedirs(mbt_src)
@@ -194,7 +245,7 @@ def main():
         pion_out = os.path.join(tmp, "pion_pkg")
         os.makedirs(pion_out)
         run_cmd([
-            args.mbt2pion,
+            mbt2pion_bin,
             "--src", mbt_src,
             "--out", pion_out,
             "--mode", "publish",
@@ -211,7 +262,7 @@ def main():
         nat_bin = os.path.join(tmp, "map_is_nat")
         run_cmd([args.pionc, "build", "-o", nat_bin, pion_out])
         pion_nat_out = run_cmd([nat_bin])
-        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999"
+        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999 :: 0:1|0:1|0:1|12:2:a,b|4"
         assert pion_nat_out == expected, f"Pion native mismatch: {pion_nat_out!r} != {expected!r}"
         print(f"[PASS] Pion native map-is: {pion_nat_out}")
 
