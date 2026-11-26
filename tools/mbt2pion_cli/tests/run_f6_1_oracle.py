@@ -316,7 +316,37 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string()
+  // R6 P1-2: `guard ... else { let always_fail_g = ... }` MUST NOT leak into statements after `guard`
+  let p4 = try {
+    guard true else {
+      let always_fail_g = local_fn
+      let _ = always_fail_g()
+      return "0"
+    }
+    let _ = always_fail_g()
+    42
+  } catch {
+    _ => 7
+  }
+  // R6 P1-3: `(Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g())` propagates to `&&` only
+  let p5 = try {
+    let ok = (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g())
+    if ok {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p6 = try {
+    let _ = (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g())
+    let _ = always_fail_g()
+    42
+  } catch {
+    _ => 9
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -491,7 +521,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -631,6 +661,56 @@ def main():
             cs_pw = run_cmd([args.pionc, "run", "--target", "wasm32", cs_pd]).stdout.strip()
             assert cs_pn == "12" and cs_pw == "12", f"Same-tail Pion ({ord_name}) mismatch: nat={cs_pn!r} wasm={cs_pw!r}"
         print("[f6-1-oracle] PASS R5 P1-1 same-tail distinct paths (left/cache @cache, right/cache @other): 4-target == 12")
+
+        # 3a-4. R6 P1-1 4-target check: transitive `--dep y` MUST NOT hijack direct import `"f6/tr/x" @y`
+        tr_m = os.path.join(work, "tr_moon")
+        for sub in ("y", "x", "down", "cmd"):
+            os.makedirs(os.path.join(tr_m, sub))
+        tr_files = [
+            ("moon.mod", 'name = "f6/tr"\n'),
+            ("y/moon.pkg", "\n"),
+            ("y/y.mbt", "pub fn get() -> Int { 2 }\n"),
+            ("x/moon.pkg", 'import { "f6/tr/y" }\n'),
+            ("x/x.mbt", "pub fn get() -> Int { @y.get() - 1 }\n"),
+            ("down/moon.pkg", 'import { "f6/tr/x" @y }\n'),
+            ("down/down.mbt", "pub fn run_tr() -> Int { @y.get() }\n"),
+            ("cmd/moon.pkg", 'import { "f6/tr/down" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@down.run_tr().to_string()) }\n"),
+        ]
+        for rel, txt in tr_files:
+            with open(os.path.join(tr_m, rel), "w") as f:
+                f.write(txt)
+        tr_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=tr_m).stdout.strip()
+        tr_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=tr_m).stdout.strip()
+        assert tr_mn == "1" and tr_mw == "1", f"Transitive dep Moon mismatch: nat={tr_mn!r} wgc={tr_mw!r}"
+
+        tr_py = os.path.join(work, "tr_py")
+        tr_px = os.path.join(work, "tr_px")
+        os.makedirs(os.path.join(tr_py, "src"))
+        os.makedirs(os.path.join(tr_px, "src"))
+        with open(os.path.join(tr_py, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "y"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(tr_m, "y"), "--out", os.path.join(tr_py, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        with open(os.path.join(tr_px, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "x"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\ny = {{ path = "{tr_py}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(tr_m, "x"), "--out", os.path.join(tr_px, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"y={tr_py}", "--pionc", args.pionc])
+
+        for ord_name, dep_flags, extra_toml in [
+            ("x_only", ["--dep", f"x={tr_px}"], ""),
+            ("xy", ["--dep", f"x={tr_px}", "--dep", f"y={tr_py}"], f'y = {{ path = "{tr_py}" }}\n'),
+            ("yx", ["--dep", f"y={tr_py}", "--dep", f"x={tr_px}"], f'y = {{ path = "{tr_py}" }}\n'),
+        ]:
+            tr_pd = os.path.join(work, f"tr_pd_{ord_name}")
+            os.makedirs(os.path.join(tr_pd, "src"))
+            with open(os.path.join(tr_pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "tr_down_{ord_name}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nx = {{ path = "{tr_px}" }}\n{extra_toml}')
+            run_cmd([bin_path, "--src", os.path.join(tr_m, "down"), "--out", os.path.join(tr_pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc])
+            with open(os.path.join(tr_pd, "src", "main.pion"), "w") as f:
+                f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_tr().to_string())\n  0\n}\n")
+            tr_pn = run_cmd([args.pionc, "run", tr_pd]).stdout.strip()
+            tr_pw = run_cmd([args.pionc, "run", "--target", "wasm32", tr_pd]).stdout.strip()
+            assert tr_pn == "1" and tr_pw == "1", f"Transitive dep Pion ({ord_name}) mismatch: nat={tr_pn!r} wasm={tr_pw!r}"
+        print("[f6-1-oracle] PASS R6 P1-1 transitive dep y->x->down(x @y) in all 3 --dep configs: 4-target == 1")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
