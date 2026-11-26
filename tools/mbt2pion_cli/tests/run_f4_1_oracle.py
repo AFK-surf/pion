@@ -133,11 +133,30 @@ pub fn run_4_for_remove_break_and_confined() -> String {
   ints(xs) + "|" + confined_pool.length().to_string() + "|" + opt(active) + "|" + opt(matched)
 }
 
+fn run_5_disjoint_2d_helper(xs : Array[Int], grid : Array[Array[String]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      grid[0].push("a")
+      grid[0][0] = "b"
+    }
+    s = s + x
+  }
+  s
+}
+
+pub fn run_5_disjoint_2d_param() -> String {
+  let xs = [1, 2, 3]
+  let grid : Array[Array[String]] = [["init"]]
+  run_5_disjoint_2d_helper(xs, grid).to_string()
+}
+
 pub fn run_all() -> String {
   "P1:" + run_1_inplace_write() + "\n" +
   "P2:" + run_2_push_only() + "\n" +
   "P3:" + run_3_edge_and_laziness() + "\n" +
-  "P4:" + run_4_for_remove_break_and_confined()
+  "P4:" + run_4_for_remove_break_and_confined() + "\n" +
+  "P5:" + run_5_disjoint_2d_param()
 }
 '''
 
@@ -1094,6 +1113,123 @@ pub fn f(xs : Array[Int], g3 : Array[Array[Array[Int]]]) -> Int {
     if x == 1 {
       g3[0][0].push(4)
       g3[0][0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_let_block_indexed": (r'''
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = { grid[0] }
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_let_if_indexed": (r'''
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = if x == 1 { grid[0] } else { [] }
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_let_field_indexed": (r'''
+priv struct Grid { grid : Array[Array[Int]] }
+pub fn f(xs : Array[Int], v : Grid) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = v.grid[0]
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_generic_tparam_struct_clash": (r'''
+priv struct T { v : Int }
+fn[T] note_t(row : T) -> Unit { let _ = row }
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let _ : T = { v: 0 }
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = grid[0]
+      note_t(row)
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_inner_tuple_shadow": (r'''
+fn use_int(a : Int) -> Unit { let _ = a }
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = grid[0]
+      if false {
+        let (row, k) = (3, 2)
+        use_int(row)
+        let _ = k
+      }
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_fresh_2d_helper_put": (r'''
+fn put_outer(g : Array[Array[Int]], a : Array[Int]) -> Unit { g[0] = a }
+pub fn f(xs : Array[Int]) -> Int {
+  let g : Array[Array[Int]] = [[], []]
+  let mut s = 0
+  for x in xs {
+    if x == 2 {
+      g[0].push(4)
+      g[0][1] = 9
+    }
+    if x == 1 {
+      put_outer(g, xs)
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_fresh_2d_alias_write": (r'''
+pub fn f(xs : Array[Int]) -> Int {
+  let g : Array[Array[Int]] = [[], []]
+  let u = g
+  let mut s = 0
+  for x in xs {
+    if x == 2 {
+      g[0].push(4)
+      g[0][1] = 9
+    }
+    if x == 1 {
+      u[0] = xs
     }
     s = s + x
   }

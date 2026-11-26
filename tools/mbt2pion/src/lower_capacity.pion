@@ -772,7 +772,28 @@ fn name_handed_out(tokens : Array[Token], name : String, body_open : Int, limit 
         pk.kind == TokenKind::Colon || pk.kind == TokenKind::Comma || pk.raw == "return")
       // The last expression of the body (its value), or inside a closure.
       let tail = !read_through && nx == TokenKind::RBrace && j + 1 == body_close
-      if arg || stored || tail || enclosing_closure_open(tokens, j, body_open) >= 0 {
+      let co = enclosing_closure_open(tokens, j, body_open)
+      let mut in_escaping_closure = co >= 0
+      if in_escaping_closure && read_through && !arg && !stored && !tail {
+        // Synchronous `mbt_compat::ordered_map_each(m, fn(..) { arr.push(..) })` / `m.each(fn(..) { arr.push(..) })`
+        // drops the closure on return; if `arr` is only read-through (`.push`), it does not escape.
+        let mut h = co - 1
+        while h > body_open && !tokens[h].newline_before && tokens[h].kind != TokenKind::RParen { h = h - 1 }
+        if h > body_open && tokens[h].kind == TokenKind::RParen {
+          let f_lp = find_open_before(tokens, h, body_open)
+          if f_lp > body_open && tokens[f_lp - 1].raw == "fn" && enclosing_closure_open(tokens, f_lp - 1, body_open) < 0 {
+            let call_lp = enclosing_open(tokens, f_lp - 1, body_open, TokenKind::LParen)
+            if call_lp >= 3 && tokens[call_lp - 2].kind == TokenKind::ColonColon && tokens[call_lp - 3].raw == "mbt_compat" &&
+            (tokens[call_lp - 1].raw == "ordered_map_each" || tokens[call_lp - 1].raw == "map_each" ||
+              tokens[call_lp - 1].raw == "ordered_set_each") {
+              in_escaping_closure = false
+            } else if call_lp >= 2 && tokens[call_lp - 2].kind == TokenKind::Dot && tokens[call_lp - 1].raw == "each" {
+              in_escaping_closure = false
+            }
+          }
+        }
+      }
+      if arg || stored || tail || in_escaping_closure {
         return true
       }
     }
@@ -3001,11 +3022,20 @@ pub struct CapFnEffect {
   mut may_grow : Bool
   mut may_write : Bool
   mut may_shrink_to_fit : Bool
+  // Non-field, non-global, non-fresh array mutations tracked by element type (or unknown element).
+  mutated_arr_elems : Map[String, Bool]
+  mut may_shrink_unk_elem : Bool
+  grew_arr_elems : Map[String, Bool]
+  mut may_grow_unk_elem : Bool
+  wrote_arr_elems : Map[String, Bool]
+  mut may_write_unk_elem : Bool
   // True for any unknown call (opaque closure, indirect call, cross-package dep call, etc.).
   mut may_call_unknown : Bool
   // True specifically for opaque / non-dep-helper unknown calls (indirect, closure param, `|>`, `InterpString`,
-  // 3-seg dep call, or mutating/unknown `impl Eq`).
+  // or mutating/unknown `impl Eq`).
   mut may_call_opaque : Bool
+  // True for 3-segment cross-package calls `dep::Type::method(...)` (cannot touch `Array[PrivLocalStruct]` unless a param escapes).
+  mut may_call_dep_3seg : Bool
   // True iff this function (or a callee) passes a function parameter directly to a cross-package `dep::f(param)` call.
   mut may_pass_param_to_dep : Bool
   // Positional parameter indices (0-based) passed directly to a cross-package `dep::f(param)` call.
@@ -3049,6 +3079,21 @@ fn is_builtin_first_order_method(m : String) -> Bool {
   m == "abs" || m == "floor" || m == "ceil" || m == "round" || m == "trunc" || m == "sqrt" ||
   m == "min" || m == "max" || m == "clamp" || m == "to_double" || m == "to_float" || m == "to_int64" ||
   m == "to_uint" || m == "to_uint64" || m == "to_byte" || m == "to_bytes" ||
+  m == "to_int" || m == "to_int16" || m == "to_uint16" || m == "to_char" || m == "to_string" ||
+  m == "is_finite" || m == "is_nan" || m == "is_inf" || m == "is_pos_inf" || m == "is_neg_inf" ||
+  m == "reinterpret_as_int" || m == "reinterpret_as_uint" || m == "reinterpret_as_float" ||
+  m == "reinterpret_as_double" || m == "reinterpret_as_int64" || m == "reinterpret_as_uint64" ||
+  m == "clz" || m == "ctz" || m == "popcnt" || m == "is_ascii" || m == "is_ascii_digit" ||
+  m == "is_ascii_alphabetic" || m == "is_ascii_alphanumeric" || m == "is_ascii_whitespace" ||
+  m == "is_ascii_uppercase" || m == "is_ascii_lowercase" || m == "code_unit_at" || m == "char_at" ||
+  m == "byte_at" || m == "get_char" || m == "find" || m == "rev_find" || m == "contains_char" ||
+  m == "view" || m == "iter" || m == "iter2" || m == "rev_iter" || m == "chars" ||
+  m == "to_array" || m == "to_fixedarray" || m == "unsafe_get" || m == "unsafe_set" ||
+  m == "blit_to" || m == "fill" || m == "copy" || m == "swap" || m == "reverse" ||
+  m == "pow" || m == "sin" || m == "cos" || m == "tan" || m == "asin" || m == "acos" ||
+  m == "atan" || m == "atan2" || m == "exp" || m == "ln" || m == "log10" || m == "log2" ||
+  m == "hypot" || m == "signum" || m == "copysign" || m == "add" || m == "insert" ||
+  m == "push_str" || m == "write_substring" || m == "reset" || m == "as_bytes" ||
   m == "has_prefix" || m == "has_suffix" || m == "starts_with" || m == "ends_with" ||
   m == "trim" || m == "trim_start" || m == "trim_end" || m == "to_lower" || m == "to_upper" ||
   m == "index_of" || m == "last_index_of" || m == "slice" || m == "substring" || m == "split"
@@ -3078,8 +3123,20 @@ pub struct CapPkgSummary {
   pure_enum_ctors : Map[String, Bool]
   // All struct type names declared in this package.
   local_struct_names : Map[String, Bool]
+  // All enum type names declared in this package.
+  local_enum_names : Map[String, Bool]
   // Private struct type names (`priv struct Name`) declared in this package (cannot be named by any dependency).
   priv_local_struct_names : Map[String, Bool]
+  // Private enum type names (`priv enum Name`) declared in this package (cannot be named by any dependency).
+  priv_local_enum_names : Map[String, Bool]
+  // Non-generic local structs/enums transitively proven free of any `Array`, closure, generic, or foreign field/payload.
+  array_free_types : Map[String, Bool]
+  // Non-generic local structs/enums -> transitive reachable `Array[Elem]` element types, plus unk/foreign flags.
+  type_reach_elems : Map[String, Map[String, Bool]]
+  type_reach_unk : Map[String, Bool]
+  type_reach_foreign : Map[String, Bool]
+  // Local function callback parameter types (`"fn_name#arg_ord#cparam_ord"` -> `"Array:Elem"` or `"__NON_ARR__"`).
+  fn_closure_param_types : Map[String, String]
   // Local functions' parameter positions typed as concrete non-generic foreign types (`pkg::Ty` without `[...]`).
   fn_nongeneric_foreign_params : Map[String, Map[Int, Bool]]
   // Unambiguous local free-function return types (`fn f(..) -> Int` -> `"Int"`, `-> Array[Rule]` -> `"Array:Rule"`).
@@ -3132,7 +3189,14 @@ pub fn CapPkgSummary::empty() -> CapPkgSummary {
     pure_eq_types: Map(),
     pure_enum_ctors: Map(),
     local_struct_names: Map(),
+    local_enum_names: Map(),
     priv_local_struct_names: Map(),
+    priv_local_enum_names: Map(),
+    array_free_types: Map(),
+    type_reach_elems: Map(),
+    type_reach_unk: Map(),
+    type_reach_foreign: Map(),
+    fn_closure_param_types: Map(),
     fn_nongeneric_foreign_params: Map(),
     fn_return_types: Map(),
     field_types: Map(),
@@ -4372,6 +4436,533 @@ fn nth_arg_root(tokens : Array[Token], as_ : Int, ae_ : Int, target_idx : Int) -
   ""
 }
 
+///| True iff the type expression in `ts[s_in..e_in)` is transitively guaranteed to neither be nor contain any `Array`.
+fn type_span_is_array_free(
+  ts : Array[Token],
+  s_in : Int,
+  e_in : Int,
+  array_free_types : Map[String, Bool],
+  depth : Int,
+) -> Bool {
+  if depth > 8 || e_in <= s_in {
+    return false
+  }
+  let mut s = s_in
+  let mut e = e_in
+  while e > s && ts[e - 1].raw == "?" {
+    e = e - 1
+  }
+  if e <= s {
+    return false
+  }
+  // Strip `mbt_compat::` qualifier (e.g. `mbt_compat::OrderedSet[Int]`, `mbt_compat::OrderedMap[String, Int]`).
+  if s + 2 < e && ts[s].raw == "mbt_compat" && ts[s + 1].kind == TokenKind::ColonColon {
+    s = s + 2
+  }
+  // Reject any function/closure type `(..) -> ..` at depth 0 (closures can capture arrays).
+  let mut ci = s
+  let mut cd = 0
+  while ci < e {
+    let ck = ts[ci].kind
+    if ck == TokenKind::LParen || ck == TokenKind::LBracket || ck == TokenKind::LBrace { cd = cd + 1 }
+    else if ck == TokenKind::RParen || ck == TokenKind::RBracket || ck == TokenKind::RBrace { cd = cd - 1 }
+    else if cd == 0 && (ck == TokenKind::Arrow || ts[ci].raw == "->") {
+      return false
+    }
+    ci = ci + 1
+  }
+  // Tuple or parenthesized type `(T1, T2, ...)`: array-free iff every element is array-free.
+  if ts[s].kind == TokenKind::LParen && find_matching_delim(ts, s) == e - 1 {
+    if e - s == 2 {
+      return true
+    }
+    let mut seg_s = s + 1
+    let mut ti = s + 1
+    let mut td = 0
+    while ti <= e - 1 {
+      let at_end = ti == e - 1
+      let is_comma = !at_end && td == 0 && ts[ti].kind == TokenKind::Comma
+      if at_end || is_comma {
+        if ti > seg_s {
+          if !type_span_is_array_free(ts, seg_s, ti, array_free_types, depth + 1) {
+            return false
+          }
+        }
+        seg_s = ti + 1
+      } else {
+        let tk = ts[ti].kind
+        if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+        else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+      }
+      ti = ti + 1
+    }
+    return true
+  }
+  // Single concrete type identifier `T`
+  if e == s + 1 {
+    let t = ts[s].raw
+    return is_builtin_eq_type_name(t) || t == "Bytes" || t == "SourceLoc" ||
+    t == "StringBuilder" || t == "Buffer" || array_free_types.contains(t)
+  }
+  // Built-in generic containers `Head[Arg1, ...]` whose element types are all array-free
+  if ts[s + 1].kind == TokenKind::LBracket && find_matching_delim(ts, s + 1) == e - 1 {
+    let head = ts[s].raw
+    if head == "Option" || head == "Result" || head == "Map" || head == "OrderedMap" ||
+    head == "OrderedSet" || head == "Set" || head == "FixedArray" || head == "Ref" {
+      let mut seg_s = s + 2
+      let mut ti = s + 2
+      let mut td = 0
+      let mut n_args = 0
+      while ti <= e - 1 {
+        let at_end = ti == e - 1
+        let is_comma = !at_end && td == 0 && ts[ti].kind == TokenKind::Comma
+        if at_end || is_comma {
+          if ti > seg_s {
+            n_args = n_args + 1
+            if !type_span_is_array_free(ts, seg_s, ti, array_free_types, depth + 1) {
+              return false
+            }
+          }
+          seg_s = ti + 1
+        } else {
+          let tk = ts[ti].kind
+          if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+          else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+        }
+        ti = ti + 1
+      }
+      return n_args > 0
+    }
+  }
+  false
+}
+
+///| Compute the fixed-point set of non-generic local structs and enums transitively free of `Array`/closure/foreign types.
+fn collect_array_free_types(all_tokens : Array[Array[Token]]) -> Map[String, Bool] {
+  // Record `(file_idx, decl_name, spans)` for every non-generic struct/enum declaration.
+  let decl_names : Array[String] = []
+  let decl_file : Array[Int] = []
+  let decl_spans : Array[Array[(Int, Int)]] = []
+  let mut fi = 0
+  while fi < all_tokens.length() {
+    let ts = all_tokens[fi]
+    let n = ts.length()
+    let mut i = 0
+    while i + 2 < n {
+      let kw = ts[i].raw
+      if (kw == "struct" || kw == "enum") && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident) &&
+      is_type_ident_tok(ts[i + 1].kind) {
+        let name = ts[i + 1].raw
+        // Skip generic structs/enums (`struct Foo[T]`)
+        if ts[i + 2].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, i + 2)
+          if close > i + 2 {
+            let spans : Array[(Int, Int)] = []
+            let mut ok = true
+            if kw == "struct" {
+              let mut k = i + 3
+              let mut d = 0
+              while k < close {
+                let kk = ts[k].kind
+                if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+                else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+                else if d == 0 && kk == TokenKind::Ident && k + 1 < close && ts[k + 1].kind == TokenKind::Colon {
+                  let ty_s = k + 2
+                  let mut ty_e = ty_s
+                  let mut td = 0
+                  while ty_e < close {
+                    let tk2 = ts[ty_e].kind
+                    if td == 0 && (tk2 == TokenKind::Comma || tk2 == TokenKind::Semi || (ty_e > ty_s && ts[ty_e].newline_before)) {
+                      break
+                    }
+                    if tk2 == TokenKind::LParen || tk2 == TokenKind::LBracket || tk2 == TokenKind::LBrace { td = td + 1 }
+                    else if tk2 == TokenKind::RParen || tk2 == TokenKind::RBracket || tk2 == TokenKind::RBrace {
+                      if td == 0 { break }
+                      td = td - 1
+                    }
+                    ty_e = ty_e + 1
+                  }
+                  if ty_e <= ty_s { ok = false; break }
+                  spans.push((ty_s, ty_e))
+                  k = ty_e
+                  continue
+                }
+                k = k + 1
+              }
+            } else {
+              // enum: collect every payload type inside `Variant(T1, label~ : T2, ...)`
+              let mut k = i + 3
+              let mut d = 0
+              while k < close {
+                let kk = ts[k].kind
+                if d == 0 && is_type_ident_tok(kk) && k + 1 < close && ts[k + 1].kind == TokenKind::LParen {
+                  let cp = find_matching_delim(ts, k + 1)
+                  if cp > k + 1 && cp < close {
+                    let mut seg_s = k + 2
+                    let mut pi = k + 2
+                    let mut pd = 0
+                    while pi <= cp {
+                      let at_end = pi == cp
+                      let is_comma = !at_end && pd == 0 && ts[pi].kind == TokenKind::Comma
+                      if at_end || is_comma {
+                        let mut ps = seg_s
+                        while ps < pi && (ts[ps].raw == "mut" || ts[ps].raw == "priv") { ps = ps + 1 }
+                        if ps + 2 < pi && ts[ps].kind == TokenKind::Ident && ts[ps + 1].kind == TokenKind::Colon {
+                          ps = ps + 2
+                        } else if ps + 3 < pi && ts[ps].kind == TokenKind::Ident &&
+                        (ts[ps + 1].raw == "~" || ts[ps + 1].raw == "?") && ts[ps + 2].kind == TokenKind::Colon {
+                          ps = ps + 3
+                        }
+                        if pi > ps {
+                          spans.push((ps, pi))
+                        }
+                        seg_s = pi + 1
+                      } else {
+                        let pk = ts[pi].kind
+                        if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+                        else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+                      }
+                      pi = pi + 1
+                    }
+                    k = cp + 1
+                    continue
+                  }
+                }
+                if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+                else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+                k = k + 1
+              }
+            }
+            if ok {
+              decl_names.push(name)
+              decl_file.push(fi)
+              decl_spans.push(spans)
+            }
+            i = close
+            continue
+          }
+        }
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  let out : Map[String, Bool] = Map()
+  let mut changed = true
+  let mut iter = 0
+  while changed && iter < 16 {
+    changed = false
+    iter = iter + 1
+    let mut di = 0
+    while di < decl_names.length() {
+      let nm = decl_names[di]
+      if !out.contains(nm) {
+        let ts = all_tokens[decl_file[di]]
+        let spans = decl_spans[di]
+        let mut all_ok = true
+        for sp in spans {
+          if !type_span_is_array_free(ts, sp.0, sp.1, out, 0) {
+            all_ok = false
+            break
+          }
+        }
+        if all_ok {
+          out[nm] = true
+          changed = true
+        }
+      }
+      di = di + 1
+    }
+  }
+  out
+}
+
+///| Collect transitive `Array[Elem]` reachability from type span `ts[s_in..e_in)`.
+///| `dst_flags` is `[unk, foreign]`.
+fn type_span_collect_reach(
+  ts : Array[Token],
+  s_in : Int,
+  e_in : Int,
+  reach_elems : Map[String, Map[String, Bool]],
+  reach_unk : Map[String, Bool],
+  reach_foreign : Map[String, Bool],
+  dst_elems : Map[String, Bool],
+  dst_flags : Array[Bool],
+  depth : Int,
+) -> Unit {
+  if depth > 8 || e_in <= s_in {
+    dst_flags[0] = true
+    return
+  }
+  let mut s = s_in
+  let mut e = e_in
+  while e > s && ts[e - 1].raw == "?" {
+    e = e - 1
+  }
+  if e <= s {
+    dst_flags[0] = true
+    return
+  }
+  if s + 2 < e && ts[s].raw == "mbt_compat" && ts[s + 1].kind == TokenKind::ColonColon {
+    s = s + 2
+  }
+  // Any closure/function type `(..) -> ..` at depth 0 may capture arbitrary arrays.
+  let mut ci = s
+  let mut cd = 0
+  while ci < e {
+    let ck = ts[ci].kind
+    if ck == TokenKind::LParen || ck == TokenKind::LBracket || ck == TokenKind::LBrace { cd = cd + 1 }
+    else if ck == TokenKind::RParen || ck == TokenKind::RBracket || ck == TokenKind::RBrace { cd = cd - 1 }
+    else if cd == 0 && (ck == TokenKind::Arrow || ts[ci].raw == "->") {
+      dst_flags[0] = true
+      return
+    }
+    ci = ci + 1
+  }
+  // Tuple or parenthesized type `(T1, T2, ...)`
+  if ts[s].kind == TokenKind::LParen && find_matching_delim(ts, s) == e - 1 {
+    if e - s == 2 {
+      return
+    }
+    let mut seg_s = s + 1
+    let mut ti = s + 1
+    let mut td = 0
+    while ti <= e - 1 {
+      let at_end = ti == e - 1
+      let is_comma = !at_end && td == 0 && ts[ti].kind == TokenKind::Comma
+      if at_end || is_comma {
+        if ti > seg_s {
+          type_span_collect_reach(ts, seg_s, ti, reach_elems, reach_unk, reach_foreign, dst_elems, dst_flags, depth + 1)
+        }
+        seg_s = ti + 1
+      } else {
+        let tk = ts[ti].kind
+        if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+        else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+      }
+      ti = ti + 1
+    }
+    return
+  }
+  // Single concrete type identifier `T`
+  if e == s + 1 {
+    let t = ts[s].raw
+    if is_builtin_eq_type_name(t) || t == "Bytes" || t == "SourceLoc" ||
+    t == "StringBuilder" || t == "Buffer" {
+      return
+    }
+    match reach_elems.get(t) {
+      Some(re) => {
+        for el in re.keys() {
+          dst_elems[el] = true
+        }
+        if reach_unk.contains(t) { dst_flags[0] = true }
+        if reach_foreign.contains(t) { dst_flags[1] = true }
+      }
+      None => dst_flags[0] = true
+    }
+    return
+  }
+  // Non-generic foreign type `pkg::Ty`
+  if e == s + 3 && ts[s].kind == TokenKind::Ident && ts[s + 1].kind == TokenKind::ColonColon &&
+  is_type_ident_tok(ts[s + 2].kind) {
+    dst_flags[1] = true
+    return
+  }
+  // `Array[Inner]`
+  if ts[s].raw == "Array" && s + 1 < e && ts[s + 1].kind == TokenKind::LBracket &&
+  find_matching_delim(ts, s + 1) == e - 1 {
+    let el_c = canonical_type_span(ts, s + 2, e - 1)
+    if el_c.length() > 0 && !el_c.starts_with("Array") {
+      dst_elems[el_c] = true
+      type_span_collect_reach(ts, s + 2, e - 1, reach_elems, reach_unk, reach_foreign, dst_elems, dst_flags, depth + 1)
+    } else {
+      dst_flags[0] = true
+    }
+    return
+  }
+  // Built-in generic containers `Head[Arg1, ...]`
+  if ts[s + 1].kind == TokenKind::LBracket && find_matching_delim(ts, s + 1) == e - 1 {
+    let head = ts[s].raw
+    if head == "Option" || head == "Result" || head == "Map" || head == "OrderedMap" ||
+    head == "OrderedSet" || head == "Set" || head == "FixedArray" || head == "Ref" {
+      let mut seg_s = s + 2
+      let mut ti = s + 2
+      let mut td = 0
+      let mut n_args = 0
+      while ti <= e - 1 {
+        let at_end = ti == e - 1
+        let is_comma = !at_end && td == 0 && ts[ti].kind == TokenKind::Comma
+        if at_end || is_comma {
+          if ti > seg_s {
+            n_args = n_args + 1
+            type_span_collect_reach(ts, seg_s, ti, reach_elems, reach_unk, reach_foreign, dst_elems, dst_flags, depth + 1)
+          }
+          seg_s = ti + 1
+        } else {
+          let tk = ts[ti].kind
+          if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+          else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+        }
+        ti = ti + 1
+      }
+      if n_args == 0 { dst_flags[0] = true }
+      return
+    }
+  }
+  dst_flags[0] = true
+}
+
+///| Compute transitive `Array[Elem]` reachability for all non-generic local structs and enums.
+fn collect_type_array_reach(
+  all_tokens : Array[Array[Token]],
+) -> (Map[String, Map[String, Bool]], Map[String, Bool], Map[String, Bool]) {
+  let decl_names : Array[String] = []
+  let decl_file : Array[Int] = []
+  let decl_spans : Array[Array[(Int, Int)]] = []
+  let reach_elems : Map[String, Map[String, Bool]] = Map()
+  let reach_unk : Map[String, Bool] = Map()
+  let reach_foreign : Map[String, Bool] = Map()
+  let mut fi = 0
+  while fi < all_tokens.length() {
+    let ts = all_tokens[fi]
+    let n = ts.length()
+    let mut i = 0
+    while i + 2 < n {
+      let kw = ts[i].raw
+      if (kw == "struct" || kw == "enum") && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident) &&
+      is_type_ident_tok(ts[i + 1].kind) && ts[i + 2].kind == TokenKind::LBrace {
+        let name = ts[i + 1].raw
+        let close = find_matching_delim(ts, i + 2)
+        if close > i + 2 {
+          let spans : Array[(Int, Int)] = []
+          let mut ok = true
+          if kw == "struct" {
+            let mut k = i + 3
+            let mut d = 0
+            while k < close {
+              let kk = ts[k].kind
+              if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+              else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+              else if d == 0 && kk == TokenKind::Ident && k + 1 < close && ts[k + 1].kind == TokenKind::Colon {
+                let ty_s = k + 2
+                let mut ty_e = ty_s
+                let mut td = 0
+                while ty_e < close {
+                  let tk2 = ts[ty_e].kind
+                  if td == 0 && (tk2 == TokenKind::Comma || tk2 == TokenKind::Semi || (ty_e > ty_s && ts[ty_e].newline_before)) {
+                    break
+                  }
+                  if tk2 == TokenKind::LParen || tk2 == TokenKind::LBracket || tk2 == TokenKind::LBrace { td = td + 1 }
+                  else if tk2 == TokenKind::RParen || tk2 == TokenKind::RBracket || tk2 == TokenKind::RBrace {
+                    if td == 0 { break }
+                    td = td - 1
+                  }
+                  ty_e = ty_e + 1
+                }
+                if ty_e <= ty_s { ok = false; break }
+                spans.push((ty_s, ty_e))
+                k = ty_e
+                continue
+              }
+              k = k + 1
+            }
+          } else {
+            let mut k = i + 3
+            let mut d = 0
+            while k < close {
+              let kk = ts[k].kind
+              if d == 0 && is_type_ident_tok(kk) && k + 1 < close && ts[k + 1].kind == TokenKind::LParen {
+                let cp = find_matching_delim(ts, k + 1)
+                if cp > k + 1 && cp < close {
+                  let mut seg_s = k + 2
+                  let mut pi = k + 2
+                  let mut pd = 0
+                  while pi <= cp {
+                    let at_end = pi == cp
+                    let is_comma = !at_end && pd == 0 && ts[pi].kind == TokenKind::Comma
+                    if at_end || is_comma {
+                      let mut ps = seg_s
+                      while ps < pi && (ts[ps].raw == "mut" || ts[ps].raw == "priv") { ps = ps + 1 }
+                      if ps + 2 < pi && ts[ps].kind == TokenKind::Ident && ts[ps + 1].kind == TokenKind::Colon {
+                        ps = ps + 2
+                      } else if ps + 3 < pi && ts[ps].kind == TokenKind::Ident &&
+                      (ts[ps + 1].raw == "~" || ts[ps + 1].raw == "?") && ts[ps + 2].kind == TokenKind::Colon {
+                        ps = ps + 3
+                      }
+                      if pi > ps {
+                        spans.push((ps, pi))
+                      }
+                      seg_s = pi + 1
+                    } else {
+                      let pk = ts[pi].kind
+                      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+                      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+                    }
+                    pi = pi + 1
+                  }
+                  k = cp + 1
+                  continue
+                }
+              }
+              if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+              else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+              k = k + 1
+            }
+          }
+          if ok {
+            decl_names.push(name)
+            decl_file.push(fi)
+            decl_spans.push(spans)
+            if !reach_elems.contains(name) {
+              reach_elems[name] = Map()
+            }
+          }
+          i = close
+          continue
+        }
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  let mut changed = true
+  let mut iter = 0
+  while changed && iter < 16 {
+    changed = false
+    iter = iter + 1
+    let mut di = 0
+    while di < decl_names.length() {
+      let nm = decl_names[di]
+      let ts = all_tokens[decl_file[di]]
+      let spans = decl_spans[di]
+      let dst_elems : Map[String, Bool] = Map()
+      let dst_flags = [false, false]
+      for sp in spans {
+        type_span_collect_reach(ts, sp.0, sp.1, reach_elems, reach_unk, reach_foreign, dst_elems, dst_flags, 0)
+      }
+      let cur = match reach_elems.get(nm) { Some(m) => m, None => Map() }
+      for el in dst_elems.keys() {
+        if !cur.contains(el) {
+          cur[el] = true
+          changed = true
+        }
+      }
+      reach_elems[nm] = cur
+      if dst_flags[0] && !reach_unk.contains(nm) {
+        reach_unk[nm] = true
+        changed = true
+      }
+      if dst_flags[1] && !reach_foreign.contains(nm) {
+        reach_foreign[nm] = true
+        changed = true
+      }
+      di = di + 1
+    }
+  }
+  (reach_elems, reach_unk, reach_foreign)
+}
+
 ///| Build declaration-bound `CapPkgSummary` from pre-lexed package tokens (zero re-lexing).
 pub fn collect_cap_pkg_summary(
   all_tokens : Array[Array[Token]],
@@ -4382,6 +4973,9 @@ pub fn collect_cap_pkg_summary(
   let local_sort_env = sort_key_env_of_with_deps(all_tokens, Map())
   let local_has_custom_eq = local_sort_env.methods.contains(" eq")
   let array_fields = collect_array_fields_from_tokens(all_tokens)
+  let array_free_types = collect_array_free_types(all_tokens)
+  let (type_reach_elems, type_reach_unk, type_reach_foreign) = collect_type_array_reach(all_tokens)
+  let fn_closure_param_types : Map[String, String] = Map()
   let pkg_globals : Map[String, Bool] = Map()
   let pkg_global_types : Map[String, String] = Map()
   for ts in all_tokens {
@@ -4398,12 +4992,20 @@ pub fn collect_cap_pkg_summary(
         if ni < n && ts[ni].kind == TokenKind::Ident {
           let gname = ts[ni].raw
           pkg_globals[gname] = true
-          if ni + 5 < n && ts[ni + 1].kind == TokenKind::Colon && ts[ni + 2].raw == "Array" &&
+          if ni + 4 < n && ts[ni + 1].kind == TokenKind::Colon && ts[ni + 2].raw == "Array" &&
           ts[ni + 3].kind == TokenKind::LBracket {
-            if is_type_ident_tok(ts[ni + 4].kind) && ts[ni + 5].kind == TokenKind::RBracket {
-              pkg_global_types[gname] = "Array:" + ts[ni + 4].raw
-            } else if ts[ni + 4].kind == TokenKind::LParen {
-              pkg_global_types[gname] = "Array:("
+            let rb_g = find_matching_delim(ts, ni + 3)
+            if rb_g > ni + 4 && rb_g < n {
+              if rb_g == ni + 5 && is_type_ident_tok(ts[ni + 4].kind) {
+                pkg_global_types[gname] = "Array:" + ts[ni + 4].raw
+              } else if ts[ni + 4].kind == TokenKind::LParen {
+                pkg_global_types[gname] = "Array:("
+              } else {
+                let inner_g = canonical_type_span(ts, ni + 4, rb_g)
+                if inner_g.length() > 0 {
+                  pkg_global_types[gname] = "Array:" + inner_g
+                }
+              }
             }
           }
         }
@@ -4436,8 +5038,15 @@ pub fn collect_cap_pkg_summary(
       may_grow: false,
       may_write: false,
       may_shrink_to_fit: false,
+      mutated_arr_elems: Map(),
+      may_shrink_unk_elem: false,
+      grew_arr_elems: Map(),
+      may_grow_unk_elem: false,
+      wrote_arr_elems: Map(),
+      may_write_unk_elem: false,
       may_call_unknown: false,
       may_call_opaque: false,
+      may_call_dep_3seg: false,
       may_pass_param_to_dep: false,
       dep_escaped_params: Map(),
       scalar_params: Map(),
@@ -4452,6 +5061,9 @@ pub fn collect_cap_pkg_summary(
     // (to detect `fn w(b : Box) { dep::mutate(b) }` per-parameter without false positives on sibling params).
     let fn_param_idx : Map[String, Int] = Map()
     let fn_arr_params : Map[String, Int] = Map()
+    let fn_arr_elem_vars : Map[String, String] = Map()
+    let fn_non_arr_vars : Map[String, Bool] = Map()
+    let fn_decl_tparams = fn_type_params_of(ts, body_open)
     let fs_decl = fn_start_of(ts, body_open)
     if fs_decl >= 0 {
       let mut pk = fs_decl + 1
@@ -4464,19 +5076,101 @@ pub fn collect_cap_pkg_summary(
         else if pkk == TokenKind::RParen { paren_d = paren_d - 1 }
         else if pkk == TokenKind::LBracket { brack_d = brack_d + 1 }
         else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
-        else if paren_d == 1 && brack_d == 0 && (pkk == TokenKind::Ident || ts[pk].raw == "self") && ts[pk + 1].kind == TokenKind::Colon {
+        else if paren_d == 1 && brack_d == 0 && (pkk == TokenKind::Ident || ts[pk].raw == "self") &&
+        (ts[pk + 1].kind == TokenKind::Colon ||
+          (pk + 2 < body_open && (ts[pk + 1].raw == "?" || ts[pk + 1].raw == "~") && ts[pk + 2].kind == TokenKind::Colon)) {
+          let is_opt_param = ts[pk + 1].raw == "?"
+          let col_i = if ts[pk + 1].kind == TokenKind::Colon { pk + 1 } else { pk + 2 }
+          let ty_s = col_i + 1
+          let mut ty_e = ty_s
+          let mut td = 0
+          while ty_e < body_open {
+            let tk2 = ts[ty_e].kind
+            if td == 0 && (tk2 == TokenKind::Comma || tk2 == TokenKind::RParen || tk2 == TokenKind::Eq) {
+              break
+            }
+            if tk2 == TokenKind::LParen || tk2 == TokenKind::LBracket || tk2 == TokenKind::LBrace { td = td + 1 }
+            else if tk2 == TokenKind::RParen || tk2 == TokenKind::RBracket || tk2 == TokenKind::RBrace {
+              if td == 0 { break }
+              td = td - 1
+            }
+            ty_e = ty_e + 1
+          }
           fn_param_idx[ts[pk].raw] = p_ord
-          if pk + 2 < body_open {
-            let pty = ts[pk + 2].raw
-            if pty == "Array" {
+          if ty_s < ty_e {
+            let ty_s_eff = if ty_s + 2 < ty_e && ts[ty_s].raw == "mbt_compat" && ts[ty_s + 1].kind == TokenKind::ColonColon { ty_s + 2 } else { ty_s }
+            let pty = ts[ty_s_eff].raw
+            if !is_opt_param && pty == "Array" {
               fn_arr_params[ts[pk].raw] = p_ord
-            } else if (is_builtin_eq_type_name(pty) || pty == "Bytes") &&
-            !(pk + 3 < body_open && (ts[pk + 3].kind == TokenKind::LBracket || ts[pk + 3].kind == TokenKind::ColonColon || ts[pk + 3].raw == "?")) {
-              ef.scalar_params[p_ord] = true
-              ef.param_types[p_ord] = pty
-            } else if is_type_ident_tok(ts[pk + 2].kind) &&
-            !(pk + 3 < body_open && (ts[pk + 3].kind == TokenKind::LBracket || ts[pk + 3].kind == TokenKind::ColonColon || ts[pk + 3].raw == "?")) {
-              ef.param_types[p_ord] = pty
+              if ty_s + 2 < ty_e && ts[ty_s + 1].kind == TokenKind::LBracket {
+                let rb_pa = find_matching_delim(ts, ty_s + 1)
+                if rb_pa > ty_s + 2 && rb_pa < ty_e {
+                  let el_pa = canonical_type_span(ts, ty_s + 2, rb_pa)
+                  if el_pa.length() > 0 && !type_mentions_param(el_pa, fn_decl_tparams) {
+                    ef.param_types[p_ord] = "Array:" + el_pa
+                    fn_arr_elem_vars[ts[pk].raw] = el_pa
+                  }
+                }
+              }
+            } else if !is_opt_param && ts[ty_s].kind == TokenKind::LParen {
+              // Check if this param is a callback `(P0, P1, ...) -> Ret` and record its Array/array-free param types!
+              let rp_cb = find_matching_delim(ts, ty_s)
+              if rp_cb > ty_s && rp_cb + 1 < ty_e && (ts[rp_cb + 1].kind == TokenKind::Arrow || ts[rp_cb + 1].raw == "->") {
+                if decl_key.starts_with("::") {
+                  let mut cseg_s = ty_s + 1
+                  let mut ci2 = ty_s + 1
+                  let mut cd2 = 0
+                  let mut c_ord = 0
+                  while ci2 <= rp_cb {
+                    let at_end = ci2 == rp_cb
+                    let is_c = !at_end && cd2 == 0 && ts[ci2].kind == TokenKind::Comma
+                    if at_end || is_c {
+                      if ci2 > cseg_s {
+                        let ckey = bare_name + "#" + p_ord.to_string() + "#" + c_ord.to_string()
+                        if ts[cseg_s].raw == "Array" && cseg_s + 2 < ci2 && ts[cseg_s + 1].kind == TokenKind::LBracket {
+                          let rb_c = find_matching_delim(ts, cseg_s + 1)
+                          if rb_c > cseg_s + 2 && rb_c < ci2 {
+                            let el_c = canonical_type_span(ts, cseg_s + 2, rb_c)
+                            if el_c.length() > 0 && !type_mentions_param(el_c, fn_decl_tparams) {
+                              fn_closure_param_types[ckey] = "Array:" + el_c
+                            }
+                          }
+                        } else if type_span_is_array_free(ts, cseg_s, ci2, array_free_types, 0) {
+                          fn_closure_param_types[ckey] = "__NON_ARR__"
+                        }
+                      }
+                      c_ord = c_ord + 1
+                      cseg_s = ci2 + 1
+                    } else {
+                      let ck2 = ts[ci2].kind
+                      if ck2 == TokenKind::LParen || ck2 == TokenKind::LBracket || ck2 == TokenKind::LBrace { cd2 = cd2 + 1 }
+                      else if ck2 == TokenKind::RParen || ck2 == TokenKind::RBracket || ck2 == TokenKind::RBrace { cd2 = cd2 - 1 }
+                    }
+                    ci2 = ci2 + 1
+                  }
+                }
+              } else if type_span_is_array_free(ts, ty_s, ty_e, array_free_types, 0) {
+                ef.param_types[p_ord] = "__NON_ARR__"
+              }
+            } else if !fn_decl_tparams.contains(pty) {
+              if pty == "Map" || pty == "OrderedMap" || pty == "OrderedSet" || pty == "Set" || pty == "StringBuilder" || pty == "Buffer" {
+                fn_non_arr_vars[ts[pk].raw] = true
+              }
+              if type_span_is_array_free(ts, ty_s, ty_e, array_free_types, 0) {
+                if !is_opt_param && ty_e == ty_s + 1 && (is_builtin_eq_type_name(pty) || pty == "Bytes") {
+                  ef.scalar_params[p_ord] = true
+                  ef.param_types[p_ord] = pty
+                } else {
+                  ef.param_types[p_ord] = "__NON_ARR__"
+                }
+              } else if !is_opt_param && ts[ty_s].kind == TokenKind::Ident && ty_s + 2 < ty_e &&
+              ts[ty_s + 1].kind == TokenKind::ColonColon && is_type_ident_tok(ts[ty_s + 2].kind) &&
+              !(ty_s + 3 < ty_e && ts[ty_s + 3].kind == TokenKind::LBracket) {
+                ef.param_types[p_ord] = "dep:" + pty + "::" + ts[ty_s + 2].raw
+              } else if !is_opt_param && is_type_ident_tok(ts[ty_s].kind) &&
+              !(ty_s + 1 < ty_e && ts[ty_s + 1].kind == TokenKind::ColonColon) {
+                ef.param_types[p_ord] = "local:" + pty
+              }
             }
           }
           p_ord = p_ord + 1
@@ -4501,6 +5195,75 @@ pub fn collect_cap_pkg_summary(
       out
     }
     let local_fresh = fresh_locals_before(ts, body_open, body_close)
+    // Pre-scan local variable type annotations for non-Array containers and typed `Array[Elem]` locals.
+    let mut lk = body_open + 1
+    while lk + 3 < body_close {
+      if ts[lk].raw == "let" {
+        let mut ni = lk + 1
+        if ni < body_close && ts[ni].raw == "mut" { ni = ni + 1 }
+        if ni + 2 < body_close && ts[ni].kind == TokenKind::Ident {
+          let lnm = ts[ni].raw
+          if ts[ni + 1].kind == TokenKind::Colon {
+            let lts = if ni + 4 < body_close && ts[ni + 2].raw == "mbt_compat" && ts[ni + 3].kind == TokenKind::ColonColon { ni + 4 } else { ni + 2 }
+            let lpty = ts[lts].raw
+            if lpty == "Array" && lts + 2 < body_close && ts[lts + 1].kind == TokenKind::LBracket {
+              let rb_la = find_matching_delim(ts, lts + 1)
+              if rb_la > lts + 2 && rb_la < body_close {
+                let el_la = canonical_type_span(ts, lts + 2, rb_la)
+                if el_la.length() > 0 && !type_mentions_param(el_la, fn_decl_tparams) {
+                  if !fn_arr_elem_vars.contains(lnm) {
+                    fn_arr_elem_vars[lnm] = el_la
+                  } else if fn_arr_elem_vars.get(lnm) != Some(el_la) {
+                    fn_arr_elem_vars[lnm] = ""
+                  }
+                }
+              }
+            } else if lpty == "Map" || lpty == "OrderedMap" || lpty == "OrderedSet" || lpty == "Set" || lpty == "StringBuilder" || lpty == "Buffer" {
+              fn_non_arr_vars[lnm] = true
+            }
+          } else if ts[ni + 1].kind == TokenKind::Eq {
+            let r0 = ts[ni + 2].raw
+            if r0 == "Map" || r0 == "OrderedMap" || r0 == "OrderedSet" || r0 == "Set" || r0 == "StringBuilder" || r0 == "Buffer" {
+              fn_non_arr_vars[lnm] = true
+            } else if r0 == "mbt_compat" && ni + 4 < body_close && ts[ni + 3].kind == TokenKind::ColonColon {
+              let cm = ts[ni + 4].raw
+              if cm == "ordered_map_new" || cm == "ordered_map_from_array" || cm == "map_new" ||
+              cm == "ordered_set_new" || cm == "sb_new" || cm == "str_builder_new" || cm == "buf_new" {
+                fn_non_arr_vars[lnm] = true
+              }
+            }
+          }
+        }
+      }
+      lk = lk + 1
+    }
+    let record_non_field_shrink = fn(rnm : String) {
+      if rnm.length() > 0 && fn_non_arr_vars.contains(rnm) {
+        return
+      }
+      match fn_arr_elem_vars.get(rnm) {
+        Some(el) => if el.length() > 0 { ef.mutated_arr_elems[el] = true } else { ef.may_shrink_unk_elem = true }
+        None => ef.may_shrink_unk_elem = true
+      }
+    }
+    let record_non_field_grow = fn(rnm : String) {
+      if rnm.length() > 0 && fn_non_arr_vars.contains(rnm) {
+        return
+      }
+      match fn_arr_elem_vars.get(rnm) {
+        Some(el) => if el.length() > 0 { ef.grew_arr_elems[el] = true } else { ef.may_grow_unk_elem = true }
+        None => ef.may_grow_unk_elem = true
+      }
+    }
+    let record_non_field_write = fn(rnm : String) {
+      if rnm.length() > 0 && fn_non_arr_vars.contains(rnm) {
+        return
+      }
+      match fn_arr_elem_vars.get(rnm) {
+        Some(el) => if el.length() > 0 { ef.wrote_arr_elems[el] = true } else { ef.may_write_unk_elem = true }
+        None => ef.may_write_unk_elem = true
+      }
+    }
     let mut k = body_open + 1
     while k < body_close {
       let tk = ts[k]
@@ -4524,29 +5287,35 @@ pub fn collect_cap_pkg_summary(
         let m = ts[k + 1].raw
         let (recv_is_field, _, recv_r, recv_tail) = indexed_field_tail(ts, k - 1, body_open)
         let is_own_fresh = !recv_is_field && recv_r.length() > 0 && local_fresh.contains(recv_r)
+        let is_non_arr_field_recv = recv_is_field && recv_tail.length() > 0 &&
+        array_fields.get(recv_tail) != Some(true) && (m == "remove" || m == "clear" || m == "set" || m == "get")
         let is_arr_op = is_cap_arr_shrink_or_shift_method(m) || is_cap_arr_growth_method(m) ||
         is_cap_arr_write_method(m) || m == "shrink_to_fit"
         if is_cap_arr_shrink_or_shift_method(m) {
-          if !is_own_fresh {
+          if !is_own_fresh && !is_non_arr_field_recv {
             ef.may_shrink_or_shift = true
             if recv_is_field && recv_tail.length() > 0 { ef.mutated_fields[recv_tail] = true }
             else if !recv_is_field && pkg_globals.contains(recv_r) { ef.mutated_globals[recv_r] = true }
+            else { record_non_field_shrink(recv_r) }
           }
         } else if is_cap_arr_growth_method(m) {
-          if !is_own_fresh {
+          if !is_own_fresh && !is_non_arr_field_recv {
             ef.may_grow = true
             if recv_is_field && recv_tail.length() > 0 { ef.grew_fields[recv_tail] = true }
+            else { record_non_field_grow(recv_r) }
           }
         } else if is_cap_arr_write_method(m) {
-          if !is_own_fresh {
+          if !is_own_fresh && !is_non_arr_field_recv {
             ef.may_write = true
             if recv_is_field && recv_tail.length() > 0 { ef.wrote_fields[recv_tail] = true }
+            else { record_non_field_write(recv_r) }
           }
         } else if m == "shrink_to_fit" {
-          if !is_own_fresh {
+          if !is_own_fresh && !is_non_arr_field_recv {
             ef.may_shrink_to_fit = true
             if recv_is_field && recv_tail.length() > 0 { ef.mutated_fields[recv_tail] = true }
             else if !recv_is_field && pkg_globals.contains(recv_r) { ef.mutated_globals[recv_r] = true }
+            else { record_non_field_shrink(recv_r) }
           }
         } else if is_higher_order_arr_method(m) {
           ef.may_call_unknown = true
@@ -4570,6 +5339,7 @@ pub fn collect_cap_pkg_summary(
           if !is_own_fresh {
             ef.may_write = true
             if wr_is_field && wr_tail.length() > 0 { ef.wrote_fields[wr_tail] = true }
+            else { record_non_field_write(wr_r) }
           }
         }
       } else if (tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket) &&
@@ -4601,22 +5371,26 @@ pub fn collect_cap_pkg_summary(
                 ef.may_shrink_or_shift = true
                 if a0_is_field && a0_tail.length() > 0 { ef.mutated_fields[a0_tail] = true }
                 else if !a0_is_field && pkg_globals.contains(a0_r) { ef.mutated_globals[a0_r] = true }
+                else { record_non_field_shrink(a0_r) }
               }
             } else if is_cap_compat_growth_fn(tk.raw) {
               if !a0_fresh {
                 ef.may_grow = true
                 if a0_is_field && a0_tail.length() > 0 { ef.grew_fields[a0_tail] = true }
+                else { record_non_field_grow(a0_r) }
               }
             } else if is_cap_compat_write_fn(tk.raw) {
               if !a0_fresh {
                 ef.may_write = true
                 if a0_is_field && a0_tail.length() > 0 { ef.wrote_fields[a0_tail] = true }
+                else { record_non_field_write(a0_r) }
               }
             } else if tk.raw == "arr_shrink_to_fit" {
               if !a0_fresh {
                 ef.may_shrink_to_fit = true
                 if a0_is_field && a0_tail.length() > 0 { ef.mutated_fields[a0_tail] = true }
                 else if !a0_is_field && pkg_globals.contains(a0_r) { ef.mutated_globals[a0_r] = true }
+                else { record_non_field_shrink(a0_r) }
               }
             } else if !is_pure_key_compat_helper(tk.raw) && !is_pure_first_order_mbt_compat_fn(tk.raw) {
               ef.may_call_unknown = true
@@ -4626,7 +5400,7 @@ pub fn collect_cap_pkg_summary(
           } else if k >= 3 && ts[k - 3].kind == TokenKind::ColonColon {
             // 3-segment cross-package call `dep::Type::method(...)`: opaque (never collide with local `Type::method`)
             ef.may_call_unknown = true
-            ef.may_call_opaque = true
+            ef.may_call_dep_3seg = true
             let cp_q = find_matching_delim(ts, k + 1)
             if cp_q > k + 1 {
               for pidx in collect_passed_param_indices(k + 2, cp_q) {
@@ -4790,8 +5564,21 @@ pub fn collect_cap_pkg_summary(
     if cef.may_grow && !ef.may_grow { ef.may_grow = true; ch = true }
     if cef.may_write && !ef.may_write { ef.may_write = true; ch = true }
     if cef.may_shrink_to_fit && !ef.may_shrink_to_fit { ef.may_shrink_to_fit = true; ch = true }
+    if cef.may_shrink_unk_elem && !ef.may_shrink_unk_elem { ef.may_shrink_unk_elem = true; ch = true }
+    if cef.may_grow_unk_elem && !ef.may_grow_unk_elem { ef.may_grow_unk_elem = true; ch = true }
+    if cef.may_write_unk_elem && !ef.may_write_unk_elem { ef.may_write_unk_elem = true; ch = true }
+    for el in cef.mutated_arr_elems.keys() {
+      if !ef.mutated_arr_elems.contains(el) { ef.mutated_arr_elems[el] = true; ch = true }
+    }
+    for el in cef.grew_arr_elems.keys() {
+      if !ef.grew_arr_elems.contains(el) { ef.grew_arr_elems[el] = true; ch = true }
+    }
+    for el in cef.wrote_arr_elems.keys() {
+      if !ef.wrote_arr_elems.contains(el) { ef.wrote_arr_elems[el] = true; ch = true }
+    }
     if cef.may_call_unknown && !ef.may_call_unknown { ef.may_call_unknown = true; ch = true }
     if cef.may_call_opaque && !ef.may_call_opaque { ef.may_call_opaque = true; ch = true }
+    if cef.may_call_dep_3seg && !ef.may_call_dep_3seg { ef.may_call_dep_3seg = true; ch = true }
     if cef.may_pass_param_to_dep && !ef.may_pass_param_to_dep { ef.may_pass_param_to_dep = true; ch = true }
     for g in cef.mutated_globals.keys() {
       if !ef.mutated_globals.contains(g) { ef.mutated_globals[g] = true; ch = true }
@@ -5061,6 +5848,8 @@ pub fn collect_cap_pkg_summary(
   let fn_return_types : Map[String, String] = Map()
   let fn_nongeneric_foreign_params : Map[String, Map[Int, Bool]] = Map()
   let priv_local_struct_names : Map[String, Bool] = Map()
+  let local_enum_names : Map[String, Bool] = Map()
+  let priv_local_enum_names : Map[String, Bool] = Map()
   for ts in all_tokens {
     let n = ts.length()
     let mut i = 0
@@ -5068,6 +5857,13 @@ pub fn collect_cap_pkg_summary(
       if ts[i].raw == "struct" && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident) &&
       (i == 0 || ts[i - 1].raw != "pub") && is_type_ident_tok(ts[i + 1].kind) {
         priv_local_struct_names[ts[i + 1].raw] = true
+      }
+      if ts[i].raw == "enum" && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident) &&
+      is_type_ident_tok(ts[i + 1].kind) {
+        local_enum_names[ts[i + 1].raw] = true
+        if i == 0 || ts[i - 1].raw != "pub" {
+          priv_local_enum_names[ts[i + 1].raw] = true
+        }
       }
       if ts[i].raw == "fn" {
         let mut fn_key = ""
@@ -5107,19 +5903,32 @@ pub fn collect_cap_pkg_summary(
           }
           if cp > lp_f && cp + 2 < n && ts[cp + 1].raw == "->" {
             let rs = cp + 2
-            let rty = if ts[rs].raw == "Array" && rs + 3 < n && ts[rs + 1].kind == TokenKind::LBracket &&
-            is_type_ident_tok(ts[rs + 2].kind) && ts[rs + 3].kind == TokenKind::RBracket &&
-            !(rs + 4 < n && ts[rs + 4].raw == "?") {
-              "Array:" + ts[rs + 2].raw
-            } else if ts[rs].raw == "Array" && rs + 4 < n && ts[rs + 1].kind == TokenKind::LBracket &&
-            is_type_ident_tok(ts[rs + 2].kind) && ts[rs + 3].kind == TokenKind::RBracket &&
-            ts[rs + 4].raw == "?" {
-              "Option:Array:" + ts[rs + 2].raw
-            } else if ts[rs].raw == "Option" && rs + 6 < n && ts[rs + 1].kind == TokenKind::LBracket &&
-            ts[rs + 2].raw == "Array" && ts[rs + 3].kind == TokenKind::LBracket &&
-            is_type_ident_tok(ts[rs + 4].kind) && ts[rs + 5].kind == TokenKind::RBracket &&
-            ts[rs + 6].kind == TokenKind::RBracket {
-              "Option:Array:" + ts[rs + 4].raw
+            let rty = if ts[rs].raw == "Array" && rs + 3 < n && ts[rs + 1].kind == TokenKind::LBracket {
+              let rb_r = find_matching_delim(ts, rs + 1)
+              if rb_r > rs + 2 && rb_r < n {
+                let inner_r = canonical_type_span(ts, rs + 2, rb_r)
+                if inner_r.length() > 0 {
+                  if rb_r + 1 < n && ts[rb_r + 1].raw == "?" {
+                    "Option:Array:" + inner_r
+                  } else {
+                    "Array:" + inner_r
+                  }
+                } else {
+                  ""
+                }
+              } else {
+                ""
+              }
+            } else if ts[rs].raw == "Option" && rs + 5 < n && ts[rs + 1].kind == TokenKind::LBracket &&
+            ts[rs + 2].raw == "Array" && ts[rs + 3].kind == TokenKind::LBracket {
+              let rb_o = find_matching_delim(ts, rs + 1)
+              let rb_i = find_matching_delim(ts, rs + 3)
+              if rb_i > rs + 4 && rb_o == rb_i + 1 && rb_o < n {
+                let inner_r = canonical_type_span(ts, rs + 4, rb_i)
+                if inner_r.length() > 0 { "Option:Array:" + inner_r } else { "" }
+              } else {
+                ""
+              }
             } else if is_type_ident_tok(ts[rs].kind) &&
             !(rs + 1 < n && (ts[rs + 1].kind == TokenKind::LBracket || ts[rs + 1].kind == TokenKind::ColonColon || ts[rs + 1].raw == "?")) {
               ts[rs].raw
@@ -5546,7 +6355,14 @@ pub fn collect_cap_pkg_summary(
     pure_eq_types: pure_eq_types,
     pure_enum_ctors: pure_enum_ctors,
     local_struct_names: local_struct_names,
+    local_enum_names: local_enum_names,
     priv_local_struct_names: priv_local_struct_names,
+    priv_local_enum_names: priv_local_enum_names,
+    array_free_types: array_free_types,
+    type_reach_elems: type_reach_elems,
+    type_reach_unk: type_reach_unk,
+    type_reach_foreign: type_reach_foreign,
+    fn_closure_param_types: fn_closure_param_types,
     fn_nongeneric_foreign_params: fn_nongeneric_foreign_params,
     fn_return_types: fn_return_types,
     field_types: field_types,
@@ -5746,21 +6562,50 @@ fn resolve_local_type_name(
         if ni < cur_pos && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == nm &&
         (ni + 1 >= cur_pos || tokens[ni + 1].kind == TokenKind::Colon || tokens[ni + 1].kind == TokenKind::Eq) {
           if ni + 2 < cur_pos && tokens[ni + 1].kind == TokenKind::Colon {
-            if tokens[ni + 2].raw == "Array" && ni + 3 < cur_pos && tokens[ni + 3].kind == TokenKind::LBracket {
-              let rb_a = find_matching_delim(tokens, ni + 3)
-              if rb_a > ni + 4 && rb_a < cur_pos {
-                if rb_a == ni + 5 && is_type_ident_tok(tokens[ni + 4].kind) {
-                  return "Array:" + tokens[ni + 4].raw
+            let ty_s = ni + 2
+            let mut ty_e = ty_s
+            let mut td = 0
+            while ty_e < cur_pos {
+              let tk2 = tokens[ty_e].kind
+              if td == 0 && (tk2 == TokenKind::Eq || tk2 == TokenKind::Semi || (ty_e > ty_s && tokens[ty_e].newline_before)) {
+                break
+              }
+              if tk2 == TokenKind::LParen || tk2 == TokenKind::LBracket || tk2 == TokenKind::LBrace { td = td + 1 }
+              else if tk2 == TokenKind::RParen || tk2 == TokenKind::RBracket || tk2 == TokenKind::RBrace {
+                if td == 0 { break }
+                td = td - 1
+              }
+              ty_e = ty_e + 1
+            }
+            if tokens[ty_s].raw == "Array" && ty_s + 2 < ty_e && tokens[ty_s + 1].kind == TokenKind::LBracket {
+              let rb_a = find_matching_delim(tokens, ty_s + 1)
+              if rb_a > ty_s + 2 && rb_a < ty_e {
+                if rb_a == ty_s + 3 && is_type_ident_tok(tokens[ty_s + 2].kind) {
+                  return "Array:" + tokens[ty_s + 2].raw
                 }
-                let inner_c = canonical_type_span(tokens, ni + 4, rb_a)
+                let inner_c = canonical_type_span(tokens, ty_s + 2, rb_a)
                 if inner_c.length() > 0 {
                   return "Array:" + inner_c
                 }
               }
             }
-            if is_type_ident_tok(tokens[ni + 2].kind) &&
-            !(ni + 3 < cur_pos && (tokens[ni + 3].kind == TokenKind::LBracket || tokens[ni + 3].kind == TokenKind::ColonColon)) {
-              return tokens[ni + 2].raw
+            if type_span_is_array_free(tokens, ty_s, ty_e, summary.array_free_types, 0) {
+              if ty_e == ty_s + 1 && is_type_ident_tok(tokens[ty_s].kind) {
+                return tokens[ty_s].raw
+              }
+              return "__NON_ARR__"
+            }
+            let raw_ty0 = if ty_s + 2 < ty_e && tokens[ty_s].raw == "mbt_compat" && tokens[ty_s + 1].kind == TokenKind::ColonColon {
+              tokens[ty_s + 2].raw
+            } else {
+              tokens[ty_s].raw
+            }
+            if raw_ty0 == "Map" || raw_ty0 == "OrderedMap" || raw_ty0 == "OrderedSet" || raw_ty0 == "Set" {
+              return raw_ty0
+            }
+            if is_type_ident_tok(tokens[ty_s].kind) &&
+            !(ty_s + 1 < ty_e && (tokens[ty_s + 1].kind == TokenKind::LBracket || tokens[ty_s + 1].kind == TokenKind::ColonColon)) {
+              return tokens[ty_s].raw
             }
             return ""
           } else if ni + 2 < cur_pos && tokens[ni + 1].kind == TokenKind::Eq {
@@ -5819,8 +6664,85 @@ fn resolve_local_type_name(
                 }
               }
             }
+            if rk == TokenKind::LBracket {
+              let rb_lit = find_matching_delim(tokens, rhs)
+              if rb_lit > rhs + 1 && rb_lit < cur_pos && is_stmt_boundary(rb_lit) {
+                let fk = tokens[rhs + 1].kind
+                let fr = tokens[rhs + 1].raw
+                if fk == TokenKind::IntLit { return "Array:Int" }
+                if fk == TokenKind::FloatLit { return "Array:Double" }
+                if fk == TokenKind::StringLit { return "Array:String" }
+                if fr == "true" || fr == "false" { return "Array:Bool" }
+              }
+            }
+            if rk == TokenKind::UpperIdent {
+              let r_raw = tokens[rhs].raw
+              if r_raw == "StringBuilder" || r_raw == "Buffer" {
+                return r_raw
+              }
+              // `Type::{ ... }` struct literal -> concrete type `Type`
+              if rhs + 2 < cur_pos && tokens[rhs + 1].kind == TokenKind::ColonColon &&
+              tokens[rhs + 2].kind == TokenKind::LBrace {
+                let rb_st = find_matching_delim(tokens, rhs + 2)
+                if rb_st > rhs + 2 && rb_st < cur_pos && is_stmt_boundary(rb_st) {
+                  return tokens[rhs].raw
+                }
+              }
+              // `Type::fn_name(...)` -> lookup `summary.fn_return_types`
+              if rhs + 3 < cur_pos && tokens[rhs + 1].kind == TokenKind::ColonColon &&
+              tokens[rhs + 2].kind == TokenKind::Ident && tokens[rhs + 3].kind == TokenKind::LParen &&
+              !tokens[rhs + 3].newline_before {
+                let cp_tf = find_matching_delim(tokens, rhs + 3)
+                if cp_tf > rhs + 3 && cp_tf < cur_pos && is_stmt_boundary(cp_tf) {
+                  match summary.fn_return_types.get(tokens[rhs].raw + "::" + tokens[rhs + 2].raw) {
+                    Some(rt) => if rt.length() > 0 { return rt }
+                    None => ()
+                  }
+                }
+              }
+            }
+            // Depth-0 binary arithmetic/comparison/logical expr (excluding `+` which can concat arrays,
+            // and excluding `if`/`match`/`{` control-flow exprs) always yields a non-Array scalar.
+            if tokens[rhs].raw != "if" && tokens[rhs].raw != "match" && tokens[rhs].raw != "for" &&
+            tokens[rhs].raw != "while" && rk != TokenKind::LBrace {
+              let se_op = statement_end(tokens, rhs, cur_pos)
+              let mut oi = rhs
+              let mut od = 0
+              while oi < se_op {
+                let ok = tokens[oi].kind
+                let oraw = tokens[oi].raw
+                if ok == TokenKind::LParen || ok == TokenKind::LBracket || ok == TokenKind::LBrace { od = od + 1 }
+                else if ok == TokenKind::RParen || ok == TokenKind::RBracket || ok == TokenKind::RBrace { od = od - 1 }
+                else if od == 0 && (oraw == "-" || oraw == "*" || oraw == "/" || oraw == "%" ||
+                  oraw == "==" || oraw == "!=" || oraw == "<" || oraw == ">" || oraw == "<=" ||
+                  oraw == ">=" || oraw == "&&" || oraw == "||") {
+                  return "Int"
+                }
+                oi = oi + 1
+              }
+            }
+            if rk == TokenKind::Ident && tokens[rhs].raw == nm && is_stmt_boundary(rhs) && li > fn_bo {
+              return resolve_local_type_name(tokens, nm, fn_bo, li, summary)
+            }
             if rk == TokenKind::Ident && tokens[rhs].raw != nm {
               // `Array::make(n, <lit>)` or `mbt_compat::arr_make(n, <lit>)`
+              if tokens[rhs].raw == "mbt_compat" && rhs + 3 < cur_pos && tokens[rhs + 1].kind == TokenKind::ColonColon {
+                let cm = tokens[rhs + 2].raw
+                if cm == "ordered_map_new" || cm == "ordered_map_from_array" || cm == "map_new" { return "OrderedMap" }
+                if cm == "ordered_set_new" { return "OrderedSet" }
+                if cm == "sb_new" || cm == "str_builder_new" { return "StringBuilder" }
+                if cm == "buf_new" { return "Buffer" }
+              }
+              // `pkg::Ty::ctor(...)` -> concrete non-generic foreign type `"dep:pkg::Ty"`
+              if rhs + 5 < cur_pos && tokens[rhs + 1].kind == TokenKind::ColonColon &&
+              tokens[rhs + 2].kind == TokenKind::UpperIdent && tokens[rhs + 3].kind == TokenKind::ColonColon &&
+              tokens[rhs + 4].kind == TokenKind::Ident && tokens[rhs + 5].kind == TokenKind::LParen &&
+              !tokens[rhs + 5].newline_before {
+                let cp_df = find_matching_delim(tokens, rhs + 5)
+                if cp_df > rhs + 5 && cp_df < cur_pos && is_stmt_boundary(cp_df) {
+                  return "dep:" + tokens[rhs].raw + "::" + tokens[rhs + 2].raw
+                }
+              }
               if (tokens[rhs].raw == "Array" || tokens[rhs].raw == "mbt_compat") && rhs + 4 < cur_pos &&
               tokens[rhs + 1].kind == TokenKind::ColonColon && (tokens[rhs + 2].raw == "make" || tokens[rhs + 2].raw == "arr_make") &&
               tokens[rhs + 3].kind == TokenKind::LParen {
@@ -6111,24 +7033,34 @@ fn resolve_local_type_name(
       if lp > fn_bo && tokens[lp - 1].raw == "fn" {
         let mut pk = lp + 1
         let mut pd = 0
-        let mut untyped_match = false
+        let mut cparam_ord = 0
+        let mut untyped_ord = -1
         while pk < ci {
           let pkk = tokens[pk].kind
           if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
           else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
+          else if pd == 0 && pkk == TokenKind::Comma { cparam_ord = cparam_ord + 1 }
           else if pd == 0 && pkk == TokenKind::Ident && tokens[pk].raw == nm {
             if pk + 2 < ci && tokens[pk + 1].kind == TokenKind::Colon {
-              if tokens[pk + 2].raw == "Array" && pk + 5 < ci && tokens[pk + 3].kind == TokenKind::LBracket &&
-              is_type_ident_tok(tokens[pk + 4].kind) && tokens[pk + 5].kind == TokenKind::RBracket {
-                return "Array:" + tokens[pk + 4].raw
+              if tokens[pk + 2].raw == "Array" && pk + 4 < ci && tokens[pk + 3].kind == TokenKind::LBracket {
+                let rb_cp = find_matching_delim(tokens, pk + 3)
+                if rb_cp > pk + 4 && rb_cp < ci {
+                  if rb_cp == pk + 5 && is_type_ident_tok(tokens[pk + 4].kind) {
+                    return "Array:" + tokens[pk + 4].raw
+                  }
+                  let inner_cp = canonical_type_span(tokens, pk + 4, rb_cp)
+                  if inner_cp.length() > 0 {
+                    return "Array:" + inner_cp
+                  }
+                }
               }
               return tokens[pk + 2].raw
             }
-            untyped_match = true
+            untyped_ord = cparam_ord
           }
           pk = pk + 1
         }
-        if untyped_match {
+        if untyped_ord >= 0 {
           // Untyped closure param `arr.search_by(fn(r) { ... })` / `.any`/`.all`/`.find_first`/`.each`
           if lp >= 5 && tokens[lp - 2].kind == TokenKind::LParen &&
           tokens[lp - 3].kind == TokenKind::Ident && tokens[lp - 4].kind == TokenKind::Dot {
@@ -6154,6 +7086,28 @@ fn resolve_local_type_name(
               }
             }
           }
+          // Untyped closure param passed to a local function `f(..., fn(es) { ... })` whose signature specifies `(Array[Elem]) -> ...`
+          let call_lp = enclosing_open(tokens, lp - 1, fn_bo, TokenKind::LParen)
+          if call_lp > fn_bo && tokens[call_lp - 1].kind == TokenKind::Ident &&
+          !(call_lp >= 2 && (tokens[call_lp - 2].kind == TokenKind::Dot || tokens[call_lp - 2].kind == TokenKind::ColonColon)) {
+            let callee_nm = tokens[call_lp - 1].raw
+            let mut ai = call_lp + 1
+            let mut ad = 0
+            let mut aord = 0
+            while ai < lp - 1 {
+              let ak = tokens[ai].kind
+              if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+              else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+              else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
+              ai = ai + 1
+            }
+            if ad == 0 {
+              match summary.fn_closure_param_types.get(callee_nm + "#" + aord.to_string() + "#" + untyped_ord.to_string()) {
+                Some(cty) => if cty.length() > 0 { return cty }
+                None => ()
+              }
+            }
+          }
           // Unannotated closure param shadows outer scopes -> fail closed!
           return ""
         }
@@ -6174,18 +7128,66 @@ fn resolve_local_type_name(
       else if pkk == TokenKind::LBracket { brack_d = brack_d + 1 }
       else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
       else if paren_d == 1 && brack_d == 0 && (pkk == TokenKind::Ident || tokens[pk].raw == "self") && tokens[pk].raw == nm &&
-      tokens[pk + 1].kind == TokenKind::Colon {
-        if tokens[pk + 2].raw == "Array" && pk + 5 < fn_bo && tokens[pk + 3].kind == TokenKind::LBracket {
-          if is_type_ident_tok(tokens[pk + 4].kind) && tokens[pk + 5].kind == TokenKind::RBracket {
-            return "Array:" + tokens[pk + 4].raw
+      (tokens[pk + 1].kind == TokenKind::Colon ||
+        (pk + 2 < fn_bo && (tokens[pk + 1].raw == "?" || tokens[pk + 1].raw == "~") && tokens[pk + 2].kind == TokenKind::Colon)) {
+        let is_opt_fp = tokens[pk + 1].raw == "?"
+        let col_fp = if tokens[pk + 1].kind == TokenKind::Colon { pk + 1 } else { pk + 2 }
+        let ty_s = col_fp + 1
+        let mut ty_e = ty_s
+        let mut td = 0
+        while ty_e < fn_bo {
+          let tk2 = tokens[ty_e].kind
+          if td == 0 && (tk2 == TokenKind::Comma || tk2 == TokenKind::RParen || tk2 == TokenKind::Eq) {
+            break
           }
-          if tokens[pk + 4].kind == TokenKind::LParen {
-            return "Array:("
+          if tk2 == TokenKind::LParen || tk2 == TokenKind::LBracket || tk2 == TokenKind::LBrace { td = td + 1 }
+          else if tk2 == TokenKind::RParen || tk2 == TokenKind::RBracket || tk2 == TokenKind::RBrace {
+            if td == 0 { break }
+            td = td - 1
           }
+          ty_e = ty_e + 1
         }
-        if is_type_ident_tok(tokens[pk + 2].kind) &&
-        !(pk + 3 < fn_bo && (tokens[pk + 3].kind == TokenKind::LBracket || tokens[pk + 3].kind == TokenKind::ColonColon)) {
-          return tokens[pk + 2].raw
+        if ty_s < ty_e {
+          if !is_opt_fp && tokens[ty_s].raw == "Array" && ty_s + 2 < ty_e && tokens[ty_s + 1].kind == TokenKind::LBracket {
+            let rb_fp = find_matching_delim(tokens, ty_s + 1)
+            if rb_fp > ty_s + 2 && rb_fp < ty_e {
+              if rb_fp == ty_s + 3 && is_type_ident_tok(tokens[ty_s + 2].kind) {
+                return "Array:" + tokens[ty_s + 2].raw
+              }
+              if tokens[ty_s + 2].kind == TokenKind::LParen {
+                return "Array:("
+              }
+              let inner_fp = canonical_type_span(tokens, ty_s + 2, rb_fp)
+              if inner_fp.length() > 0 {
+                return "Array:" + inner_fp
+              }
+            }
+          }
+          if type_span_is_array_free(tokens, ty_s, ty_e, summary.array_free_types, 0) {
+            if !is_opt_fp && ty_e == ty_s + 1 && is_type_ident_tok(tokens[ty_s].kind) {
+              return tokens[ty_s].raw
+            }
+            return "__NON_ARR__"
+          }
+          if !is_opt_fp {
+            let fraw0 = if ty_s + 2 < ty_e && tokens[ty_s].raw == "mbt_compat" && tokens[ty_s + 1].kind == TokenKind::ColonColon {
+              tokens[ty_s + 2].raw
+            } else {
+              tokens[ty_s].raw
+            }
+            if fraw0 == "Map" || fraw0 == "OrderedMap" || fraw0 == "OrderedSet" || fraw0 == "Set" {
+              return fraw0
+            }
+            if tokens[ty_s].kind == TokenKind::Ident && ty_s + 2 < ty_e &&
+            tokens[ty_s + 1].kind == TokenKind::ColonColon && is_type_ident_tok(tokens[ty_s + 2].kind) &&
+            !(ty_s + 3 < ty_e && tokens[ty_s + 3].kind == TokenKind::LBracket) {
+              return "dep:" + fraw0 + "::" + tokens[ty_s + 2].raw
+            }
+          }
+          if !is_opt_fp && is_type_ident_tok(tokens[ty_s].kind) &&
+          !(ty_s + 1 < ty_e && (tokens[ty_s + 1].kind == TokenKind::LBracket || tokens[ty_s + 1].kind == TokenKind::ColonColon)) {
+            return tokens[ty_s].raw
+          }
         }
         return ""
       }
@@ -7296,14 +8298,30 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
         None => iter_field_elem_unk = true
       }
     } else {
-      match summary.array_elem_type_sets.get(tail) {
-        Some(s) => {
-          for t in s.keys() { iter_field_elem_set[t] = true }
+      let mut resolved_exact = false
+      if root.length() > 0 && body_open >= 0 {
+        let sn_it = resolve_local_type_name(tokens, root, body_open, for_i, summary)
+        if sn_it.length() > 0 && summary.local_struct_names.contains(sn_it) {
+          match summary.array_elem_types.get(sn_it + "." + tail) {
+            Some(et) =>
+            if et.length() > 0 {
+              iter_field_elem_set[et] = true
+              resolved_exact = true
+            }
+            None => ()
+          }
         }
-        None => ()
       }
-      if summary.array_elem_unknown.get(tail) == Some(true) || iter_field_elem_set.length() == 0 {
-        iter_field_elem_unk = true
+      if !resolved_exact {
+        match summary.array_elem_type_sets.get(tail) {
+          Some(s) => {
+            for t in s.keys() { iter_field_elem_set[t] = true }
+          }
+          None => ()
+        }
+        if summary.array_elem_unknown.get(tail) == Some(true) || iter_field_elem_set.length() == 0 {
+          iter_field_elem_unk = true
+        }
       }
     }
   }
@@ -7369,7 +8387,7 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
                 }
               }
               if is_pure_path {
-                let (rhs_is_f, rhs_is_idx, rhs_r, _) = indexed_field_tail(tokens, re, rs)
+                let (rhs_is_f, rhs_is_idx, rhs_r, rhs_tail) = indexed_field_tail(tokens, re, rs)
                 if !rhs_is_f && rhs_is_idx {
                   let rty = if rhs_r.length() > 0 && body_open >= 0 {
                     resolve_local_type_name(tokens, rhs_r, body_open, ai, summary)
@@ -7378,50 +8396,33 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
                   }
                   let is_plain_1d = rty.starts_with("Array:") && !rty.starts_with("Array:Array") &&
                   !type_mentions_param(rty.slice(6, rty.length()), fn_tparams_h)
-                  let is_disjoint_2d = rty.starts_with("Array:Array[") && rty.ends_with("]") &&
-                  !rty.slice(12, rty.length() - 1).starts_with("Array") &&
+                  let inner_2d_h = if rty.starts_with("Array:Array[") && rty.ends_with("]") { rty.slice(12, rty.length() - 1) } else { "" }
+                  let is_disjoint_2d = inner_2d_h.length() > 0 && !inner_2d_h.starts_with("Array") &&
+                  (is_builtin_eq_type_name(inner_2d_h) || summary.local_struct_names.contains(inner_2d_h)) &&
                   iter_el_h.length() > 0 && !type_mentions_param(iter_el_h, fn_tparams_h) &&
-                  !type_mentions_param(rty.slice(12, rty.length() - 1), fn_tparams_h) &&
-                  rty.slice(12, rty.length() - 1) != iter_el_h
+                  !type_mentions_param(inner_2d_h, fn_tparams_h) && inner_2d_h != iter_el_h
                   let mut proven_non_arr_by_call = false
-                  if !is_plain_1d && !is_disjoint_2d {
+                  if !is_plain_1d && !is_disjoint_2d && name_binding_count(tokens, body_open, alias_nm) == 1 {
                     let blk_o = enclosing_open(tokens, ai, body_open, TokenKind::LBrace)
                     let blk_c = if blk_o >= body_open { find_matching_delim(tokens, blk_o) } else { body_close }
                     let scan_end = if blk_c > se && blk_c <= body_close { blk_c } else { body_close }
                     let mut ci = se
+                    let mut brace_d = 0
                     while ci + 2 < scan_end {
-                      // Stop if `alias_nm` is shadowed by a `let`, `for`, `match` arm, or closure param.
-                      if tokens[ci].kind == TokenKind::Ident && tokens[ci].raw == alias_nm &&
-                      (tokens[ci - 1].raw == "let" || (tokens[ci - 1].raw == "mut" && ci >= 2 && tokens[ci - 2].raw == "let")) {
-                        break
+                      if tokens[ci].kind == TokenKind::LBrace {
+                        brace_d = brace_d + 1
+                        ci = ci + 1
+                        continue
                       }
-                      if tokens[ci].raw == "for" {
-                        let mut fk2 = ci + 1
-                        while fk2 < scan_end && tokens[fk2].raw != "in" && tokens[fk2].kind != TokenKind::LBrace {
-                          if tokens[fk2].kind == TokenKind::Ident && tokens[fk2].raw == alias_nm {
-                            ci = scan_end
-                            break
-                          }
-                          fk2 = fk2 + 1
-                        }
-                        if ci >= scan_end { break }
+                      if tokens[ci].kind == TokenKind::RBrace {
+                        if brace_d == 0 { break }
+                        brace_d = brace_d - 1
+                        ci = ci + 1
+                        continue
                       }
-                      if tokens[ci].kind == TokenKind::FatArrow && match_arm_pattern_binds(tokens, ci, se, alias_nm) {
-                        break
-                      }
-                      if tokens[ci].raw == "fn" && tokens[ci + 1].kind == TokenKind::LParen {
-                        let cfp = find_matching_delim(tokens, ci + 1)
-                        if cfp > ci + 1 && cfp < scan_end {
-                          let mut fpi = ci + 2
-                          while fpi < cfp {
-                            if tokens[fpi].kind == TokenKind::Ident && tokens[fpi].raw == alias_nm {
-                              ci = scan_end
-                              break
-                            }
-                            fpi = fpi + 1
-                          }
-                          if ci >= scan_end { break }
-                        }
+                      if brace_d > 0 {
+                        ci = ci + 1
+                        continue
                       }
                       if tokens[ci].kind == TokenKind::Ident && tokens[ci + 1].kind == TokenKind::LParen &&
                       !tokens[ci + 1].newline_before &&
@@ -7464,6 +8465,39 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
                     }
                   }
                   if !is_plain_1d && !is_disjoint_2d && !proven_non_arr_by_call {
+                    for an in array_aliases(tokens, alias_nm, body_open, body_close).keys() {
+                      na[an] = true
+                    }
+                  }
+                } else if rhs_is_f && rhs_is_idx && rhs_tail.length() > 0 {
+                  let rhs_dot = field_dot_pos_of(tokens, re, rs)
+                  let rhs_local = rhs_dot >= 0 && eq_field_recv_is_local(tokens, rhs_dot, body_open, ai, summary)
+                  let rhs_may_alias = if !rhs_local {
+                    true
+                  } else if summary.field_types.contains(rhs_tail) && summary.array_fields.get(rhs_tail) != Some(true) {
+                    false
+                  } else if summary.array_fields.get(rhs_tail) == Some(true) {
+                    let is_plain_non_arr = summary.array_elem_unknown.get(rhs_tail) != Some(true) &&
+                    match summary.array_elem_types.get(rhs_tail) {
+                      Some(et) => et.length() > 0 && !et.starts_with("Array") && !type_mentions_param(et, fn_tparams_h)
+                      None => false
+                    }
+                    if is_plain_non_arr {
+                      false
+                    } else {
+                      match summary.nested_array_elem_types.get(rhs_tail) {
+                        Some(nt) =>
+                        !(nt.length() > 0 && !nt.starts_with("Array") &&
+                          (is_builtin_eq_type_name(nt) || summary.local_struct_names.contains(nt)) &&
+                          iter_el_h.length() > 0 && !type_mentions_param(iter_el_h, fn_tparams_h) &&
+                          !type_mentions_param(nt, fn_tparams_h) && nt != iter_el_h)
+                        None => true
+                      }
+                    }
+                  } else {
+                    !summary.field_types.contains(rhs_tail)
+                  }
+                  if rhs_may_alias {
                     for an in array_aliases(tokens, alias_nm, body_open, body_close).keys() {
                       na[an] = true
                     }
@@ -7679,6 +8713,7 @@ fn for_in_body_hazard(
   }
   let iter_elem_set : Map[String, Bool] = Map()
   let mut iter_elem_unk = false
+  let mut iter_raw_elem = ""
   if is_field_iter && tail.length() > 0 {
     if !iter_field_is_local_struct {
       iter_elem_unk = true
@@ -7688,26 +8723,52 @@ fn for_in_body_hazard(
         None => iter_elem_unk = true
       }
     } else {
-      match summary.array_elem_type_sets.get(tail) {
-        Some(ms) => {
-          for t in ms.keys() {
-            if type_mentions_param(t, fn_tparams) {
-              iter_elem_unk = true
-            } else {
-              iter_elem_set[t] = true
+      let mut resolved_exact = false
+      if root.length() > 0 && body_open >= 0 {
+        let sn_it = resolve_local_type_name(tokens, root, body_open, loop_open, summary)
+        if sn_it.length() > 0 && summary.local_struct_names.contains(sn_it) {
+          match summary.array_elem_types.get(sn_it + "." + tail) {
+            Some(et) =>
+            if et.length() > 0 && !type_mentions_param(et, fn_tparams) {
+              iter_elem_set[et] = true
+              resolved_exact = true
             }
+            None => ()
           }
         }
-        None => ()
       }
-      if summary.array_elem_unknown.get(tail) == Some(true) || iter_elem_set.length() == 0 {
-        iter_elem_unk = true
+      if !resolved_exact {
+        match summary.array_elem_type_sets.get(tail) {
+          Some(ms) => {
+            for t in ms.keys() {
+              if type_mentions_param(t, fn_tparams) {
+                iter_elem_unk = true
+              } else {
+                iter_elem_set[t] = true
+              }
+            }
+          }
+          None => ()
+        }
+        if summary.array_elem_unknown.get(tail) == Some(true) || iter_elem_set.length() == 0 {
+          iter_elem_unk = true
+        }
+      }
+    }
+    if !iter_elem_unk && iter_elem_set.length() == 1 {
+      for et in iter_elem_set.keys() {
+        if et.length() > 0 && !et.starts_with("Array") {
+          iter_raw_elem = et
+        }
       }
     }
   } else if !is_field_iter && root.length() > 0 && body_open >= 0 {
     let rty = resolve_local_type_name(tokens, root, body_open, loop_open, summary)
     if rty.starts_with("Array:") {
       let ie = rty.slice(6, rty.length())
+      if ie.length() > 0 && !ie.starts_with("Array") {
+        iter_raw_elem = ie
+      }
       if ie.length() > 0 && !type_mentions_param(ie, fn_tparams) {
         iter_elem_set[ie] = true
       } else {
@@ -7762,6 +8823,35 @@ fn for_in_body_hazard(
       false
     }
   }
+  // Package imports are acyclic: no non-generic foreign type `dep::Ty` can name or hold `Array[LocalStruct/LocalEnum]`.
+  let iter_all_priv_elems = fn() -> Bool {
+    if iter_elem_unk || iter_elem_set.length() == 0 {
+      return false
+    }
+    for et in iter_elem_set.keys() {
+      if !summary.local_struct_names.contains(et) && !summary.local_enum_names.contains(et) {
+        return false
+      }
+    }
+    true
+  }
+  let local_nominal_cannot_contain_iter = fn(lty : String) -> Bool {
+    if lty.length() == 0 || fn_tparams.contains(lty) || summary.type_reach_unk.contains(lty) {
+      return false
+    }
+    if summary.type_reach_foreign.contains(lty) && !iter_all_priv_elems() {
+      return false
+    }
+    match summary.type_reach_elems.get(lty) {
+      Some(re) =>
+      if re.length() == 0 {
+        true
+      } else {
+        !elem_sets_may_overlap(iter_elem_set, iter_elem_unk, re, false)
+      }
+      None => false
+    }
+  }
   let may_alias_target = fn(r : String, r_tail : String, r_is_field : Bool, r_is_indexed : Bool, r_is_local_struct : Bool, pos : Int) -> Bool {
     if is_computed_iter {
       !is_local_fresh_recv(r, r_is_field, pos)
@@ -7777,14 +8867,15 @@ fn for_in_body_hazard(
         let rty = resolve_local_type_name(tokens, r, body_open, pos, summary)
         let is_plain_1d = rty.starts_with("Array:") && !rty.starts_with("Array:Array") &&
         !type_mentions_param(rty.slice(6, rty.length()), fn_tparams)
-        let is_disjoint_2d = rty.starts_with("Array:Array[") && rty.ends_with("]") &&
-        !rty.slice(12, rty.length() - 1).starts_with("Array") &&
+        let inner_2d = if rty.starts_with("Array:Array[") && rty.ends_with("]") { rty.slice(12, rty.length() - 1) } else { "" }
+        let is_disjoint_2d = inner_2d.length() > 0 && !inner_2d.starts_with("Array") &&
+        (is_builtin_eq_type_name(inner_2d) || summary.local_struct_names.contains(inner_2d)) &&
         !iter_elem_unk && iter_elem_set.length() > 0 &&
-        !type_mentions_param(rty.slice(12, rty.length() - 1), fn_tparams) &&
-        !iter_elem_set.contains(rty.slice(12, rty.length() - 1))
+        !type_mentions_param(inner_2d, fn_tparams) && !iter_elem_set.contains(inner_2d)
         // Fresh local 2D array initialized solely with empty `[]` literals (e.g. `let pauses = [[], []]`)
-        // whose outer slots are never overwritten or pushed to anywhere in the function body: its inner arrays
-        // cannot alias any external array.
+        // whose every non-decl occurrence in the function body satisfies a strict whitelist:
+        // only `r.length()`, `r.is_empty()`, or `r[idx].<member>` / `r[idx][j]` (never `r[i] = ...`,
+        // `let u = r`, `put(r, ...)`, `r.push(...)`, `let u = r[0]`, `f(r[0])`).
         let mut is_fresh_empty_2d = false
         if !(is_plain_1d || is_disjoint_2d) && is_local_fresh_recv(r, false, pos) &&
         name_binding_count(tokens, body_open, r) == 1 {
@@ -7792,7 +8883,7 @@ fn for_in_body_hazard(
           let mut bi = body_open + 1
           let mut saw_empty_2d = false
           let mut outer_mutated = false
-          while bi + 2 < body_close_2d {
+          while bi < body_close_2d {
             if tokens[bi].raw == "let" {
               let mut ni = bi + 1
               if ni < body_close_2d && tokens[ni].raw == "mut" { ni = ni + 1 }
@@ -7815,28 +8906,28 @@ fn for_in_body_hazard(
                         break
                       }
                     }
-                    if all_empty_arr { saw_empty_2d = true }
+                    if all_empty_arr {
+                      saw_empty_2d = true
+                      bi = rb2 + 1
+                      continue
+                    }
                   }
                 }
               }
             } else if tokens[bi].kind == TokenKind::Ident && tokens[bi].raw == r &&
             !(bi > body_open && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) {
-              if tokens[bi + 1].kind == TokenKind::Dot && bi + 2 < body_close_2d && tokens[bi + 2].kind == TokenKind::Ident {
-                let rm = tokens[bi + 2].raw
-                if is_cap_arr_growth_method(rm) || is_cap_arr_write_method(rm) {
-                  outer_mutated = true
-                  break
-                }
-              } else if tokens[bi + 1].kind == TokenKind::LBracket {
+              let is_whitelisted_len = bi + 4 < body_close_2d && tokens[bi + 1].kind == TokenKind::Dot &&
+              (tokens[bi + 2].raw == "length" || tokens[bi + 2].raw == "is_empty") &&
+              tokens[bi + 3].kind == TokenKind::LParen && tokens[bi + 4].kind == TokenKind::RParen
+              let mut is_whitelisted_idx = false
+              if !is_whitelisted_len && bi + 1 < body_close_2d && tokens[bi + 1].kind == TokenKind::LBracket {
                 let rb_o = find_matching_delim(tokens, bi + 1)
                 if rb_o > bi + 1 && rb_o + 1 < body_close_2d &&
-                (tokens[rb_o + 1].kind == TokenKind::Eq || tokens[rb_o + 1].kind == TokenKind::AssignOp) {
-                  outer_mutated = true
-                  break
+                (tokens[rb_o + 1].kind == TokenKind::Dot || tokens[rb_o + 1].kind == TokenKind::LBracket) {
+                  is_whitelisted_idx = true
                 }
-              } else if bi >= 4 && tokens[bi - 1].kind == TokenKind::LParen &&
-              tokens[bi - 3].kind == TokenKind::ColonColon && tokens[bi - 4].raw == "mbt_compat" &&
-              (is_cap_compat_growth_fn(tokens[bi - 2].raw) || is_cap_compat_write_fn(tokens[bi - 2].raw)) {
+              }
+              if !(is_whitelisted_len || is_whitelisted_idx) {
                 outer_mutated = true
                 break
               }
@@ -7853,47 +8944,49 @@ fn for_in_body_hazard(
       }
     } else if is_local_fresh_recv(r, r_is_field, pos) {
       false
-    } else if is_field_iter {
-      let param_can_alias = if !r_is_field && arr_params.contains(r) && !fresh_before.contains(r) {
-        if !is_nested_field_iter && iter_field_is_local_struct && summary.distinct_array_fields.contains(tail) {
-          false
-        } else {
-          let rty = if body_open >= 0 { resolve_local_type_name(tokens, r, body_open, pos, summary) } else { "" }
-          let re = if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
+    } else if r_is_field {
+      other_field_can_alias(r_tail, r_is_indexed, r_is_local_struct)
+    } else {
+      // Non-field, non-indexed local/param/global `r` (not a fresh local): fail closed unless proven disjoint!
+      if names.contains(r) {
+        true
+      } else if is_field_iter && !is_nested_field_iter && iter_field_is_local_struct &&
+      summary.distinct_array_fields.contains(tail) {
+        false
+      } else if r.length() > 0 && body_open >= 0 {
+        let rty = resolve_local_type_name(tokens, r, body_open, pos, summary)
+        if rty.starts_with("Array:") {
+          let re = rty.slice(6, rty.length())
           if re.length() > 0 && !type_mentions_param(re, fn_tparams) && !iter_elem_unk && iter_elem_set.length() > 0 {
             iter_elem_set.contains(re)
           } else {
             true
           }
-        }
-      } else {
-        false
-      }
-      (r_is_field && other_field_can_alias(r_tail, r_is_indexed, r_is_local_struct)) || (!r_is_field && names.contains(r)) || param_can_alias
-    } else {
-      let param_can_alias = if !r_is_field && arr_params.contains(r) && !fresh_before.contains(r) {
-        let rty = if body_open >= 0 { resolve_local_type_name(tokens, r, body_open, pos, summary) } else { "" }
-        let re = if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
-        if re.length() > 0 && !type_mentions_param(re, fn_tparams) && !iter_elem_unk && iter_elem_set.length() > 0 {
-          iter_elem_set.contains(re)
+        } else if rty.starts_with("dep:") && iter_all_priv_elems() {
+          false
+        } else if rty.length() > 0 && !rty.starts_with("Array") &&
+        (rty == iter_raw_elem || (!iter_elem_unk && iter_elem_set.contains(rty)) || rty == "__NON_ARR__" ||
+          local_nominal_cannot_contain_iter(rty) ||
+          (!fn_tparams.contains(rty) &&
+            (is_builtin_eq_type_name(rty) || rty == "Bytes" || rty == "SourceLoc" ||
+              rty == "StringBuilder" || rty == "Buffer" || summary.array_free_types.contains(rty)))) {
+          false
         } else {
           true
         }
       } else {
-        false
+        true
       }
-      let field_can_alias = r_is_field && other_field_can_alias(r_tail, r_is_indexed, r_is_local_struct)
-      (!r_is_field && (names.contains(r) || param_can_alias)) || field_can_alias
     }
   }
   let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, arg_open : Int, arg_close : Int, is_method_call : Bool, recv_is_root : Bool, pos : Int, label : String) -> String {
     // pass_kind: 2 = iterated Array itself passed/received; 1 = owner struct of `root.tail` passed/received; 0 = neither
     if pass_kind == 2 {
-      if (ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || ef.may_pass_param_to_dep) && !can_exit(pos) {
+      if (ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || ef.may_call_dep_3seg || ef.may_pass_param_to_dep) && !can_exit(pos) {
         return label + " may mutate the array during `for .. in`"
       }
-      if ef.may_grow { flags[0] = true }
-      if ef.may_write { flags[1] = true }
+      if ef.may_grow && !can_exit(pos) { flags[0] = true }
+      if ef.may_write && !can_exit(pos) { flags[1] = true }
     } else if pass_kind == 1 {
       if is_field_iter && tail.length() > 0 {
         // Check if `root` (or any non-fresh arg when `root == ""`) is passed at a parameter position that `ef` passes to a cross-package `dep::f(param)`.
@@ -7928,11 +9021,112 @@ fn for_in_body_hazard(
             }
           }
         }
-        if (ef.mutated_fields.contains(tail) || root_escapes_to_dep) && !can_exit(pos) {
+        let tail_distinct = !is_nested_field_iter && iter_field_is_local_struct && summary.distinct_array_fields.contains(tail)
+        if !root_escapes_to_dep && !tail_distinct && ef.may_pass_param_to_dep {
+          if is_method_call && ef.dep_escaped_params.contains(0) {
+            root_escapes_to_dep = true
+          }
+          if !root_escapes_to_dep && arg_open >= 0 && arg_close > arg_open {
+            let mut ai = arg_open + 1
+            let mut ad = 0
+            let mut arg_ord = if is_method_call { 1 } else { 0 }
+            while ai < arg_close {
+              let ak = tokens[ai].kind
+              if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+              else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+              else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
+              else if ad == 0 && (ak == TokenKind::Ident || tokens[ai].raw == "self") &&
+              !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
+              !is_local_fresh_recv(tokens[ai].raw, false, ai) && ef.dep_escaped_params.contains(arg_ord) {
+                root_escapes_to_dep = true
+                break
+              }
+              ai = ai + 1
+            }
+          }
+        }
+        let shrink_nf_overlap = (ef.may_shrink_unk_elem || ef.mutated_arr_elems.length() > 0) &&
+        elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.mutated_arr_elems, ef.may_shrink_unk_elem)
+        if (ef.mutated_fields.contains(tail) || root_escapes_to_dep || (!tail_distinct && shrink_nf_overlap)) && !can_exit(pos) {
           return label + " may mutate field `." + tail + "` during `for .. in`"
         }
-        if ef.grew_fields.contains(tail) { flags[0] = true }
-        if ef.wrote_fields.contains(tail) { flags[1] = true }
+        if !can_exit(pos) {
+          let grow_nf_overlap = (ef.may_grow_unk_elem || ef.grew_arr_elems.length() > 0) &&
+          elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.grew_arr_elems, ef.may_grow_unk_elem)
+          let write_nf_overlap = (ef.may_write_unk_elem || ef.wrote_arr_elems.length() > 0) &&
+          elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.wrote_arr_elems, ef.may_write_unk_elem)
+          if ef.grew_fields.contains(tail) || (!tail_distinct && grow_nf_overlap) { flags[0] = true }
+          if ef.wrote_fields.contains(tail) || (!tail_distinct && write_nf_overlap) { flags[1] = true }
+        }
+      } else {
+        let mut field_may_alias = false
+        for mf in ef.mutated_fields.keys() {
+          if other_field_can_alias(mf, false, true) {
+            field_may_alias = true
+            break
+          }
+        }
+        let shrink_nf_overlap = (ef.may_shrink_unk_elem || ef.mutated_arr_elems.length() > 0) &&
+        elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.mutated_arr_elems, ef.may_shrink_unk_elem)
+        let iter_all_priv = iter_all_priv_elems()
+        let mut arg_escapes_to_dep = false
+        if ef.may_pass_param_to_dep {
+          if is_method_call && ef.dep_escaped_params.contains(0) {
+            let p0 = match ef.param_types.get(0) { Some(v) => v, None => "" }
+            if p0 != "__NON_ARR__" && !(p0.starts_with("dep:") && iter_all_priv) {
+              arg_escapes_to_dep = true
+            }
+          }
+          if !arg_escapes_to_dep && arg_open >= 0 && arg_close > arg_open {
+            let mut ai = arg_open + 1
+            let mut ad = 0
+            let mut arg_ord = if is_method_call { 1 } else { 0 }
+            while ai < arg_close {
+              let ak = tokens[ai].kind
+              if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+              else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+              else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
+              else if ad == 0 && (ak == TokenKind::Ident || tokens[ai].raw == "self") &&
+              !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
+              ef.dep_escaped_params.contains(arg_ord) && !ef.scalar_params.contains(arg_ord) {
+                let pa = match ef.param_types.get(arg_ord) { Some(v) => v, None => "" }
+                if pa != "__NON_ARR__" && !(pa.starts_with("dep:") && iter_all_priv) {
+                  arg_escapes_to_dep = true
+                  break
+                }
+              }
+              ai = ai + 1
+            }
+          }
+        }
+        if (field_may_alias || shrink_nf_overlap || ef.may_call_opaque || (ef.may_call_dep_3seg && !iter_all_priv) ||
+          arg_escapes_to_dep || (is_global_iter && ef.mutated_globals.contains(root))) && !can_exit(pos) {
+          return label + " may mutate the array during `for .. in`"
+        }
+        if !can_exit(pos) {
+          if (ef.may_grow_unk_elem || ef.grew_arr_elems.length() > 0) &&
+          elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.grew_arr_elems, ef.may_grow_unk_elem) {
+            flags[0] = true
+          } else {
+            for gf in ef.grew_fields.keys() {
+              if other_field_can_alias(gf, false, true) {
+                flags[0] = true
+                break
+              }
+            }
+          }
+          if (ef.may_write_unk_elem || ef.wrote_arr_elems.length() > 0) &&
+          elem_sets_may_overlap(iter_elem_set, iter_elem_unk, ef.wrote_arr_elems, ef.may_write_unk_elem) {
+            flags[1] = true
+          } else {
+            for wf in ef.wrote_fields.keys() {
+              if other_field_can_alias(wf, false, true) {
+                flags[1] = true
+                break
+              }
+            }
+          }
+        }
       }
     } else {
       if is_global_iter && ef.mutated_globals.contains(root) && !can_exit(pos) {
@@ -7942,8 +9136,10 @@ fn for_in_body_hazard(
         if ef.mutated_fields.contains(tail) && !can_exit(pos) {
           return label + " mutates field `." + tail + "` during `for .. in`"
         }
-        if ef.grew_fields.contains(tail) { flags[0] = true }
-        if ef.wrote_fields.contains(tail) { flags[1] = true }
+        if !can_exit(pos) {
+          if ef.grew_fields.contains(tail) { flags[0] = true }
+          if ef.wrote_fields.contains(tail) { flags[1] = true }
+        }
         if root.length() == 0 && ef.may_pass_param_to_dep && !can_exit(pos) {
           let mut unknown_owner_escapes = false
           if is_method_call && ef.dep_escaped_params.contains(0) {
@@ -7976,10 +9172,57 @@ fn for_in_body_hazard(
     ""
   }
   let empty_scalars : Map[Int, Bool] = Map()
-  let args_pass_kind_ex = fn(as_ : Int, ae_ : Int, scalar_params : Map[Int, Bool], arg_base : Int) -> Int {
+  let empty_ptypes : Map[Int, String] = Map()
+  let args_pass_kind_ex = fn(as_ : Int, ae_ : Int, scalar_params : Map[Int, Bool], param_types : Map[Int, String], arg_base : Int) -> Int {
     if ae_ <= as_ {
       return 0
     }
+    let all_iter_elems_priv = fn() -> Bool {
+      iter_all_priv_elems()
+    }
+    let is_non_arr_param = fn(ord : Int) -> Bool {
+      if scalar_params.contains(ord) { return true }
+      match param_types.get(ord) {
+        Some(pty) =>
+        if pty == "__NON_ARR__" {
+          true
+        } else if pty.starts_with("dep:") {
+          all_iter_elems_priv()
+        } else if pty.starts_with("local:") {
+          local_nominal_cannot_contain_iter(pty.slice(6, pty.length()))
+        } else if pty.starts_with("Array:") {
+          let pe = pty.slice(6, pty.length())
+          pe.length() > 0 && !pe.starts_with("Array") && !iter_elem_unk && iter_elem_set.length() > 0 &&
+          !type_mentions_param(pe, fn_tparams) &&
+          (is_builtin_eq_type_name(pe) || summary.array_free_types.contains(pe) || local_nominal_cannot_contain_iter(pe)) &&
+          !iter_elem_set.contains(pe)
+        } else {
+          pty != "Array" && !pty.starts_with("Array") &&
+          (is_builtin_eq_type_name(pty) || pty == "Bytes" || pty == "SourceLoc" ||
+            pty == "StringBuilder" || pty == "Buffer" || summary.array_free_types.contains(pty))
+        }
+        None => false
+      }
+    }
+    let is_local_nominal_param = fn(ord : Int) -> Bool {
+      match param_types.get(ord) {
+        Some(pty) =>
+        if pty.starts_with("local:") {
+          let lty = pty.slice(6, pty.length())
+          summary.local_struct_names.contains(lty) || summary.local_enum_names.contains(lty)
+        } else if pty.starts_with("Array:") {
+          let pe = pty.slice(6, pty.length())
+          pe.length() > 0 && !pe.starts_with("Array") && !iter_elem_unk && iter_elem_set.length() > 0 &&
+          !type_mentions_param(pe, fn_tparams) &&
+          (summary.local_struct_names.contains(pe) || summary.local_enum_names.contains(pe)) &&
+          !iter_elem_set.contains(pe)
+        } else {
+          false
+        }
+        None => false
+      }
+    }
+    let mut best_pk = 0
     if is_computed_iter {
       // Computed iterable (`ident(xs)` / `bag[0]`): any non-literal argument at a non-scalar param may pass the array or its owner.
       let mut ai = as_
@@ -8008,7 +9251,7 @@ fn for_in_body_hazard(
         if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
         else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
         else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
-        else if !scalar_params.contains(aord) {
+        else if !is_non_arr_param(aord) {
           let next_is_lp = ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::LParen
           let next_is_lb = ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::LBracket
           if ak == TokenKind::Ident && !next_is_lp && !(ai > as_ && tokens[ai - 1].kind == TokenKind::ColonColon) {
@@ -8152,7 +9395,11 @@ fn for_in_body_hazard(
                 true
               }
               if may_yield_arr && may_alias_target(receiver_root(tokens, ai), fname, true, next_is_lb, fld_local, ai) {
-                return 2
+                if is_local_nominal_param(aord) {
+                  if best_pk < 1 { best_pk = 1 }
+                } else {
+                  return 2
+                }
               }
             } else if !(ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::Dot) {
               let rname = tokens[ai].raw
@@ -8163,7 +9410,11 @@ fn for_in_body_hazard(
                 false
               }
               if !elem_non_arr && may_alias_target(rname, "", false, false, false, ai) {
-                return 2
+                if is_local_nominal_param(aord) {
+                  if best_pk < 1 { best_pk = 1 }
+                } else {
+                  return 2
+                }
               }
             }
           }
@@ -8181,7 +9432,7 @@ fn for_in_body_hazard(
         if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
         else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
         else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
-        else if !scalar_params.contains(aord) && ak == TokenKind::Ident && names.contains(tokens[ai].raw) &&
+        else if !is_non_arr_param(aord) && ak == TokenKind::Ident && names.contains(tokens[ai].raw) &&
         !(ai > as_ && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) {
           return 2
         }
@@ -8189,17 +9440,18 @@ fn for_in_body_hazard(
       }
     }
     if is_field_iter {
-      if root.length() > 0 {
+      let spk = if root.length() > 0 {
         span_passes_owner_or_field(tokens, as_, ae_, root, tail)
       } else {
         0
       }
+      if best_pk > spk { best_pk } else { spk }
     } else {
-      0
+      best_pk
     }
   }
   let args_pass_kind = fn(as_ : Int, ae_ : Int) -> Int {
-    args_pass_kind_ex(as_, ae_, empty_scalars, 0)
+    args_pass_kind_ex(as_, ae_, empty_scalars, empty_ptypes, 0)
   }
   let mut k = s
   while k < e {
@@ -8252,7 +9504,15 @@ fn for_in_body_hazard(
       let (recv_is_field, recv_is_idx, recv_r, recv_tail) = indexed_field_tail(tokens, k - 1, s)
       let recv_dot = if recv_is_field { field_dot_pos_of(tokens, k - 1, s) } else { -1 }
       let recv_local = recv_dot >= 0 && eq_field_recv_is_local(tokens, recv_dot, body_open, k, summary)
-      let may_alias = may_alias_target(recv_r, recv_tail, recv_is_field, recv_is_idx, recv_local, k)
+      let recv_is_non_arr_container = (recv_is_field && match summary.field_types.get(recv_tail) {
+        Some(ft) => ft == "Map" || ft == "OrderedMap" || ft == "OrderedSet" || ft == "Set" || ft == "StringBuilder" || ft == "Buffer"
+        None => false
+      }) || (!recv_is_field && !recv_is_idx && recv_r.length() > 0 && body_open >= 0 && {
+        let rt_c = resolve_local_type_name(tokens, recv_r, body_open, k, summary)
+        rt_c == "Map" || rt_c == "OrderedMap" || rt_c == "OrderedSet" || rt_c == "Set" ||
+        rt_c == "StringBuilder" || rt_c == "Buffer"
+      })
+      let may_alias = if recv_is_non_arr_container { false } else { may_alias_target(recv_r, recv_tail, recv_is_field, recv_is_idx, recv_local, k) }
       let unknown_recv_may_alias = !recv_is_field && recv_r.length() == 0 && !fresh_root &&
       !(is_field_iter && !is_nested_field_iter && iter_field_is_local_struct && summary.distinct_array_fields.contains(tail))
       if may_alias || unknown_recv_may_alias {
@@ -8276,23 +9536,63 @@ fn for_in_body_hazard(
       } else {
         0
       }
-      let recv_is_builtin_arr_or_val = (recv_is_field && summary.array_fields.get(recv_tail) == Some(true)) ||
+      let recv_is_builtin_arr_or_val = (recv_is_field && (summary.array_fields.get(recv_tail) == Some(true) ||
+        match summary.field_types.get(recv_tail) {
+          Some(ft) => ft == "Map" || ft == "OrderedMap" || ft == "OrderedSet" || ft == "Set" || ft == "StringBuilder" || ft == "Buffer"
+          None => false
+      })) ||
       (!recv_is_field && recv_r.length() > 0 && body_open >= 0 &&
-        (fresh_local_binding(tokens, recv_r, body_open, k, false) ||
-          resolve_local_type_name(tokens, recv_r, body_open, k, summary).starts_with("Array:"))) ||
+        (fresh_local_binding(tokens, recv_r, body_open, k, false) || {
+          let rt_b = resolve_local_type_name(tokens, recv_r, body_open, k, summary)
+          rt_b.starts_with("Array:") || rt_b == "Map" || rt_b == "OrderedMap" || rt_b == "OrderedSet" ||
+          rt_b == "Set" || rt_b == "StringBuilder" || rt_b == "Buffer"
+      })) ||
       (body_open >= 0 && receiver_is_builtin(tokens, k - 1, body_open, k, summary.sort_env))
       let recv_proven_disjoint_builtin = !may_alias && is_builtin_first_order_method(m) && apk == 0 &&
       (!summary.by_name.contains(m) || recv_is_builtin_arr_or_val)
       if !recv_proven_disjoint_builtin {
+        let exact_recv_ty = if body_open >= 0 {
+          if !recv_is_field && !recv_is_idx && recv_r.length() > 0 {
+            resolve_local_type_name(tokens, recv_r, body_open, k, summary)
+          } else if recv_is_field && !recv_is_idx && recv_local {
+            match summary.field_types.get(recv_tail) { Some(ft) => ft, None => "" }
+          } else {
+            ""
+          }
+        } else {
+          ""
+        }
+        let exact_dk = if exact_recv_ty.length() > 0 && summary.effects.contains(exact_recv_ty + "::" + m) {
+          exact_recv_ty + "::" + m
+        } else {
+          ""
+        }
         match summary.by_name.get(m) {
           Some(keys) => {
-            for dk in keys {
+            let eff_keys = if exact_dk.length() > 0 { [exact_dk] } else { keys }
+            for dk in eff_keys {
               match summary.effects.get(dk) {
                 Some(ef) => {
-                  let apk_ef = args_pass_kind_ex(k + 3, cp_m, ef.scalar_params, 1)
-                  let pk_ef = if may_alias || apk_ef == 2 {
+                  let apk_ef = args_pass_kind_ex(k + 3, cp_m, ef.scalar_params, ef.param_types, 1)
+                  let recv_non_arr_ef = match ef.param_types.get(0) {
+                    Some(pty) => pty == "__NON_ARR__" ||
+                    (pty.starts_with("local:") && local_nominal_cannot_contain_iter(pty.slice(6, pty.length()))) ||
+                    (pty.starts_with("dep:") && iter_all_priv_elems()) ||
+                    (pty != "Array" && !pty.starts_with("Array") &&
+                      (is_builtin_eq_type_name(pty) || pty == "Bytes" || pty == "SourceLoc" ||
+                        pty == "StringBuilder" || pty == "Buffer" || summary.array_free_types.contains(pty)))
+                    None => false
+                  }
+                  let recv_local_nominal_ef = match ef.param_types.get(0) {
+                    Some(pty) => pty.starts_with("local:") && {
+                      let lty = pty.slice(6, pty.length())
+                      summary.local_struct_names.contains(lty) || summary.local_enum_names.contains(lty)
+                    }
+                    None => false
+                  }
+                  let pk_ef = if (may_alias && !recv_non_arr_ef && !recv_local_nominal_ef) || apk_ef == 2 {
                     2
-                  } else if (is_field_iter && recv_is_root) || apk_ef == 1 {
+                  } else if (may_alias && recv_local_nominal_ef) || (is_field_iter && recv_is_root) || apk_ef == 1 {
                     1
                   } else {
                     0
@@ -8383,7 +9683,7 @@ fn for_in_body_hazard(
         } else {
           match summary.effects.get(q + "::" + tk.raw) {
             Some(ef) => {
-              let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, 0)
+              let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, ef.param_types, 0)
               let why = check_pkg_effect(ef, pk_ef, k + 1, cp, false, false, k, "call to `" + q + "::" + tk.raw + "(..)`")
               if why.length() > 0 { return why }
             }
@@ -8416,7 +9716,7 @@ fn for_in_body_hazard(
       } else {
         match summary.effects.get("::" + tk.raw) {
           Some(ef) => {
-            let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, 0)
+            let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, ef.param_types, 0)
             let why = check_pkg_effect(ef, pk_ef, k + 1, cp, false, false, k, "call to `" + tk.raw + "(..)`")
             if why.length() > 0 { return why }
           }
