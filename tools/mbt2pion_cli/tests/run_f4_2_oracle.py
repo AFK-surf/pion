@@ -122,7 +122,7 @@ fn run_repr_and_iter() -> String {
   let kh = m.keys().head().unwrap_or("none")
   let kn = m.keys().next().unwrap_or("none")
   let ka = m.keys().any(fn(k) { k == "beta" })
-  // Astra P1-3: deleting an unvisited key during Map::keys().any(...) must match MoonBit callback count
+  // Deleting an unvisited key during Map::keys().any(...) must match MoonBit callback count
   let m2 : Map[String, Int] = { "a": 1, "b": 2 }
   let mut n2 = 0
   let _ = m2.keys().any(fn(k) {
@@ -475,6 +475,13 @@ def main():
             ("nl_dot_pop_mut", "fn ndp(a : Array[Int], v : ArrayView[Int]) -> Int { let al = [a]\n  .unsafe_pop()\n  al[0] = 99\n  v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { ndp(a, ops[0:2]) }\n"),
             ("v1escape", "fn mk(p : ArrayView[Int]) -> () -> Int { fn() { p[0] } }\npub fn f(xs : Array[Int]) -> () -> Int { mk(xs[0:2]) }\n"),
             ("v2shadowfresh", "fn patch(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = ys; if p.length() > 0 { let a = [0]; a[0] = 1 }; a[0] = 99; p[0] }\npub fn f(xs : Array[Int], zs : Array[Int]) -> Int { patch(xs[0:2], zs) }\n"),
+            ("trailing_paren_cb", "fn rd(v : ArrayView[Int], _u : Unit) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int], cb : (Array[Int]) -> Unit) -> Int { rd(xs[0:3], (cb)(ys)) }\n"),
+            ("trailing_interp_mut", "fn mut_ys(ys : Array[Int]) -> Int { ys[1] = 9; 0 }\nfn rd(v : ArrayView[Int], _s : String) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { rd(xs[0:3], \"\\{mut_ys(ys)}\") }\n"),
+            ("rhs_before_bind", "fn rbb(a : Array[Int], v : ArrayView[Int]) -> Int { let a : Array[Int] = [{ a[0] = 99; 1 }]; let _ = a; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { rbb(a, ops[0:2]) }\n"),
+            ("match_arm_leak", "fn mal(m : Array[Int], om : Map[String, Int]?, v : ArrayView[Int]) -> Int { match om { Some(m) => { m[\"k\"] = 1 }; None => { m[0] = 99 } }; v[0] }\npub fn f(m : Array[Int], om : Map[String, Int]?, ops : Array[Int]) -> Int { mal(m, om, ops[0:2]) }\n"),
+            ("named_fn_escape", "fn mk(p : ArrayView[Int]) -> () -> Int { fn inner() -> Int { p[0] }; inner }\npub fn f(xs : Array[Int]) -> () -> Int { mk(xs[0:2]) }\n"),
+            ("pat_fn_escape", "fn mk(p : ArrayView[Int]) -> (Int) -> Int { fn { 0 => p[0]; _ => 0 } }\npub fn f(xs : Array[Int]) -> (Int) -> Int { mk(xs[0:2]) }\n"),
+            ("match_arrow_escape", "fn mk(flag : Bool, p : ArrayView[Int]) -> (Int) -> Int { match flag { true => _ => p[0]; false => _ => 0 } }\npub fn f(flag : Bool, xs : Array[Int]) -> (Int) -> Int { mk(flag, xs[0:2]) }\n"),
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
 
