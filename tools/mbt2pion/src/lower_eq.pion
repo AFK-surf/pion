@@ -4,15 +4,16 @@
 ///|    - Non-comparable fields (closures, `StringBuilder`, `Map`, `OrderedMap`, `mbt_compat::Ref`,
 ///|      `dyn Trait`) emit native `#derive(Eq)` so Pion's `FINAL_CHECK` rejects them fail-closed.
 ///|    - Types whose direct fields/payloads contain `Bytes` (including inside `Option`/`Array`/
-///|      `FixedArray`/`ImmArray`/`Result`/tuples, and including generic types) emit native Pion
-///|      `[pub] impl Eq` / `[pub] impl[T : Eq, ...] Eq` with inline byte comparison, eliminating
-///|      declaration-order sensitivity and legacy `__mbt_eq_*` helpers.
+///|      `FixedArray`/`ImmArray`/`Result`/tuples, and including generic types) OR `#derive(Eq)`
+///|      types on a self-recursive / mutually-recursive cycle emit native Pion
+///|      `[pub] impl Eq` / `[pub] impl[T : Eq, ...] Eq` with inline byte/container comparison,
+///|      eliminating declaration-order sensitivity and legacy `__mbt_eq_*` helpers.
 ///|    - All other types (including `MbtJson`, `OrderedSet`, nested structs/enums in any order)
 ///|      emit native Pion `#derive(Eq)` directly.
 ///| 2. MoonBit `[pub] impl Eq` / `[pub] impl[T, ...] Eq` lowering to Pion built-in `impl Eq`,
-///|    with anti-hijacking (`!ctx.symtab.local_types.contains("Eq")`), omitted parameter/return type
-///|    auto-fill, `Self` normalization, `impl_param_scope` binding, and fail-closed rejection of
-///|    `with not_equal` or any non-`equal` method.
+///|    with anti-hijacking (`!ctx.symtab.local_types.contains("Eq")`), optional `with fn equal`,
+///|    omitted parameter/return type auto-fill, `Self` normalization, `impl_param_scope` binding,
+///|    and fail-closed rejection of `with [fn] not_equal` or any non-`equal` method.
 
 ///| Return true if lowered type string `ty` has a top-level function arrow `->`.
 fn eq_is_fn_type(ty : String) -> Bool {
@@ -144,10 +145,162 @@ fn eq_type_has_direct_bytes(ty : String) -> Bool {
   false
 }
 
+///| Prescan all `#derive(Eq)` / trailing `derive(Eq)` structs, tuple structs, and enums across
+///| all files in the package, build their directed type-reference graph, and mark every type
+///| that can reach itself in >= 1 step (self-recursive or mutually-recursive) in
+///| `ctx.symtab.recursive_derive_eq_types`.
+fn prescan_recursive_derive_eq_types(ctx : StageAContext, files : Array[SourceFile]) -> Unit {
+  let derive_eq_set : Map[String, Bool] = Map()
+  let deps : Map[String, Array[String]] = Map()
+  for sf in files {
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    while i < n {
+      let t = tokens[i]
+      if t.kind == TokenKind::Keyword && (t.raw == "struct" || t.raw == "enum") &&
+      i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        let kind_kw = t.raw
+        let tname = tokens[i + 1].raw
+        let mut lb = i + 2
+        if lb < n && tokens[lb].kind == TokenKind::LBracket {
+          lb = find_matching_delim(tokens, lb) + 1
+        }
+        let is_brace = lb < n && tokens[lb].kind == TokenKind::LBrace
+        let is_tuple = kind_kw == "struct" && lb < n && tokens[lb].kind == TokenKind::LParen
+        if is_brace || is_tuple {
+          let close_b = find_matching_delim(tokens, lb)
+          let mut has_eq = false
+          // Check trailing `derive(...Eq...)`
+          if close_b + 2 < n && (tokens[close_b + 1].kind == TokenKind::Keyword || tokens[close_b + 1].kind == TokenKind::Ident) &&
+          tokens[close_b + 1].raw == "derive" && tokens[close_b + 2].kind == TokenKind::LParen {
+            let dp = find_matching_delim(tokens, close_b + 2)
+            let mut di = close_b + 3
+            while di < dp {
+              if tokens[di].raw == "Eq" { has_eq = true }
+              di = di + 1
+            }
+          }
+          // Check leading `#derive(...Eq...)`
+          let mut back_i = i - 1
+          while back_i >= 0 && (tokens[back_i].kind == TokenKind::Keyword || tokens[back_i].kind == TokenKind::LParen ||
+            tokens[back_i].kind == TokenKind::RParen || tokens[back_i].kind == TokenKind::Ident || tokens[back_i].kind == TokenKind::Attr) {
+            if tokens[back_i].kind == TokenKind::Attr && tokens[back_i].raw.starts_with("#derive") && str_has(tokens[back_i].raw, "Eq") {
+              has_eq = true
+            }
+            if tokens[back_i].kind == TokenKind::Keyword && !(tokens[back_i].raw == "pub" || tokens[back_i].raw == "priv") {
+              break
+            }
+            back_i = back_i - 1
+          }
+          if has_eq {
+            derive_eq_set[tname] = true
+            let refs : Array[String] = match deps.get(tname) {
+              Some(xs) => xs
+              None => []
+            }
+            if kind_kw == "struct" && is_brace {
+              let mut k = lb + 1
+              while k < close_b {
+                if tokens[k].kind == TokenKind::UpperIdent && !(k > lb + 1 && tokens[k - 1].kind == TokenKind::Dot) {
+                  refs.push(tokens[k].raw)
+                }
+                k = k + 1
+              }
+            } else if is_tuple {
+              let mut k = lb + 1
+              while k < close_b {
+                if tokens[k].kind == TokenKind::UpperIdent && !(k > lb + 1 && tokens[k - 1].kind == TokenKind::Dot) {
+                  refs.push(tokens[k].raw)
+                }
+                k = k + 1
+              }
+            } else {
+              // enum: collect UpperIdent tokens inside variant payloads `Variant(...)`
+              let mut ei = lb + 1
+              while ei < close_b {
+                if tokens[ei].kind == TokenKind::UpperIdent {
+                  if ei + 1 < close_b && tokens[ei + 1].kind == TokenKind::LParen {
+                    let vp = find_matching_delim(tokens, ei + 1)
+                    let mut k = ei + 2
+                    while k < vp {
+                      if tokens[k].kind == TokenKind::UpperIdent && !(k > ei + 2 && tokens[k - 1].kind == TokenKind::Dot) {
+                        refs.push(tokens[k].raw)
+                      }
+                      k = k + 1
+                    }
+                    ei = vp + 1
+                  } else {
+                    ei = ei + 1
+                  }
+                } else {
+                  ei = ei + 1
+                }
+              }
+            }
+            deps[tname] = refs
+          }
+          i = close_b + 1
+          continue
+        }
+      }
+      if t.kind == TokenKind::LBrace {
+        i = find_matching_delim(tokens, i) + 1
+        continue
+      }
+      i = i + 1
+    }
+  }
+  // Reachability: mark any `#derive(Eq)` type that can reach itself in >= 1 step
+  for start in derive_eq_set.keys() {
+    let visited : Map[String, Bool] = Map()
+    let stack : Array[String] = []
+    match deps.get(start) {
+      Some(xs) => {
+        for nxt in xs {
+          if derive_eq_set.contains(nxt) && !visited.contains(nxt) {
+            visited[nxt] = true
+            stack.push(nxt)
+          }
+        }
+      }
+      None => ()
+    }
+    let mut qi = 0
+    let mut cyclic = false
+    while qi < stack.length() {
+      let cur = stack[qi]
+      qi = qi + 1
+      if cur == start {
+        cyclic = true
+        break
+      }
+      match deps.get(cur) {
+        Some(xs) => {
+          for nxt in xs {
+            if derive_eq_set.contains(nxt) && !visited.contains(nxt) {
+              visited[nxt] = true
+              stack.push(nxt)
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    if cyclic {
+      ctx.symtab.recursive_derive_eq_types[start] = true
+    }
+  }
+}
+
 ///| Whether a `#derive(Eq)` struct / tuple struct should emit native Pion `#derive(Eq)` (`true`)
-///| or synthesize a native Pion `[pub] impl[T : Eq, ...] Eq` (`false`, only when a direct field
-///| contains `Bytes` and no field is non-comparable).
-fn should_use_native_derive_eq_struct(field_types : Array[(String, String)]) -> Bool {
+///| or synthesize a native Pion `[pub] impl[T : Eq, ...] Eq` (`false`, when a direct field
+///| contains `Bytes` or the type is self-/mutually-recursive, and no field is non-comparable).
+fn should_use_native_derive_eq_struct(
+  tname : String,
+  field_types : Array[(String, String)],
+  recursive_types : Map[String, Bool],
+) -> Bool {
   let mut has_bytes = false
   for ft in field_types {
     if eq_type_has_non_comparable(ft.1) {
@@ -157,13 +310,17 @@ fn should_use_native_derive_eq_struct(field_types : Array[(String, String)]) -> 
       has_bytes = true
     }
   }
-  !has_bytes
+  !(has_bytes || recursive_types.contains(tname))
 }
 
 ///| Whether a `#derive(Eq)` enum should emit native Pion `#derive(Eq)` (`true`)
-///| or synthesize a native Pion `[pub] impl[T : Eq, ...] Eq` (`false`, only when a direct payload
-///| contains `Bytes` and no payload is non-comparable).
-fn should_use_native_derive_eq_enum(variants : Array[(String, Array[String])]) -> Bool {
+///| or synthesize a native Pion `[pub] impl[T : Eq, ...] Eq` (`false`, when a direct payload
+///| contains `Bytes` or the type is self-/mutually-recursive, and no payload is non-comparable).
+fn should_use_native_derive_eq_enum(
+  tname : String,
+  variants : Array[(String, Array[String])],
+  recursive_types : Map[String, Bool],
+) -> Bool {
   let mut has_bytes = false
   for ev in variants {
     for aty in ev.1 {
@@ -175,12 +332,13 @@ fn should_use_native_derive_eq_enum(variants : Array[(String, Array[String])]) -
       }
     }
   }
-  !has_bytes
+  !(has_bytes || recursive_types.contains(tname))
 }
 
 ///| Synthesize a native Pion `[pub] impl[T : Eq, ...] Eq for Type[T, ...]` block for a `#derive(Eq)`
-///| struct, tuple struct, or enum whose direct fields/payloads contain `Bytes`.
-fn gen_bytes_derive_eq_impl(
+///| struct, tuple struct, or enum whose direct fields/payloads contain `Bytes` or participate in a
+///| self-recursive / mutually-recursive cycle.
+fn gen_explicit_derive_eq_impl(
   type_vis : String,
   tname : String,
   generic_names : Array[String],
@@ -275,11 +433,15 @@ fn try_lower_builtin_eq_impl(
     ""
   }
   let self_ty = lower_type_tokens_checked(ctx, tokens, for_i + 1, with_i, sf.rel_path).trim()
-  let raw_mname = if with_i + 1 < lb { tokens[with_i + 1].raw } else { "" }
+  let mut mname_i = with_i + 1
+  if mname_i < lb && tokens[mname_i].kind == TokenKind::Keyword && tokens[mname_i].raw == "fn" {
+    mname_i = mname_i + 1
+  }
+  let raw_mname = if mname_i < lb { tokens[mname_i].raw } else { "" }
   let mname = rename_keyword_ident(raw_mname)
 
-  // Fail-closed red line: built-in `impl Eq` only supports `with equal`.
-  // `with not_equal` or any other method MUST be rejected with MBT2PION_UNSUPPORTED_SYNTAX.
+  // Fail-closed red line: built-in `impl Eq` only supports `with [fn] equal`.
+  // `with [fn] not_equal` or any other method MUST be rejected with MBT2PION_UNSUPPORTED_SYNTAX.
   if mname != "equal" {
     ctx.diags.push(diag_error(
       "MBT2PION_UNSUPPORTED_SYNTAX",
@@ -300,7 +462,7 @@ fn try_lower_builtin_eq_impl(
     return (true, rb + 1)
   }
 
-  let mut open_p = with_i + 2
+  let mut open_p = mname_i + 1
   while open_p < lb && tokens[open_p].kind != TokenKind::LParen {
     open_p = open_p + 1
   }

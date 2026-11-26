@@ -13734,8 +13734,14 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
       if t.kind == TokenKind::Keyword && t.raw == "impl" && i + 5 < n && tokens[i + 1].raw == "Eq" &&
       tokens[i + 2].raw == "for" && tokens[i + 3].kind == TokenKind::UpperIdent &&
-      tokens[i + 4].raw == "with" && tokens[i + 5].raw == "equal" {
-        ctx.symtab.custom_impl_eq_types[tokens[i + 3].raw] = true
+      tokens[i + 4].raw == "with" {
+        let mut eq_mi = i + 5
+        if eq_mi < n && tokens[eq_mi].kind == TokenKind::Keyword && tokens[eq_mi].raw == "fn" {
+          eq_mi = eq_mi + 1
+        }
+        if eq_mi < n && tokens[eq_mi].raw == "equal" {
+          ctx.symtab.custom_impl_eq_types[tokens[i + 3].raw] = true
+        }
       }
       if t.kind == TokenKind::Keyword && t.raw == "trait" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
         next_autofill = false
@@ -13850,6 +13856,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
     }
   }
+  prescan_recursive_derive_eq_types(ctx, files)
 }
 
 ///| Lower a single `.mbt` file through Stage A, emitting declaration anchors,
@@ -14514,9 +14521,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
         }
         let use_native_derive_eq = if kind_kw == "struct" {
-          should_use_native_derive_eq_struct(field_types)
+          should_use_native_derive_eq_struct(tname, field_types, ctx.symtab.recursive_derive_eq_types)
         } else {
-          should_use_native_derive_eq_enum(enum_variants)
+          should_use_native_derive_eq_enum(tname, enum_variants, ctx.symtab.recursive_derive_eq_types)
         }
         for d in pending_derives {
           if d == "Debug" {
@@ -14556,8 +14563,8 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              // Direct `Bytes` field/payload: synthesize native Pion `[pub] impl[T : Eq, ...] Eq`
-              recipe_impls_sb.write_string(gen_bytes_derive_eq_impl(type_vis, tname, type_added_generics, kind_kw == "struct", field_types, enum_variants))
+              // Direct `Bytes` or recursive `#derive(Eq)` type: synthesize native Pion `[pub] impl[T : Eq, ...] Eq`
+              recipe_impls_sb.write_string(gen_explicit_derive_eq_impl(type_vis, tname, type_added_generics, kind_kw == "struct", field_types, enum_variants))
             } else if d == "Hash" {
               let mut all_hashable = true
               if kind_kw == "struct" {
@@ -14743,7 +14750,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let type_vis = if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
         let mut pion_derives : Array[String] = []
         let mut recipe_impls_sb = StringBuilder()
-        let use_native_derive_eq = should_use_native_derive_eq_struct(field_types)
+        let use_native_derive_eq = should_use_native_derive_eq_struct(tname, field_types, ctx.symtab.recursive_derive_eq_types)
         for d in pending_derives {
           if d == "Debug" {
             continue
@@ -14774,7 +14781,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              recipe_impls_sb.write_string(gen_bytes_derive_eq_impl(type_vis, tname, type_added_generics, true, field_types, []))
+              recipe_impls_sb.write_string(gen_explicit_derive_eq_impl(type_vis, tname, type_added_generics, true, field_types, []))
             } else if d == "Hash" {
               let mut all_hashable = true
               for ft in field_types {
@@ -15725,9 +15732,10 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
   if t == "Bytes" {
     let ba = "__ba_" + depth.to_string()
     let bb = "__bb_" + depth.to_string()
+    let bl = "__bl_" + depth.to_string()
     let bi = "__bi_" + depth.to_string()
     let beq = "__beq_" + depth.to_string()
-    return "{ let " + ba + " = " + a + "; let " + bb + " = " + b + "; let mut " + beq + " = " + ba + ".length() == " + bb + ".length(); if " + beq + " { let mut " + bi + " = 0; while " + bi + " < " + ba + ".length() { if " + ba + "[" + bi + "] != " + bb + "[" + bi + "] { " + beq + " = false; break }; " + bi + " = " + bi + " + 1 } }; " + beq + " }"
+    return "{ let " + ba + " = " + a + "; let " + bb + " = " + b + "; let " + bl + " = " + ba + ".length(); let mut " + beq + " = " + bl + " == " + bb + ".length(); if " + beq + " { let mut " + bi + " = 0; while " + bi + " < " + bl + " { if " + ba + "[" + bi + "] != " + bb + "[" + bi + "] { " + beq + " = false; break }; " + bi + " = " + bi + " + 1 } }; " + beq + " }"
   }
   if t == "MbtJson" || t == "mbt_compat::MbtJson" {
     return "mbt_compat::mbt_json_eq(" + a + ", " + b + ")"
@@ -15738,15 +15746,19 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
   if t.starts_with("(") && t.ends_with(")") {
     let elems = split_tuple_types(t.slice(1, t.length() - 1))
     if elems.length() >= 2 {
+      let ta = "__ta_" + depth.to_string()
+      let tb = "__tb_" + depth.to_string()
       let sb = StringBuilder()
+      sb.write_string("{ let " + ta + " = " + a + "; let " + tb + " = " + b + "; ")
       let mut k = 0
       while k < elems.length() {
         if k > 0 { sb.write_string(" && ") }
-        let ak = "(" + a + ")." + k.to_string()
-        let bk = "(" + b + ")." + k.to_string()
+        let ak = ta + "." + k.to_string()
+        let bk = tb + "." + k.to_string()
         sb.write_string("(" + gen_eq_expr(ak, bk, elems[k], depth * 10 + k + 1, custom_eq) + ")")
         k = k + 1
       }
+      sb.write_string(" }")
       return sb.to_string()
     }
   }
@@ -15772,10 +15784,13 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
   if (t.starts_with("Array[") || t.starts_with("FixedArray[") || t.starts_with("ImmArray[")) && t.ends_with("]") {
     let open_idx = t.index_of("[")
     let inner = t.slice(open_idx + 1, t.length() - 1).trim()
+    let aa = "__aa_" + depth.to_string()
+    let ab = "__ab_" + depth.to_string()
+    let al = "__al_" + depth.to_string()
     let idx = "__ai_" + depth.to_string()
     let eqv = "__aeq_" + depth.to_string()
-    let elem_eq = gen_eq_expr(a + "[" + idx + "]", b + "[" + idx + "]", inner, depth + 1, custom_eq)
-    return "{ let mut " + eqv + " = " + a + ".length() == " + b + ".length(); if " + eqv + " { let mut " + idx + " = 0; while " + idx + " < " + a + ".length() { if !(" + elem_eq + ") { " + eqv + " = false; break }; " + idx + " = " + idx + " + 1 } }; " + eqv + " }"
+    let elem_eq = gen_eq_expr(aa + "[" + idx + "]", ab + "[" + idx + "]", inner, depth + 1, custom_eq)
+    return "{ let " + aa + " = " + a + "; let " + ab + " = " + b + "; let " + al + " = " + aa + ".length(); let mut " + eqv + " = " + al + " == " + ab + ".length(); if " + eqv + " { let mut " + idx + " = 0; while " + idx + " < " + al + " { if !(" + elem_eq + ") { " + eqv + " = false; break }; " + idx + " = " + idx + " + 1 } }; " + eqv + " }"
   }
   a + " == " + b
 }

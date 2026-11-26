@@ -214,6 +214,64 @@ impl Eq for SelfEq with equal(a : SelfEq, b : SelfEq) -> Bool {
   a.v == b.v
 }
 
+// 7. R3: Mutually recursive MdInline/MdItem/MdBlock, generic Tree[T], mut-array single-eval, and `with fn equal`
+#derive(Eq)
+pub(all) enum MdInline {
+  Text(String)
+  Bold(Array[MdInline])
+}
+
+#derive(Eq)
+pub(all) struct MdItem {
+  task : Bool?
+  blocks : Array[MdBlock]
+}
+
+#derive(Eq)
+pub(all) enum MdBlock {
+  Para(Array[MdInline])
+  List(Array[MdItem])
+  Rule
+}
+
+#derive(Eq)
+pub(all) enum Tree[T] {
+  Leaf(T)
+  Node(Array[Tree[T]])
+}
+
+pub(all) struct MutK {
+  id : Int
+  flip : Ref[Bool]
+  holder : Array[MutWrap[Int]]
+}
+
+impl Eq for MutK with equal(a, b) {
+  if a.flip.val {
+    a.flip.val = false
+    if a.holder.length() > 0 {
+      a.holder[0].v = [{ id: 999, flip: Ref(false), holder: [] }]
+    }
+  }
+  a.id == b.id
+}
+
+#derive(Eq)
+pub(all) struct MutWrap[T] {
+  tag : T
+  data : Bytes
+  mut v : Array[MutK]
+}
+
+#derive(Hash)
+pub(all) struct FnEqKey {
+  code : Int
+}
+
+pub impl Eq for FnEqKey with fn equal(a, b) {
+  a.code == b.code
+}
+
 pub fn run_all() -> String {
   // Case 1: non-primitive #derive(Eq) + H2 nested custom impl Eq + single-eval !=
   let h1 = [0]
@@ -300,7 +358,35 @@ pub fn run_all() -> String {
   let se2 : SelfEq = { v: 5 }
   let line6 = "F3d1b-6:\{ob1 == ob2 && ob1 != ob3},\{oj1 == oj2 && oj1 != oj3},\{oe1 == oe2 && oe1 != oe3},\{bb1 == bb2 && bb1 != bb3},\{gbj1 == gbj2},\{gbs1 == gbs2},\{dep_v},\{se1 == se2}"
 
-  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6
+  // Case 7: R3 mutual recursion (MdInline/MdItem/MdBlock), generic Tree[T], mut-array single-eval, and `with fn equal` MapKey
+  let md1 = MdBlock::List([
+    { task: Some(true), blocks: [Para([Text("a"), Bold([Text("b")])]), Rule] },
+  ])
+  let md2 = MdBlock::List([
+    { task: Some(true), blocks: [Para([Text("a"), Bold([Text("b")])]), Rule] },
+  ])
+  let md3 = MdBlock::List([
+    { task: Some(false), blocks: [Para([Text("a"), Bold([Text("c")])]), Rule] },
+  ])
+  let tr1 : Tree[Int] = Node([Leaf(1), Node([Leaf(2), Leaf(3)])])
+  let tr2 : Tree[Int] = Node([Leaf(1), Node([Leaf(2), Leaf(3)])])
+  let tr3 : Tree[Int] = Node([Leaf(1), Node([Leaf(2), Leaf(4)])])
+  let holder : Array[MutWrap[Int]] = []
+  let flip = Ref(true)
+  let mk1 : MutK = { id: 1, flip: flip, holder: holder }
+  let mk2 : MutK = { id: 2, flip: Ref(false), holder: [] }
+  let mk1b : MutK = { id: 1, flip: Ref(false), holder: [] }
+  let mk2b : MutK = { id: 2, flip: Ref(false), holder: [] }
+  let mw1 : MutWrap[Int] = { tag: 10, data: b"zz", v: [mk1, mk2] }
+  let mw2 : MutWrap[Int] = { tag: 10, data: b"zz", v: [mk1b, mk2b] }
+  holder.push(mw1)
+  let mw_eq = mw1 == mw2
+  let mfn : Map[FnEqKey, Int] = {}
+  mfn[{ code: 7 }] = 42
+  let fn_v = mfn.get({ code: 7 }).unwrap_or(-1)
+  let line7 = "F3d1b-7:\{md1 == md2},\{md1 == md3},\{tr1 == tr2},\{tr1 == tr3},\{mw_eq},\{fn_v}"
+
+  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6 + "\n" + line7
 }
 '''
 
@@ -313,6 +399,11 @@ NEG_SPLIT_NOT_EQUAL = r'''
 pub struct BadSplit { x : Int }
 impl Eq for BadSplit with equal(a, b) { a.x == b.x }
 impl Eq for BadSplit with not_equal(a, b) { a.x != b.x }
+'''
+
+NEG_FN_NOT_EQUAL = r'''
+pub struct BadFnNeq { x : Int }
+impl Eq for BadFnNeq with fn not_equal(a, b) { a.x != b.x }
 '''
 
 NEG_CLOSURE_DERIVE = r'''
@@ -425,7 +516,8 @@ def main():
             "F3d1b-3:false,hits=1\n"
             "F3d1b-4:true,true,true\n"
             "F3d1b-5:100,ok\n"
-            "F3d1b-6:true,true,true,true,true,true,42,true"
+            "F3d1b-6:true,true,true,true,true,true,42,true\n"
+            "F3d1b-7:true,false,true,false,true,42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -434,11 +526,12 @@ def main():
         # 3. Negative fail-closed publish gates (each in its own isolated package)
         assert_publish_refused(bin_path, args.pionc, work, "not_equal", NEG_NOT_EQUAL, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_refused(bin_path, args.pionc, work, "split_not_equal", NEG_SPLIT_NOT_EQUAL, "MBT2PION_UNSUPPORTED_SYNTAX")
+        assert_publish_refused(bin_path, args.pionc, work, "fn_not_equal", NEG_FN_NOT_EQUAL, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_refused(bin_path, args.pionc, work, "closure_derive", NEG_CLOSURE_DERIVE)
         assert_publish_refused(bin_path, args.pionc, work, "generic_show", NEG_GENERIC_SHOW, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_refused(bin_path, args.pionc, work, "box_closure", NEG_BOX_CLOSURE)
 
-        print("[f3d1b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) + 5 fail-closed negative gates!\n" + moon_out)
+        print("[f3d1b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) + 6 fail-closed negative gates!\n" + moon_out)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
