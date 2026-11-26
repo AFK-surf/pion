@@ -406,7 +406,29 @@ def main():
             "--dep", f"leg={leg_dep}",
         ])
 
-        # 3b. Dual-alias identical published ABI on the EXACT SAME directory `p_orig` (BOTH orders)
+        # 3b. Single-alias + dual-alias identical published ABI on the EXACT SAME directory `p_orig`
+        #     with inline TOML comments on `[package]` and `name = "f43orig"` (BOTH orders)
+        with open(os.path.join(p_orig, "pion.toml"), "w") as fh:
+            fh.write(
+                f'[package] # dep pkg\n'
+                f'name = "f43orig" # real dependency name\n'
+                f'version = "0.1.0"\n'
+                f'[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        single_src = os.path.join(work, "single_alias_src")
+        os.makedirs(single_src)
+        with open(os.path.join(single_src, "s.mbt"), "w") as fh:
+            fh.write(
+                "pub fn use_single() -> Int {\n"
+                "  let b : @f43orig_alias.Buffer = { val: 4, cap: 5 }\n"
+                "  b.cap\n"
+                "}\n"
+            )
+        run_cmd([
+            bin_path, "--src", single_src, "--out", os.path.join(work, "single_alias_out"),
+            "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
+            "--dep", f"f43orig_alias={p_orig}",
+        ])
         dual_src = os.path.join(work, "dual_alias_src")
         os.makedirs(dual_src)
         with open(os.path.join(dual_src, "d.mbt"), "w") as fh:
