@@ -17,7 +17,7 @@ Covers:
      resolving nested Show + Debug probes cleanly.
   7. Negative fail-closed gate on ambiguous struct update.
 """
-import argparse, os, shutil, subprocess, tempfile
+import argparse, json, os, shutil, subprocess, tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
@@ -537,43 +537,76 @@ def main():
             "MBT2PION_UINT16_ESCAPE",
         )
 
-        # 4c. Cross-file `__mbt_probe` path-collision negative test (3-file package, equal-length identifiers at identical offsets)
-        cf_sdir = os.path.join(work, "neg_probe_file_collision_src")
-        cf_odir = os.path.join(work, "neg_probe_file_collision_out")
-        cf_rep = os.path.join(work, "neg_probe_file_collision_report.json")
-        os.makedirs(cf_sdir)
-        os.makedirs(cf_odir)
-        with open(os.path.join(cf_sdir, "support.mbt"), "w") as fh:
-            fh.write('fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n')
-        with open(os.path.join(cf_sdir, "f.mbt"), "w") as fh:
-            fh.write(
-                'pub fn bad_peq() -> Int {\n'
-                '  let physical_equal = first_for("a"[0])\n'
-                '  let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
-                '  (n + n).to_int()\n'
-                '}\n'
+        # 4c. Cross-file `__mbt_probe` path-collision negative tests (equal-length identifiers at identical offsets)
+        def assert_cross_file_collision_blocked(tag, support_src, f_src, probe_src):
+            cf_sdir = os.path.join(work, f"neg_{tag}_src")
+            cf_odir = os.path.join(work, f"neg_{tag}_out")
+            cf_rep = os.path.join(work, f"neg_{tag}_report.json")
+            os.makedirs(cf_sdir)
+            os.makedirs(cf_odir)
+            with open(os.path.join(cf_sdir, "support.mbt"), "w") as fh:
+                fh.write(support_src)
+            with open(os.path.join(cf_sdir, "f.mbt"), "w") as fh:
+                fh.write(f_src)
+            with open(os.path.join(cf_sdir, "f__mbt_probe.mbt"), "w") as fh:
+                fh.write(probe_src)
+            cf_p = subprocess.run(
+                [
+                    bin_path, "--src", cf_sdir, "--out", cf_odir, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", cf_rep,
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
             )
-        with open(os.path.join(cf_sdir, "f__mbt_probe.mbt"), "w") as fh:
-            fh.write(
-                'pub fn ok__peq() -> Int {\n'
-                '  let other_val_name = first_for("a"[0])\n'
-                '  let b = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
-                '  ignore(other_val_name); if b { 2 } else { 0 }\n'
-                '}\n'
+            cf_rep_txt = open(cf_rep).read() if os.path.exists(cf_rep) else ""
+            cf_combined = cf_p.stdout + "\n" + cf_p.stderr + "\n" + cf_rep_txt
+            assert cf_p.returncode != 0 and os.path.exists(cf_rep), (
+                f"3-file collision case `{tag}` must block publish and write report:\n{cf_combined}"
             )
-        cf_p = subprocess.run(
-            [
-                bin_path, "--src", cf_sdir, "--out", cf_odir, "--target", "native", "--mode", "publish",
-                "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", cf_rep,
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+            diags = json.loads(cf_rep_txt).get("diagnostics", [])
+            has_f_escape = any(
+                d.get("code") == "MBT2PION_UINT16_ESCAPE"
+                and (d.get("file") == "f.pion" or str(d.get("file", "")).endswith("/f.pion"))
+                for d in diags
+            )
+            has_probe_escape = any(
+                d.get("code") == "MBT2PION_UINT16_ESCAPE"
+                and (d.get("file") == "f__mbt_probe.pion" or str(d.get("file", "")).endswith("/f__mbt_probe.pion"))
+                for d in diags
+            )
+            assert has_f_escape, f"`{tag}` must report MBT2PION_UINT16_ESCAPE on f.pion:\n{cf_rep_txt}"
+            assert not has_probe_escape, f"`{tag}` must NOT report MBT2PION_UINT16_ESCAPE on f__mbt_probe.pion:\n{cf_rep_txt}"
+            assert not os.listdir(cf_odir), f"blocked 3-file collision `{tag}` must leave --out empty"
+
+        assert_cross_file_collision_blocked(
+            "probe_file_collision_str",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n',
+            'pub fn bad_peq() -> Int {\n'
+            '  let physical_equal = first_for("a"[0])\n'
+            '  let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '  (n + n).to_int()\n'
+            '}\n',
+            'pub fn ok__peq() -> Int {\n'
+            '  let other_val_name = first_for("a"[0])\n'
+            '  let b = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '  ignore(other_val_name); if b { 2 } else { 0 }\n'
+            '}\n',
         )
-        cf_rep_txt = open(cf_rep).read() if os.path.exists(cf_rep) else ""
-        cf_combined = cf_p.stdout + "\n" + cf_p.stderr + "\n" + cf_rep_txt
-        assert cf_p.returncode != 0 and "MBT2PION_UINT16_ESCAPE" in cf_combined, (
-            f"3-file __mbt_probe collision case must block publish with MBT2PION_UINT16_ESCAPE:\n{cf_combined}"
+        assert_cross_file_collision_blocked(
+            "probe_file_collision_sample",
+            'pub struct Sample { v : Int }\n'
+            'pub fn Sample::code_unit_at(self : Sample, _i : Int) -> Int { self.v }\n'
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n',
+            'pub fn bad_peq(s : String) -> Int {\n'
+            '  let physical_equal = first_for("a"[0])\n'
+            '  let n = physical_equal(s.code_unit_at(1), s.code_unit_at(1))\n'
+            '  (n + n).to_int()\n'
+            '}\n',
+            'pub fn ok__peq(s : Sample) -> Int {\n'
+            '  let other_val_name = first_for("a"[0])\n'
+            '  let b = physical_equal(s.code_unit_at(1), s.code_unit_at(1))\n'
+            '  ignore(other_val_name); if b { 2 } else { 0 }\n'
+            '}\n',
         )
-        assert not os.listdir(cf_odir), "blocked 3-file collision publish must leave --out empty"
 
         # 5. Single-file `f__mbt_probe.mbt` legitimate builtin physical_equal must publish and match 4 targets == "2"
         sf_md = os.path.join(work, "sf_probe_moon")
