@@ -39,6 +39,7 @@ import PionProofs.QbeEcosystemUnboxFixedLen
 import PionProofs.QbeBinarySizeOpts
 import PionProofs.QbeCompileSpeedZ1
 import PionProofs.QbeRealWorkloadDataOpts
+import PionProofs.WaveAA1Wasm
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -879,3 +880,28 @@ import PionProofs.QbeRealWorkloadDataOpts
 #print axioms QbeRealWorkloadDataOpts.SparseData.loop_blocks
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget_4096
+#print axioms WaveAA1Wasm.ExtAndEqz.extsw_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extuw_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extsh_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extuh_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extsb_const
+#print axioms WaveAA1Wasm.ExtAndEqz.extub_const
+#print axioms WaveAA1Wasm.ExtAndEqz.trunc32_sext32
+#print axioms WaveAA1Wasm.ExtAndEqz.trunc32_zext32
+#print axioms WaveAA1Wasm.ExtAndEqz.ceqw_zero_eq_eqz
+#print axioms WaveAA1Wasm.ExtAndEqz.ceql_zero_eq_eqz
+#print axioms WaveAA1Wasm.ExtAndEqz.cnew_zero_eq_eqz_eqz
+#print axioms WaveAA1Wasm.ExtAndEqz.cnel_zero_eq_eqz_eqz
+#print axioms WaveAA1Wasm.ExprForward.evalExpr_depends_only_on_leaves
+#print axioms WaveAA1Wasm.ExprForward.execOps_append
+#print axioms WaveAA1Wasm.ExprForward.emitExpr_stack_prefix
+#print axioms WaveAA1Wasm.ExprForward.forward_single_use_sound
+#print axioms WaveAA1Wasm.EmitPeephole.set_get_eq_tee
+#print axioms WaveAA1Wasm.EmitPeephole.tee_preserves_promoted_write
+#print axioms WaveAA1Wasm.EmitPeephole.ext_s_wrap_nop
+#print axioms WaveAA1Wasm.EmitPeephole.ext_u_wrap_nop
+#print axioms WaveAA1Wasm.LocalColorAndReorder.intrablock_slot_preserved
+#print axioms WaveAA1Wasm.LocalColorAndReorder.updateEnv_rel
+#print axioms WaveAA1Wasm.LocalColorAndReorder.remapOp_step_equiv
+#print axioms WaveAA1Wasm.LocalColorAndReorder.local_bijection_run_equiv
+#print axioms WaveAA1Wasm.DisambigFastPath.fast_path_sound

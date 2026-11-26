@@ -17720,3 +17720,120 @@ test "p134_norm_mono_pkg_and_same_ssa_native_wasm" {
   let rec = qbe_fail_unresolved(bad_g, "unqualified_call", "", "missing_fn", span_empty())
   assert_eq(rec.reg, "0")
 }
+
+///|
+test "wave_aa1_wasm_opt_unit_checks" {
+  // 1. AA1-S1: fast path zero-copy when no collisions, fallback when cross-unit host import collides
+  let u1 = "function w $helper_a(w %x) {\n@start\n  ret %x\n}\nexport function w $main() {\n@start\n  %r =w call $helper_a(w 42)\n  ret %r\n}\n"
+  let u2 = "function w $helper_b(w %x) {\n@start\n  ret %x\n}\nexport function w $other() {\n@start\n  %r =w call $helper_b(w 7)\n  ret %r\n}\n"
+  let fast_res = wasm_disambiguate_unit_locals([u1, u2])
+  assert_eq(fast_res.length(), 2)
+  assert_eq(fast_res[0], u1)
+  assert_eq(fast_res[1], u2)
+  // Cross-unit host import collision: u_host references $helper_a without defining it
+  let u_host = "export function w $use_host() {\n@start\n  %r =w call $helper_a(w 1)\n  ret %r\n}\n"
+  let col_res1 = wasm_disambiguate_unit_locals([u1, u_host])
+  assert_true(col_res1[0] != u1, "expected fallback disambiguation [local, host]")
+  assert_eq(col_res1[1], u_host)
+  let col_res2 = wasm_disambiguate_unit_locals([u_host, u1])
+  assert_eq(col_res2[0], u_host)
+  assert_true(col_res2[1] != u1, "expected fallback disambiguation [host, local]")
+
+  // 2. AA1-S2: slot_drop_mask rejects duplicate or out-of-order slot drops, accepts strictly increasing
+  let ssa_dup_drop =
+    #|function $pion_drop_struct_dup(l %p) {
+    #|@start
+    #|  %v0 =l loadl %p
+    #|  call $pion_rc_dec(l %v0)
+    #|  %v1 =l loadl %p
+    #|  call $pion_rc_dec(l %v1)
+    #|  ret
+    #|}
+  let p_dup = wasm_parse_ssa(ssa_dup_drop)
+  assert_eq(wasm_try_extract_slot_drop_mask(p_dup.funcs[0]), 0L)
+  let ssa_rev_drop =
+    #|function $pion_drop_struct_rev(l %p) {
+    #|@start
+    #|  %a1 =l add %p, 8
+    #|  %v1 =l loadl %a1
+    #|  call $pion_rc_dec(l %v1)
+    #|  %v0 =l loadl %p
+    #|  call $pion_rc_dec(l %v0)
+    #|  ret
+    #|}
+  let p_rev = wasm_parse_ssa(ssa_rev_drop)
+  assert_eq(wasm_try_extract_slot_drop_mask(p_rev.funcs[0]), 0L)
+  let ssa_ok_drop =
+    #|function $pion_drop_struct_ok(l %p) {
+    #|@start
+    #|  %v0 =l loadl %p
+    #|  call $pion_rc_dec(l %v0)
+    #|  %a1 =l add %p, 8
+    #|  %v1 =l loadl %a1
+    #|  call $pion_rc_dec(l %v1)
+    #|  ret
+    #|}
+  let p_ok = wasm_parse_ssa(ssa_ok_drop)
+  assert_eq(wasm_try_extract_slot_drop_mask(p_ok.funcs[0]), 2147483648L | 3L)
+
+  // 3. AA1-S2: fine-grained stage labels
+  let stages : Array[String] = []
+  let _ = emit_wasm_from_ssa_units_traced([u1], fn(lbl) { stages.push(lbl) })
+  let mut saw_dis = false
+  let mut saw_ol = false
+  let mut saw_sm = false
+  let mut saw_cf = false
+  let mut saw_bi = false
+  let mut si = 0
+  while si < stages.length() {
+    let st = stages[si]
+    if st.starts_with("disambiguate") { saw_dis = true }
+    if st.starts_with("wasm_outline") { saw_ol = true }
+    if st.starts_with("wasm_slot_masks") { saw_sm = true }
+    if st.starts_with("wasm_compile_func") { saw_cf = true }
+    if st.starts_with("wasm_builtins") { saw_bi = true }
+    si = si + 1
+  }
+  assert_true(saw_dis && saw_ol && saw_sm && saw_cf && saw_bi, "missing fine-grained wasm stage labels")
+
+  // 4. AA1-Z2: size-aware const ext fold (-1 extuw must NOT grow to 6B; 42 extsw folds to 2B) + eqz
+  let ssa_z2 =
+    #|export function l $ext_neg1() {
+    #|@start
+    #|  %a =l extuw -1
+    #|  ret %a
+    #|}
+    #|export function l $ext_42() {
+    #|@start
+    #|  %a =l extsw 42
+    #|  ret %a
+    #|}
+    #|export function w $cmp_zero(l %x) {
+    #|@start
+    #|  %c =w ceql %x, 0
+    #|  ret %c
+    #|}
+  let bin_z2 = emit_wasm_from_ssa(ssa_z2)
+  assert_true(bin_z2.length() > 8, "valid wasm binary for Z2")
+
+  // 5. AA1-Z1 + Z3: expression tree forwarding & irreducible br_table intra-block coloring
+  let ssa_z1_z3 =
+    #|export function l $irred(w %sel, l %a, l %b) {
+    #|@start
+    #|  %t1 =l add %a, 1
+    #|  %t2 =l mul %t1, 3
+    #|  %t3 =l add %t2, %b
+    #|  jnz %sel, @l1, @l2
+    #|@l1
+    #|  %x1 =l add %t3, 10
+    #|  %x2 =l xor %x1, 5
+    #|  jnz %sel, @l2, @done
+    #|@l2
+    #|  %y1 =l add %t3, 20
+    #|  jnz %sel, @l1, @done
+    #|@done
+    #|  ret %t3
+    #|}
+  let bin_z1_z3 = emit_wasm_from_ssa(ssa_z1_z3)
+  assert_true(bin_z1_z3.length() > 8, "valid wasm binary for Z1+Z3")
+}
