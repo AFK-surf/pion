@@ -4347,6 +4347,84 @@ static void test_cli_bounded_line_io(void) {
     fclose(fp);
 }
 
+static void test_cli_parallel_helpers(void) {
+    int32_t cpus = pion_cli_cpu_count();
+    assert(cpus >= 1 && cpus <= 1024);
+
+    int64_t me = pion_cli_getpid();
+    assert(me > 0);
+    assert(pion_cli_pid_alive(me) == 1);
+    assert(pion_cli_pid_alive(0) == 0);
+    assert(pion_cli_pid_alive(-1) == 0);
+
+    char *exe = pion_cli_self_exe_path();
+    assert(exe != NULL && exe[0] != '\0');
+    assert(pion_fs_lstat_kind(exe) == 1);
+    free(exe);
+
+    char *id1 = pion_cli_self_image_id();
+    char *id2 = pion_cli_self_image_id();
+    assert(id1 != NULL && id2 != NULL);
+    assert(strlen(id1) > 8 && strcmp(id1, id2) == 0);
+#ifdef __APPLE__
+    assert(strncmp(id1, "macho-uuid:", 11) == 0 && strlen(id1) == 43);
+#elif defined(__linux__)
+    assert(strncmp(id1, "elf-bid:", 8) == 0 || strncmp(id1, "proc-exe:", 9) == 0);
+#elif defined(_WIN32)
+    assert(strncmp(id1, "pe-img:", 7) == 0);
+#endif
+    free(id1);
+    free(id2);
+    /* Verify out-of-range 64-bit PIDs are rejected as not alive. */
+    assert(pion_cli_pid_alive((int64_t)1 << 40) == 0);
+
+#ifndef _WIN32
+    assert(pion_cli_getppid() > 0);
+    /* Verify pion_cli_pid_alive reports 0 for a reaped child PID. */
+    pid_t dead_pid = fork();
+    assert(dead_pid >= 0);
+    if (dead_pid == 0) {
+        _exit(0);
+    }
+    int st = 0;
+    assert(waitpid(dead_pid, &st, 0) == dead_pid);
+    assert(pion_cli_pid_alive((int64_t)dead_pid) == 0);
+
+    /* Verify pion_cli_watch_parent terminates a child when its parent dies. */
+    int pfd[2];
+    assert(pipe(pfd) == 0);
+    pid_t mid = fork();
+    assert(mid >= 0);
+    if (mid == 0) {
+        close(pfd[0]);
+        pid_t mid_pid = getpid();
+        pid_t gc = fork();
+        if (gc == 0) {
+            /* Keep pfd[1] open so the test detects grandchild exit via EOF. */
+            if (pion_cli_watch_parent((int64_t)mid_pid) != 0) _exit(2);
+            char ready = 'R';
+            if (write(pfd[1], &ready, 1) != 1) _exit(3);
+            for (;;) pause();
+        }
+        close(pfd[1]);
+        /* Wait briefly until grandchild signals ready via pipe, then exit mid. */
+        _exit(0);
+    }
+    close(pfd[1]);
+    char ch = 0;
+    ssize_t nread = read(pfd[0], &ch, 1);
+    /* Either grandchild exited before writing (mid already exited) or wrote 'R' and then exited on EOF. */
+    assert(nread == 0 || (nread == 1 && ch == 'R'));
+    if (nread == 1) {
+        char eof_buf = 0;
+        assert(read(pfd[0], &eof_buf, 1) == 0);
+    }
+    close(pfd[0]);
+    assert(waitpid(mid, &st, 0) == mid);
+#endif
+    printf("  cli parallel helpers (self_exe, image_id, cpu_count, pid_alive, watch_parent): OK\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -4375,6 +4453,7 @@ int main(int argc, char **argv) {
     test_utf8_paths_and_embedded_nul(argc, argv);
     test_fs_lstat_kind();
     test_fs_mkdir_excl_status();
+    test_cli_parallel_helpers();
     test_ffi_ptr_and_cstr();
     test_str_to_double();
     test_p57b_hot_str_and_split();

@@ -402,6 +402,55 @@ fi
 MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
 echo "[PASS] Windows directory junction, relative & drive-root --emit-web-rt collision guards verified"
 
+# Lightweight Windows parallel workspace build smoke test (exercises CreateProcessW / WaitForMultipleObjects)
+WIN_PAR_WS="$TMP_DIR/win_par_ws"
+mkdir -p "$WIN_PAR_WS/lib_a/src" "$WIN_PAR_WS/lib_b/src" "$WIN_PAR_WS/app/src"
+cat <<'EOF' > "$WIN_PAR_WS/lib_a/pion.toml"
+[package]
+name = "lib_a"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$WIN_PAR_WS/lib_a/src/lib.pion"
+pub fn val_a() -> Int { 19 }
+EOF
+cat <<'EOF' > "$WIN_PAR_WS/lib_b/pion.toml"
+[package]
+name = "lib_b"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$WIN_PAR_WS/lib_b/src/lib.pion"
+pub fn val_b() -> Int { 23 }
+EOF
+cat <<'EOF' > "$WIN_PAR_WS/app/pion.toml"
+[package]
+name = "win_par_app"
+version = "0.1.0"
+
+[dependencies]
+lib_a = { path = "../lib_a" }
+lib_b = { path = "../lib_b" }
+EOF
+cat <<'EOF' > "$WIN_PAR_WS/app/src/main.pion"
+import "lib_a"
+import "lib_b"
+
+pub fn main(w : World) -> Int {
+  let v = lib_a::val_a() + lib_b::val_b()
+  io_println(w, "winpar=" + v.to_string())
+  0
+}
+EOF
+mkdir -p "$TMP_DIR/cas_winpar_1" "$TMP_DIR/cas_winpar_4"
+PION_WS_PAR_MIN_PKG_BYTES=1 PION_CACHE_DIR="$TMP_DIR/cas_winpar_1" "$PIONC" build --jobs 1 -o "$TMP_DIR/winpar_j1.exe" "$WIN_PAR_WS/app"
+PION_WS_PAR_MIN_PKG_BYTES=1 PION_CACHE_DIR="$TMP_DIR/cas_winpar_4" "$PIONC" build --jobs 4 -o "$TMP_DIR/winpar_j4.exe" "$WIN_PAR_WS/app"
+WINPAR_OUT1="$("$TMP_DIR/winpar_j1.exe" | tr -d '\r')"
+WINPAR_OUT4="$("$TMP_DIR/winpar_j4.exe" | tr -d '\r')"
+if [ "$WINPAR_OUT1" != "winpar=42" ] || [ "$WINPAR_OUT4" != "winpar=42" ]; then
+  echo "FAIL: Windows parallel workspace smoke mismatch: j1='$WINPAR_OUT1' j4='$WINPAR_OUT4'" >&2
+  exit 1
+fi
+echo "[PASS] Windows multi-package parallel build smoke (--jobs 1 vs --jobs 4)"
+
 verify_bench() {
   name="$1"
   expected="$2"
