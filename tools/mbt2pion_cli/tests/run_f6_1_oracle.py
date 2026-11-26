@@ -293,6 +293,10 @@ priv struct R9Box {
   v : Bool
 }
 
+fn pipe_both(a : Bool, _b : Int) -> Bool {
+  a
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -420,7 +424,47 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string()
+  // R10 P1: `|>` has lower precedence than `&&` -> `always_fail_g` MUST NOT leak across `|>`!
+  let p14 = try {
+    let obj = R9Box::{ v: (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g()) |> pipe_both(always_fail_g()) }
+    if obj.v {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p15 = try {
+    let obj = R9Box::{ v: ((Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g())) |> pipe_both(always_fail_g()) }
+    if obj.v {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p16 = try {
+    let obj = R9Box::{ v: Some(local_fn) is Some(always_fail_g) && yes_helper(always_fail_g()) |> pipe_both(always_fail_g()) }
+    if obj.v {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p17 = try {
+    if ((Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g()) |> pipe_both(always_fail_g())) {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -595,7 +639,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
