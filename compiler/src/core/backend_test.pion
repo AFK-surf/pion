@@ -5791,7 +5791,7 @@ test "p44c_drop_slots_null_guard_leaf_nodrop_and_loop_inline" {
   )
   let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
   let funcs = ssa.split("function ")
-  let mut drop_slots_ssa = ""
+  let mut gen_box_ssa = ""
   let mut drop_node_ssa = ""
   let mut leaf_ssa = ""
   let mut branch_ssa = ""
@@ -5802,8 +5802,8 @@ test "p44c_drop_slots_null_guard_leaf_nodrop_and_loop_inline" {
     let f = funcs[fi]
     if f.starts_with("$pion_drop_slots_3(") {
       drop_node_ssa = f
-    } else if f.starts_with("$pion_drop_slots_") {
-      drop_slots_ssa = f
+    } else if f.contains("$pion_fn_mk_gen_box(") {
+      gen_box_ssa = f
     } else if f.contains("$pion_fn_mk_leaf(") {
       leaf_ssa = f
     } else if f.contains("$pion_fn_mk_branch(") {
@@ -5825,11 +5825,9 @@ test "p44c_drop_slots_null_guard_leaf_nodrop_and_loop_inline" {
     ),
     drop_node_ssa,
   )
-  assert_true(
-    drop_slots_ssa == "" ||
-    (drop_slots_ssa.contains("jnz %v") && drop_slots_ssa.contains("@d")),
-    drop_slots_ssa,
-  )
+  // The generic `Box2[String]` instance (RC slots {0, 1}) reuses the same
+  // canonical helper as the non-generic structs.
+  assert_true(gen_box_ssa.contains("(w 16, w 4, l $pion_drop_slots_3)"), gen_box_ssa)
   // 1b. Immutable all-None leaf passes drop_fn = 0
   assert_true(
     leaf_ssa.contains("(w 16, w 4, l 0)") && !leaf_ssa.contains("$pion_drop_"),
@@ -18032,4 +18030,75 @@ test "aa3_runtime_canonical_drops_release_children" {
   assert_eq(area, 2 * 4950 + 3 * 328350)
   assert_eq(ml, 10 * 2 + 90 * 3 + 4950)
   assert_eq(aa3_area(Aa3Empty) + aa3_msg_len(Aa3Quit), -1)
+}
+
+///|
+test "aa3_slot_drop_symbol_namespaces_stay_short" {
+  let cr = check_source_files_full("aa3k", ["k.pion"], ["pub fn f() -> Int { 1 }\n"])
+  let g = qbe_new(cr.tc, false, false)
+  // max_slot <= 30: decimal mask (Wasm32 P47-A parses it).
+  assert_eq(qbe_register_slot_drop(g, [30, 0]), "$pion_drop_slots_1073741825")
+  // 31 <= max_slot <= 127: zero-padded 16-bit hex chunks, high chunk first.
+  assert_eq(qbe_register_slot_drop(g, [31]), "$pion_drop_slots_x_80000000")
+  let s127 = qbe_register_slot_drop(g, [127, 0])
+  assert_eq(s127, "$pion_drop_slots_x_80000000000000000000000000000001")
+  // max_slot > 127: table index, independent of the slot values.
+  let w0 = qbe_register_slot_drop(g, [4016])
+  assert_eq(w0, "$pion_drop_slots_w_3")
+  assert_eq(qbe_register_slot_drop(g, [128]), "$pion_drop_slots_w_4")
+  let w_big = qbe_register_slot_drop(g, [0, 4016, 100000])
+  assert_eq(w_big, "$pion_drop_slots_w_5")
+  assert_true(w_big.length() < 30, w_big)
+  // Re-registering any order / duplicates of a known set returns its symbol.
+  assert_eq(qbe_register_slot_drop(g, [4016, 4016]), w0)
+  assert_eq(qbe_register_slot_drop(g, [0, 30, 30]), "$pion_drop_slots_1073741825")
+  assert_eq(qbe_register_slot_drop(g, [0, 127]), s127)
+  assert_eq(g.slot_drop_keys.length(), 6)
+  // The emitted bodies keep the exact slot offsets.
+  let out = StringBuilder()
+  qbe_emit_helper_drops(g, out)
+  let ssa = out.to_string()
+  let wide = j2_extract_fn(ssa, "function $pion_drop_slots_w_5(")
+  assert_true(
+    wide.contains("%a0 =l add %p, 0\n") &&
+      wide.contains("%a4016 =l add %p, 32128\n") &&
+      wide.contains("%a100000 =l add %p, 800000\n"),
+    wide,
+  )
+  assert_eq(p58_count_substr(wide, "call $pion_rc_dec("), 3)
+  assert_eq(p58_count_substr(ssa, "function $pion_drop_slots_"), 6)
+}
+
+///|
+test "aa3_shadowed_none_keeps_drop_fn" {
+  let src =
+    #|pub struct Holder {
+    #|  value : String
+    #|}
+    #|pub struct OHolder {
+    #|  value : Option[String]
+    #|}
+    #|pub fn keep(None : String) -> Holder {
+    #|  Holder::{ value: None }
+    #|}
+    #|pub fn keep_opt(None : Option[String]) -> OHolder {
+    #|  OHolder::{ value: None }
+    #|}
+    #|pub fn real_none() -> OHolder {
+    #|  OHolder::{ value: None }
+    #|}
+    #|pub fn real_none_path() -> OHolder {
+    #|  OHolder::{ value: Option::None }
+    #|}
+  let cr = check_source_files_full("aa3n", ["n.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let keep = j2_extract_fn(ssa, "function l $pion_fn_keep(")
+  assert_true(keep.contains("call $pion_alloc_uninit(w 8, w 4, l $pion_drop_slots_1)"), keep)
+  let keep_opt = j2_extract_fn(ssa, "function l $pion_fn_keep_opt(")
+  assert_true(keep_opt.contains("call $pion_alloc_uninit(w 8, w 4, l $pion_drop_slots_1)"), keep_opt)
+  let real = j2_extract_fn(ssa, "function l $pion_fn_real_none(")
+  assert_true(real.contains("call $pion_alloc_uninit(w 8, w 4, l 0)"), real)
+  let real_p = j2_extract_fn(ssa, "function l $pion_fn_real_none_path(")
+  assert_true(real_p.contains("call $pion_alloc_uninit(w 8, w 4, l 0)"), real_p)
 }

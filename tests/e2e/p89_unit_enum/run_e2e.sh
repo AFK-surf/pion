@@ -1216,16 +1216,24 @@ pub enum Shape {
 }
 
 pub fn main(world : World) -> Int {
-  let p = Pair::{ a: "pq", b: "r" }
-  let local = p.a.length() + p.b.length() + match Rect(2, 5) {
+  // Every string is built at runtime (heap, not an immortal literal), so a
+  // missing cross-package drop shows up as an LSan leak.
+  let mut local = match Rect(2, 5) {
     Rect(w, h) => w * h
     _ => 0
   }
-  let lp = aa3lib::LPair::{ a: "x", b: "yy" }
-  let lm = aa3lib::LMsg::LText("zzz")
-  let ls = aa3lib::LShape::LRect(3, 4)
-  let lt = aa3lib::LTree::LNode(aa3lib::LTree::LLeaf, aa3lib::mk_ltree(2))
-  let x = aa3lib::lpair_len(lp) + aa3lib::lmsg_len(lm) + aa3lib::lshape_area(ls) + aa3lib::lcount(lt)
+  let mut x = 0
+  let mut n = 0
+  while n < 10 {
+    let p = Pair::{ a: "p" + n.to_string(), b: "q" + n.to_string() }
+    local = local + p.a.length() + p.b.length()
+    let lp = aa3lib::LPair::{ a: "x" + n.to_string(), b: "yy" + n.to_string() }
+    let lm = aa3lib::LMsg::LText("zzz" + n.to_string())
+    let ls = aa3lib::LShape::LRect(3, n)
+    let lt = aa3lib::LTree::LNode(aa3lib::LTree::LLeaf, aa3lib::mk_ltree(2))
+    x = x + aa3lib::lpair_len(lp) + aa3lib::lmsg_len(lm) + aa3lib::lshape_area(ls) + aa3lib::lcount(lt)
+    n = n + 1
+  }
   io_println(world, "aa3x ok local=" + local.to_string() + " xpkg=" + x.to_string())
   0
 }
@@ -1291,7 +1299,8 @@ SSA_EOF
 echo "p89 aa3 SSA audit -> OK"
 # Cross-package: app-local Pair / RC-free Shape next to aa3lib's LPair, LMsg
 # (one RC variant), RC-free LShape and niche LTree.
-EXP_AA3_X="aa3x ok local=13 xpkg=23"
+# local = 10 + 10 * (2 + 2); xpkg = sum over n < 10 of (2 + 3) + 4 + 3n + 5 = 275
+EXP_AA3_X="aa3x ok local=50 xpkg=275"
 OUT_AA3_X=$(PION_CACHE_DIR="$CAS_DIR/aa3x" "$PIONC" run "$TMP_DIR/aa3/app")
 echo "p89 aa3 xpkg dev -> $OUT_AA3_X"
 [ "$OUT_AA3_X" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 xpkg dev mismatch (expected '$EXP_AA3_X')" >&2; exit 1; }
@@ -1308,6 +1317,25 @@ if printf '%s\n' "$NM_X" | grep -Eq 'pion_drop_struct_|pion_drop_enum_[A-Za-z0-9
   exit 1
 fi
 echo "p89 aa3 xpkg symbol audit -> OK"
+# aa3app's own allocation sites (whole-workspace SSA via the Wasm32 path, which
+# supports --emit-ssa for manifest builds): drop operand of every constructor.
+"$PIONC" build --release --target wasm32 --emit-ssa "$TMP_DIR/aa3x_wasm.ssa" -o "$TMP_DIR/aa3x_ssa.wasm" "$TMP_DIR/aa3/app"
+python3 - "$TMP_DIR/aa3x_wasm.ssa" <<'SSA_EOF'
+import re, sys
+ssa = open(sys.argv[1]).read()
+m = re.search(r"function [^\n]*\$[A-Za-z0-9_]*aa3app[A-Za-z0-9_]*main\(.*?\n\}", ssa, re.S)
+assert m, "aa3app main not found"
+body = m.group(0)
+allocs = re.findall(r"\$pion_alloc_uninit\(w (\d+), w (\d+), l ([^)]+)\)", body)
+drops = sorted(set(a[2] for a in allocs))
+print("aa3app main alloc drop operands:", drops)
+# Wasm32 namespaces file-local symbols per package (`pion_drop_slots_<pkg>__<key>`).
+assert any(re.fullmatch(r"\$pion_drop_slots_(?:[A-Za-z0-9_]+__)?3", d) for d in drops), "Pair / LPair (slots {0, 1}) must allocate with $pion_drop_slots_3"
+assert any(re.fullmatch(r"\$pion_drop_enum_[A-Za-z0-9_]*LMsg", d) for d in drops), "LText must allocate with LMsg's per-type drop"
+assert ("24", "5", "0") in allocs, "RC-free LRect(3, n) must allocate with drop_fn 0"
+assert not any("drop_struct" in d for d in drops), "unexpected $pion_drop_struct_*"
+SSA_EOF
+echo "p89 aa3 xpkg app SSA drop operands -> OK"
 PION_CACHE_DIR="$CAS_DIR/asan_aa3" "$PIONC" build --release --emit-staticlib "$TMP_DIR/libp89_aa3.a" "$TMP_DIR/aa3/app"
 "$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libp89_aa3.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p89_aa3_asan" 2>/dev/null \
   || "$CC_BIN" -fsanitize=address -Wl,-force_load,"$TMP_DIR/libp89_aa3.a" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p89_aa3_asan"
@@ -1329,5 +1357,107 @@ if command -v node >/dev/null 2>&1; then
   echo "p89 aa3 xpkg Wasm32 -> $OUT_AA3_XWASM"
   [ "$OUT_AA3_XWASM" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 xpkg Wasm32 mismatch" >&2; exit 1; }
 fi
+
+# =====================================================================
+# Part 5 (Wave AA3 review): wide slot sets and shadowed `None`.
+#   - A struct whose only RC field sits at slot 4016 must emit a short
+#     `$pion_drop_slots_w_<idx>` helper (QBE's ELF / Mach-O writers abort on
+#     symbol names over 1024 bytes) and still release the field.
+#   - A parameter named `None` is a live value: `Holder::{ value: None }`
+#     must keep its drop function (no leak under LSan).
+# =====================================================================
+python3 - "$TMP_DIR/aa3_wide.pion" <<'GEN_EOF'
+import sys
+n = 4016
+fields = "".join(f"  f{i} : Int\n" for i in range(n))
+inits = ", ".join(f"f{i}: k" for i in range(n))
+src = f"""pub struct Wide {{
+{fields}  s : String
+  tail : Int
+}}
+
+pub fn mk_wide(k : Int) -> Wide {{
+  Wide::{{ {inits}, s: "w" + k.to_string(), tail: k }}
+}}
+
+pub struct Holder {{
+  value : String
+}}
+
+pub fn keep(None : String) -> Holder {{
+  Holder::{{ value: None }}
+}}
+
+pub struct OHolder {{
+  value : Option[String]
+}}
+
+pub fn keep_opt(None : Option[String]) -> OHolder {{
+  OHolder::{{ value: None }}
+}}
+
+pub fn real_none() -> OHolder {{
+  OHolder::{{ value: None }}
+}}
+
+pub fn main(world : World) -> Int {{
+  let mut acc = 0
+  let mut k = 0
+  while k < 20 {{
+    let w = mk_wide(k)
+    acc = acc + w.s.length() + w.f4015 + w.tail
+    let h = keep("h" + k.to_string())
+    acc = acc + h.value.length()
+    let o = keep_opt(Some("o" + k.to_string()))
+    acc = acc + match o.value {{
+      Some(v) => v.length()
+      None => 0
+    }}
+    acc = acc + match real_none().value {{
+      Some(_) => 1000
+      None => 0
+    }}
+    k = k + 1
+  }}
+  io_println(world, "aa3 wide ok acc=" + acc.to_string())
+  0
+}}
+"""
+open(sys.argv[1], "w").write(src)
+GEN_EOF
+# acc = sum over k < 20 of 3 * (1 + digits(k)) + 2k = 3 * 50 + 380 = 530
+EXP_AA3_WIDE="aa3 wide ok acc=530"
+"$PIONC" build --emit-ssa "$TMP_DIR/aa3_wide.ssa" -o "$TMP_DIR/aa3_wide_dev" "$TMP_DIR/aa3_wide.pion"
+python3 - "$TMP_DIR/aa3_wide.ssa" <<'SSA_EOF'
+import re, sys
+ssa = open(sys.argv[1]).read()
+syms = set(re.findall(r"\$[A-Za-z0-9_.]+", ssa))
+longest = max(len(x) for x in syms)
+assert longest < 1024, f"symbol of {longest} bytes"
+def fn(name):
+    m = re.search(r"function [^\n]*\$pion_fn_" + name + r"\(.*?\n\}", ssa, re.S)
+    assert m, name
+    return m.group(0)
+wide = fn("mk_wide")
+w = re.findall(r"\$pion_alloc_uninit\(w (\d+), w 4, l (\$pion_drop_slots_w_\d+)\)", wide)
+assert w and w[0][0] == str(8 * 4018), f"wide alloc {w}"
+helper = re.search(r"function \$" + re.escape(w[0][1][1:]) + r"\(l %p\) \{.*?\n\}", ssa, re.S).group(0)
+assert helper.count("call $pion_rc_dec(") == 1 and "add %p, 32128\n" in helper, helper[:300]
+assert "(w 8, w 4, l $pion_drop_slots_1)" in fn("keep"), "shadowed None : String must keep its drop"
+assert "(w 8, w 4, l $pion_drop_slots_1)" in fn("keep_opt"), "shadowed None : Option[String] must keep its drop"
+assert "(w 8, w 4, l 0)" in fn("real_none"), "Option::None literal keeps the static-null fast path"
+print("longest symbol", longest, "wide helper", w[0][1])
+SSA_EOF
+OUT_WIDE_DEV=$("$TMP_DIR/aa3_wide_dev")
+echo "p89 aa3 wide dev -> $OUT_WIDE_DEV"
+[ "$OUT_WIDE_DEV" = "$EXP_AA3_WIDE" ] || { echo "FAIL: aa3 wide dev mismatch (expected '$EXP_AA3_WIDE')" >&2; exit 1; }
+OUT_WIDE_REL=$("$PIONC" run --release "$TMP_DIR/aa3_wide.pion")
+echo "p89 aa3 wide release -> $OUT_WIDE_REL"
+[ "$OUT_WIDE_REL" = "$EXP_AA3_WIDE" ] || { echo "FAIL: aa3 wide release mismatch" >&2; exit 1; }
+PION_CACHE_DIR="$CAS_DIR/asan_wide" "$PIONC" build --release --emit-obj "$TMP_DIR/aa3_wide.o" "$TMP_DIR/aa3_wide.pion"
+"$CC_BIN" -fsanitize=address "$TMP_DIR/aa3_wide.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/aa3_wide_asan"
+OUT_WIDE_ASAN=$(ASAN_OPTIONS="$ASAN_OPTS" "$TMP_DIR/aa3_wide_asan")
+echo "p89 aa3 wide ASan -> $OUT_WIDE_ASAN"
+[ "$OUT_WIDE_ASAN" = "$EXP_AA3_WIDE" ] || { echo "FAIL: aa3 wide ASan mismatch" >&2; exit 1; }
 
 echo "p89_unit_enum: ALL PASSED"

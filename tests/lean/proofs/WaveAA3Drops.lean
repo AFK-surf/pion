@@ -31,6 +31,13 @@ observable effect and contributes nothing to the trace.
      equal to `drop_fn = NULL` when no variant has an RC slot;
      `rc_tagged_enum_drop_needed` shows the converse: one RC variant makes
      the drop observable, so it must be kept.
+  6. `suffix_injective` — the emitted `$pion_drop_slots_<suffix>`
+     (`qbe_slot_drop_suffix`): decimal mask for `max ≤ 30`, `x_` + 4-digit hex
+     chunks for `31 ≤ max ≤ 127`, `w_<idx>` beyond, as code-point strings.
+     Each namespace is injective (`decKey_inj`, `hexKey_eq_sets`), the three
+     are pairwise disjoint (`namespaces_disjoint`), and with the table's
+     one-index-per-set contract (`table_index_contract`) two registered sets
+     share a symbol iff they are equal.
 
 The models cover the emitted drop bodies and the runtime's destroy step;
 the correspondence with the Pion sources is checked by the regression tests
@@ -325,5 +332,302 @@ theorem rc_tagged_enum_drop_needed (rcSlots : Nat → List Nat) (vi k n : Nat)
         · simp [taggedEnumDrop, hr, hne, ih hlt]
   rw [key n hvi]
   simp
+
+/-! ## 6. The emitted symbol suffix (`qbe_slot_drop_suffix`)
+
+Characters are modelled by their code points. The suffix of a canonical slot
+set `S` (strictly sorted, non-empty) registered at table index `idx` is
+  * `max S ≤ 30`: the decimal digits of `slotMask S`;
+  * `31 ≤ max S ≤ 127`: `x_` followed by `max S / 16 + 1` zero-padded 4-digit
+    lowercase hex chunks, highest chunk first, chunk `i` holding bit `j` iff
+    `16 i + j ∈ S`;
+  * `max S > 127`: `w_` followed by the decimal digits of `idx`.
+`suffix_injective`: two registered sets get the same symbol iff they are the
+same set (the table gives distinct sets distinct indices). -/
+
+/-- Most-significant-first decimal digits (`Int::to_string` on `n ≥ 0`). -/
+def decDigits (n : Nat) : List Nat :=
+  if n < 10 then [n] else decDigits (n / 10) ++ [n % 10]
+termination_by n
+decreasing_by omega
+
+theorem decDigits_ne_nil (n : Nat) : decDigits n ≠ [] := by
+  unfold decDigits
+  split <;> simp
+
+theorem decDigits_lt (n : Nat) : ∀ d ∈ decDigits n, d < 10 := by
+  induction n using Nat.strongRecOn with
+  | _ n ih =>
+    unfold decDigits
+    split
+    · intro d hd; simp at hd; omega
+    · intro d hd
+      rcases List.mem_append.mp hd with h | h
+      · exact ih (n / 10) (by omega) d h
+      · simp at h; omega
+
+theorem decDigits_inj : ∀ a b : Nat, decDigits a = decDigits b → a = b := by
+  intro a
+  induction a using Nat.strongRecOn with
+  | _ a ih =>
+    intro b h
+    unfold decDigits at h
+    by_cases ha : a < 10 <;> by_cases hb : b < 10 <;> simp only [ha, hb, ↓reduceIte] at h
+    · simpa using h
+    · have hl := congrArg List.length h
+      have := decDigits_ne_nil (b / 10)
+      cases hd : decDigits (b / 10) with
+      | nil => exact absurd hd this
+      | cons _ _ => simp [hd] at hl
+    · have hl := congrArg List.length h
+      have := decDigits_ne_nil (a / 10)
+      cases hd : decDigits (a / 10) with
+      | nil => exact absurd hd this
+      | cons _ _ => simp [hd] at hl
+    · have hlast := List.append_inj' h rfl
+      have hq := ih (a / 10) (by omega) (b / 10) hlast.1
+      have hr : a % 10 = b % 10 := by simpa using hlast.2
+      omega
+
+def digitChar (d : Nat) : Nat := 48 + d
+def hexChar (h : Nat) : Nat := if h < 10 then 48 + h else 87 + h
+
+def decKey (n : Nat) : List Nat := (decDigits n).map digitChar
+
+theorem map_digitChar_inj : ∀ a b : List Nat, a.map digitChar = b.map digitChar → a = b
+  | [], [], _ => rfl
+  | [], _ :: _, h => by simp at h
+  | _ :: _, [], h => by simp at h
+  | x :: xs, y :: ys, h => by
+    simp only [List.map_cons, List.cons.injEq, digitChar] at h
+    rw [map_digitChar_inj xs ys h.2]
+    congr 1
+    omega
+
+theorem decKey_inj (a b : Nat) (h : decKey a = decKey b) : a = b :=
+  decDigits_inj a b (map_digitChar_inj _ _ h)
+
+theorem decKey_digits (n : Nat) : ∀ c ∈ decKey n, 48 ≤ c ∧ c < 58 := by
+  intro c hc
+  simp only [decKey, List.mem_map] at hc
+  obtain ⟨d, hd, rfl⟩ := hc
+  have := decDigits_lt n d hd
+  simp only [digitChar]; omega
+
+/-- One 16-bit chunk as four lowercase hex digits. -/
+def hex4 (v : Nat) : List Nat :=
+  [hexChar (v / 4096 % 16), hexChar (v / 256 % 16), hexChar (v / 16 % 16), hexChar (v % 16)]
+
+theorem hexChar_inj (a b : Nat) (ha : a < 16) (hb : b < 16) (h : hexChar a = hexChar b) : a = b := by
+  unfold hexChar at h
+  split at h <;> split at h <;> omega
+
+theorem hex4_inj (a b : Nat) (ha : a < 65536) (hb : b < 65536) (h : hex4 a = hex4 b) : a = b := by
+  simp only [hex4, List.cons.injEq, and_true] at h
+  obtain ⟨h1, h2, h3, h4⟩ := h
+  have e1 := hexChar_inj _ _ (by omega) (by omega) h1
+  have e2 := hexChar_inj _ _ (by omega) (by omega) h2
+  have e3 := hexChar_inj _ _ (by omega) (by omega) h3
+  have e4 := hexChar_inj _ _ (by omega) (by omega) h4
+  omega
+
+theorem flatMap_hex4_inj (f g : Nat → Nat) (hf : ∀ i, f i < 65536) (hg : ∀ i, g i < 65536) :
+    ∀ l : List Nat, l.flatMap (fun i => hex4 (f i)) = l.flatMap (fun i => hex4 (g i)) →
+      ∀ i ∈ l, f i = g i
+  | [], _ => by simp
+  | k :: ks, h => by
+    simp only [List.flatMap_cons] at h
+    have hs := List.append_inj h (by simp [hex4])
+    intro i hi
+    rcases List.mem_cons.mp hi with e | e
+    · subst e; exact hex4_inj _ _ (hf i) (hg i) hs.1
+    · exact flatMap_hex4_inj f g hf hg ks hs.2 i e
+
+/-- Low-bit positions of the slots in chunk `i`. -/
+def chunkBits (S : List Nat) (i : Nat) : List Nat :=
+  S.filterMap (fun x => if x / 16 = i then some (x % 16) else none)
+
+def chunk (S : List Nat) (i : Nat) : Nat := slotMask (chunkBits S i)
+
+theorem foldl_mask_lt (n : Nat) :
+    ∀ (l : List Nat) (acc : Nat), acc < 2 ^ n → (∀ k ∈ l, k < n) →
+      l.foldl (fun acc k => acc ||| 2 ^ k) acc < 2 ^ n
+  | [], acc, h, _ => by simpa using h
+  | k :: ks, acc, h, hk => by
+    rw [List.foldl_cons]
+    apply foldl_mask_lt n ks
+    · exact Nat.or_lt_two_pow h (Nat.pow_lt_pow_right (by decide) (hk k (by simp)))
+    · intro x hx; exact hk x (by simp [hx])
+
+theorem chunk_lt (S : List Nat) (i : Nat) : chunk S i < 65536 := by
+  have : chunk S i < 2 ^ 16 := by
+    unfold chunk slotMask
+    apply foldl_mask_lt 16 _ 0 (by decide)
+    intro k hk
+    simp only [chunkBits, List.mem_filterMap] at hk
+    obtain ⟨x, _, hx⟩ := hk
+    split at hx
+    · simp at hx; omega
+    · simp at hx
+  simpa using this
+
+theorem testBit_chunk (S : List Nat) (i j : Nat) (hj : j < 16) :
+    (chunk S i).testBit j = decide (16 * i + j ∈ S) := by
+  unfold chunk
+  rw [testBit_slotMask]
+  congr 1
+  apply propext
+  simp only [chunkBits, List.mem_filterMap]
+  constructor
+  · rintro ⟨x, hx, hxe⟩
+    split at hxe
+    · simp at hxe
+      have : x = 16 * i + j := by omega
+      subst this; exact hx
+    · simp at hxe
+  · intro h
+    exact ⟨16 * i + j, h, by simp; omega⟩
+
+/-- `x_` + `n` chunks, highest first. -/
+def hexKey (S : List Nat) (n : Nat) : List Nat :=
+  120 :: 95 :: ((List.range n).reverse.flatMap (fun i => hex4 (chunk S i)))
+
+theorem flatMap_hex4_length (f : Nat → Nat) :
+    ∀ l : List Nat, (l.flatMap (fun i => hex4 (f i))).length = 4 * l.length
+  | [] => by simp
+  | k :: ks => by
+    rw [List.flatMap_cons, List.length_append, flatMap_hex4_length f ks]
+    simp [hex4]; omega
+
+theorem hexKey_length (S : List Nat) (n : Nat) : (hexKey S n).length = 2 + 4 * n := by
+  unfold hexKey
+  rw [List.length_cons, List.length_cons, flatMap_hex4_length]
+  simp; omega
+
+theorem hexKey_mem (a b : List Nat) (na nb : Nat) (h : hexKey a na = hexKey b nb) :
+    ∀ x ∈ a, x < 16 * na → x ∈ b := by
+  have hn : na = nb := by
+    have := congrArg List.length h
+    rw [hexKey_length, hexKey_length] at this
+    omega
+  subst hn
+  simp only [hexKey, List.cons.injEq, true_and] at h
+  have hc := flatMap_hex4_inj (chunk a) (chunk b) (chunk_lt a) (chunk_lt b) _ h
+  intro x hx hxa
+  have hi : x / 16 ∈ (List.range na).reverse := by simp; omega
+  have e := hc _ hi
+  have ta := testBit_chunk a (x / 16) (x % 16) (by omega)
+  have tb := testBit_chunk b (x / 16) (x % 16) (by omega)
+  have hx' : 16 * (x / 16) + x % 16 = x := by omega
+  rw [hx'] at ta tb
+  rw [e, tb] at ta
+  simpa [hx] using ta
+
+def wKey (idx : Nat) : List Nat := 119 :: 95 :: decKey idx
+
+/-- Largest slot of a set (`sorted[sorted.length() - 1]`). -/
+def maxSlot (S : List Nat) : Nat := S.foldr max 0
+
+theorem le_maxSlot : ∀ (S : List Nat), ∀ x ∈ S, x ≤ maxSlot S
+  | [], x, h => by simp at h
+  | y :: ys, x, h => by
+    have ih := le_maxSlot ys
+    simp only [maxSlot, List.foldr_cons] at ih ⊢
+    rcases List.mem_cons.mp h with e | e
+    · subst e; omega
+    · have := ih x e; omega
+
+def suffix (S : List Nat) (idx : Nat) : List Nat :=
+  if maxSlot S ≤ 30 then decKey (slotMask S)
+  else if maxSlot S ≤ 127 then hexKey S (maxSlot S / 16 + 1)
+  else wKey idx
+
+/-- The three namespaces never share a symbol: decimal keys start with a
+    digit, hex keys with `x`, wide keys with `w`. -/
+theorem namespaces_disjoint (m : Nat) (S : List Nat) (n idx : Nat) :
+    decKey m ≠ hexKey S n ∧ decKey m ≠ wKey idx ∧ hexKey S n ≠ wKey idx := by
+  have hd : ∀ c ∈ decKey m, 48 ≤ c ∧ c < 58 := decKey_digits m
+  refine ⟨fun h => ?_, fun h => ?_, fun h => ?_⟩
+  · have := hd 120 (by rw [h]; simp [hexKey]); omega
+  · have := hd 119 (by rw [h]; simp [wKey]); omega
+  · simp [hexKey, wKey] at h
+
+theorem dec_ne_hex (m : Nat) (S : List Nat) (n : Nat) : decKey m ≠ hexKey S n :=
+  (namespaces_disjoint m S n 0).1
+
+theorem dec_ne_w (m idx : Nat) : decKey m ≠ wKey idx :=
+  (namespaces_disjoint m [] 0 idx).2.1
+
+theorem hex_ne_w (S : List Nat) (n idx : Nat) : hexKey S n ≠ wKey idx :=
+  (namespaces_disjoint 0 S n idx).2.2
+
+theorem hexKey_eq_sets (a b : List Nat) (ha : StrictSorted a) (hb : StrictSorted b)
+    (h : hexKey a (maxSlot a / 16 + 1) = hexKey b (maxSlot b / 16 + 1)) : a = b := by
+  have ba : ∀ x ∈ a, x < 16 * (maxSlot a / 16 + 1) := fun x hx => by
+    have := le_maxSlot a x hx; omega
+  have bb : ∀ x ∈ b, x < 16 * (maxSlot b / 16 + 1) := fun x hx => by
+    have := le_maxSlot b x hx; omega
+  apply strictSorted_ext a b ha hb
+  intro x
+  exact ⟨fun hx => hexKey_mem a b _ _ h x hx (ba x hx),
+    fun hx => hexKey_mem b a _ _ h.symm x hx (bb x hx)⟩
+
+/-- Distinct registered sets get distinct symbols, equal sets the same one.
+    `hidx` is the helper table's contract: one index per distinct set. -/
+theorem suffix_injective (a b : List Nat) (ia ib : Nat) (ha : StrictSorted a) (hb : StrictSorted b)
+    (hidx : ia = ib ↔ a = b) : suffix a ia = suffix b ib ↔ a = b := by
+  constructor
+  · intro h
+    unfold suffix at h
+    by_cases a1 : maxSlot a ≤ 30 <;> by_cases b1 : maxSlot b ≤ 30 <;>
+      by_cases a2 : maxSlot a ≤ 127 <;> by_cases b2 : maxSlot b ≤ 127 <;>
+      simp only [a1, b1, a2, b2, ↓reduceIte] at h
+    all_goals first
+      | omega
+      | exact slot_key_injective a b ha hb (decKey_inj _ _ h)
+      | exact hexKey_eq_sets a b ha hb h
+      | exact hidx.mp (decKey_inj _ _ (List.cons.inj (List.cons.inj h).2).2)
+      | exact (dec_ne_hex _ _ _ h).elim
+      | exact (dec_ne_hex _ _ _ h.symm).elim
+      | exact (dec_ne_w _ _ h).elim
+      | exact (dec_ne_w _ _ h.symm).elim
+      | exact (hex_ne_w _ _ _ h).elim
+      | exact (hex_ne_w _ _ _ h.symm).elim
+  · intro h
+    subst h
+    have := hidx.mpr rfl
+    subst this
+    rfl
+
+/-- The registration table (`slot_drop_keys` / `slot_drop_specs`) holds each
+    set once, so its index map satisfies `suffix_injective`'s contract. -/
+theorem nodup_getElem_inj :
+    ∀ (tbl : List (List Nat)), tbl.Nodup → ∀ (i j : Nat) (hi : i < tbl.length) (hj : j < tbl.length),
+      tbl[i] = tbl[j] → i = j
+  | [], _, _, _, hi, _, _ => by simp at hi
+  | x :: xs, hnd, i, j, hi, hj, h => by
+    have hnd' := List.nodup_cons.mp hnd
+    cases i with
+    | zero =>
+      cases j with
+      | zero => rfl
+      | succ j =>
+        simp only [List.getElem_cons_zero, List.getElem_cons_succ] at h
+        exact absurd (by rw [h]; simp : x ∈ xs) hnd'.1
+    | succ i =>
+      cases j with
+      | zero =>
+        simp only [List.getElem_cons_zero, List.getElem_cons_succ] at h
+        exact absurd (by rw [← h]; simp : x ∈ xs) hnd'.1
+      | succ j =>
+        simp only [List.getElem_cons_succ] at h
+        have := nodup_getElem_inj xs hnd'.2 i j (by simp at hi; omega) (by simp at hj; omega) h
+        omega
+
+theorem table_index_contract (tbl : List (List Nat)) (hnd : tbl.Nodup) (i j : Nat)
+    (hi : i < tbl.length) (hj : j < tbl.length) : i = j ↔ tbl[i] = tbl[j] := by
+  constructor
+  · intro h; subst h; rfl
+  · intro h; exact nodup_getElem_inj tbl hnd i j hi hj h
 
 end PionWaveAA3Drops

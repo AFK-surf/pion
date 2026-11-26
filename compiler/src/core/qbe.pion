@@ -201,9 +201,11 @@ pub struct QbeGen {
   cstring_ids : Map[String, Int]
   enum_consts : Array[QbeEnumConst]
   enum_const_seen : Map[String, Bool]
+  /// Emitted `$pion_drop_slots_<suffix>` suffixes, in registration order.
   slot_drop_keys : Array[String]
   slot_drop_specs : Array[Array[Int]]
-  slot_drop_seen : Map[String, Bool]
+  /// Full canonical slot-set key (`qbe_slots_canonical_key`) -> emitted suffix.
+  slot_drop_seen : Map[String, String]
   fn_wrappers : Array[QbeFnWrapper]
   fn_wrapper_seen : Map[String, Bool]
   dyn_vtable_seen : Map[String, Bool]
@@ -23101,18 +23103,37 @@ fn qbe_merge_slot_lists(a : Array[Int], b : Array[Int]) -> Array[Int] {
 }
 
 ///|
+/// The emitted symbol suffix of a canonical slot set, in three disjoint
+/// namespaces (`SPEC.md` §4.1.1): the decimal mask for `max_slot <= 30`
+/// (Wasm32 P47-A parses it), `x_<hex>` for `31 <= max_slot <= 127` (at most
+/// 34 characters), and `w_<idx>` for wider sets, where `idx` is the set's
+/// position in this unit's helper table, so symbol length never grows with the
+/// slot index (QBE's ELF / Mach-O writers cap symbol names at 1024 bytes).
+fn qbe_slot_drop_suffix(sorted : Array[Int], key : String, idx : Int) -> String {
+  if sorted[sorted.length() - 1] <= 127 {
+    key
+  } else {
+    "w_" + idx.to_string()
+  }
+}
+
+///|
 fn qbe_register_slot_drop(g : QbeGen, slots : Array[Int]) -> String {
   let sorted = qbe_sort_unique_slots(slots)
   if sorted.length() == 0 {
     return "0"
   }
   let key = qbe_slots_canonical_key(sorted)
-  if !g.slot_drop_seen.contains(key) {
-    g.slot_drop_seen.set(key, true)
-    g.slot_drop_keys.push(key)
-    g.slot_drop_specs.push(sorted)
+  match g.slot_drop_seen.get(key) {
+    Some(suffix) => "$pion_drop_slots_" + suffix
+    None => {
+      let suffix = qbe_slot_drop_suffix(sorted, key, g.slot_drop_keys.length())
+      g.slot_drop_seen.set(key, suffix)
+      g.slot_drop_keys.push(suffix)
+      g.slot_drop_specs.push(sorted)
+      "$pion_drop_slots_" + suffix
+    }
   }
-  "$pion_drop_slots_" + key
 }
 
 ///|
@@ -24899,6 +24920,33 @@ fn qbe_collect_boxed_mut_vars(stmts : Array[Stmt]) -> Map[String, Bool] {
     qbe_collect_closure_caps_stmts(stmts, muts, out)
   }
   out
+}
+
+///|
+/// Whether the bare identifier `name` resolves to `Option::None` here, i.e.
+/// it is spelled `None` and no local, parameter, constant or function of that
+/// name shadows it (the resolution order of `EIdent` in `qbe_emit_expr`).
+fn qbe_ident_is_option_none(g : QbeGen, name : String) -> Bool {
+  if name != "None" {
+    return false
+  }
+  match qbe_lookup_local(g, name) {
+    Some(_) => return false
+    None => ()
+  }
+  if g.tc.consts.contains(name) || g.tc.fns.contains(name) {
+    return false
+  }
+  if g.mono_pkg != "" {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        if ipkg.tc.consts.contains(name) || ipkg.tc.fns.contains(name) {
+          return false
+        }
+      None => ()
+    }
+  }
+  true
 }
 
 ///|
@@ -46043,9 +46091,20 @@ fn qbe_emit_expr_inner(
                 let mut ffi = 0
                 while ffi < fields.length() {
                   if fields[ffi].name == sinfo.field_names[fk] {
+                    // Only `Option`'s own `None` is the static null pointer:
+                    // a local / parameter / const / fn named `None` or another
+                    // enum's `X::None` is a live value that needs its drop.
+                    let is_opt_field = match concrete_fk {
+                      TOption(_) => true
+                      _ =>
+                        match slot_tys[fk] {
+                          TOption(_) => true
+                          _ => false
+                        }
+                    }
                     is_null_lit = match fields[ffi].value {
-                      EIdent(idn, _) => idn == "None"
-                      EPath(_, mem, _) => mem == "None"
+                      EIdent(idn, _) => is_opt_field && qbe_ident_is_option_none(g, idn)
+                      EPath(q, mem, _) => is_opt_field && q == "Option" && mem == "None"
                       EUnit(_) => true
                       _ => false
                     }
