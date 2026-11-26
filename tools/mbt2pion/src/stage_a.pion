@@ -12931,7 +12931,165 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
   let bb_priv_decls : Array[String] = []
   let bb_all_idents : Map[String, Bool] = Map()
   let method_seen_count : Map[String, Int] = Map()
+  // Pre-pass 0: collect all local_types, raw_type_aliases, and using_types across all files
+  // (respecting #cfg exclusions) before the main prescan loop so struct_field_types,
+  // exported_abi_enums, fn_param_types, fn_ret_types, and recursive #derive(Eq) detection all
+  // observe the same converged, single-lowered `ctx.symtab.type_aliases`.
   let raw_type_aliases : Map[String, String] = Map()
+  let pending_using_types : Array[(String, String)] = []
+  for sf in files {
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut pi = 0
+    let mut p_cfg_excluded = false
+    while pi < n {
+      let pt = tokens[pi]
+      if pt.kind == TokenKind::Attr {
+        if pt.raw.starts_with("#cfg") {
+          match eval_cfg_attr(pt.raw, ctx.opts.target) {
+            Some(false) => p_cfg_excluded = true
+            None => p_cfg_excluded = true
+            Some(true) => ()
+          }
+        }
+        pi = pi + 1
+        continue
+      }
+      if p_cfg_excluded {
+        p_cfg_excluded = false
+        pi = skip_top_level_decl(tokens, pi, n)
+        continue
+      }
+      if pt.kind == TokenKind::Keyword &&
+      (pt.raw == "struct" || pt.raw == "enum" || pt.raw == "type" || pt.raw == "suberror" || pt.raw == "trait") &&
+      pi + 1 < n && tokens[pi + 1].kind == TokenKind::UpperIdent {
+        ctx.symtab.local_types[tokens[pi + 1].raw] = true
+      }
+      if pt.kind == TokenKind::Keyword && pt.raw == "type" && pi + 3 < n &&
+      tokens[pi + 1].kind == TokenKind::UpperIdent && tokens[pi + 2].kind == TokenKind::Eq {
+        let aname = tokens[pi + 1].raw
+        let rhs_end = find_top_level_let_expr_end(tokens, pi + 3, n)
+        if rhs_end > pi + 3 {
+          let raw_rhs = sf.content.slice(tokens[pi + 3].start_byte, tokens[rhs_end - 1].end_byte).trim()
+          if raw_rhs.length() > 0 {
+            raw_type_aliases[aname] = raw_rhs
+          }
+        }
+        pi = rhs_end
+        continue
+      }
+      if (pt.kind == TokenKind::Keyword || pt.kind == TokenKind::Ident) && pt.raw == "using" &&
+      pi + 2 < n && tokens[pi + 1].kind == TokenKind::PkgRef && tokens[pi + 2].kind == TokenKind::LBrace {
+        let raw_pkg = tokens[pi + 1].raw.slice(1, tokens[pi + 1].raw.length())
+        let target_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
+          Some(p) => p
+          None => raw_pkg
+        }
+        let rb = find_matching_delim(tokens, pi + 2)
+        let mut uk = pi + 3
+        while uk < rb {
+          let ut = tokens[uk]
+          if ut.kind == TokenKind::Comma || ut.kind == TokenKind::Semi {
+            uk = uk + 1
+            continue
+          }
+          if (ut.kind == TokenKind::Keyword || ut.kind == TokenKind::Ident) &&
+          (ut.raw == "type" || ut.raw == "trait") && uk + 1 < rb &&
+          (tokens[uk + 1].kind == TokenKind::UpperIdent || tokens[uk + 1].kind == TokenKind::Ident) {
+            let tname = tokens[uk + 1].raw
+            pending_using_types.push((tname, target_pkg + "::" + tname))
+            uk = uk + 2
+            continue
+          }
+          uk = uk + 1
+        }
+        pi = rb + 1
+        continue
+      }
+      if pt.kind == TokenKind::LBrace {
+        pi = find_matching_delim(tokens, pi) + 1
+        continue
+      }
+      pi = pi + 1
+    }
+  }
+  for ut in pending_using_types {
+    if !ctx.symtab.local_types.contains(ut.0) {
+      ctx.symtab.using_types[ut.0] = ut.1
+    }
+  }
+  // Step A: fixed-point expand type alias chains on raw MoonBit source text (bounded to 16 iterations)
+  // so MoonBit types (e.g. `ReadOnlyArray[Int]`) are never prematurely lowered and re-aliased.
+  let mut ta_iter = 0
+  while ta_iter < 16 {
+    let mut ta_changed = false
+    for aname in raw_type_aliases.keys() {
+      match raw_type_aliases.get(aname) {
+        Some(cur_raw) => {
+          let rtoks = lex_moonbit(cur_raw)
+          let rn = rtoks.length() - 1
+          let sb = StringBuilder()
+          let mut pos = 0
+          let mut did_sub = false
+          let mut k = 0
+          while k < rn {
+            let tk = rtoks[k]
+            if tk.kind == TokenKind::UpperIdent &&
+            !(k > 0 && rtoks[k - 1].kind == TokenKind::Dot) &&
+            tk.raw != aname &&
+            !(k + 1 < rn && rtoks[k + 1].kind == TokenKind::LBracket) {
+              match raw_type_aliases.get(tk.raw) {
+                Some(aliased) => {
+                  sb.write_string(cur_raw.slice(pos, tk.start_byte))
+                  sb.write_string(aliased)
+                  pos = tk.end_byte
+                  did_sub = true
+                }
+                None => ()
+              }
+            }
+            k = k + 1
+          }
+          if did_sub {
+            sb.write_string(cur_raw.slice(pos, cur_raw.length()))
+            let next_raw = sb.to_string().trim()
+            if next_raw != cur_raw && next_raw.length() > 0 {
+              raw_type_aliases[aname] = next_raw
+              ta_changed = true
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    if !ta_changed {
+      break
+    }
+    ta_iter = ta_iter + 1
+  }
+  // Step B: lower each fully expanded MoonBit alias RHS exactly once with an empty `type_aliases` map.
+  for old_k in ctx.symtab.type_aliases.keys() {
+    ctx.symtab.type_aliases.remove(old_k)
+  }
+  let lowered_aliases : Map[String, String] = Map()
+  for aname in raw_type_aliases.keys() {
+    match raw_type_aliases.get(aname) {
+      Some(exp_raw) => {
+        let rtoks = lex_moonbit(exp_raw)
+        let rty = lower_type_tokens(rtoks, 0, rtoks.length() - 1, ctx.symtab, ctx.recipes).trim()
+        if rty.length() > 0 {
+          lowered_aliases[aname] = rty
+        }
+      }
+      None => ()
+    }
+  }
+  for aname in lowered_aliases.keys() {
+    match lowered_aliases.get(aname) {
+      Some(rty) => ctx.symtab.type_aliases[aname] = rty
+      None => ()
+    }
+  }
   for sf in files {
     ctx.all_source_texts.push(sf.content)
     let is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
@@ -13460,14 +13618,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if t.kind == TokenKind::Keyword && t.raw == "type" && i + 3 < n &&
       tokens[i + 1].kind == TokenKind::UpperIdent && tokens[i + 2].kind == TokenKind::Eq {
         next_autofill = false
-        let aname = tokens[i + 1].raw
         let rhs_end = find_top_level_let_expr_end(tokens, i + 3, n)
-        if rhs_end > i + 3 {
-          let raw_rhs = sf.content.slice(tokens[i + 3].start_byte, tokens[rhs_end - 1].end_byte).trim()
-          if raw_rhs.length() > 0 {
-            raw_type_aliases[aname] = raw_rhs
-          }
-        }
         i = rhs_end
         continue
       }
@@ -13857,78 +14008,6 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if ctx.symtab.blackbox_autofill_loc_fns.contains(nm) {
         ctx.symtab.blackbox_autofill_loc_fns[cand] = true
       }
-    }
-  }
-  // Step A: fixed-point expand type alias chains on raw MoonBit source text (bounded to 16 iterations)
-  // so MoonBit types (e.g. `ReadOnlyArray[Int]`) are never prematurely lowered and re-aliased.
-  let mut ta_iter = 0
-  while ta_iter < 16 {
-    let mut ta_changed = false
-    for aname in raw_type_aliases.keys() {
-      match raw_type_aliases.get(aname) {
-        Some(cur_raw) => {
-          let rtoks = lex_moonbit(cur_raw)
-          let rn = rtoks.length() - 1
-          let sb = StringBuilder()
-          let mut pos = 0
-          let mut did_sub = false
-          let mut k = 0
-          while k < rn {
-            let tk = rtoks[k]
-            if tk.kind == TokenKind::UpperIdent &&
-            !(k > 0 && rtoks[k - 1].kind == TokenKind::Dot) &&
-            tk.raw != aname &&
-            !(k + 1 < rn && rtoks[k + 1].kind == TokenKind::LBracket) {
-              match raw_type_aliases.get(tk.raw) {
-                Some(aliased) => {
-                  sb.write_string(cur_raw.slice(pos, tk.start_byte))
-                  sb.write_string(aliased)
-                  pos = tk.end_byte
-                  did_sub = true
-                }
-                None => ()
-              }
-            }
-            k = k + 1
-          }
-          if did_sub {
-            sb.write_string(cur_raw.slice(pos, cur_raw.length()))
-            let next_raw = sb.to_string().trim()
-            if next_raw != cur_raw && next_raw.length() > 0 {
-              raw_type_aliases[aname] = next_raw
-              ta_changed = true
-            }
-          }
-        }
-        None => ()
-      }
-    }
-    if !ta_changed {
-      break
-    }
-    ta_iter = ta_iter + 1
-  }
-  // Step B: lower each fully expanded MoonBit alias RHS exactly once with an empty `type_aliases` map.
-  for old_k in ctx.symtab.type_aliases.keys() {
-    ctx.symtab.type_aliases.remove(old_k)
-  }
-  let lowered_aliases : Map[String, String] = Map()
-  for aname in raw_type_aliases.keys() {
-    match raw_type_aliases.get(aname) {
-      Some(exp_raw) => {
-        let rtoks = lex_moonbit(exp_raw)
-        let rty = lower_type_tokens(rtoks, 0, rtoks.length() - 1, ctx.symtab, ctx.recipes).trim()
-        if rty.length() > 0 {
-          lowered_aliases[aname] = rty
-        }
-      }
-      None => ()
-    }
-  }
-  for aname in lowered_aliases.keys() {
-    match lowered_aliases.get(aname) {
-      Some(rty) => ctx.symtab.type_aliases[aname] = rty
-      None => ()
     }
   }
   prescan_recursive_derive_eq_types(ctx, files)
