@@ -309,6 +309,37 @@ fn ov_fail() -> Int? raise LocalErr {
   raise Empty
 }
 
+fn calm_ok() -> Int raise LocalErr {
+  1
+}
+
+fn yes_res(_r : Result[Int, LocalErr]) -> Bool {
+  true
+}
+
+fn pick_shadow_res(
+  always_fail_g : () -> Result[Int, LocalErr],
+  x? : Bool = yes_res(always_fail_g()) && yes_helper(calm_ok()) catch { _ => false },
+) -> Bool {
+  x
+}
+
+fn pick_shadow_int(always_fail_g : () -> Int, x? : Int = always_fail_g()) -> Int {
+  x
+}
+
+fn pick_raise_def(x? : Int = always_fail_g()) -> Int raise LocalErr {
+  x
+}
+
+fn pick_raise_chain(
+  a : Int,
+  x? : Int = a + 1,
+  y? : Int = x + always_fail_g(),
+) -> Int raise LocalErr {
+  y
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -572,7 +603,14 @@ fn case_r5_paren_and_guard() -> String {
     let v = always_fail_g() catch { _ => 4 }
     v
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string()
+  // R13: default param lexical scope (prior params shadow package raising fns) & raising fn default param frame
+  let p32 = if pick_shadow_res(fn() { Err(Empty) }) { 42 } else { 0 }
+  let p33 = pick_shadow_int(fn() { 42 })
+  let p34 = pick_raise_def() catch { _ => 7 }
+  let p35 = pick_raise_def(x=42) catch { _ => 7 }
+  let p36 = pick_raise_chain(10) catch { _ => 7 }
+  let p37 = pick_raise_chain(10, y=42) catch { _ => 7 }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -747,7 +785,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
