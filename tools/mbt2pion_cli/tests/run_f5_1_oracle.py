@@ -536,6 +536,83 @@ def main():
             '}\n',
             "MBT2PION_UINT16_ESCAPE",
         )
+
+        # 4c. Cross-file `__mbt_probe` path-collision negative test (3-file package, equal-length identifiers at identical offsets)
+        cf_sdir = os.path.join(work, "neg_probe_file_collision_src")
+        cf_odir = os.path.join(work, "neg_probe_file_collision_out")
+        cf_rep = os.path.join(work, "neg_probe_file_collision_report.json")
+        os.makedirs(cf_sdir)
+        os.makedirs(cf_odir)
+        with open(os.path.join(cf_sdir, "support.mbt"), "w") as fh:
+            fh.write('fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n')
+        with open(os.path.join(cf_sdir, "f.mbt"), "w") as fh:
+            fh.write(
+                'pub fn bad_peq() -> Int {\n'
+                '  let physical_equal = first_for("a"[0])\n'
+                '  let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+                '  (n + n).to_int()\n'
+                '}\n'
+            )
+        with open(os.path.join(cf_sdir, "f__mbt_probe.mbt"), "w") as fh:
+            fh.write(
+                'pub fn ok__peq() -> Int {\n'
+                '  let other_val_name = first_for("a"[0])\n'
+                '  let b = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+                '  ignore(other_val_name); if b { 2 } else { 0 }\n'
+                '}\n'
+            )
+        cf_p = subprocess.run(
+            [
+                bin_path, "--src", cf_sdir, "--out", cf_odir, "--target", "native", "--mode", "publish",
+                "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", cf_rep,
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+        )
+        cf_rep_txt = open(cf_rep).read() if os.path.exists(cf_rep) else ""
+        cf_combined = cf_p.stdout + "\n" + cf_p.stderr + "\n" + cf_rep_txt
+        assert cf_p.returncode != 0 and "MBT2PION_UINT16_ESCAPE" in cf_combined, (
+            f"3-file __mbt_probe collision case must block publish with MBT2PION_UINT16_ESCAPE:\n{cf_combined}"
+        )
+        assert not os.listdir(cf_odir), "blocked 3-file collision publish must leave --out empty"
+
+        # 5. Single-file `f__mbt_probe.mbt` legitimate builtin physical_equal must publish and match 4 targets == "2"
+        sf_md = os.path.join(work, "sf_probe_moon")
+        for sub in ("sfapp", "cmd"):
+            os.makedirs(os.path.join(sf_md, sub))
+        sf_mbt = (
+            'pub fn probe_val() -> Int {\n'
+            '  if physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1)) { 2 } else { 0 }\n'
+            '}\n'
+        )
+        for rel, txt in [
+            ("moon.mod", 'name = "f51/sfprobe"\n'),
+            ("sfapp/moon.pkg", "\n"),
+            ("sfapp/f__mbt_probe.mbt", sf_mbt),
+            ("cmd/moon.pkg", 'import { "f51/sfprobe/sfapp" }\npkgtype(kind: "executable")\n'),
+            ("cmd/main.mbt", "fn main { println(@sfapp.probe_val()) }\n"),
+        ]:
+            with open(os.path.join(sf_md, rel), "w") as fh:
+                fh.write(txt)
+        sf_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=sf_md)
+        sf_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=sf_md)
+        sf_papp = os.path.join(work, "sf_probe_pion")
+        os.makedirs(os.path.join(sf_papp, "src"))
+        with open(os.path.join(sf_papp, "pion.toml"), "w") as fh:
+            fh.write(
+                f'[package]\nname = "sfapp"\nversion = "0.1.0"\n'
+                f'[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        run_cmd([
+            bin_path, "--src", os.path.join(sf_md, "sfapp"), "--out", os.path.join(sf_papp, "src"),
+            "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
+        ])
+        with open(os.path.join(sf_papp, "src", "main.pion"), "w") as fh:
+            fh.write('pub fn main(w : World) -> Int { io_println(w, probe_val().to_string()); 0 }\n')
+        sf_pn = run_cmd([args.pionc, "run", sf_papp])
+        sf_pw = run_cmd([args.pionc, "run", "--target", "wasm32", sf_papp])
+        assert sf_mn == "2" and sf_mw == "2" and sf_pn == "2" and sf_pw == "2", (
+            f"single-file f__mbt_probe.mbt 4-target mismatch: {sf_mn}, {sf_mw}, {sf_pn}, {sf_pw}"
+        )
         assert_publish_blocked(
             bin_path, args.pionc, work, "u16_array_elem_eq",
             'pub fn probe() -> Int {\n'
