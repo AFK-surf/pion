@@ -477,6 +477,8 @@ sh "$ROOT_DIR/tests/e2e/p131_cond_branch_rc_guard/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p132_mod_pow2_loop_break/run_e2e.sh" "$PIONC2"
 # P133: `for i in a..<b` whose body shadows `i` pops the body scope before incrementing the loop counter (dev + --release native, ASan/LSan, Wasm32).
 sh "$ROOT_DIR/tests/e2e/p133_for_range_shadow/run_e2e.sh" "$PIONC2"
+# P135: QBE TCO / TRMA / single-push scanners cover every Stmt (dev + --release native, ASan/LSan, Wasm32).
+sh "$ROOT_DIR/tests/e2e/p135_sforrange_scanners/run_e2e.sh" "$PIONC2"
 # P134: QBE generic eq/arith single-scan O(V+E) reverse propagation, canonical mono_pkg normalization & fail-closed ICE on unresolved bindings (4-mode native/wasm32 dev/release + frontend diag + backend ICE).
 sh "$ROOT_DIR/tests/e2e/p134_qbe_soundness/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
