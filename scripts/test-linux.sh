@@ -715,6 +715,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p130_real_workload_data_opts/run_e2e.s
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p131_cond_branch_rc_guard/run_e2e.sh" "$PIONC"
 # P132: `x % 2^k == 0` evaluates `x` once, folds only divisors the operand width represents (qbe_try_emit_mod_pow2_eq_zero; every power-of-two divisor of 6 integer types over all 8-bit values and wide boundaries, side-effecting operands, `if` and value contexts incl. an operand that leaves; narrowed-to-0 divisors keep the #verify division-by-zero panic and match a variable divisor otherwise), and `break` / `continue` are E_TYPE_MISMATCH outside a loop body (incl. every `while` / C-style `for` condition and step) while nested loop init / bounds / iterables leave / continue the enclosing loop (dev + --release native, ASan/LSan, Wasm32; `pionc check` negatives).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p132_mod_pow2_loop_break/run_e2e.sh" "$PIONC"
+# P133: QBE generic eq/arith single-scan O(V+E) reverse propagation, canonical mono_pkg normalization & fail-closed ICE on unresolved bindings (4-mode native/wasm32 dev/release + frontend diag).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p133_qbe_soundness/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
