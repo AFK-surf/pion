@@ -905,6 +905,7 @@ def main():
         for ord_name, dep_flags in [
             ("lr", ["--dep", f"x={r9_dirs['L'][1]}", "--dep", f"other={r9_dirs['R'][1]}"]),
             ("rl", ["--dep", f"other={r9_dirs['R'][1]}", "--dep", f"x={r9_dirs['L'][1]}"]),
+            ("dup_first_wins", ["--dep", f"x={r9_dirs['L'][1]}", "--dep", f"x={r9_dirs['R'][1]}", "--dep", f"other={r9_dirs['R'][1]}"]),
         ]:
             r9_dn_out = os.path.join(r9_base, f"dn_fail_{ord_name}")
             os.makedirs(r9_dn_out)
