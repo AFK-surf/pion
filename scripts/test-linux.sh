@@ -749,6 +749,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC"
 # PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC"
+# CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/cas_pin_and_cstub_deps/run_e2e.sh" "$PIONC"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
