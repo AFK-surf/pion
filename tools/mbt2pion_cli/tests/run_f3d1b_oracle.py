@@ -424,7 +424,7 @@ pub fn run_all() -> String {
   let xa1 : CrossA = CrossA::More([{ a: CrossA::Done }])
   let xa2 : CrossA = CrossA::More([{ a: CrossA::Done }])
   let xa3 : CrossA = CrossA::Done
-  let line8 = "F3d1b-8:\{at1 == at2},\{at1 == at3},\{ft1 != ft2},\{rt1 == rt2},\{xa1 == xa2},\{xa1 == xa3}"
+  let line8 = "F3d1b-8:\{at1 == at2},\{at1 == at3},\{ft1 != ft2},\{rt1 == rt2},\{xa1 == xa2},\{xa1 == xa3},\{@shadow_eq.shadow_probe()},\{@shadow_eq.ctrl_probe()}"
 
   line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6 + "\n" + line7 + "\n" + line8
 }
@@ -444,6 +444,33 @@ pub type CrossKids = Array[CrossB]
 #derive(Eq)
 pub(all) struct CrossB {
   a : CrossA
+}
+'''
+
+LIB_ALIAS_SHADOW_MBT = r'''
+type Array = Int
+type ShadowKids = ReadOnlyArray[Int]
+type ShadowTreeKids = ReadOnlyArray[ShadowTree]
+
+#derive(Eq)
+priv enum ShadowTree {
+  SLeaf(Int)
+  SBranch(ShadowTreeKids)
+}
+
+pub fn shadow_probe() -> String {
+  let a : ShadowKids = [42]
+  let t1 : ShadowTree = SBranch([SLeaf(1)])
+  let t2 : ShadowTree = SBranch([SLeaf(2)])
+  "\{a[0]},\{t1 != t2}"
+}
+
+type Spare = Int
+type CtrlKids = ReadOnlyArray[Int]
+
+pub fn ctrl_probe() -> Int {
+  let a : CtrlKids = [42]
+  a[0]
 }
 '''
 
@@ -520,15 +547,17 @@ def main():
         bin_path = os.path.join(work, "mbt2pion")
         run_cmd([args.pionc, "build", CLI_DIR, "-o", bin_path])
 
-        # 1. MoonBit multi-package project (dep_eq, lib, cmd)
+        # 1. MoonBit multi-package project (dep_eq, shadow_eq, lib, cmd)
         md = os.path.join(work, "moon_proj")
-        for sub in ("dep_eq", "lib", "cmd"):
+        for sub in ("dep_eq", "shadow_eq", "lib", "cmd"):
             os.makedirs(os.path.join(md, sub))
         for rel, txt in [
             ("moon.mod", 'name = "f3d1b/oracle"\n'),
             ("dep_eq/moon.pkg", "\n"),
             ("dep_eq/dep_eq.mbt", DEP_EQ_MBT),
-            ("lib/moon.pkg", 'import {\n  "f3d1b/oracle/dep_eq",\n}\n'),
+            ("shadow_eq/moon.pkg", "\n"),
+            ("shadow_eq/alias_shadow.mbt", LIB_ALIAS_SHADOW_MBT),
+            ("lib/moon.pkg", 'import {\n  "f3d1b/oracle/dep_eq",\n  "f3d1b/oracle/shadow_eq",\n}\n'),
             ("lib/f3d1b.mbt", F3D1B_MBT),
             ("lib/alias_a.mbt", LIB_ALIAS_A_MBT),
             ("lib/alias_b.mbt", LIB_ALIAS_B_MBT),
@@ -538,8 +567,9 @@ def main():
             open(os.path.join(md, rel), "w").write(txt)
         moon_out = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=md)
 
-        # 2. Transpile dep_eq and lib to Pion in dependency order
+        # 2. Transpile dep_eq, shadow_eq, and lib to Pion in dependency order
         p_dep = os.path.join(work, "p_dep_eq")
+        p_shadow = os.path.join(work, "p_shadow_eq")
         p_lib = os.path.join(work, "p_lib")
         os.makedirs(os.path.join(p_dep, "src"))
         open(os.path.join(p_dep, "pion.toml"), "w").write(
@@ -551,16 +581,28 @@ def main():
             "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
         ])
 
+        os.makedirs(os.path.join(p_shadow, "src"))
+        open(os.path.join(p_shadow, "pion.toml"), "w").write(
+            f'[package]\nname = "shadow_eq"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+        )
+        run_cmd([
+            bin_path, "--src", os.path.join(md, "shadow_eq"), "--out", os.path.join(p_shadow, "src"),
+            "--package-manifest", os.path.join(p_shadow, "pion.toml"),
+            "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
+        ])
+
         os.makedirs(os.path.join(p_lib, "src"))
         open(os.path.join(p_lib, "pion.toml"), "w").write(
             f'[package]\nname = "f3d1blib"\nversion = "0.1.0"\n[dependencies]\n'
             f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
             f'dep_eq = {{ path = "{p_dep}" }}\n'
+            f'shadow_eq = {{ path = "{p_shadow}" }}\n'
         )
         run_cmd([
             bin_path, "--src", os.path.join(md, "lib"), "--out", os.path.join(p_lib, "src"),
             "--package-manifest", os.path.join(p_lib, "pion.toml"),
             "--dep", f"dep_eq={p_dep}",
+            "--dep", f"shadow_eq={p_shadow}",
             "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
         ])
         open(os.path.join(p_lib, "src", "main.pion"), "w").write(
@@ -577,7 +619,7 @@ def main():
             "F3d1b-5:100,ok\n"
             "F3d1b-6:true,true,true,true,true,true,42,true\n"
             "F3d1b-7:true,false,true,false,true,42\n"
-            "F3d1b-8:true,false,true,true,true,false"
+            "F3d1b-8:true,false,true,true,true,false,42,true,42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
