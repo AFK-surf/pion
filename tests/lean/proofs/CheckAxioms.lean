@@ -38,6 +38,7 @@ import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
 import PionProofs.QbeBinarySizeOpts
 import PionProofs.QbeCompileSpeedZ1
+import PionProofs.QbeRealWorkloadDataOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -851,3 +852,30 @@ import PionProofs.QbeCompileSpeedZ1
 #print axioms QbeCompileSpeedZ1.BodyLines.partition_eq
 #print axioms QbeCompileSpeedZ1.DriverTarget.same_target
 #print axioms QbeCompileSpeedZ1.DriverTarget.repeated
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.literal_alphabet
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.scan_spec
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.pack_spec
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.same_static_bytes_and_length
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.encode_bytes
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.roundtrip
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.neg_literal_word
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.int32_min_word
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.stores_spec
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.array_equivalence
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.fresh_objects
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.other_objects
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.alloc_wf
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.alloc_fresh
+#print axioms QbeRealWorkloadDataOpts.FlatRows.immortal_refs
+#print axioms QbeRealWorkloadDataOpts.FlatRows.sameHeap
+#print axioms QbeRealWorkloadDataOpts.SparseData.zrun_zero
+#print axioms QbeRealWorkloadDataOpts.SparseData.getD_drop
+#print axioms QbeRealWorkloadDataOpts.SparseData.loop_inv
+#print axioms QbeRealWorkloadDataOpts.SparseData.spans_inv
+#print axioms QbeRealWorkloadDataOpts.SparseData.span_count
+#print axioms QbeRealWorkloadDataOpts.SparseData.span_bounds
+#print axioms QbeRealWorkloadDataOpts.SparseData.rebuild
+#print axioms QbeRealWorkloadDataOpts.SparseData.all_zero
+#print axioms QbeRealWorkloadDataOpts.SparseData.loop_blocks
+#print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget
+#print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget_4096
