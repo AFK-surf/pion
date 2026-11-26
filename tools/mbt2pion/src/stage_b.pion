@@ -1806,11 +1806,40 @@ pub fn run_stage_b_with_ops_and_deps(
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> (Array[GeneratedFile], Int, Array[(String, Int)]) {
+  let (out_files, iters, hist, _) = run_stage_b_with_ops_deps_and_qt(
+    files,
+    api_map,
+    op_lookup,
+    dep_methods,
+    check_fn,
+    None,
+    empty_pkg_query_types(),
+    diags,
+    drift_ledger,
+  )
+  (out_files, iters, hist)
+}
+
+pub fn run_stage_b_with_ops_deps_and_qt(
+  files : Array[GeneratedFile],
+  api_map : ApiMap,
+  op_lookup : Map[String, String],
+  dep_methods : Map[String, Bool],
+  check_fn : (Array[(String, String)]) -> String,
+  query_types_cb : Option[(Array[(String, String)]) -> String],
+  initial_qt : PkgQueryTypes,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Array[(String, Int)], PkgQueryTypes) {
   let mut cur_files : Array[GeneratedFile] = []
   let file_vers : Map[String, Int] = Map()
   let token_cache : Map[String, (Int, Array[Token])] = Map()
+  let mut any_boundary_changed = false
   for f in files {
     let with_bounds = apply_api_boundary_conversions(f.content, api_map, f.rel_path, diags, drift_ledger)
+    if with_bounds != f.content {
+      any_boundary_changed = true
+    }
     file_vers[f.rel_path] = 0
     cur_files.push(GeneratedFile::{
       rel_path: f.rel_path,
@@ -1822,14 +1851,45 @@ pub fn run_stage_b_with_ops_and_deps(
 
   let mut iter = 0
   let mut final_hist : Array[(String, Int)] = []
+  let mut round0_qt : PkgQueryTypes = if !any_boundary_changed && initial_qt.ok {
+    initial_qt
+  } else {
+    empty_pkg_query_types()
+  }
+  let mut any_round_changed = false
 
+  let mut need_qt_for_capacity = false
+  for f in cur_files {
+    if str_has(f.content, "shrink_to_fit") || str_has(f.content, ".iter(") {
+      need_qt_for_capacity = true
+      break
+    }
+  }
   while iter < 16 {
     stage_b_perf_stats[4] = stage_b_perf_stats[4] + 1
     let batch : Array[(String, String)] = []
     for f in cur_files {
       batch.push((f.rel_path, f.content))
     }
-    let raw_json = check_fn(batch)
+    let raw_json = if iter == 0 && !round0_qt.ok && need_qt_for_capacity {
+      match query_types_cb {
+        Some(qt_cb) => {
+          let r = qt_cb(batch)
+          if r.length() > 0 {
+            let parsed_qt = parse_pkg_query_types_json(r)
+            if parsed_qt.ok {
+              round0_qt = parsed_qt
+            }
+            r
+          } else {
+            check_fn(batch)
+          }
+        }
+        None => check_fn(batch)
+      }
+    } else {
+      check_fn(batch)
+    }
     let pdiags = parse_pionc_diagnostics(raw_json)
 
     let counts : Map[String, Int] = Map()
@@ -1867,20 +1927,34 @@ pub fn run_stage_b_with_ops_and_deps(
       }
       out
     }
+    let build_shrink_pkg = fn() -> ShrinkPkg {
+      let toks = get_all_round_tokens()
+      if round0_qt.ok && !any_round_changed {
+        let rels : Array[String] = []
+        let contents : Array[String] = []
+        for cf in cur_files {
+          rels.push(cf.rel_path)
+          contents.push(cf.content)
+        }
+        collect_shrink_pkg_tokens_with_qt(toks, rels, contents, round0_qt)
+      } else {
+        collect_shrink_pkg_tokens(toks)
+      }
+    }
     let get_shrink_pkg = fn() -> ShrinkPkg {
       if stage_b_cache_flag[0] {
         match round_shrink_pkg {
           Some(sp) => sp
           None => {
             stage_b_perf_stats[1] = stage_b_perf_stats[1] + 1
-            let sp = collect_shrink_pkg_tokens(get_all_round_tokens())
+            let sp = build_shrink_pkg()
             round_shrink_pkg = Some(sp)
             sp
           }
         }
       } else {
         stage_b_perf_stats[1] = stage_b_perf_stats[1] + 1
-        collect_shrink_pkg_tokens(get_all_round_tokens())
+        build_shrink_pkg()
       }
     }
     let get_sort_key_env = fn() -> SortKeyEnv {
@@ -1989,9 +2063,14 @@ pub fn run_stage_b_with_ops_and_deps(
                     stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
                   }
                   let mut skip_rewrite = false
+                  let file_qfi_opt : Option[QtFileIndex] = if round0_qt.ok && file_vers.get(f.rel_path) == Some(0) {
+                    round0_qt.files.get(f.rel_path)
+                  } else {
+                    None
+                  }
                   if helper == "mbt_compat::arr_shrink_to_fit" {
                     let ftoks = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
-                    if !stage_b_check_shrink_snapshot_cached(ftoks, get_shrink_pkg(), f.rel_path, d.line, d.col, diags) {
+                    if !stage_b_check_shrink_snapshot_cached(ftoks, get_shrink_pkg(), f.rel_path, f.content, file_qfi_opt, d.line, d.col, diags) {
                       skip_rewrite = true
                     }
                   }
@@ -2003,7 +2082,8 @@ pub fn run_stage_b_with_ops_and_deps(
                   }
                   if helper == "mbt_compat::arr_iter" {
                     let _ = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
-                    if !stage_b_check_kept_iter(round_file_tokens, f.rel_path, f.content, d.line, d.col, diags) {
+                    let decl_tys = if round0_qt.ok { get_shrink_pkg().declared_types } else { Map() }
+                    if !stage_b_check_kept_iter(round_file_tokens, f.rel_path, f.content, file_qfi_opt, decl_tys, d.line, d.col, diags) {
                       skip_rewrite = true
                     }
                   }
@@ -2982,12 +3062,15 @@ pub fn run_stage_b_with_ops_and_deps(
       }
       file_vers[rel] = prev_ver + 1
     }
-    if !changed {
+    if changed {
+      any_round_changed = true
+    } else {
       break
     }
   }
 
-  (cur_files, iter, final_hist)
+  let out_qt = if !any_round_changed { round0_qt } else { empty_pkg_query_types() }
+  (cur_files, iter, final_hist, out_qt)
 }
 
 ///| Rewrite `<recv>.to_char()` on `Int` inline to MoonBit's exact Unicode scalar check
@@ -3119,6 +3202,8 @@ fn stage_b_check_shrink_snapshot_cached(
   tokens : Array[Token],
   shrink_pkg : ShrinkPkg,
   f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
   line : Int,
   col : Int,
   diags : Array[Diag],
@@ -3140,7 +3225,7 @@ fn stage_b_check_shrink_snapshot_cached(
   if name_i < 0 {
     return false
   }
-  let why = shrink_snapshot_hazard(tokens, name_i, shrink_pkg)
+  let why = shrink_snapshot_hazard_with_qt(tokens, name_i, shrink_pkg, content, qfi_opt)
   if why.length() == 0 {
     return true
   }
@@ -3166,6 +3251,8 @@ fn stage_b_check_kept_iter(
   file_tokens : Map[String, Array[Token]],
   f_rel : String,
   content : String,
+  qfi_opt : Option[QtFileIndex],
+  declared_types : Map[String, Bool],
   line : Int,
   col : Int,
   diags : Array[Diag],
@@ -3195,7 +3282,7 @@ fn stage_b_check_kept_iter(
   if dot_i < 0 {
     return false
   }
-  let why = kept_iter_hazard(tokens, dot_i)
+  let why = kept_iter_hazard_with_qt(tokens, dot_i, content, qfi_opt, declared_types)
   if why.length() == 0 {
     return true
   }

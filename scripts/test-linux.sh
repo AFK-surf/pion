@@ -631,6 +631,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p31c_jsx_dot/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32a_toolchain/run_e2e.sh" "$PIONC"
 # P32-B: multi-package virtual [workspace], [workspace.dependencies], { workspace = true }, shared pion.lock, CLI --package/-p.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32b_workspace/run_e2e.sh" "$PIONC"
+# P32-D: external path/git deps inherit `{ workspace = true }` from their own enclosing [workspace], never the consumer's.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32d_external_ws_dep/run_e2e.sh" "$PIONC"
 # P32-C: amd64_sysv direct ELF64 XMM stack-arg encoding (>8 Double/Float + mixed GPR/XMM).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32c_abi_fp_stack/run_e2e.sh" "$PIONC"
 # P33-B: multi-package incremental CAS for `pionc check` (.pionsig/.pionstub) & `pionc build --target wasm32` (.ssa/.wasm).
@@ -745,6 +747,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/closure_early_ret_and_infer/run_e2e.sh
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC"
 # Round 232: untyped tuple array literal -> generic Array[(K, V)] monomorphization (dev, --release, wasm32, ASan/LSan).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC"
+# PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.

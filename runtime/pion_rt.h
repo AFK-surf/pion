@@ -280,8 +280,20 @@ int64_t  pion_fs_lock(const char *path);
 void     pion_fs_unlock(int64_t handle);
 char*    pion_fs_canon_path(const char *path);
 int64_t  pion_cli_getpid(void);
+int64_t  pion_cli_getppid(void);
 int64_t  pion_cli_next_seq(void);
 int32_t  pion_cli_is_windows(void);
+int32_t  pion_cli_cpu_count(void);
+int32_t  pion_cli_pid_alive(int64_t pid);
+int32_t  pion_cli_watch_parent(int64_t expected_ppid);
+char*    pion_cli_self_exe_path(void);
+char*    pion_cli_self_image_id(void);
+int64_t  pion_cli_spawn_ws_worker(const char *exe, const char *spec_path,
+                                  const char *res_path, const char *expected_fp,
+                                  const char *parent_pid_str);
+int64_t  pion_cli_wait_any_ws_worker(void);
+int32_t  pion_cli_last_ws_worker_rc(void);
+int32_t  pion_cli_can_reap_children(void);
 int32_t  pion_fs_lstat_kind(const char *path);
 void*    pion_world_fs_list_dir(void *w, void *path_str);
 int32_t  pion_world_fs_remove(void *w, void *path_str);

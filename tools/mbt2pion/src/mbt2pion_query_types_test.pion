@@ -1,0 +1,346 @@
+///| Tests for `query_types` Stage A.5 acceleration, span remapping, and real-type capacity checks.
+
+test "query_types: streaming parser, pkg-hash stripping, and ambiguous/error fail-closed" {
+  assert_true(qt_strip_pkg_hash("mbt_compat__d0db2732::ArrayView[Int]") == "mbt_compat::ArrayView[Int]", "strip 8-hex pkg hash")
+  assert_true(qt_strip_pkg_hash("Array[Int]") == "Array[Int]", "plain type unchanged")
+  assert_true(qt_strip_pkg_hash("mbt_compat__nothex!!::Foo") == "mbt_compat__nothex!!::Foo", "non-hex suffix untouched")
+
+  // Protocol error, malformed JSON, leading garbage, trailing garbage, bad escapes, and mismatched brackets must fail closed
+  let bad1 = parse_pkg_query_types_json("{\"protocol_error\":\"bad\",\"types\":[]}")
+  assert_true(!bad1.ok, "protocol_error must fail closed")
+  let bad2 = parse_pkg_query_types_json("{broken")
+  assert_true(!bad2.ok, "malformed json must fail closed")
+  assert_true(!parse_pkg_query_types_json("junk {\"types\":[]}").ok, "leading garbage must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"types\":[]} junk").ok, "trailing garbage must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"types\":[],\"extra\":[}]}").ok, "mismatched brackets must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"types\":[{\"file\":\"src/a\\x.pion\"}]}").ok, "invalid escape must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"id\":1,\"ok\":true,\"diagnostics\":[0,],\"types\":[]}").ok, "array trailing comma must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[],}").ok, "object trailing comma must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[],\"note\":\"\\q\"}").ok, "invalid escape in skipped string must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[],\"note\":\"\\u123\"}").ok, "truncated unicode escape must fail closed")
+  assert_true(!parse_pkg_query_types_json("{\"id\":1,\"ok\":true,\"diagnostics\":[]\"types\":[]}").ok, "missing comma between top-level entries must fail closed")
+
+  // Valid server response with `types` array, `ty_canon`, `receiver_ty`, and `ambiguous: true`
+  let src = "fn f(s : String, xs : Array[Int], v : mbt_compat::ArrayView[Int]) -> Int {\n  let a = s.length()\n  let b = v[0]\n  let c = xs[0]\n  a + b + c\n}\n"
+  let len_op = src.index_of("length")
+  let v_start = src.index_of("v[0]")
+  let v_op = v_start + 1
+  let xs_start = src.index_of("xs[0]")
+  let xs_op = xs_start + 2
+  let json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + (len_op - 2).to_string() + ",\"end_byte\":" + (len_op + 8).to_string() + ",\"op_byte\":" + len_op.to_string() + ",\"ty\":\"Int\",\"receiver_ty\":\"String\"}," +
+  "{\"start_byte\":" + v_start.to_string() + ",\"end_byte\":" + v_op.to_string() + ",\"ty\":\"mbt_compat__d0db2732::ArrayView[Int]\",\"ty_canon\":\"mbt_compat__d0db2732::ArrayView[Int]\"}," +
+  "{\"start_byte\":" + xs_start.to_string() + ",\"end_byte\":" + xs_op.to_string() + ",\"ty\":\"Array[Int]\",\"ambiguous\":true}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(json)
+  assert_true(qt.ok, "valid server response should parse")
+  let qfi = match qt.files.get("a.pion") {
+    Some(x) => x
+    None => panic("missing a.pion in PkgQueryTypes")
+  }
+  let mk_site = fn(kind : String, sb : Int, eb : Int, ob : Int) -> ProbeSite {
+    ProbeSite::{
+      probe_id: "q1_1",
+      file: "a.pion",
+      probe_kind: kind,
+      start_byte: sb,
+      end_byte: eb,
+      op_byte: ob,
+      line: 1,
+      col: 1,
+      lhs_expr: "",
+      rhs_expr: "",
+      assign_op: "",
+      slice_hi: "",
+      divisor_is_zero: false,
+      rhs_has_lit: false,
+      rhs_is_neg: false,
+      rhs_u64: 0UL,
+      rhs_overflow: false,
+    }
+  }
+  // `.length()` resolves to `String`
+  assert_true(
+    lookup_probe_site_type_from_qt(qfi, src, mk_site("mbt_len_probe", len_op - 2, len_op + 8, len_op)) == Some("String"),
+    ".length() receiver must resolve to String",
+  )
+  // `v[0]` strips package hash to `mbt_compat::ArrayView[Int]`
+  assert_true(
+    lookup_probe_site_type_from_qt(qfi, src, mk_site("mbt_idx_probe", v_start, v_start + 4, v_op)) == Some("mbt_compat::ArrayView[Int]"),
+    "index receiver must strip pkg hash",
+  )
+  // `xs[0]` has `ambiguous: true` -> MUST return None (fail-closed)
+  let amb_res = lookup_probe_site_type_from_qt(qfi, src, mk_site("mbt_idx_probe", xs_start, xs_start + 5, xs_op))
+  assert_true(match amb_res { None => true, Some(_) => false }, "ambiguous entry must fail closed")
+}
+
+test "query_types: remap_qt_file_index preserves enclosing outer span across nested rewrite" {
+  // Simulate rewriting inner `s.length()` inside `arr[s.length()]`
+  let old_src = "arr[s.length()]"
+  let inner_s = 4
+  let inner_e = 14
+  let repl = "mbt_compat::utf16_len(s)"
+  let qfi = QtFileIndex::{
+    rel_path: "a.pion",
+    exprs: [
+      QtExprEntry::{
+        start_byte: 0,
+        end_byte: 3,
+        op_byte: -1,
+        role: "",
+        ty: "Array[Int]",
+        ty_canon: "Array[Int]",
+        receiver_ty: "",
+        receiver_ty_canon: "",
+        ambiguous: false,
+      },
+      QtExprEntry::{
+        start_byte: 0,
+        end_byte: 15,
+        op_byte: 3,
+        role: "",
+        ty: "Int",
+        ty_canon: "Int",
+        receiver_ty: "",
+        receiver_ty_canon: "",
+        ambiguous: false,
+      },
+      QtExprEntry::{
+        start_byte: inner_s,
+        end_byte: inner_e,
+        op_byte: 6,
+        role: "",
+        ty: "Int",
+        ty_canon: "Int",
+        receiver_ty: "String",
+        receiver_ty_canon: "String",
+        ambiguous: false,
+      },
+    ],
+    calls: [],
+    by_op_byte: Map(),
+    by_span: Map(),
+    calls_by_op: Map(),
+    interp_holes: [],
+    for_iters: [],
+  }
+  let remapped = remap_qt_file_index(qfi, [(inner_s, inner_e, repl)])
+  let new_src = apply_byte_edits(old_src, [(inner_s, inner_e, repl)])
+  // Outer receiver `arr` at [0, 3) is preserved, outer `arr[...]` end_byte shifted by +10, inner op_byte invalidated
+  assert_true(
+    qt_lookup_receiver_ty_at_op(remapped, new_src, 3, 0, new_src.length(), false) == Some("Array[Int]"),
+    "remapped outer index receiver must still resolve to Array[Int]",
+  )
+  assert_true(!remapped.by_op_byte.contains(6), "replaced inner op_byte must be invalidated")
+}
+
+test "query_types: real-type shrink_snapshot_hazard clears disjoint nominal types and fails closed on generic/ambiguous" {
+  let src = "struct ListboxEntry { id : Int }\nstruct MenubarEntry { id : Int }\nstruct LB { entries : Array[ListboxEntry] }\nstruct MB { entries : Array[MenubarEntry] }\nfn helper() -> Unit {}\nfn iter_lb(lb : LB) -> Unit {\n  for e in lb.entries {\n    helper()\n  }\n}\nfn shrink_mb(mb : MB) -> Unit {\n  mb.entries.shrink_to_fit()\n}\nfn shrink_lb(lb : LB) -> Unit {\n  lb.entries.shrink_to_fit()\n}\n"
+  let toks = lex_moonbit(src)
+  let lb_iter_s = src.index_of("lb.entries {")
+  let lb_iter_e = lb_iter_s + 10
+  let mb_shr_s = src.index_of("mb.entries.shrink_to_fit")
+  let mb_shr_e = mb_shr_s + 10
+  let lb_shr_s = src.index_of("lb.entries.shrink_to_fit")
+  let lb_shr_e = lb_shr_s + 10
+
+  // 1. Without query_types: lexical tail `entries` blocks BOTH `shrink_mb` and `shrink_lb`
+  let pkg_no_qt = collect_shrink_pkg_tokens([toks])
+  let mut mb_name_i = -1
+  let mut lb_name_i = -1
+  let mut i = 0
+  while i < toks.length() {
+    if toks[i].raw == "shrink_to_fit" {
+      if mb_name_i < 0 { mb_name_i = i } else { lb_name_i = i }
+    }
+    i = i + 1
+  }
+  assert_true(shrink_snapshot_hazard(toks, mb_name_i, pkg_no_qt).length() > 0, "lexical fallback blocks mb")
+  assert_true(shrink_snapshot_hazard(toks, lb_name_i, pkg_no_qt).length() > 0, "lexical fallback blocks lb")
+
+  // 2. With concrete ground query_types: `mb.entries` (Array[MenubarEntry]) is disjoint from `lb.entries` (Array[ListboxEntry])!
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + lb_iter_s.to_string() + ",\"end_byte\":" + lb_iter_e.to_string() + ",\"ty\":\"Array[ListboxEntry]\"}," +
+  "{\"start_byte\":" + mb_shr_s.to_string() + ",\"end_byte\":" + mb_shr_e.to_string() + ",\"ty\":\"Array[MenubarEntry]\"}," +
+  "{\"start_byte\":" + lb_shr_s.to_string() + ",\"end_byte\":" + lb_shr_e.to_string() + ",\"ty\":\"Array[ListboxEntry]\"}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  let pkg_qt = collect_shrink_pkg_tokens_with_qt([toks], ["a.pion"], [src], qt)
+  let qfi = qt.files.get("a.pion")
+  assert_true(shrink_snapshot_hazard_with_qt(toks, mb_name_i, pkg_qt, src, qfi) == "", "disjoint nominal type must clear")
+  assert_true(shrink_snapshot_hazard_with_qt(toks, lb_name_i, pkg_qt, src, qfi).length() > 0, "same nominal type must stay blocked")
+
+  // 3. With `ambiguous: true` on `mb.entries`: MUST fail closed!
+  let qt_ambig_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + lb_iter_s.to_string() + ",\"end_byte\":" + lb_iter_e.to_string() + ",\"ty\":\"Array[ListboxEntry]\"}," +
+  "{\"start_byte\":" + mb_shr_s.to_string() + ",\"end_byte\":" + mb_shr_e.to_string() + ",\"ty\":\"Array[MenubarEntry]\",\"ambiguous\":true}" +
+  "],\"call_targets\":[]}]}"
+  let qt_ambig = parse_pkg_query_types_json(qt_ambig_json)
+  let pkg_ambig = collect_shrink_pkg_tokens_with_qt([toks], ["a.pion"], [src], qt_ambig)
+  assert_true(shrink_snapshot_hazard_with_qt(toks, mb_name_i, pkg_ambig, src, qt_ambig.files.get("a.pion")).length() > 0, "ambiguous receiver must fail closed")
+
+  // 4. With generic `Array[T]` on `mb.entries`: MUST fail closed!
+  let qt_gen_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + lb_iter_s.to_string() + ",\"end_byte\":" + lb_iter_e.to_string() + ",\"ty\":\"Array[ListboxEntry]\"}," +
+  "{\"start_byte\":" + mb_shr_s.to_string() + ",\"end_byte\":" + mb_shr_e.to_string() + ",\"ty\":\"Array[T]\"}" +
+  "],\"call_targets\":[]}]}"
+  let qt_gen = parse_pkg_query_types_json(qt_gen_json)
+  let pkg_gen = collect_shrink_pkg_tokens_with_qt([toks], ["a.pion"], [src], qt_gen)
+  assert_true(shrink_snapshot_hazard_with_qt(toks, mb_name_i, pkg_gen, src, qt_gen.files.get("a.pion")).length() > 0, "generic Array[T] must fail closed")
+}
+
+test "query_types: real-type kept_iter_hazard clears disjoint Map/Array mutations and blocks same-type or user-struct" {
+  let src = "struct Item { v : Int }\nstruct Other { v : Int }\nstruct Widget { items : Array[Item] }\nfn f(xs : Array[Item], m : Map[Int, Int], ys : Array[Other], w : Widget) -> Int {\n  let it = xs.iter()\n  m.remove(1)\n  ys.remove(0)\n  it.count()\n}\nfn g(xs : Array[Item], w : Widget) -> Int {\n  let it = xs.iter()\n  w.remove(0)\n  it.count()\n}\n"
+  let toks = lex_moonbit(src)
+  let decl_tys : Map[String, Bool] = Map()
+  decl_tys["Item"] = true
+  decl_tys["Other"] = true
+  decl_tys["Widget"] = true
+
+  let f_xs_s = src.index_of("xs.iter()")
+  let m_s = src.index_of("m.remove")
+  let ys_s = src.index_of("ys.remove")
+  let g_xs_s = src.index_of("fn g(")
+  let g_iter_s = src.slice(g_xs_s, src.length()).index_of("xs.iter()") + g_xs_s
+  let w_s = src.index_of("w.remove")
+
+  let mut f_dot = -1
+  let mut g_dot = -1
+  let mut i = 0
+  while i + 1 < toks.length() {
+    if toks[i].kind == TokenKind::Dot && toks[i + 1].raw == "iter" {
+      if f_dot < 0 { f_dot = i } else { g_dot = i }
+    }
+    i = i + 1
+  }
+  // Without query_types: `m.remove(1)` / `ys.remove(0)` triggers lexical hazard in `f`
+  assert_true(kept_iter_hazard(toks, f_dot).length() > 0, "lexical fallback blocks Map::remove")
+
+  // With query_types: `f` clears (Map[Int, Int] and Array[Other] are disjoint built-in containers from Array[Item]),
+  // while `g` stays BLOCKED (`Widget::remove` is a user struct method that could mutate `Array[Item]`)!
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + f_xs_s.to_string() + ",\"end_byte\":" + (f_xs_s + 2).to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + m_s.to_string() + ",\"end_byte\":" + (m_s + 1).to_string() + ",\"ty\":\"Map[Int, Int]\"}," +
+  "{\"start_byte\":" + ys_s.to_string() + ",\"end_byte\":" + (ys_s + 2).to_string() + ",\"ty\":\"Array[Other]\"}," +
+  "{\"start_byte\":" + g_iter_s.to_string() + ",\"end_byte\":" + (g_iter_s + 2).to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + w_s.to_string() + ",\"end_byte\":" + (w_s + 1).to_string() + ",\"ty\":\"Widget\"}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  let qfi = qt.files.get("a.pion")
+  assert_true(kept_iter_hazard_with_qt(toks, f_dot, src, qfi, decl_tys) == "", "disjoint built-in containers must clear")
+  assert_true(kept_iter_hazard_with_qt(toks, g_dot, src, qfi, decl_tys).length() > 0, "user struct .remove must stay blocked")
+}
+
+test "query_types: generic type parameter shadowing top-level struct T stays fail-closed" {
+  let src = "struct T { x : Int }\nstruct Item { id : Int }\nstruct Holder { entries : Array[Item] }\nfn helper() -> Unit {}\nfn iter_h(h : Holder) -> Unit {\n  for e in h.entries {\n    helper()\n  }\n}\nfn shrink_any[T](entries : Array[T]) -> Unit {\n  entries.shrink_to_fit()\n}\n"
+  let toks = lex_moonbit(src)
+  let h_iter_s = src.index_of("h.entries {")
+  let h_iter_e = h_iter_s + 9
+  let gen_shr_s = src.index_of("entries.shrink_to_fit")
+  let gen_shr_e = gen_shr_s + 7
+  let mut shr_i = -1
+  let mut i = 0
+  while i < toks.length() {
+    if toks[i].raw == "shrink_to_fit" {
+      shr_i = i
+      break
+    }
+    i = i + 1
+  }
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + h_iter_s.to_string() + ",\"end_byte\":" + h_iter_e.to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + gen_shr_s.to_string() + ",\"end_byte\":" + gen_shr_e.to_string() + ",\"ty\":\"Array[T]\"}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  let pkg_qt = collect_shrink_pkg_tokens_with_qt([toks], ["a.pion"], [src], qt)
+  let qfi = qt.files.get("a.pion")
+  assert_true(
+    shrink_snapshot_hazard_with_qt(toks, shr_i, pkg_qt, src, qfi).length() > 0,
+    "generic type param T shadowing struct T must remain fail-closed",
+  )
+}
+
+test "query_types: kept_iter blocks blit_to, retain callback, and Map[UserKey, V] mutations" {
+  let src = "struct Item { v : Int }\nstruct Other { v : Int }\nstruct UserKey { k : Int }\nfn f_blit(xs : Array[Item], src : FixedArray[Item]) -> Int {\n  let it = xs.iter()\n  src.blit_to(xs, 0)\n  it.count()\n}\nfn f_retain(xs : Array[Item], ys : Array[Other]) -> Int {\n  let it = xs.iter()\n  ys.retain(top_fn)\n  it.count()\n}\nfn f_map(xs : Array[Item], m : Map[UserKey, Int], k : UserKey) -> Int {\n  let it = xs.iter()\n  m.remove(k)\n  it.count()\n}\n"
+  let toks = lex_moonbit(src)
+  let decl_tys : Map[String, Bool] = Map()
+  decl_tys["Item"] = true
+  decl_tys["Other"] = true
+  decl_tys["UserKey"] = true
+
+  let dots : Array[Int] = []
+  let mut i = 0
+  while i + 1 < toks.length() {
+    if toks[i].kind == TokenKind::Dot && toks[i + 1].raw == "iter" {
+      dots.push(i)
+    }
+    i = i + 1
+  }
+  let p_blit = src.index_of("src.blit_to")
+  let p_ret = src.index_of("ys.retain")
+  let p_map = src.index_of("m.remove")
+  let d0_xs = toks[dots[0] - 1].start_byte
+  let d1_xs = toks[dots[1] - 1].start_byte
+  let d2_xs = toks[dots[2] - 1].start_byte
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":" + d0_xs.to_string() + ",\"end_byte\":" + (d0_xs + 2).to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + p_blit.to_string() + ",\"end_byte\":" + (p_blit + 3).to_string() + ",\"ty\":\"FixedArray[Item]\"}," +
+  "{\"start_byte\":" + d1_xs.to_string() + ",\"end_byte\":" + (d1_xs + 2).to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + p_ret.to_string() + ",\"end_byte\":" + (p_ret + 2).to_string() + ",\"ty\":\"Array[Other]\"}," +
+  "{\"start_byte\":" + d2_xs.to_string() + ",\"end_byte\":" + (d2_xs + 2).to_string() + ",\"ty\":\"Array[Item]\"}," +
+  "{\"start_byte\":" + p_map.to_string() + ",\"end_byte\":" + (p_map + 1).to_string() + ",\"ty\":\"Map[UserKey, Int]\"}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  let qfi = qt.files.get("a.pion")
+  assert_true(kept_iter_hazard_with_qt(toks, dots[0], src, qfi, decl_tys).length() > 0, "blit_to must stay blocked")
+  assert_true(kept_iter_hazard_with_qt(toks, dots[1], src, qfi, decl_tys).length() > 0, "retain callback must stay blocked")
+  assert_true(kept_iter_hazard_with_qt(toks, dots[2], src, qfi, decl_tys).length() > 0, "Map[UserKey, Int]::remove must stay blocked")
+}
+
+test "query_types: ambiguous without receiver_ty never falls through to span lookup" {
+  let src = "s.length()"
+  // op_byte=2 (`length`) has an ambiguous entry with omitted receiver_ty, while span [0, 1) (`s`) has `String`.
+  // Strict 3-state lookup MUST short-circuit fail-closed (None) and NEVER fall through to [0, 1).
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[" +
+  "{\"start_byte\":0,\"end_byte\":1,\"ty\":\"String\"}," +
+  "{\"start_byte\":0,\"end_byte\":10,\"op_byte\":2,\"ty\":\"Int\",\"ambiguous\":true}" +
+  "],\"call_targets\":[]}]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  let qfi = match qt.files.get("a.pion") {
+    Some(x) => x
+    None => panic("missing a.pion")
+  }
+  let res = qt_lookup_receiver_ty_at_op(qfi, src, 2, 0, 10, false)
+  assert_true(match res { None => true, Some(_) => false }, "explicit ambiguous op_byte must short-circuit without falling through to span")
+}
+
+test "query_types: real __mbt_probe filename stays distinct and duplicate file key fails closed" {
+  // Real file `a__mbt_probe.pion` must NOT be normalized to `a.pion`!
+  let qt_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[" +
+  "{\"file\":\"src/a.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":1,\"ty\":\"String\"}],\"call_targets\":[]}," +
+  "{\"file\":\"src/a__mbt_probe.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":1,\"ty\":\"Bytes\"}],\"call_targets\":[]}" +
+  "]}"
+  let qt = parse_pkg_query_types_json(qt_json)
+  assert_true(qt.ok, "distinct a.pion and a__mbt_probe.pion must parse")
+  assert_true(qt.files.contains("a.pion"), "a.pion present")
+  assert_true(qt.files.contains("a__mbt_probe.pion"), "a__mbt_probe.pion preserved without renaming")
+  match qt.files.get("a.pion") {
+    Some(qfi) => assert_true(qfi.exprs[0].ty == "String", "a.pion keeps String")
+    None => panic("missing a.pion")
+  }
+  match qt.files.get("a__mbt_probe.pion") {
+    Some(qfi) => assert_true(qfi.exprs[0].ty == "Bytes", "a__mbt_probe.pion keeps Bytes")
+    None => panic("missing a__mbt_probe.pion")
+  }
+
+  // Duplicate `file` key in JSON must remove that file from the index (fail-closed -> fallback)
+  let dup_json = "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[" +
+  "{\"file\":\"src/a.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":1,\"ty\":\"String\"}],\"call_targets\":[]}," +
+  "{\"file\":\"src/a.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":1,\"ty\":\"Bytes\"}],\"call_targets\":[]}," +
+  "{\"file\":\"src/b.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":1,\"ty\":\"Int\"}],\"call_targets\":[]}" +
+  "]}"
+  let dup_qt = parse_pkg_query_types_json(dup_json)
+  assert_true(dup_qt.ok, "duplicate file entry keeps package parse ok")
+  assert_true(!dup_qt.files.contains("a.pion"), "conflicted a.pion must be dropped to force fallback")
+  assert_true(dup_qt.files.contains("b.pion"), "non-conflicted b.pion stays indexed")
+}

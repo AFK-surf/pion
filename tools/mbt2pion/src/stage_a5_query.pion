@@ -1,0 +1,814 @@
+///| Query-types accelerated Stage A.5 driver (`include_types: true` over `pionc check --server`).
+///| Queries the compiler's real type table ONCE per package, resolves nested `.length()`, `[i]`, `/`, `%`,
+///| `.to_string()`, `\{expr}`, and `.val` probe layers in-memory via span remapping without extra RPCs,
+///| and runs the exact fail-closed probe fallback in-place while preserving `safe_map_by_file` so already-safe
+///| sites are never re-probed.
+
+///| Resolve the `00_init_order.pion` probe slot for `site` if applicable.
+fn qt_compute_init_slot(
+  init_origins_by_file : Map[String, Array[InitOriginRecord]],
+  init_used_slots : Map[String, Map[Int, Bool]],
+  round_seen_per_item_kind : Map[String, Int],
+  rel_path : String,
+  content : String,
+  site : ProbeSite,
+) -> (String, Int) {
+  let mut site_slot = -1
+  let mut slot_key = ""
+  if rel_path == "00_init_order.pion" || rel_path == "00_init_order_test.pion" {
+    let mut hdr_origin = ""
+    let mut hdr_probes = ""
+    let mut has_hdr = false
+    match lookup_init_origin_record(init_origins_by_file, rel_path, site.line) {
+      Some(rec) => {
+        has_hdr = true
+        hdr_origin = rec.source_file + ":" + rec.line.to_string() + ":" + rec.col.to_string() + ":" + rec.start_line.to_string()
+        hdr_probes = rec.probe_origins
+      }
+      None => {
+        let (hdr_li, ho, hp) = find_init_origin_header(content, rel_path, site.line)
+        if hdr_li >= 0 {
+          has_hdr = true
+          hdr_origin = ho
+          hdr_probes = hp
+        }
+      }
+    }
+    if has_hdr && hdr_probes.length() > 0 {
+      slot_key = rel_path + "|" + hdr_origin + "|" + site.probe_kind
+      let rem_idx = match round_seen_per_item_kind.get(slot_key) {
+        Some(k) => k
+        None => 0
+      }
+      round_seen_per_item_kind[slot_key] = rem_idx + 1
+      let used_m = match init_used_slots.get(slot_key) {
+        Some(m) => m
+        None => Map()
+      }
+      let total_coords = parse_origin_probes_for_kind(hdr_probes, site.probe_kind).length()
+      let mut avail_seen = 0
+      let mut cand = 0
+      while cand < total_coords {
+        if !used_m.contains(cand) {
+          if avail_seen == rem_idx {
+            site_slot = cand
+            break
+          }
+          avail_seen = avail_seen + 1
+        }
+        cand = cand + 1
+      }
+    }
+  }
+  (slot_key, site_slot)
+}
+
+///| Execute Stage A.5 using `query_types_cb` (`include_types: true`) as a single-RPC fast path with
+///| in-memory span remapping across nesting rounds, plus in-place fail-closed fallback to `check_fn`
+///| that preserves `safe_map_by_file` (never re-probing already-proven-safe sites).
+///| Returns `(files, total_rounds, total_instrumented, total_resolved, last_pkg_query_types)`.
+pub fn run_stage_a5_with_query_types(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  init_origins_in : Map[String, Array[InitOriginRecord]],
+  check_fn : (Array[(String, String)]) -> String,
+  query_types_cb : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int, PkgQueryTypes) {
+  run_stage_a5_with_query_types_and_seed(
+    files,
+    recipes,
+    api_map,
+    struct_val_fields,
+    val_probe_sites,
+    init_origins_in,
+    check_fn,
+    query_types_cb,
+    empty_pkg_query_types(),
+    diags,
+    drift_ledger,
+    probe_dispositions,
+    max_rounds,
+  )
+}
+
+pub fn run_stage_a5_with_query_types_and_seed(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  init_origins_in : Map[String, Array[InitOriginRecord]],
+  check_fn : (Array[(String, String)]) -> String,
+  query_types_cb : (Array[(String, String)]) -> String,
+  seed_qt : PkgQueryTypes,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int, PkgQueryTypes) {
+  let val_placeholders_by_file : Map[String, Map[String, Bool]] = Map()
+  for vps in val_probe_sites {
+    match val_placeholders_by_file.get(vps.file) {
+      Some(m) => m[vps.placeholder_ident] = true
+      None => {
+        let m : Map[String, Bool] = Map()
+        m[vps.placeholder_ident] = true
+        val_placeholders_by_file[vps.file] = m
+      }
+    }
+  }
+  let init_origins_by_file : Map[String, Array[InitOriginRecord]] = Map()
+  for k in init_origins_in.keys() {
+    match init_origins_in.get(k) {
+      Some(v) => init_origins_by_file[k] = v
+      None => ()
+    }
+  }
+  let mut cur_files : Array[GeneratedFile] = []
+  let safe_list_by_file : Map[String, Array[Int]] = Map()
+  let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
+  let failed_list_by_file : Map[String, Array[Int]] = Map()
+  let failed_map_by_file : Map[String, Map[Int, Bool]] = Map()
+  let init_used_slots : Map[String, Map[Int, Bool]] = Map()
+  for f in files {
+    cur_files.push(f)
+    safe_list_by_file[f.rel_path] = []
+    safe_map_by_file[f.rel_path] = Map()
+    failed_list_by_file[f.rel_path] = []
+    failed_map_by_file[f.rel_path] = Map()
+  }
+  let (declared_values, declared_types) = collect_package_value_and_type_names(cur_files)
+  let (qual_values, qual_types) = collect_qualified_api_names(api_map)
+
+  let mut total_rounds = 0
+  let mut total_instrumented = 0
+  let mut total_resolved = 0
+  let mut global_probe_seq = 0
+  let mut last_qt = empty_pkg_query_types()
+  let qt_by_file : Map[String, QtFileIndex] = Map()
+  let mut qt_queried = false
+  let mut qt_ok = false
+
+  // Phase 1: Single-RPC query_types fast path with in-memory QtFileIndex span remapping across nesting layers.
+  let mut qt_pass = 0
+  while qt_pass < max_rounds {
+    let sites_by_file : Map[String, Array[ProbeSite]] = Map()
+    let mut round_probes = 0
+    for f in cur_files {
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let skip_map : Map[Int, Bool] = Map()
+      for k in smap.keys() { skip_map[k] = true }
+      for k in fmap.keys() { skip_map[k] = true }
+      let file_val_placeholders = match val_placeholders_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let (_, raw_sites) = instrument_probes_for_file_with_safe(
+        f.rel_path,
+        f.content,
+        skip_map,
+        0,
+        declared_values,
+        declared_types,
+        qual_values,
+        qual_types,
+        file_val_placeholders,
+      )
+      let numbered_sites : Array[ProbeSite] = []
+      for rs in raw_sites {
+        global_probe_seq = global_probe_seq + 1
+        let pid = "q" + (qt_pass + 1).to_string() + "_" + global_probe_seq.to_string()
+        numbered_sites.push(ProbeSite::{
+          probe_id: pid,
+          file: rs.file,
+          probe_kind: rs.probe_kind,
+          start_byte: rs.start_byte,
+          end_byte: rs.end_byte,
+          op_byte: rs.op_byte,
+          line: rs.line,
+          col: rs.col,
+          lhs_expr: rs.lhs_expr,
+          rhs_expr: rs.rhs_expr,
+          assign_op: rs.assign_op,
+          slice_hi: rs.slice_hi,
+          divisor_is_zero: rs.divisor_is_zero,
+          rhs_has_lit: rs.rhs_has_lit,
+          rhs_is_neg: rs.rhs_is_neg,
+          rhs_u64: rs.rhs_u64,
+          rhs_overflow: rs.rhs_overflow,
+        })
+      }
+      sites_by_file[f.rel_path] = numbered_sites
+      round_probes = round_probes + numbered_sites.length()
+    }
+
+    if round_probes == 0 {
+      break
+    }
+
+    if !qt_queried {
+      qt_queried = true
+      let qt = if seed_qt.ok {
+        seed_qt
+      } else {
+        let plain_batch : Array[(String, String)] = []
+        for f in cur_files {
+          plain_batch.push((f.rel_path, f.content))
+        }
+        let qt_raw = query_types_cb(plain_batch)
+        parse_pkg_query_types_json(qt_raw)
+      }
+      if qt.ok {
+        qt_ok = true
+        last_qt = qt
+        for k in qt.files.keys() {
+          match qt.files.get(k) {
+            Some(qfi) => qt_by_file[k] = qfi
+            None => ()
+          }
+        }
+        if !seed_qt.ok {
+          total_rounds = total_rounds + 1
+        }
+      }
+    }
+    if !qt_ok {
+      break
+    }
+
+    let next_files : Array[GeneratedFile] = []
+    let mut qt_resolved_this_pass = 0
+    let mut any_changed = false
+    let mut newly_marked_safe = false
+    for f in cur_files {
+      let sites = match sites_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let slist = match safe_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let flist = match failed_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let edits : Array[(Int, Int, String)] = []
+      let remap_edits : Array[(Int, Int, String, String, String)] = []
+      let round_seen_per_item_kind : Map[String, Int] = Map()
+      let round_newly_used : Array[(String, Int)] = []
+      let mut file_used_idents_base : Option[Map[String, Bool]] = None
+      match qt_by_file.get(f.rel_path) {
+        Some(qfi) => {
+          for site in sites {
+            let (slot_key, site_slot) = qt_compute_init_slot(
+              init_origins_by_file,
+              init_used_slots,
+              round_seen_per_item_kind,
+              f.rel_path,
+              f.content,
+              site,
+            )
+            match lookup_probe_site_type_from_qt(qfi, f.content, site) {
+              Some(matched_ty) => {
+                qt_resolved_this_pass = qt_resolved_this_pass + 1
+                total_resolved = total_resolved + 1
+                if slot_key.length() > 0 && site_slot >= 0 {
+                  round_newly_used.push((slot_key, site_slot))
+                }
+                let (disp_file, disp_line, disp_col) = resolve_init_order_origin_structured(
+                  init_origins_by_file,
+                  f.content,
+                  f.rel_path,
+                  site.line,
+                  site.col,
+                  site.probe_kind,
+                  site_slot,
+                )
+                let file_used_idents = match file_used_idents_base {
+                  Some(base) => base.copy()
+                  None => {
+                    let base = collect_used_idents(f.content)
+                    file_used_idents_base = Some(base)
+                    base.copy()
+                  }
+                }
+                match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
+                  Some(repl) => {
+                    edits.push((site.start_byte, site.end_byte, repl))
+                    remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+                    probe_dispositions.push(ProbeDisposition::{
+                      probe_id: site.probe_id,
+                      probe_kind: site.probe_kind,
+                      file: disp_file,
+                      line: disp_line,
+                      col: disp_col,
+                      resolved_type: matched_ty,
+                      disposition: "rewritten",
+                    })
+                  }
+                  None => {
+                    if !smap.contains(site.op_byte) {
+                      smap[site.op_byte] = true
+                      slist.push(site.op_byte)
+                      newly_marked_safe = true
+                    }
+                    probe_dispositions.push(ProbeDisposition::{
+                      probe_id: site.probe_id,
+                      probe_kind: site.probe_kind,
+                      file: disp_file,
+                      line: disp_line,
+                      col: disp_col,
+                      resolved_type: matched_ty,
+                      disposition: "kept_safe",
+                    })
+                  }
+                }
+              }
+              None => ()
+            }
+          }
+        }
+        None => ()
+      }
+      for nu in round_newly_used {
+        match init_used_slots.get(nu.0) {
+          Some(m) => m[nu.1] = true
+          None => {
+            let m : Map[Int, Bool] = Map()
+            m[nu.1] = true
+            init_used_slots[nu.0] = m
+          }
+        }
+      }
+      if edits.length() > 0 {
+        any_changed = true
+        let updated = apply_byte_edits(f.content, edits)
+        match init_origins_by_file.get(f.rel_path) {
+          Some(recs) => init_origins_by_file[f.rel_path] = remap_init_origin_records(recs, f.content, edits)
+          None => ()
+        }
+        let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
+        let (nfl, nfm) = remap_safe_offsets(f.content, flist, remap_edits)
+        safe_list_by_file[f.rel_path] = nl
+        safe_map_by_file[f.rel_path] = nm
+        failed_list_by_file[f.rel_path] = nfl
+        failed_map_by_file[f.rel_path] = nfm
+        match qt_by_file.get(f.rel_path) {
+          Some(qfi) => qt_by_file[f.rel_path] = remap_qt_file_index(qfi, edits)
+          None => ()
+        }
+        next_files.push(GeneratedFile::{
+          rel_path: f.rel_path,
+          content: updated,
+          source_file: f.source_file,
+          anchors: f.anchors,
+        })
+      } else {
+        safe_list_by_file[f.rel_path] = slist
+        safe_map_by_file[f.rel_path] = smap
+        failed_list_by_file[f.rel_path] = flist
+        failed_map_by_file[f.rel_path] = fmap
+        next_files.push(f)
+      }
+    }
+
+    if qt_resolved_this_pass > 0 && (any_changed || newly_marked_safe) {
+      total_instrumented = total_instrumented + qt_resolved_this_pass
+      cur_files = next_files
+      qt_pass = qt_pass + 1
+      continue
+    }
+    break
+  }
+
+  // Phase 2: In-place fail-closed probe fallback for any remaining un-disposed sites
+  // (e.g. slice/debug/show_trait/ufcs/match_scrut probes or ambiguous/untyped expressions),
+  // preserving `safe_map_by_file`, `failed_map_by_file`, and `init_used_slots` so already-safe
+  // sites are NEVER re-probed!
+  let mut fb_round = 0
+  let rem_max = if max_rounds > total_rounds { max_rounds - total_rounds } else { 1 }
+  while fb_round < rem_max {
+    let instrumented_batch : Array[(String, String)] = []
+    let sites_by_file : Map[String, Array[ProbeSite]] = Map()
+    let mut round_probes = 0
+
+    for f in cur_files {
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let skip_map : Map[Int, Bool] = Map()
+      for k in smap.keys() { skip_map[k] = true }
+      for k in fmap.keys() { skip_map[k] = true }
+      let file_val_placeholders = match val_placeholders_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let (inst_src, raw_sites) = instrument_probes_for_file_with_safe(
+        f.rel_path,
+        f.content,
+        skip_map,
+        0,
+        declared_values,
+        declared_types,
+        qual_values,
+        qual_types,
+        file_val_placeholders,
+      )
+      let numbered_sites : Array[ProbeSite] = []
+      for rs in raw_sites {
+        global_probe_seq = global_probe_seq + 1
+        let pid = "p" + (fb_round + 1).to_string() + "_" + global_probe_seq.to_string()
+        numbered_sites.push(ProbeSite::{
+          probe_id: pid,
+          file: rs.file,
+          probe_kind: rs.probe_kind,
+          start_byte: rs.start_byte,
+          end_byte: rs.end_byte,
+          op_byte: rs.op_byte,
+          line: rs.line,
+          col: rs.col,
+          lhs_expr: rs.lhs_expr,
+          rhs_expr: rs.rhs_expr,
+          assign_op: rs.assign_op,
+          slice_hi: rs.slice_hi,
+          divisor_is_zero: rs.divisor_is_zero,
+          rhs_has_lit: rs.rhs_has_lit,
+          rhs_is_neg: rs.rhs_is_neg,
+          rhs_u64: rs.rhs_u64,
+          rhs_overflow: rs.rhs_overflow,
+        })
+      }
+      let tagged_src = tag_instrumented_probes_unique(inst_src, numbered_sites)
+      instrumented_batch.push((f.rel_path, tagged_src))
+      sites_by_file[f.rel_path] = numbered_sites
+      round_probes = round_probes + numbered_sites.length()
+    }
+
+    if round_probes == 0 {
+      break
+    }
+
+    total_rounds = total_rounds + 1
+    total_instrumented = total_instrumented + round_probes
+
+    let raw_json = check_fn(instrumented_batch)
+    let pionc_diags = parse_pionc_diagnostics(raw_json)
+
+    let raw_results : Array[ProbeResult] = []
+    for pd in pionc_diags {
+      match extract_probe_with_id_from_diag(pd) {
+        Some((pkind, pid, rty)) =>
+        raw_results.push(ProbeResult::{
+          file: pd.file,
+          line: pd.line,
+          col: pd.col,
+          probe_kind: pkind,
+          probe_id: pid,
+          resolved_type: rty,
+        })
+        None => ()
+      }
+    }
+
+    let probe_results = sort_probe_results(raw_results)
+    let consumed : Array[Bool] = []
+    let mut ci = 0
+    while ci < probe_results.length() {
+      consumed.push(false)
+      ci = ci + 1
+    }
+    let tagged_index : Map[String, Array[Int]] = Map()
+    let tagged_cursor : Map[String, Int] = Map()
+    let mut pri = 0
+    while pri < probe_results.length() {
+      let pr = probe_results[pri]
+      if pr.probe_id.length() > 0 {
+        let bkey = probe_match_key_a5(pr.probe_id, pr.probe_kind)
+        match tagged_index.get(bkey) {
+          Some(b) => b.push(pri)
+          None => tagged_index[bkey] = [pri]
+        }
+      }
+      pri = pri + 1
+    }
+
+    let next_files : Array[GeneratedFile] = []
+    let round_unresolved : Array[(String, String, ProbeSite, Int)] = []
+    let mut any_changed = false
+    let mut newly_marked_safe = false
+    for f in cur_files {
+      let sites = match sites_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let slist = match safe_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let flist = match failed_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let edits : Array[(Int, Int, String)] = []
+      let remap_edits : Array[(Int, Int, String, String, String)] = []
+      let round_seen_per_item_kind : Map[String, Int] = Map()
+      let round_newly_used : Array[(String, Int)] = []
+      let mut file_used_idents_base : Option[Map[String, Bool]] = None
+      for site in sites {
+        let (slot_key, site_slot) = qt_compute_init_slot(
+          init_origins_by_file,
+          init_used_slots,
+          round_seen_per_item_kind,
+          f.rel_path,
+          f.content,
+          site,
+        )
+        let mut matched_idx = -1
+        let round_prefix = "p" + (fb_round + 1).to_string() + "_"
+        if site.probe_id.length() > 0 && site.probe_id.starts_with(round_prefix) {
+          let tkey = probe_match_key_a5(site.probe_id, site.probe_kind)
+          match tagged_index.get(tkey) {
+            Some(bucket) => {
+              let mut cur = match tagged_cursor.get(tkey) {
+                Some(c) => c
+                None => 0
+              }
+              while cur < bucket.length() && consumed[bucket[cur]] {
+                cur = cur + 1
+              }
+              tagged_cursor[tkey] = cur
+              if cur < bucket.length() {
+                let first_idx = bucket[cur]
+                let first_pr = probe_results[first_idx]
+                let first_ty = first_pr.resolved_type.trim()
+                let trusted_ty = qt_is_trusted_type(first_ty)
+                let mut dup_conflict = false
+                let mut bi = cur
+                while bi < bucket.length() {
+                  if !consumed[bucket[bi]] {
+                    let bpr = probe_results[bucket[bi]]
+                    if bpr.resolved_type.trim() != first_ty ||
+                    bpr.file != first_pr.file ||
+                    bpr.line != first_pr.line ||
+                    bpr.col != first_pr.col {
+                      dup_conflict = true
+                    }
+                  }
+                  bi = bi + 1
+                }
+                if !trusted_ty || dup_conflict {
+                  let mut ci2 = cur
+                  while ci2 < bucket.length() {
+                    consumed[bucket[ci2]] = true
+                    ci2 = ci2 + 1
+                  }
+                } else {
+                  matched_idx = first_idx
+                  let mut ci2 = cur + 1
+                  while ci2 < bucket.length() {
+                    consumed[bucket[ci2]] = true
+                    ci2 = ci2 + 1
+                  }
+                }
+              }
+            }
+            None => ()
+          }
+        }
+        if matched_idx >= 0 {
+          consumed[matched_idx] = true
+          total_resolved = total_resolved + 1
+          let matched_ty = probe_results[matched_idx].resolved_type
+          if slot_key.length() > 0 && site_slot >= 0 {
+            round_newly_used.push((slot_key, site_slot))
+          }
+          let (disp_file, disp_line, disp_col) = resolve_init_order_origin_structured(
+            init_origins_by_file,
+            f.content,
+            f.rel_path,
+            site.line,
+            site.col,
+            site.probe_kind,
+            site_slot,
+          )
+          let file_used_idents = match file_used_idents_base {
+            Some(base) => base.copy()
+            None => {
+              let base = collect_used_idents(f.content)
+              file_used_idents_base = Some(base)
+              base.copy()
+            }
+          }
+          match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
+            Some(repl) => {
+              edits.push((site.start_byte, site.end_byte, repl))
+              remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: disp_file,
+                line: disp_line,
+                col: disp_col,
+                resolved_type: matched_ty,
+                disposition: "rewritten",
+              })
+            }
+            None => {
+              if !smap.contains(site.op_byte) {
+                smap[site.op_byte] = true
+                slist.push(site.op_byte)
+                newly_marked_safe = true
+              }
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: disp_file,
+                line: disp_line,
+                col: disp_col,
+                resolved_type: matched_ty,
+                disposition: "kept_safe",
+              })
+            }
+          }
+        } else {
+          round_unresolved.push((f.rel_path, f.content, site, site_slot))
+        }
+      }
+      for nu in round_newly_used {
+        match init_used_slots.get(nu.0) {
+          Some(m) => m[nu.1] = true
+          None => {
+            let m : Map[Int, Bool] = Map()
+            m[nu.1] = true
+            init_used_slots[nu.0] = m
+          }
+        }
+      }
+      if edits.length() > 0 {
+        any_changed = true
+        let updated = apply_byte_edits(f.content, edits)
+        match init_origins_by_file.get(f.rel_path) {
+          Some(recs) => init_origins_by_file[f.rel_path] = remap_init_origin_records(recs, f.content, edits)
+          None => ()
+        }
+        let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
+        let (nfl, nfm) = remap_safe_offsets(f.content, flist, remap_edits)
+        safe_list_by_file[f.rel_path] = nl
+        safe_map_by_file[f.rel_path] = nm
+        failed_list_by_file[f.rel_path] = nfl
+        failed_map_by_file[f.rel_path] = nfm
+        match qt_by_file.get(f.rel_path) {
+          Some(qfi) => qt_by_file[f.rel_path] = remap_qt_file_index(qfi, edits)
+          None => ()
+        }
+        next_files.push(GeneratedFile::{
+          rel_path: f.rel_path,
+          content: updated,
+          source_file: f.source_file,
+          anchors: f.anchors,
+        })
+      } else {
+        safe_list_by_file[f.rel_path] = slist
+        safe_map_by_file[f.rel_path] = smap
+        failed_list_by_file[f.rel_path] = flist
+        failed_map_by_file[f.rel_path] = fmap
+        next_files.push(f)
+      }
+    }
+    cur_files = next_files
+    let will_continue = (any_changed || newly_marked_safe) && (fb_round + 1 < rem_max)
+    if !will_continue {
+      for entry in round_unresolved {
+        let (rel_p, fcontent, site, site_slot) = entry
+        let (rep_file, rep_line, rep_col) = resolve_init_order_origin_structured(
+          init_origins_by_file,
+          fcontent,
+          rel_p,
+          site.line,
+          site.col,
+          site.probe_kind,
+          site_slot,
+        )
+        diags.push(diag_error(
+          "MBT2PION_UNDISPOSED_PROBE_SITE",
+          rep_file,
+          rep_line,
+          rep_col,
+          "unresolved Stage A.5 probe `" + site.probe_id + "` (" + site.probe_kind + ") at " + rep_file + ":" + rep_line.to_string() + ":" + rep_col.to_string(),
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          expr: site.lhs_expr,
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "probe " + site.probe_id + " received no type diagnostic from pionc",
+        })
+        probe_dispositions.push(ProbeDisposition::{
+          probe_id: site.probe_id,
+          probe_kind: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          resolved_type: "",
+          disposition: "unresolved",
+        })
+        match failed_map_by_file.get(rel_p) {
+          Some(fmap) =>
+          if !fmap.contains(site.op_byte) {
+            fmap[site.op_byte] = true
+            match failed_list_by_file.get(rel_p) {
+              Some(flist) => flist.push(site.op_byte)
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
+      break
+    }
+    fb_round = fb_round + 1
+  }
+
+  for f in cur_files {
+    if has_probe_residual(f.content) {
+      diags.push(diag_error(
+        "MBT2PION_PROBE_RESIDUAL",
+        f.rel_path,
+        1,
+        1,
+        "Stage A.5 residual probe identifier found in final output of " + f.rel_path,
+      ))
+    }
+    let smap = match safe_map_by_file.get(f.rel_path) {
+      Some(m) => m
+      None => Map()
+    }
+    let fmap = match failed_map_by_file.get(f.rel_path) {
+      Some(m) => m
+      None => Map()
+    }
+    let audit_skip : Map[Int, Bool] = Map()
+    for k in smap.keys() { audit_skip[k] = true }
+    for k in fmap.keys() { audit_skip[k] = true }
+    audit_undisposed_div_mod(f.rel_path, f.content, audit_skip, 0, 0, diags, drift_ledger)
+    audit_undisposed_raw_tokens(
+      f.rel_path,
+      f.content,
+      audit_skip,
+      0,
+      0,
+      declared_values,
+      declared_types,
+      qual_values,
+      qual_types,
+      diags,
+      drift_ledger,
+    )
+  }
+
+  let final_qt = if qt_ok {
+    PkgQueryTypes::{ ok: true, files: qt_by_file }
+  } else {
+    last_qt
+  }
+  (cur_files, total_rounds, total_instrumented, total_resolved, final_qt)
+}
