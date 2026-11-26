@@ -52,6 +52,10 @@ pub suberror UErr {
   OtherU
 }
 
+pub(all) suberror PubErr {
+  PubBad
+}
+
 pub fn fail_u(x : Int) -> Int raise UErr {
   if x < 0 {
     raise BadU(x * 3)
@@ -254,12 +258,71 @@ pub fn case_renamed_dep_compound_return(stop : Bool) -> Int {
   }
 }
 
+priv suberror FlagErr {
+  Flag(Bool)
+}
+
+fn raise_flag(b : Bool) -> Int raise FlagErr {
+  raise Flag(b)
+}
+
+fn always_fail_g() -> Int raise LocalErr {
+  raise Empty
+}
+
+fn good_or_fail(b : Bool) -> Int raise LocalErr {
+  if b {
+    raise Empty
+  }
+  0
+}
+
+pub fn case_r4_semantics() -> String {
+  // P1-1: `is` scope isolation
+  let s1 = try {
+    let _ = Some(1) is Some(always_fail_g)
+    let _ = always_fail_g()
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  let s2 = if Some(1) is Some(always_fail_g) {
+    always_fail_g
+  } else {
+    0
+  }
+  let s3 = try {
+    let ok = Some(1) is Some(always_fail_g) && always_fail_g > 0
+    let _ = always_fail_g()
+    if ok {
+      99
+    } else {
+      0
+    }
+  } catch {
+    _ => 8
+  }
+  // P2-4: cross-package construction of `pub(all) suberror`
+  let pe : Result[Int, @u.PubErr] = Err(@u.PubErr::PubBad)
+  let s4 = match pe {
+    Ok(v) => v
+    Err(@u.PubErr::PubBad) => 55
+  }
+  // P2-5: exhaustive Bool payload catch
+  let s5 = raise_flag(false) catch {
+    Flag(true) => 1
+    Flag(false) => 2
+  }
+  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string()
+}
+
 pub fn run_all() -> String {
   "X:" + case_cross_pkg() +
     "\nR:" + case_rethrow_and_nested() +
     "\nI:" + case_interp_and_struct_update() +
     "\nH:" + case_headers_in_try() +
-    "\nU:" + case_renamed_dep_compound_return(true).to_string() + "," + case_renamed_dep_compound_return(false).to_string()
+    "\nU:" + case_renamed_dep_compound_return(true).to_string() + "," + case_renamed_dep_compound_return(false).to_string() +
+    "\nS:" + case_r4_semantics()
 }
 '''
 
@@ -267,6 +330,10 @@ NEGATIVE_CASES = [
     (
         "incomplete_catch",
         "priv suberror E { A; B(Int) }\nfn g() -> Int raise E { raise A }\npub fn f() -> Int { g() catch { A => 1 } }\n",
+    ),
+    (
+        "incomplete_bool_catch",
+        "priv suberror E { Flag(Bool) }\nfn g() -> Int raise E { raise Flag(false) }\npub fn f() -> Int { g() catch { Flag(true) => 1 } }\n",
     ),
     (
         "bare_raise",
@@ -382,12 +449,100 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
         )
         print("[f6-1-oracle] PASS: 4-engine (moon native == moon wasm-gc == pion native == pion wasm32) 100% identical!\n" + moon_nat)
+
+        # 3a-1. P1-2 4-target check: user-defined `fn panic(_s : String) -> Int { 42 }` MUST NOT hijack `try!`
+        for tc_name, tc_body in [
+            ("direct_try_bang", "try! g()"),
+            ("compound_try_bang", "try! { let x = g(); x + 1 }"),
+        ]:
+            sh_m = os.path.join(work, f"sh_{tc_name}_moon")
+            os.makedirs(os.path.join(sh_m, "cmd"))
+            sh_src = (
+                "priv suberror E { Bad }\n"
+                "fn panic(_s : String) -> Int { 42 }\n"
+                "fn g() -> Int raise E { raise Bad }\n"
+                f"pub fn run() -> Int {{ {tc_body} }}\n"
+            )
+            with open(os.path.join(sh_m, "moon.mod"), "w") as f:
+                f.write('name = "f6/sh"\n')
+            with open(os.path.join(sh_m, "cmd", "moon.pkg"), "w") as f:
+                f.write('options("is-main": true)\n')
+            with open(os.path.join(sh_m, "cmd", "main.mbt"), "w") as f:
+                f.write(sh_src + "fn main { println(run().to_string()) }\n")
+            mn_r = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=sh_m, check=False)
+            mw_r = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=sh_m, check=False)
+            assert mn_r.returncode != 0 and mw_r.returncode != 0, f"Moon {tc_name} did not trap: nat={mn_r.returncode} wgc={mw_r.returncode}"
+
+            sh_psrc = os.path.join(work, f"sh_{tc_name}_psrc")
+            sh_pout = os.path.join(work, f"sh_{tc_name}_pout")
+            os.makedirs(sh_psrc)
+            os.makedirs(os.path.join(sh_pout, "src"))
+            with open(os.path.join(sh_psrc, "moon.pkg"), "w") as f:
+                f.write("\n")
+            with open(os.path.join(sh_psrc, "sh.mbt"), "w") as f:
+                f.write(sh_src)
+            with open(os.path.join(sh_pout, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "sh_{tc_name}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+            run_cmd([bin_path, "--src", sh_psrc, "--out", os.path.join(sh_pout, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+            with open(os.path.join(sh_pout, "src", "main.pion"), "w") as f:
+                f.write("pub fn main(w : World) -> Int {\n  io_println(w, run().to_string())\n  0\n}\n")
+            pn_r = run_cmd([args.pionc, "run", sh_pout], check=False)
+            pw_r = run_cmd([args.pionc, "run", "--target", "wasm32", sh_pout], check=False)
+            assert pn_r.returncode != 0 and "42" not in pn_r.stdout, f"Pion native {tc_name} hijacked: rc={pn_r.returncode} out={pn_r.stdout!r}"
+            assert pw_r.returncode != 0 and "42" not in pw_r.stdout, f"Pion wasm32 {tc_name} hijacked: rc={pw_r.returncode} out={pw_r.stdout!r}"
+            print(f"[f6-1-oracle] PASS P1-2 unshadowable try! ({tc_name}): 4-target trap confirmed")
+
+        # 3a-2. P1-3 4-target check: swapped dep aliases (`a @b, b @a`) under both --dep orders
+        sw_m = os.path.join(work, "sw_moon")
+        for sub in ("a", "b", "down", "cmd"):
+            os.makedirs(os.path.join(sw_m, sub))
+        sw_files = [
+            ("moon.mod", 'name = "f6/sw"\n'),
+            ("a/moon.pkg", "\n"),
+            ("a/a.mbt", "pub fn fetch() -> Result[Int, Int] { Err(1) }\n"),
+            ("b/moon.pkg", "\n"),
+            ("b/b.mbt", "pub suberror BErr { Bad }\npub fn fetch() -> Int raise BErr { raise Bad }\npub fn ok(fail_now : Bool) -> Int raise BErr { if fail_now { raise Bad }; 0 }\n"),
+            ("down/moon.pkg", 'import { "f6/sw/a" @b, "f6/sw/b" @a }\n'),
+            ("down/down.mbt", "pub fn run_sw() -> Int { try { let _ = @b.fetch(); @a.ok(false) + 42 } catch { _ => 7 } }\n"),
+            ("cmd/moon.pkg", 'import { "f6/sw/down" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@down.run_sw().to_string()) }\n"),
+        ]
+        for rel, txt in sw_files:
+            with open(os.path.join(sw_m, rel), "w") as f:
+                f.write(txt)
+        sw_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=sw_m).stdout.strip()
+        sw_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=sw_m).stdout.strip()
+        assert sw_mn == "42" and sw_mw == "42", f"Swapped alias Moon mismatch: nat={sw_mn!r} wgc={sw_mw!r}"
+
+        sw_pa = os.path.join(work, "sw_pa")
+        sw_pb = os.path.join(work, "sw_pb")
+        for nm, pd in [("a", sw_pa), ("b", sw_pb)]:
+            os.makedirs(os.path.join(pd, "src"))
+            with open(os.path.join(pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "{nm}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+            run_cmd([bin_path, "--src", os.path.join(sw_m, nm), "--out", os.path.join(pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+
+        for ord_name, dep_flags in [
+            ("ab", ["--dep", f"a={sw_pa}", "--dep", f"b={sw_pb}"]),
+            ("ba", ["--dep", f"b={sw_pb}", "--dep", f"a={sw_pa}"]),
+        ]:
+            sw_pd = os.path.join(work, f"sw_pd_{ord_name}")
+            os.makedirs(os.path.join(sw_pd, "src"))
+            with open(os.path.join(sw_pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "down_{ord_name}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\na = {{ path = "{sw_pa}" }}\nb = {{ path = "{sw_pb}" }}\n')
+            run_cmd([bin_path, "--src", os.path.join(sw_m, "down"), "--out", os.path.join(sw_pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc])
+            with open(os.path.join(sw_pd, "src", "main.pion"), "w") as f:
+                f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_sw().to_string())\n  0\n}\n")
+            sw_pn = run_cmd([args.pionc, "run", sw_pd]).stdout.strip()
+            sw_pw = run_cmd([args.pionc, "run", "--target", "wasm32", sw_pd]).stdout.strip()
+            assert sw_pn == "42" and sw_pw == "42", f"Swapped alias Pion ({ord_name}) mismatch: nat={sw_pn!r} wasm={sw_pw!r}"
+        print("[f6-1-oracle] PASS P1-3 swapped aliases (a @b, b @a) in both --dep orders: 4-target == 42")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")

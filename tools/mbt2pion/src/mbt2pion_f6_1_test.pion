@@ -151,7 +151,7 @@ test "F6-1: lower_error local catch, try-catch, noraise, try? and try!" {
   assert_true(str_has(out, "match parse_num(s) { Ok(v) => v + 1, Err("), "try ... catch ... noraise lowered directly")
   assert_true(str_has(out, "(fn() { Ok({ let a = (match parse_num(s) { Ok(") && str_has(out, "return Err("), "compound try body lowered via IIFE with match propagation")
   assert_true(str_has(out, "fn try_q(s : String) -> Result[Int, ParseErr] {\n  parse_num(s)\n}"), "try? on direct call returns Result directly")
-  assert_true(str_has(out, "panic(\"try! failed\")"), "try! panics on Err")
+  assert_true(str_has(out, "mbt_compat::mbt_abort(\"try! failed\")"), "try! calls mbt_compat::mbt_abort on Err")
 }
 
 test "F6-1: lower_error raise functions, methods & non-try-op mode" {
@@ -756,4 +756,75 @@ test "F6-2a R2: Category A soundness, load-order invariance, opaque catch, unann
   let env_core_u8 = build_external_error_env(st_core_u8, [], Map())
   assert_true(le_is_known_non_raising_stdlib(env_core_u8, "u8", "encode"), "canonical core encoding/utf8::encode matches stdlib allowlist")
   assert_true(!le_is_known_non_raising_stdlib(env_core_u8, "u8", "decode"), "raising core encoding/utf8::decode must NOT match non-raising allowlist")
+
+  // 6. R4 P1-1: `is <pat>` scope isolation (no leak into outer block; scoped to `if`/`while` then & `&&` chain only)
+  let d_is2 : Array[Diag] = []
+  let src_is2 = "suberror E { Bad }\nfn g() -> Int raise E { raise Bad }\nfn good(b : Bool) -> Int raise E { if b { raise Bad }; 0 }\nfn t1() -> Int { try { let _ = Some(1) is Some(g); let _ = g(); good(false) + 42 } catch { _ => 7 } }\nfn t2() -> Int { let a = if Some(1) is Some(g) { g } else { g() catch { _ => 9 } }; let ok = Some(1) is Some(g) && g > 0; a + (if ok { g() catch { _ => 3 } } else { 0 }) }\n"
+  let out_is2 = lower_checked_errors_single(src_is2, "is_scope_r4.mbt", default_error_lower_config(), d_is2)
+  assert_true(d_is2.length() == 0 && str_has(out_is2, "match g()"), "R4 P1-1: `let _ = Some(1) is Some(g)` does NOT shadow outer raising `g()`")
+
+  // 7. R4 P1-2: `mbt_compat` shadowing fails closed when emitting `mbt_abort`
+  let d_sh : Array[Diag] = []
+  let src_sh = "suberror E { A }\nfn g() -> Int raise E { raise A }\nfn f() -> Int { let mbt_compat = 1; let _ = mbt_compat; try! g() }\n"
+  let _ = lower_checked_errors_single(src_sh, "mbt_compat_shadow.mbt", default_error_lower_config(), d_sh)
+  assert_true(d_sh.length() > 0 && d_sh[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "R4 P1-2: shadowing mbt_compat fails closed on try!")
+
+  // 8. R4 P1-3: Swapped dep aliases (`a @b, b @a`) resolve cleanly in both lower_error and stage_a
+  let abi_a = PackageAbi::{ package_name: "a", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [], raising_fns: [], publishable: true }
+  let abi_b = PackageAbi::{ package_name: "b", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [], raising_fns: [AbiRaisingFn::{ name: "fetch", err_ty: "b::BErr" }], publishable: true }
+  let st_sw = empty_symbol_table()
+  st_sw.moon_import_paths["b"] = "mod/a"
+  st_sw.moon_import_paths["a"] = "mod/b"
+  st_sw.dep_pkg_names["a"] = true
+  st_sw.dep_pkg_names["b"] = true
+  let env_sw1 = build_external_error_env(st_sw, [("a", abi_a), ("b", abi_b)], Map())
+  let env_sw2 = build_external_error_env(st_sw, [("b", abi_b), ("a", abi_a)], Map())
+  assert_true(
+    le_resolve_external_call_raw(default_error_lower_config(), env_sw1, "b", "fetch") == None &&
+    le_resolve_external_call_raw(default_error_lower_config(), env_sw2, "b", "fetch") == None &&
+    le_resolve_external_call_raw(default_error_lower_config(), env_sw1, "a", "fetch") == Some(("@a.fetch", "b::BErr")) &&
+    le_resolve_external_call_raw(default_error_lower_config(), env_sw2, "a", "fetch") == Some(("@a.fetch", "b::BErr")) &&
+    resolve_pkg_ref_alias(st_sw, "b") == "a" &&
+    resolve_pkg_ref_alias(st_sw, "a") == "b",
+    "R4 P1-3: swapped aliases (a @b, b @a) resolve to exact target packages regardless of dep order",
+  )
+
+  // 9. R4 P2-4: `pub(all) suberror` preserves `pub(all)` visibility modifier
+  let d_pa : Array[Diag] = []
+  let out_pa = lower_checked_errors_single("pub(all) suberror E { Bad }\n", "pub_all_err.mbt", default_error_lower_config(), d_pa)
+  assert_true(d_pa.length() == 0 && str_has(out_pa, "pub(all) enum E"), "R4 P2-4: pub(all) suberror lowers to pub(all) enum")
+
+  // 10. R4 P2-5: Bool & Unit constructor payload exhaustiveness
+  let d_bool_ok : Array[Diag] = []
+  let _ = lower_checked_errors_single(
+    "suberror E { Flag(Bool) }\nfn g() -> Int raise E { raise Flag(false) }\nfn f() -> Int { g() catch { Flag(true) => 1; Flag(false) => 2 } }\n",
+    "bool_ok.mbt",
+    default_error_lower_config(),
+    d_bool_ok,
+  )
+  assert_true(d_bool_ok.length() == 0, "R4 P2-5: Flag(true) + Flag(false) on Bool payload is exhaustive")
+  let d_unit_ok : Array[Diag] = []
+  let _ = lower_checked_errors_single(
+    "suberror E { U(Unit) }\nfn g() -> Int raise E { raise U(()) }\nfn f() -> Int { g() catch { U(()) => 1 } }\n",
+    "unit_ok.mbt",
+    default_error_lower_config(),
+    d_unit_ok,
+  )
+  assert_true(d_unit_ok.length() == 0, "R4 P2-5: U(()) on Unit payload is exhaustive")
+
+  // 11. R4 P2-5 negatives + Opus P2-1 (expr-body arrow closure) + Opus P2-2 (top-level let raising fn)
+  let r4_bads : Array[(String, String)] = [
+    ("bool_incomplete", "suberror E { Flag(Bool) }\nfn g() -> Int raise E { raise Flag(false) }\nfn f() -> Int { g() catch { Flag(true) => 1 } }\n"),
+    ("int_lit_incomplete", "suberror E { Code(Int) }\nfn g() -> Int raise E { raise Code(1) }\nfn f() -> Int { g() catch { Code(1) => 1; Code(2) => 2 } }\n"),
+    ("expr_arrow_uncaught", "suberror E { A }\nfn f(x : Int) -> Int raise E { if x < 0 { raise A }; x }\nfn g(xs : Array[Int]) -> Unit { xs.each(x => f(x) |> ignore) }\n"),
+    ("expr_arrow_in_try", "suberror E { A }\nfn f(x : Int) -> Int raise E { if x < 0 { raise A }; x }\nfn g(xs : Array[Int]) -> Int { try { let _ = xs.map(x => f(x)); 1 } catch { A => -1 } }\n"),
+    ("top_let_raising_fn", "suberror E { A }\nfn f() -> Int raise E { raise A }\nlet g = f\n"),
+  ]
+  for bc in r4_bads {
+    let ds : Array[Diag] = []
+    let _ = lower_checked_errors_single(bc.1, bc.0 + ".mbt", default_error_lower_config(), ds)
+    let mut hit = false
+    for d in ds { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit = true } }
+    assert_true(hit, "R4 fail-closed case `" + bc.0 + "` MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
 }
