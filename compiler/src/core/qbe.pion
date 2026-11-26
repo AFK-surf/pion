@@ -37985,7 +37985,10 @@ fn qbe_try_emit_rotate_idiom(
 ///|
 /// Fold `(x % pow2) == 0` / `(x % pow2) != 0` (and symmetric `0 == (x % pow2)`)
 /// into `(x & (pow2 - 1)) == 0` / `!= 0`, exact across the entire signed/unsigned
-/// 32-bit and 64-bit domains (including INT32_MIN and INT64_MIN).
+/// 8-bit, 32-bit and 64-bit domains (including INT32_MIN and INT64_MIN).
+/// Returns `None` only before `x` is emitted: once it is, any other operand
+/// type finishes the general `%` and comparison on that value, so the caller
+/// never evaluates `x` twice.
 fn qbe_try_emit_mod_pow2_eq_zero(
   g : QbeGen,
   op : String,
@@ -37995,25 +37998,25 @@ fn qbe_try_emit_mod_pow2_eq_zero(
   if op != "==" && op != "!=" {
     return None
   }
-  let mod_pair : Option[(Expr, Expr)] = match lhs {
-    EBinary("%", x_e, d_e, _) =>
+  let mod_pair : Option[(Expr, Expr, Span, Expr, Expr)] = match lhs {
+    EBinary("%", x_e, d_e, m_sp) =>
       if qbe_is_zero_int_lit(g, rhs) {
-        Some((x_e, d_e))
+        Some((x_e, d_e, m_sp, lhs, rhs))
       } else {
         None
       }
     _ =>
       match rhs {
-        EBinary("%", x_e, d_e, _) =>
+        EBinary("%", x_e, d_e, m_sp) =>
           if qbe_is_zero_int_lit(g, lhs) {
-            Some((x_e, d_e))
+            Some((x_e, d_e, m_sp, rhs, lhs))
           } else {
             None
           }
         _ => None
       }
   }
-  let (x_expr, d_expr) = match mod_pair {
+  let (x_expr, d_expr, mod_sp, mod_expr, zero_expr) = match mod_pair {
     Some(p) => p
     None => return None
   }
@@ -38024,7 +38027,12 @@ fn qbe_try_emit_mod_pow2_eq_zero(
   if d < 2L || d > 4611686018427387904L || (d & (d - 1L)) != 0L {
     return None
   }
+  // From here on `x_expr` has been emitted: never return `None` (the caller
+  // would evaluate it, and its side effects, a second time).
   let xv = qbe_emit_expr(g, x_expr, None)
+  if g.block_term {
+    return Some("0")
+  }
   let mask = (d - 1L).to_string()
   match xv.ty {
     TInt | TUInt =>
@@ -38055,15 +38063,46 @@ fn qbe_try_emit_mod_pow2_eq_zero(
       qbe_emit(g, cw + " =w " + cop + " " + masked + ", 0")
       Some(cw)
     }
-    TByte => {
+    TByte | TInt8 => {
+      // 8-bit values: for `d <= 128`, `x % d == 0` iff the low `log2 d` bits
+      // are zero (also for negative `Int8`); for `d >= 256`, `x % d == x`, so
+      // it is `x == 0`, i.e. the low 8 bits are zero. Only the low 8 bits of
+      // the register are read.
+      let m8 = if d >= 256L { "255" } else { mask }
       let masked = qbe_tmp(g)
-      qbe_emit(g, masked + " =w and " + xv.reg + ", " + mask)
+      qbe_emit(g, masked + " =w and " + xv.reg + ", " + m8)
       let cw = qbe_tmp(g)
       let cop = if op == "==" { "ceqw" } else { "cnew" }
       qbe_emit(g, cw + " =w " + cop + " " + masked + ", 0")
       Some(cw)
     }
-    _ => None
+    _ => {
+      // Any other operand type (e.g. `Double`): finish the general `%` and
+      // comparison on the value already computed. `d` and `0` are constants.
+      let dv = qbe_emit_expr(g, d_expr, Some(xv.ty))
+      let rem = qbe_emit_binary_combine(
+        g,
+        "%",
+        x_expr,
+        d_expr,
+        mod_sp,
+        QbeArgVal::{ qv: xv, borrowed: false },
+        QbeArgVal::{ qv: dv, borrowed: true },
+      )
+      let zv = qbe_emit_expr(g, zero_expr, Some(xv.ty))
+      let cv = qbe_emit_binary_combine(
+        g,
+        op,
+        mod_expr,
+        zero_expr,
+        mod_sp,
+        QbeArgVal::{ qv: rem, borrowed: false },
+        QbeArgVal::{ qv: zv, borrowed: true },
+      )
+      let cw = qbe_tmp(g)
+      qbe_emit(g, cw + " =w copy " + cv.reg)
+      Some(cw)
+    }
   }
 }
 
