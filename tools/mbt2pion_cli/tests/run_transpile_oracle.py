@@ -3458,10 +3458,20 @@ def prepare(env):
         os.path.join(env.moon_dir, "m12", "moon.pkg"),
         'import {\n  "moonbitlang/core/encoding/utf8",\n  "moonbitlang/core/json",\n  "moonbitlang/core/string",\n}\n',
     )
-    shutil.copyfile(
-        os.path.join(m12_mbt_dir, "m12_lib.mbt"),
-        os.path.join(env.moon_dir, "m12", "m12_lib.mbt"),
-    )
+    # MoonBit 0.1.20261126 removed `x |> f(a, _, b)` partial-application syntax;
+    # keep the legacy placeholder-pipe forms in `m12_mbt_src` so `mbt2pion` still
+    # tests them, while normalizing only Moon's copy to the semantically identical
+    # let-bound call (preserving left-to-right evaluation order on all Moon versions).
+    m12_moon_src = M12_LIB_MBT
+    for old, new in [
+        ("let p1 = inc(4) |> take2(2, _)", "let p1 = { let __mbt_moon_p = inc(4); take2(2, __mbt_moon_p) }"),
+        ("let p3 = step(1) |> combine3(step(2), _, step(3))", "let p3 = { let __mbt_moon_p = step(1); combine3(step(2), __mbt_moon_p, step(3)) }"),
+        ("let r1 = 5 |> take2(__mbt_p_1, _)", "let r1 = { let __mbt_moon_p = 5; take2(__mbt_p_1, __mbt_moon_p) }"),
+        ("let r2 = 6 |> sub_named(scale=3, _)", "let r2 = { let __mbt_moon_p = 6; sub_named(scale=3, __mbt_moon_p) }"),
+    ]:
+        assert old in m12_moon_src, f"expected legacy placeholder-pipe test line missing: {old}"
+        m12_moon_src = m12_moon_src.replace(old, new, 1)
+    write_file(os.path.join(env.moon_dir, "m12", "m12_lib.mbt"), m12_moon_src)
     write_file(
         os.path.join(env.moon_dir, "main", "moon.pkg"),
         'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n  "oracle/transpile/m12",\n}\n\npkgtype(kind: "executable")\n',

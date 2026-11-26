@@ -721,6 +721,23 @@ def main():
         bin_path = os.path.join(work, "mbt2pion")
         run_cmd([args.pionc, "build", CLI_DIR, "-o", bin_path])
 
+        # MoonBit 0.1.20261126 removed `x |> f(a, _, b)` partial-application syntax;
+        # feed the original `F3D3_MBT` to `mbt2pion` so placeholder-pipe inference stays
+        # covered, while normalizing only Moon's copy to the identical single-line form.
+        f3d3_moon_src = F3D3_MBT
+        for old, new in [
+            (
+                'let j11_arr : Array[Json] = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }) |> keep_json_arr2(0, _)',
+                'let j11_arr : Array[Json] = { let __mbt_moon_p : Array[Json] = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }); keep_json_arr2(0, __mbt_moon_p) }',
+            ),
+            (
+                'let j13_rg = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }) |> render_gen(_, 7)',
+                'let j13_rg = { let __mbt_moon_p : Array[Json] = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }); render_gen(__mbt_moon_p, 7) }',
+            ),
+        ]:
+            assert old in f3d3_moon_src, f"expected legacy placeholder-pipe line missing: {old}"
+            f3d3_moon_src = f3d3_moon_src.replace(old, new, 1)
+
         md = os.path.join(work, "moon_proj")
         for sub in ("f3d3dep", "f3d3", "cmd"):
             os.makedirs(os.path.join(md, sub))
@@ -729,13 +746,20 @@ def main():
             ("f3d3dep/moon.pkg", "\n"),
             ("f3d3dep/dep.mbt", DEP_MBT),
             ("f3d3/moon.pkg", 'import { "f3d3/oracle/f3d3dep" }\n'),
-            ("f3d3/f3d3.mbt", F3D3_MBT),
+            ("f3d3/f3d3.mbt", f3d3_moon_src),
             ("cmd/moon.pkg", 'import { "f3d3/oracle/f3d3" }\npkgtype(kind: "executable")\n'),
             ("cmd/main.mbt", "fn main { println(@f3d3.run_all()) }\n"),
         ]:
             with open(os.path.join(md, rel), "w") as fh:
                 fh.write(txt)
         moon_out = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=md)
+
+        mbt_f3d3 = os.path.join(work, "mbt_f3d3")
+        os.makedirs(mbt_f3d3)
+        with open(os.path.join(mbt_f3d3, "moon.pkg"), "w") as fh:
+            fh.write('import { "f3d3/oracle/f3d3dep" }\n')
+        with open(os.path.join(mbt_f3d3, "f3d3.mbt"), "w") as fh:
+            fh.write(F3D3_MBT)
 
         pd = os.path.join(work, "p_dep")
         os.makedirs(os.path.join(pd, "src"))
@@ -748,7 +772,7 @@ def main():
         os.makedirs(os.path.join(pl, "src"))
         with open(os.path.join(pl, "pion.toml"), "w") as fh:
             fh.write(f'[package]\nname = "f3d3"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nf3d3dep = {{ path = "{pd}" }}\n')
-        run_cmd([bin_path, "--src", os.path.join(md, "f3d3"), "--out", os.path.join(pl, "src"),
+        run_cmd([bin_path, "--src", mbt_f3d3, "--out", os.path.join(pl, "src"),
                  "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
                  "--dep", f"f3d3dep={pd}"])
         with open(os.path.join(pl, "src", "main.pion"), "w") as fh:
