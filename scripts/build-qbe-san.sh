@@ -18,6 +18,24 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 QBE_DIR="$ROOT_DIR/vendor/qbe"
 CC_BIN="${CC:-cc}"
 
+# On Linux ARM64, GCC libasan8 suffers ~4s per-process startup overhead; prefer
+# clang for ASan+UBSan QBE when available (qbe.cc records the compiler used).
+if [ "$(uname -s)" = "Linux" ] && { [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; }; then
+  case "$CC_BIN" in
+    cc|gcc)
+      if command -v clang >/dev/null 2>&1; then
+        _probe_c="$OUT_DIR/.clang_san_probe"
+        mkdir -p "$OUT_DIR"
+        if printf 'int main(void){return 0;}\n' | clang -x c - -fsanitize=address,undefined -fno-sanitize-recover=all -o "$_probe_c" 2>/dev/null \
+          && "$_probe_c" 2>/dev/null; then
+          CC_BIN="clang"
+        fi
+        rm -f "$_probe_c"
+      fi
+      ;;
+  esac
+fi
+
 mkdir -p "$OUT_DIR/obj"
 
 # Probe ASan+UBSan toolchain support.

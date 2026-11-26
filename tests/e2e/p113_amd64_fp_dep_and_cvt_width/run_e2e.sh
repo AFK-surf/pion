@@ -125,10 +125,11 @@ HOOK_DIR="$TMP_DIR/qbe-hook"
 mkdir -p "$HOOK_DIR"
 SAN_FLAGS=""
 HOOK_OBJS=""
-if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ] \
-  && { [ ! -f "$PION_QBE_SAN_DIR/qbe.cc" ] || [ "$(cat "$PION_QBE_SAN_DIR/qbe.cc")" = "$CC_BIN" ]; }; then
+HOOK_CC="$CC_BIN"
+if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ]; then
   SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
   HOOK_INC="$PION_QBE_SAN_DIR"
+  [ -f "$PION_QBE_SAN_DIR/qbe.cc" ] && HOOK_CC="$(cat "$PION_QBE_SAN_DIR/qbe.cc")"
   for O in "$PION_QBE_SAN_DIR"/obj/*.o; do
     case "$O" in
       */main.c.o) continue ;;
@@ -141,6 +142,7 @@ else
   if [ "$SAN_RC" -eq 0 ]; then
     SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
     HOOK_INC="$HOOK_DIR"
+    [ -f "$HOOK_DIR/qbe.cc" ] && HOOK_CC="$(cat "$HOOK_DIR/qbe.cc")"
     for O in "$HOOK_DIR"/obj/*.o; do
       case "$O" in
         */main.c.o) continue ;;
@@ -167,12 +169,12 @@ else
     exit 1
   fi
 fi
-echo "p113 hook QBE sanitizers: ${SAN_FLAGS:-<none>}"
-"$CC_BIN" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_main_hook.c" -o "$HOOK_DIR/main_hook.o"
-"$CC_BIN" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_slot_hook.c" -o "$HOOK_DIR/slot_hook.o"
-"$CC_BIN" $SAN_FLAGS $HOOK_OBJS "$HOOK_DIR/main_hook.o" "$HOOK_DIR/slot_hook.o" -o "$HOOK_DIR/qbe"
+echo "p113 hook QBE sanitizers: ${SAN_FLAGS:-<none>} (cc=$HOOK_CC)"
+"$HOOK_CC" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_main_hook.c" -o "$HOOK_DIR/main_hook.o"
+"$HOOK_CC" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_slot_hook.c" -o "$HOOK_DIR/slot_hook.o"
+"$HOOK_CC" $SAN_FLAGS $HOOK_OBJS "$HOOK_DIR/main_hook.o" "$HOOK_DIR/slot_hook.o" -o "$HOOK_DIR/qbe"
 HQBE="$HOOK_DIR/qbe"
-export ASAN_OPTIONS="${ASAN_OPTIONS:-}${ASAN_OPTIONS:+:}detect_leaks=0:abort_on_error=0"
+export ASAN_OPTIONS="${ASAN_OPTIONS:-}${ASAN_OPTIONS:+:}detect_leaks=0:abort_on_error=0:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 "$HQBE" -t amd64_sysv -o "$TMP_DIR/slots.s" "$DIR/slots.ssa"
 "$HQBE" -t amd64_win -o "$TMP_DIR/slots_win.s" "$DIR/slots.ssa"
 # Without slot_* functions the hook QBE is the real one: same output, and no

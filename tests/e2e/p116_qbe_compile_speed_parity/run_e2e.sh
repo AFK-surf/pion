@@ -260,10 +260,11 @@ INPUTS="lex.ssa flow.ssa jtbl_cfg.ssa prog_dev.ssa prog_release.ssa"
 python3 -E "$DIR/mkcheck.py" "$ROOT_DIR/vendor/qbe" "$TMP_DIR/cq"
 printf '#define Deftgt T_amd64_sysv\n' > "$TMP_DIR/cq/config.h"
 echo "p116 checking QBE sanitizers: ${SAN_FLAGS:-<none>}"
-if [ -n "$SAN_FLAGS" ] && [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ] \
-  && { [ ! -f "$PION_QBE_SAN_DIR/qbe.cc" ] || [ "$(cat "$PION_QBE_SAN_DIR/qbe.cc")" = "$CC_BIN" ]; }; then
+if [ -n "$SAN_FLAGS" ] && [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ]; then
   # mkcheck.py modifies only live.c, ssa.c and arm64/macho.c: compile those 3
   # and link with the prebuilt ASan+UBSan QBE objects for all other units.
+  CQ_CC="$CC_BIN"
+  [ -f "$PION_QBE_SAN_DIR/qbe.cc" ] && CQ_CC="$(cat "$PION_QBE_SAN_DIR/qbe.cc")"
   CQ_OBJS=""
   for O in "$PION_QBE_SAN_DIR"/obj/*.o; do
     case "$O" in
@@ -273,10 +274,10 @@ if [ -n "$SAN_FLAGS" ] && [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_
   done
   for f in live.c ssa.c arm64/macho.c; do
     O="$TMP_DIR/cq/$(printf '%s' "$f" | tr / _).o"
-    "$CC_BIN" -std=c99 -O1 -g -w $SAN_FLAGS -I "$PION_QBE_SAN_DIR" -I "$TMP_DIR/cq" -c "$TMP_DIR/cq/$f" -o "$O"
+    "$CQ_CC" -std=c99 -O1 -g -w $SAN_FLAGS -I "$PION_QBE_SAN_DIR" -I "$TMP_DIR/cq" -c "$TMP_DIR/cq/$f" -o "$O"
     CQ_OBJS="$CQ_OBJS $O"
   done
-  "$CC_BIN" $SAN_FLAGS $CQ_OBJS -o "$TMP_DIR/cq/qbe"
+  "$CQ_CC" $SAN_FLAGS $CQ_OBJS -o "$TMP_DIR/cq/qbe"
 else
   python3 -E - "$CC_BIN" "$SAN_FLAGS" "$TMP_DIR/cq" <<'PYEOF'
 import glob, os, subprocess, sys
@@ -300,7 +301,7 @@ if r.returncode != 0:
 PYEOF
 fi
 CQ="$TMP_DIR/cq/qbe"
-export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
+export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
 STATS="$TMP_DIR/stats.txt"
 : > "$STATS"

@@ -106,16 +106,17 @@ echo "p122 site checker rejects 4 mutations"
 
 # Sanitized QBE objects (2 and 5); reuse prebuilt $PION_QBE_SAN_DIR when available.
 SAN=""
+Q_CC="$CC_BIN"
 Q="$TMP_DIR/sanq"
 mkdir -p "$Q"
-export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
+export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
-if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -x "$PION_QBE_SAN_DIR/qbe" ] && [ -d "$PION_QBE_SAN_DIR/obj" ] \
-  && { [ ! -f "$PION_QBE_SAN_DIR/qbe.cc" ] || [ "$(cat "$PION_QBE_SAN_DIR/qbe.cc")" = "$CC_BIN" ]; }; then
+if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -x "$PION_QBE_SAN_DIR/qbe" ] && [ -d "$PION_QBE_SAN_DIR/obj" ]; then
   SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
   Q_OBJ_DIR="$PION_QBE_SAN_DIR/obj"
   Q_INC_DIR="$PION_QBE_SAN_DIR"
   Q_BIN="$PION_QBE_SAN_DIR/qbe"
+  [ -f "$PION_QBE_SAN_DIR/qbe.cc" ] && Q_CC="$(cat "$PION_QBE_SAN_DIR/qbe.cc")"
 else
   SAN_RC=0
   CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$Q" || SAN_RC=$?
@@ -124,6 +125,7 @@ else
     Q_OBJ_DIR="$Q/obj"
     Q_INC_DIR="$Q"
     Q_BIN="$Q/qbe"
+    [ -f "$Q/qbe.cc" ] && Q_CC="$(cat "$Q/qbe.cc")"
   elif [ "$SAN_RC" -eq 77 ]; then
     if [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
       fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
@@ -164,8 +166,8 @@ for o in "$Q_OBJ_DIR"/*.o; do
   Q_BASE_OBJS="$Q_BASE_OBJS $o"
 done
 qbe_with() { # $1 main.c source, $2 output binary
-  "$CC_BIN" -std=c99 -O1 -g -w $SAN -fno-omit-frame-pointer -I "$Q_INC_DIR" -I "$ROOT_DIR/vendor/qbe" -c "$1" -o "$2.o"
-  "$CC_BIN" $SAN $Q_BASE_OBJS "$2.o" -o "$2"
+  "$Q_CC" -std=c99 -O1 -g -w $SAN -fno-omit-frame-pointer -I "$Q_INC_DIR" -I "$ROOT_DIR/vendor/qbe" -c "$1" -o "$2.o"
+  "$Q_CC" $SAN $Q_BASE_OBJS "$2.o" -o "$2"
 }
 if [ ! -x "$Q_BIN" ]; then
   qbe_with "$ROOT_DIR/vendor/qbe/main.c" "$Q_BIN"
@@ -174,7 +176,7 @@ fi
 
 # 2. Mutants: each control is rejected by its own condition only (bounded parallel compile + run).
 MUTS=$(python3 -E "$DIR/mk_mutants.py" "$ROOT_DIR/vendor/qbe/main.c" "$Q")
-python3 -E - "$CC_BIN" "$SAN" "$Q_INC_DIR" "$ROOT_DIR/vendor/qbe" "$Q_OBJ_DIR" "$Q" "$TMP_DIR" "$F" "$DIR/check_sites.py" $MUTS <<'PYEOF'
+python3 -E - "$Q_CC" "$SAN" "$Q_INC_DIR" "$ROOT_DIR/vendor/qbe" "$Q_OBJ_DIR" "$Q" "$TMP_DIR" "$F" "$DIR/check_sites.py" $MUTS <<'PYEOF'
 import glob, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -282,27 +284,48 @@ done
 "$QBE" -t arm64_apple --obj -o "$TMP_DIR/vm.o" "$IN"
 python3 -E "$DIR/check_sites.py" "$TMP_DIR/vm_expect.txt" arm64_apple "$TMP_DIR/vm_arm64_apple.s" "$TMP_DIR/vm.o"
 
-# 5. ASan + UBSan QBE replay.
+# 5. ASan + UBSan QBE replay (bounded parallel).
 if [ -n "$SAN" ]; then
-  N=0
-  replay() { # $1 input, then qbe options
-    in=$1
-    shift
-    "$QBE" "$@" -o "$TMP_DIR/ref.out" "$in"
-    "$Q_BIN" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
-    [ ! -s "$TMP_DIR/san.err" ] || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in wrote diagnostics"; }
-    cmp "$TMP_DIR/ref.out" "$TMP_DIR/san.out" || fail "sanitized QBE $* $in: output differs from out/qbe"
-    N=$((N + 1))
-  }
-  for IN in "$F/dispatch.ssa" "$F/vm_dev.ssa" "$F/vm_release.ssa"; do
-    for T in $TARGETS; do
-      replay "$IN" -t "$T"
-      case "$T" in
-        arm64_apple|amd64_sysv) replay "$IN" -t "$T" --obj ;;
-      esac
-    done
-  done
-  [ "$N" -eq 24 ] || fail "replayed $N outputs, want 24"
+  python3 -E - "$QBE" "$Q_BIN" "$TMP_DIR" "$F/dispatch.ssa" "$F/vm_dev.ssa" "$F/vm_release.ssa" <<'PYEOF'
+import os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+qbe, san_qbe, tmp_dir = sys.argv[1:4]
+inputs = sys.argv[4:]
+targets = ["arm64_apple", "arm64", "amd64_sysv", "amd64_win", "amd64_apple", "rv64"]
+tasks = []
+idx = 0
+for inp in inputs:
+    for t in targets:
+        tasks.append((idx, inp, ["-t", t]))
+        idx += 1
+        if t in ("arm64_apple", "amd64_sysv"):
+            tasks.append((idx, inp, ["-t", t, "--obj"]))
+            idx += 1
+assert len(tasks) == 24, f"expected 24 replay tasks, got {len(tasks)}"
+jobs = min(os.cpu_count() or 1, 4)
+
+def run_one(item):
+    i, inp, opts = item
+    ref_out = os.path.join(tmp_dir, f"ref_{i}.out")
+    san_out = os.path.join(tmp_dir, f"san_{i}.out")
+    r1 = subprocess.run([qbe, *opts, "-o", ref_out, inp])
+    if r1.returncode != 0:
+        raise SystemExit(f"FAIL: p122 out/qbe {' '.join(opts)} {inp}")
+    r2 = subprocess.run([san_qbe, *opts, "-o", san_out, inp], capture_output=True, text=True)
+    if r2.returncode != 0:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p122 sanitized QBE {' '.join(opts)} {inp}")
+    if r2.stderr:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p122 sanitized QBE {' '.join(opts)} {inp} wrote diagnostics")
+    with open(ref_out, "rb") as f1, open(san_out, "rb") as f2:
+        if f1.read() != f2.read():
+            raise SystemExit(f"FAIL: p122 sanitized QBE {' '.join(opts)} {inp}: output differs from out/qbe")
+
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(run_one, tasks))
+PYEOF
   echo "p122 ASan+UBSan QBE: 24 outputs (3 inputs, 6 targets text, 2 --obj) clean and equal to out/qbe"
 fi
 

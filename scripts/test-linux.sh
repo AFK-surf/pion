@@ -5,6 +5,8 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/out"
 RT_DIR="$ROOT_DIR/runtime"
 CC="${CC:-cc}"
+ulimit -n 4096 2>/dev/null || true
+export PION_ASAN_FAST_OPTS="detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 
 # Helper sub-commands invoked inside run-e2e-parallel.sh (each uses its own
 # mktemp -d + PION_CACHE_DIR and writes nothing to shared out/ or source tree).
@@ -163,6 +165,18 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+MODE="full"
+E2E_SHARD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bootstrap-only) MODE="bootstrap"; shift ;;
+    --e2e-only) MODE="e2e"; shift ;;
+    --shard) E2E_SHARD="$2"; shift 2 ;;
+    --shard=*) E2E_SHARD="${1#--shard=}"; shift ;;
+    *) echo "usage: test-linux.sh [--bootstrap-only | --e2e-only [--shard i/N]]" >&2; exit 2 ;;
+  esac
+done
+
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
 }
@@ -206,6 +220,7 @@ else
 fi
 MULTIARCH_LIB_DIR="/usr/lib/${UNAME_M}-linux-gnu"
 
+if [ "$MODE" != "e2e" ]; then
 echo "=== [1/6] Linux ${LINUX_ARCH_LABEL} Environment & QBE (${LINUX_TARGET}) Build ==="
 uname -a
 CC="$CC" sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
@@ -258,9 +273,15 @@ if [ "$BENCH_RC" -ne 0 ]; then
   echo "NOTE: test_rt --bench returned $BENCH_RC (paravirtualized vCPU jitter); continuing functional & MT checks"
 fi
 
-# One ASan/TSan build of the runtime for all E2E suites (see scripts/san-rt.sh),
+# One ASan/TSan build of the runtime + ASan+UBSan QBE for all E2E suites (see scripts/san-rt.sh),
 # while `as` is still reachable.
 . "$ROOT_DIR/scripts/san-rt-env.sh"
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+  _tq0="$(now_ms)"
+  ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:${PION_ASAN_FAST_OPTS}" "$PION_QBE_SAN" -h >/dev/null 2>&1 || true
+  _tq1="$(now_ms)"
+  echo "qbe-san probe (cc=$(cat "${PION_QBE_SAN}.cc" 2>/dev/null || echo unknown)): $((_tq1 - _tq0))ms"
+fi
 
 # The KV load client is plain C: build it while `as` is still reachable.
 "$CC" -O2 -pthread -o "$OUT_DIR/bench_load" "$ROOT_DIR/examples/http_kv_service/bench_load.c"
@@ -469,13 +490,15 @@ cp "$TMP_DIR/linux_stage${FP_B}.ssa" "$OUT_DIR/linux_stage.ssa"
 # [6/6] must test the compiler built from this tree, not the (possibly older) seed.
 cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
 PIONC="$OUT_DIR/pionc_linux"
-# Wave K1-A (p98) is the longest E2E suite (two >65,279-section COFF big-obj
-# assemblies when mingw-w64 is installed). It is independent of everything below
-# (own mktemp -d + CAS, nothing written to the tree), so it starts now, overlaps
-# [6/6], and is joined right after the E2E pool, before any wall-clock check.
-bg_start "$TMP_DIR/p98.log" env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
-P98_PID="$BG_PID"
-T_P98_0="$(now_ms)"
+if [ "$MODE" = "full" ]; then
+  # Wave K1-A (p98) is the longest E2E suite (two >65,279-section COFF big-obj
+  # assemblies when mingw-w64 is installed). It is independent of everything below
+  # (own mktemp -d + CAS, nothing written to the tree), so it starts now, overlaps
+  # [6/6], and is joined right after the E2E pool, before any wall-clock check.
+  bg_start "$TMP_DIR/p98.log" env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
+  P98_PID="$BG_PID"
+  T_P98_0="$(now_ms)"
+fi
 
 echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
 # One long single-threaded build: overlapped, joined after the E2E pool.
@@ -552,6 +575,62 @@ if [ "$FIXED_CHK" != '{"ok":true,"unformatted":[]}' ]; then
   exit 1
 fi
 
+if [ "$MODE" = "bootstrap" ]; then
+  if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
+    CORE_PID=""
+  else
+    CORE_PID=""
+    exit 1
+  fi
+  if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
+    FP_ASM_PID=""
+    echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+  else
+    FP_ASM_PID=""
+    echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
+    exit 1
+  fi
+  echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) BOOTSTRAP GATES PASSED!"
+  GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+  echo "test-linux.sh --bootstrap-only duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::test-linux.sh --bootstrap-only (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] test-linux.sh --bootstrap-only (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
+fi
+else
+  # --e2e-only: reuse prebuilt out/ from --bootstrap-only.
+  PIONC="$OUT_DIR/pionc_linux"
+  [ -x "$PIONC" ] || { echo "FAIL: --e2e-only requires prebuilt $PIONC" >&2; exit 1; }
+  [ -x "$OUT_DIR/qbe" ] || { echo "FAIL: --e2e-only requires prebuilt $OUT_DIR/qbe" >&2; exit 1; }
+  export PION_QBE="$OUT_DIR/qbe"
+  export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+  export PION_CACHE_DIR="$TMP_DIR/cas_linux"
+  mkdir -p "$PION_CACHE_DIR"
+  unset PION_TARGET || true
+  if [ -s "$OUT_DIR/libpionrt_asan.a" ]; then
+    export PION_ASAN_RT_LIB="$OUT_DIR/libpionrt_asan.a"
+    export PION_RT_ASAN_LIB="$OUT_DIR/libpionrt_asan.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_tsan.a" ]; then
+    export PION_TSAN_RT_LIB="$OUT_DIR/libpionrt_tsan.a"
+  fi
+  if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
+    export PION_QBE_SAN_DIR="$OUT_DIR/qbe-san"
+    export PION_QBE_SAN="$OUT_DIR/qbe-san/qbe"
+  fi
+  ORIG_PATH="$PATH"
+  if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+    mkdir -p "$TMP_DIR/noas"
+    printf '#!/bin/sh\necho "FAIL: as invoked: $*" >&2\nexit 97\n' > "$TMP_DIR/noas/as"
+    chmod +x "$TMP_DIR/noas/as"
+    export PATH="$TMP_DIR/noas:$PATH"
+  fi
+fi
+
 # Build the parallel E2E pool command list (slowest & folded [6/6] suites first).
 # Lines without PATH="$ORIG_PATH" keep the failing-`as` PATH of this gate.
 E2E_CMDS="$TMP_DIR/e2e_cmds.txt"
@@ -578,9 +657,17 @@ cat >> "$E2E_CMDS" <<'E2E'
 sh "$ROOT_DIR/scripts/test-linux.sh" --group mbt_tests
 sh "$ROOT_DIR/scripts/test-linux.sh" --group std_tests
 sh "$ROOT_DIR/scripts/test-linux.sh" --group standalone_e2e
-# Slowest suites first so the pool packs well.
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+# Slowest suites first so the pool packs well (sharded giant suites spread across workers/shards).
+PION_SHARD=0/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=1/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=2/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=3/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=0/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=1/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=2/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=3/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=4/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=5/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC"
@@ -749,36 +836,58 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # assembly (and cc compiles their C driver) besides `--obj`.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
 E2E
+if [ "$MODE" = "e2e" ]; then
+  printf '%s\n' 'PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"' >> "$E2E_CMDS"
+fi
 export ROOT_DIR PIONC ORIG_PATH OUT_DIR STATION_LIB_PATH
-sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
-# Join p98 (started before [6/6]); reap any straggling descendants in its session.
-P98_RC=0
-wait "$P98_PID" || P98_RC=$?
-if kill -0 -"$P98_PID" 2>/dev/null; then
-  echo "[WARN] test-linux: reaping straggler process(es) in p98 pgid $P98_PID" >&2
-  bg_kill "$P98_PID"
-fi
-P98_PID=""
-if [ "$P98_RC" -eq 0 ]; then
-  echo "[PASS] tests/e2e/p98_section_gc/run_e2e.sh (overlapped, $(( $(now_ms) - T_P98_0 )) ms since start)"
+if [ -n "$E2E_SHARD" ]; then
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" --shard "$E2E_SHARD" < "$E2E_CMDS"
 else
-  cat "$TMP_DIR/p98.log"
-  echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
-  exit 1
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
 fi
-if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
-  CORE_PID=""
-else
-  CORE_PID=""
-  exit 1
+if [ "$MODE" = "full" ]; then
+  # Join p98 (started before [6/6]); reap any straggling descendants in its session.
+  P98_RC=0
+  wait "$P98_PID" || P98_RC=$?
+  if kill -0 -"$P98_PID" 2>/dev/null; then
+    echo "[WARN] test-linux: reaping straggler process(es) in p98 pgid $P98_PID" >&2
+    bg_kill "$P98_PID"
+  fi
+  P98_PID=""
+  if [ "$P98_RC" -eq 0 ]; then
+    echo "[PASS] tests/e2e/p98_section_gc/run_e2e.sh (overlapped, $(( $(now_ms) - T_P98_0 )) ms since start)"
+  else
+    cat "$TMP_DIR/p98.log"
+    echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
+    exit 1
+  fi
+  if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
+    CORE_PID=""
+  else
+    CORE_PID=""
+    exit 1
+  fi
+  if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
+    FP_ASM_PID=""
+    echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+  else
+    FP_ASM_PID=""
+    echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
+    exit 1
+  fi
 fi
-if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
-  FP_ASM_PID=""
-  echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
-else
-  FP_ASM_PID=""
-  echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
-  exit 1
+# In sharded --e2e-only mode, only shard 0 runs the fast serial post-pool checks (~4s).
+if [ -n "$E2E_SHARD" ] && [ "${E2E_SHARD%%/*}" != "0" ]; then
+  echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) E2E SHARD ${E2E_SHARD} GATES PASSED!"
+  GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+  echo "test-linux.sh --e2e-only --shard ${E2E_SHARD} duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::test-linux.sh --e2e-only --shard ${E2E_SHARD} (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] test-linux.sh --e2e-only --shard ${E2E_SHARD} (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
 fi
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC"

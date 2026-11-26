@@ -248,18 +248,31 @@ fi
 
 . "$ROOT_DIR/scripts/bg-lib.sh"
 T_GATE_START=$(python3 -c 'import time; print(int(time.time()))')
+MODE="full"
+E2E_SHARD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bootstrap-only) MODE="bootstrap"; shift ;;
+    --e2e-only) MODE="e2e"; shift ;;
+    --shard) E2E_SHARD="$2"; shift 2 ;;
+    --shard=*) E2E_SHARD="${1#--shard=}"; shift ;;
+    *) echo "usage: verify-all.sh [--bootstrap-only | --e2e-only [--shard i/N]]" >&2; exit 2 ;;
+  esac
+done
 RT_LOG_DIR=$(mktemp -d)
 TSAN_PID=""
 ASAN_PID=""
 SMOKE_PID=""
+CORE_PID=""
 cleanup_verify() {
-  bg_kill "$TSAN_PID" "$ASAN_PID" "$SMOKE_PID"
+  bg_kill "$TSAN_PID" "$ASAN_PID" "$SMOKE_PID" "$CORE_PID"
   rm -rf "$RT_LOG_DIR"
 }
 trap cleanup_verify EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+if [ "$MODE" != "e2e" ]; then
 echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench; TSan + ASan + QBE smoke overlapped with Stage 0) ==="
 sh "$ROOT_DIR/scripts/test-runtime.sh" --prep-only
 bg_start "$RT_LOG_DIR/tsan.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step tsan
@@ -329,21 +342,77 @@ fi
 rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
+if [ "$MODE" = "bootstrap" ]; then
+  bg_start "$RT_LOG_DIR/core_test.log" env PION_CACHE_DIR="$OUT_DIR/cas_core_test" \
+    sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"
+  CORE_PID="$BG_PID"
+  . "$ROOT_DIR/scripts/san-rt-env.sh"
+  if ! bg_join "$CORE_PID" "$RT_LOG_DIR/core_test.log"; then
+    CORE_PID=""
+    rm -rf "$OUT_DIR/cas_core_test"
+    exit 1
+  fi
+  CORE_PID=""
+  rm -rf "$OUT_DIR/cas_core_test"
+  echo "=== VERIFY-ALL BOOTSTRAP GATES PASSED ==="
+  GATE_ELAPSED_S=$(( $(python3 -c 'import time; print(int(time.time()))') - T_GATE_START ))
+  echo "verify-all.sh --bootstrap-only duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::verify-all.sh --bootstrap-only took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] verify-all.sh --bootstrap-only took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
+fi
+else
+  PIONC2="$OUT_DIR/pionc2"
+  [ -x "$PIONC2" ] || { echo "FAIL: --e2e-only requires prebuilt $PIONC2" >&2; exit 1; }
+  [ -x "$OUT_DIR/qbe" ] || { echo "FAIL: --e2e-only requires prebuilt $OUT_DIR/qbe" >&2; exit 1; }
+  export PION_QBE="$OUT_DIR/qbe"
+  export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+  if [ -s "$OUT_DIR/libpionrt_asan.a" ]; then
+    export PION_ASAN_RT_LIB="$OUT_DIR/libpionrt_asan.a"
+    export PION_RT_ASAN_LIB="$OUT_DIR/libpionrt_asan.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_tsan.a" ]; then
+    export PION_TSAN_RT_LIB="$OUT_DIR/libpionrt_tsan.a"
+  fi
+  if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
+    export PION_QBE_SAN_DIR="$OUT_DIR/qbe-san"
+    export PION_QBE_SAN="$OUT_DIR/qbe-san/qbe"
+  fi
+fi
+
 echo "=== [4-6/6] Parallel Test Runner, E2E Suites, Cross ELF64 .o & Flagship Dogfood ==="
 # Independent test groups, E2E suites, dogfood apps and flagship TLS/SQLite tests
 # (each in its own mktemp -d + CAS, ephemeral ports, nothing written to the source
 # tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
 export ROOT_DIR OUT_DIR PIONC2
-# One ASan/TSan build of the runtime for all suites (see scripts/san-rt.sh).
-. "$ROOT_DIR/scripts/san-rt-env.sh"
-sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" <<'E2E'
+if [ "$MODE" = "full" ]; then
+  # One ASan/TSan build of the runtime + ASan+UBSan QBE for all suites (see scripts/san-rt.sh).
+  . "$ROOT_DIR/scripts/san-rt-env.sh"
+fi
+E2E_CMDS="$RT_LOG_DIR/e2e_cmds.txt"
+: > "$E2E_CMDS"
+if [ "$MODE" = "full" ]; then
+  # Gate [2/6] step [6/9], deferred by PION_DEFER_CORE_TEST=1: one long single-threaded build.
+  printf '%s\n' 'PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC' >> "$E2E_CMDS"
+fi
+cat >> "$E2E_CMDS" <<'E2E'
 # Slowest suites first so the pool packs well.
-# Gate [2/6] step [6/9], deferred by PION_DEFER_CORE_TEST=1: one long single-threaded build.
-PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC
 # Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
 sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=0/4 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+PION_SHARD=1/4 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+PION_SHARD=2/4 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+PION_SHARD=3/4 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+PION_SHARD=0/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=1/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=2/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=3/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=4/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+PION_SHARD=5/6 sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
@@ -525,8 +594,15 @@ sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 E2E
+if [ -n "$E2E_SHARD" ]; then
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" --shard "$E2E_SHARD" < "$E2E_CMDS"
+else
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
+fi
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
-sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
+if [ -z "$E2E_SHARD" ] || [ "${E2E_SHARD%%/*}" = "0" ]; then
+  sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
+fi
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="
 GATE_ELAPSED_S=$(( $(python3 -c 'import time; print(int(time.time()))') - T_GATE_START ))

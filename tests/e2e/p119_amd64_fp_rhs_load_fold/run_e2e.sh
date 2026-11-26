@@ -303,8 +303,7 @@ check pion "nbody --release amd64_sysv" "$TMP_DIR/nbody.s" 'pion_fn_advance:subs
 # 5. ASan + UBSan QBE.
 SAN_QBE=""
 mkdir -p "$TMP_DIR/sanq"
-if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ] \
-  && { [ ! -f "${PION_QBE_SAN}.cc" ] || [ "$(cat "${PION_QBE_SAN}.cc")" = "$CC_BIN" ]; }; then
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
   SAN_QBE="$PION_QBE_SAN"
 else
   SAN_RC=0
@@ -317,7 +316,7 @@ else
   fi
 fi
 if [ -n "$SAN_QBE" ]; then
-  SAN_ENV="ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+  SAN_ENV="ASAN_OPTIONS=halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
   RUNS=0
   # san ARGS...: sanitized QBE, no report, same output as the plain QBE.
   san() {

@@ -223,11 +223,10 @@ for MODE in dev release; do
   echo "p114 bytecode_vm $MODE: $(cat "$TMP_DIR/vm_$MODE.out") (= C), run_vm sunk homes: $N"
 done
 
-# 6. ASan + UBSan QBE over every QBE input above.
+# 6. ASan + UBSan QBE over every QBE input above (bounded parallel).
 SAN_QBE=""
 mkdir -p "$TMP_DIR/sanq"
-if [ "$ASAN" = 1 ] && [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ] \
-  && { [ ! -f "${PION_QBE_SAN}.cc" ] || [ "$(cat "${PION_QBE_SAN}.cc")" = "$CC_BIN" ]; }; then
+if [ "$ASAN" = 1 ] && [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
   SAN_QBE="$PION_QBE_SAN"
 elif [ "$ASAN" = 1 ]; then
   SAN_RC=0
@@ -240,14 +239,34 @@ elif [ "$ASAN" = 1 ]; then
   fi
 fi
 if [ -n "$SAN_QBE" ]; then
-  for IN in "$TMP_DIR/dev.ssa" "$TMP_DIR/release.ssa" "$TMP_DIR/cfg/cfg.ssa" "$TMP_DIR/vm_dev.ssa" "$TMP_DIR/vm_release.ssa"; do
-    for T in amd64_sysv arm64_apple; do
-      ASAN_OPTIONS="${ASAN_RUN_OPTS:+$ASAN_RUN_OPTS:}halt_on_error=1" UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-        "$SAN_QBE" -t "$T" -o "$TMP_DIR/sanq/out.s" "$IN"
-      ASAN_OPTIONS="${ASAN_RUN_OPTS:+$ASAN_RUN_OPTS:}halt_on_error=1" UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-        "$SAN_QBE" -t "$T" --obj -o "$TMP_DIR/sanq/out.o" "$IN"
-    done
-  done
+  ASAN_OPTIONS="${ASAN_RUN_OPTS:+$ASAN_RUN_OPTS:}halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16" \
+  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
+  python3 -E - "$SAN_QBE" "$TMP_DIR/sanq" \
+    "$TMP_DIR/dev.ssa" "$TMP_DIR/release.ssa" "$TMP_DIR/cfg/cfg.ssa" "$TMP_DIR/vm_dev.ssa" "$TMP_DIR/vm_release.ssa" <<'PYEOF'
+import os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+san_qbe, out_dir = sys.argv[1:3]
+inputs = sys.argv[3:]
+tasks = []
+idx = 0
+for inp in inputs:
+    for t in ("amd64_sysv", "arm64_apple"):
+        tasks.append((idx, inp, ["-t", t], ".s"))
+        idx += 1
+        tasks.append((idx, inp, ["-t", t, "--obj"], ".o"))
+        idx += 1
+jobs = min(os.cpu_count() or 1, 4)
+
+def run_one(item):
+    i, inp, opts, ext = item
+    r = subprocess.run([san_qbe, *opts, "-o", os.path.join(out_dir, f"out_{i}{ext}"), inp])
+    if r.returncode != 0:
+        raise SystemExit(f"FAIL: p114 sanitized QBE {' '.join(opts)} {inp}")
+
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(run_one, tasks))
+PYEOF
   echo "p114 ASan+UBSan QBE: 5 inputs x {amd64_sysv, arm64_apple} x {text, --obj} clean"
 elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   echo "FAIL: p114 needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one" >&2

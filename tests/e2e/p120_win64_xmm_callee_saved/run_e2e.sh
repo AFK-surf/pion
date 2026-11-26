@@ -563,8 +563,7 @@ echo "p120 benchmarks + seed: amd64_win frames OK; amd64_sysv without xmm saves;
 
 # 4. ASan + UBSan QBE.
 SAN_QBE=""
-if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ] \
-  && { [ ! -f "${PION_QBE_SAN}.cc" ] || [ "$(cat "${PION_QBE_SAN}.cc")" = "$CC_BIN" ]; }; then
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
   SAN_QBE="$PION_QBE_SAN"
 else
   SAN_RC=0
@@ -576,7 +575,7 @@ else
   fi
 fi
 if [ -n "$SAN_QBE" ]; then
-  export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
+  export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
   export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
   N=0
   replay() { # $1 input, then qbe options
