@@ -468,9 +468,24 @@ pub fn shadow_probe() -> String {
 type Spare = Int
 type CtrlKids = ReadOnlyArray[Int]
 
-pub fn ctrl_probe() -> Int {
+type OptCb = (Int) -> Int
+type MaybeCb = OptCb?
+type MaybeCbGrouped = ((Int) -> Int)?
+
+pub fn ctrl_probe() -> String {
   let a : CtrlKids = [42]
-  a[0]
+  let f : OptCb = fn(x) { x + 1 }
+  let m1 : MaybeCb = Some(f)
+  let m2 : MaybeCbGrouped = Some(f)
+  let r1 = match m1 {
+    Some(g) => g(41)
+    None => 0
+  }
+  let r2 = match m2 {
+    Some(g) => g(41)
+    None => 0
+  }
+  "\{a[0]},\{r1},\{r2}"
 }
 '''
 
@@ -619,7 +634,7 @@ def main():
             "F3d1b-5:100,ok\n"
             "F3d1b-6:true,true,true,true,true,true,42,true\n"
             "F3d1b-7:true,false,true,false,true,42\n"
-            "F3d1b-8:true,false,true,true,true,false,42,true,42"
+            "F3d1b-8:true,false,true,true,true,false,42,true,42,42,42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
