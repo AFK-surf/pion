@@ -2987,6 +2987,10 @@ pub struct CapFnEffect {
   // True specifically for opaque / non-dep-helper unknown calls (indirect, closure param, `|>`, `InterpString`,
   // 3-seg dep call, or mutating/unknown `impl Eq`).
   mut may_call_opaque : Bool
+  // True iff this function (or a callee) passes a function parameter directly to a cross-package `dep::f(param)` call.
+  mut may_pass_param_to_dep : Bool
+  // Positional parameter indices (0-based) passed directly to a cross-package `dep::f(param)` call.
+  dep_escaped_params : Map[Int, Bool]
   // Package-level global array names mutated (shrink/shift/shrink_to_fit) directly or transitively.
   mutated_globals : Map[String, Bool]
   // Struct field names (`.field`) mutated (shrink/shift/shrink_to_fit), grown, or written directly or transitively.
@@ -3165,12 +3169,49 @@ pub fn collect_cap_pkg_summary(
       may_shrink_to_fit: false,
       may_call_unknown: false,
       may_call_opaque: false,
+      may_pass_param_to_dep: false,
+      dep_escaped_params: Map(),
       mutated_globals: Map(),
       mutated_fields: Map(),
       grew_fields: Map(),
       wrote_fields: Map(),
     }
     let edges : Array[String] = []
+    // Collect positional parameter index for each parameter name of this declaration
+    // (to detect `fn w(b : Box) { dep::mutate(b) }` per-parameter without false positives on sibling params).
+    let fn_param_idx : Map[String, Int] = Map()
+    let fs_decl = fn_start_of(ts, body_open)
+    if fs_decl >= 0 {
+      let mut pk = fs_decl + 1
+      let mut pd = 0
+      let mut p_ord = 0
+      while pk + 1 < body_open {
+        let pkk = ts[pk].kind
+        if pkk == TokenKind::LParen || pkk == TokenKind::LBracket { pd = pd + 1 }
+        else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket { pd = pd - 1 }
+        else if pd == 1 && pkk == TokenKind::Ident && ts[pk + 1].kind == TokenKind::Colon {
+          fn_param_idx[ts[pk].raw] = p_ord
+          p_ord = p_ord + 1
+        }
+        pk = pk + 1
+      }
+    }
+    let collect_passed_param_indices = fn(as_ : Int, ae_ : Int) -> Array[Int] {
+      let out : Array[Int] = []
+      let mut j = as_
+      while j < ae_ {
+        if ts[j].kind == TokenKind::Ident &&
+        !(j > 0 && (ts[j - 1].kind == TokenKind::Dot || ts[j - 1].kind == TokenKind::ColonColon)) &&
+        !(j + 1 < ae_ && ts[j + 1].kind == TokenKind::Dot) {
+          match fn_param_idx.get(ts[j].raw) {
+            Some(idx) => out.push(idx)
+            None => ()
+          }
+        }
+        j = j + 1
+      }
+      out
+    }
     let local_fresh = fresh_locals_before(ts, body_open, body_close)
     let mut k = body_open + 1
     while k < body_close {
@@ -3279,8 +3320,23 @@ pub fn collect_cap_pkg_summary(
             // 3-segment cross-package call `dep::Type::method(...)`: opaque (never collide with local `Type::method`)
             ef.may_call_unknown = true
             ef.may_call_opaque = true
+            let cp_q = find_matching_delim(ts, k + 1)
+            if cp_q > k + 1 {
+              for pidx in collect_passed_param_indices(k + 2, cp_q) {
+                ef.may_pass_param_to_dep = true
+                ef.dep_escaped_params[pidx] = true
+              }
+            }
           } else {
-            edges.push("Q:" + q + "::" + tk.raw)
+            let cp_q = find_matching_delim(ts, k + 1)
+            let pidxs = if cp_q > k + 1 { collect_passed_param_indices(k + 2, cp_q) } else { [] }
+            if pidxs.length() > 0 {
+              for pidx in pidxs {
+                edges.push("QP:" + pidx.to_string() + ":" + q + "::" + tk.raw)
+              }
+            } else {
+              edges.push("Q:" + q + "::" + tk.raw)
+            }
           }
         } else if !(k > 0 && ts[k - 1].kind == TokenKind::Dot) && !is_ctor_name(tk.raw) &&
         !is_pure_builtin_free_fn(tk.raw) {
@@ -3416,6 +3472,7 @@ pub fn collect_cap_pkg_summary(
     if cef.may_shrink_to_fit && !ef.may_shrink_to_fit { ef.may_shrink_to_fit = true; ch = true }
     if cef.may_call_unknown && !ef.may_call_unknown { ef.may_call_unknown = true; ch = true }
     if cef.may_call_opaque && !ef.may_call_opaque { ef.may_call_opaque = true; ch = true }
+    if cef.may_pass_param_to_dep && !ef.may_pass_param_to_dep { ef.may_pass_param_to_dep = true; ch = true }
     for g in cef.mutated_globals.keys() {
       if !ef.mutated_globals.contains(g) { ef.mutated_globals[g] = true; ch = true }
     }
@@ -3452,15 +3509,32 @@ pub fn collect_cap_pkg_summary(
                   changed = true
                 }
               }
+            } else if edge.starts_with("QP:") {
+              let rest = edge.slice(3, edge.length())
+              let sep = rest.index_of(":")
+              let pidx_s = if sep > 0 { rest.slice(0, sep) } else { "0" }
+              let qk = if sep > 0 { rest.slice(sep + 1, rest.length()) } else { rest }
+              let mut pidx = 0
+              let mut pi = 0
+              while pi < pidx_s.length() {
+                let c = pidx_s.code_unit_at(pi)
+                if c >= 48 && c <= 57 { pidx = pidx * 10 + (c - 48) }
+                pi = pi + 1
+              }
+              match effects.get(qk) {
+                Some(cef) => if merge_effect(ef, cef) { changed = true }
+                None => {
+                  if !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
+                  if !ef.may_pass_param_to_dep { ef.may_pass_param_to_dep = true; changed = true }
+                  if !ef.dep_escaped_params.contains(pidx) { ef.dep_escaped_params[pidx] = true; changed = true }
+                }
+              }
             } else if edge.starts_with("Q:") {
               let qk = edge.slice(2, edge.length())
               match effects.get(qk) {
                 Some(cef) => if merge_effect(ef, cef) { changed = true }
                 None =>
-                if !ef.may_call_unknown {
-                  ef.may_call_unknown = true
-                  changed = true
-                }
+                if !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
               }
             } else if edge == "EQ" {
               if dep_methods.contains("op_equal") || dep_methods.contains("eq") || dep_methods.contains("equal") {
@@ -3493,18 +3567,23 @@ pub fn collect_cap_pkg_summary(
                 Some(l) => l
                 None => []
               }
-              if dep_methods.contains(mn) {
-                if !ef.may_call_unknown {
-                  ef.may_call_unknown = true
-                  changed = true
-                }
-              } else if targets.length() > 0 {
+              if targets.length() > 0 {
                 for tdk in targets {
                   match effects.get(tdk) {
                     Some(cef) => if merge_effect(ef, cef) { changed = true }
                     None => ()
                   }
                 }
+              } else {
+                if !ef.may_call_unknown { ef.may_call_unknown = true; changed = true }
+                if !is_builtin_first_order_method(mn) && !ef.may_call_opaque {
+                  ef.may_call_opaque = true
+                  changed = true
+                }
+              }
+              if dep_methods.contains(mn) && !ef.may_call_unknown {
+                ef.may_call_unknown = true
+                changed = true
               }
             }
           }
@@ -4162,7 +4241,7 @@ fn for_in_body_hazard(
   // iterated array or its owner (e.g. `for k in keys { (self.same)(was, v) }` or `for x in xs { key(x) }`)
   // are left unblocked here to preserve existing package compatibility until compiler-level `(buf, init_len)`
   // snapshots are introduced.
-  let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, pos : Int, label : String) -> String {
+  let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, arg_open : Int, arg_close : Int, pos : Int, label : String) -> String {
     // pass_kind: 2 = iterated Array itself passed/received; 1 = owner struct of `root.tail` passed/received; 0 = neither
     if pass_kind == 2 {
       if (ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque) && !can_exit(pos) {
@@ -4172,8 +4251,30 @@ fn for_in_body_hazard(
       if ef.may_write { flags[1] = true }
     } else if pass_kind == 1 {
       if is_field_iter && tail.length() > 0 {
-        if ef.mutated_fields.contains(tail) && !can_exit(pos) {
-          return label + " mutates field `." + tail + "` during `for .. in`"
+        // Check if `root` is passed at a parameter position that `ef` passes to a cross-package `dep::f(param)`.
+        let mut root_escapes_to_dep = false
+        if ef.may_pass_param_to_dep && arg_open >= 0 && arg_close > arg_open {
+          let mut ai = arg_open + 1
+          let mut ad = 0
+          let mut arg_ord = 0
+          while ai < arg_close {
+            let ak = tokens[ai].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+            else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+            else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
+            else if ad == 0 && ak == TokenKind::Ident && tokens[ai].raw == root &&
+            !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
+            !(ai + 1 < arg_close && tokens[ai + 1].kind == TokenKind::Dot) {
+              if ef.dep_escaped_params.contains(arg_ord) {
+                root_escapes_to_dep = true
+                break
+              }
+            }
+            ai = ai + 1
+          }
+        }
+        if (ef.mutated_fields.contains(tail) || root_escapes_to_dep) && !can_exit(pos) {
+          return label + " may mutate field `." + tail + "` during `for .. in`"
         }
         if ef.grew_fields.contains(tail) { flags[0] = true }
         if ef.wrote_fields.contains(tail) { flags[1] = true }
@@ -4292,7 +4393,7 @@ fn for_in_body_hazard(
             for dk in keys {
               match summary.effects.get(dk) {
                 Some(ef) => {
-                  let why = check_pkg_effect(ef, pass_kind, k, "`." + m + "(..)`")
+                  let why = check_pkg_effect(ef, pass_kind, k + 2, cp_m, k, "`." + m + "(..)`")
                   if why.length() > 0 { return why }
                 }
                 None => ()
@@ -4364,7 +4465,7 @@ fn for_in_body_hazard(
         } else {
           match summary.effects.get(q + "::" + tk.raw) {
             Some(ef) => {
-              let why = check_pkg_effect(ef, pk, k, "call to `" + q + "::" + tk.raw + "(..)`")
+              let why = check_pkg_effect(ef, pk, k + 1, cp, k, "call to `" + q + "::" + tk.raw + "(..)`")
               if why.length() > 0 { return why }
             }
             None =>
@@ -4396,7 +4497,7 @@ fn for_in_body_hazard(
       } else {
         match summary.effects.get("::" + tk.raw) {
           Some(ef) => {
-            let why = check_pkg_effect(ef, pk, k, "call to `" + tk.raw + "(..)`")
+            let why = check_pkg_effect(ef, pk, k + 1, cp, k, "call to `" + tk.raw + "(..)`")
             if why.length() > 0 { return why }
           }
           None =>
