@@ -668,6 +668,8 @@ pub struct StageAContext {
   mut val_site_seq : Int
   mut init_order_seq : Int
   mut ufcs_seq : Int
+  orig_labeled_loop_locs : Map[String, Array[(Int, Int)]]
+  orig_labeled_loop_cursor : Map[String, Int]
 }
 
 pub fn stage_a_context_new(
@@ -735,6 +737,8 @@ pub fn stage_a_context_new(
     val_site_seq: 0,
     init_order_seq: 0,
     ufcs_seq: 0,
+    orig_labeled_loop_locs: Map(),
+    orig_labeled_loop_cursor: Map(),
   }
 }
 
@@ -6756,21 +6760,26 @@ fn lower_one_token_or_form(
         find_matching_delim(tokens, in_idx + 2) == lb - 1 {
           let sl_recv = tokens[in_idx + 1].raw
           if for_slice_body_is_ro_safe_f42(ctx, tokens, lb + 1, close_b, sl_recv, in_idx + 2) {
-            let b_idx = iter_s.index_of("mbt_compat::__mbt_slice_borrow(")
-            if b_idx >= 0 {
-              let mut rp_idx = -1
-              let mut scan = iter_s.length() - 1
-              while scan > b_idx {
-                if iter_s.slice(scan, scan + 1) == ")" {
-                  rp_idx = scan
-                  break
+            let it_toks = lex_moonbit(iter_s)
+            let it_n = it_toks.length() - 1
+            let mut ti = 0
+            while ti + 3 < it_n {
+              if it_toks[ti].raw == "mbt_compat" &&
+              it_toks[ti + 1].kind == TokenKind::ColonColon &&
+              it_toks[ti + 2].raw == "__mbt_slice_borrow" &&
+              it_toks[ti + 3].kind == TokenKind::LParen {
+                let rp_tok = find_matching_delim(it_toks, ti + 3)
+                if rp_tok > ti + 3 && rp_tok < it_n {
+                  let b_start = it_toks[ti].start_byte
+                  let inner_start = it_toks[ti + 3].end_byte
+                  let rp_start = it_toks[rp_tok].start_byte
+                  let rp_end = it_toks[rp_tok].end_byte
+                  iter_s = iter_s.slice(0, b_start) + "mbt_compat::__mbt_slice_owned(" +
+                  iter_s.slice(inner_start, rp_start) + ", \"__FOR_RO__\")" + iter_s.slice(rp_end, iter_s.length())
                 }
-                scan = scan - 1
+                break
               }
-              if rp_idx > b_idx {
-                iter_s = iter_s.slice(0, b_idx) + "mbt_compat::__mbt_slice_owned(" +
-                iter_s.slice(b_idx + 31, rp_idx) + ", \"__FOR_RO__\")" + iter_s.slice(rp_idx + 1, iter_s.length())
-              }
+              ti = ti + 1
             }
           }
         }
@@ -9272,6 +9281,9 @@ fn lower_one_token_or_form(
         } else {
           name + ".length()"
         }
+        let lo_is_pure_lit = colon_i == next_i + 1 ||
+        (colon_i == next_i + 2 && tokens[next_i + 1].kind == TokenKind::IntLit)
+        let need_omitted_hi_temp = close_br == colon_i + 1 && !lo_is_pure_lit
         let (sl_helper, next_after, extra_arg) = classify_slice_consumer(ctx, tokens, close_br, end, own_exempt, false, ctx.in_interp_top, t.raw, file)
         if sl_helper == "mbt_compat::__mbt_slice_borrow" && (ctx.borrowed_bufs.contains(name) || ctx.borrowed_views.contains(name)) {
           ctx.drift_ledger.push(DriftEntry::{
@@ -9284,9 +9296,20 @@ fn lower_one_token_or_form(
             status: "resolved",
             detail: "borrowed slice lowered to backing-stable ArrayBuf/ArrayView::view",
           })
+          if need_omitted_hi_temp {
+            let sl_var = fresh_temp(ctx, "sl")
+            return (trivia + "({ let " + sl_var + " = " + name + "; " + sl_var + ".view(" + lo + ", " + sl_var + ".length()) })", close_br + 1)
+          }
           return (trivia + name + ".view(" + lo + ", " + hi + ")", close_br + 1)
         }
         let extra_tail = if extra_arg.length() > 0 { ", " + extra_arg } else { "" }
+        if need_omitted_hi_temp {
+          // Omitted upper bound `xs[lo():]` with non-literal `lo` (for every consumer: borrow, to_array,
+          // length, owned): capture `name` into a hygienic temp BEFORE `lo` evaluates, so `lo()` rebinding
+          // `xs` cannot change the length taken for the omitted upper bound.
+          let sl_var = fresh_temp(ctx, "sl")
+          return (trivia + "({ let " + sl_var + " = " + name + "; " + sl_helper + "(" + sl_var + ", " + lo + ", " + sl_var + ".length()" + extra_tail + ") })", next_after)
+        }
         return (trivia + sl_helper + "(" + name + ", " + lo + ", " + hi + extra_tail + ")", next_after)
       }
       // Indexing `a[i]` or `a[i] = rhs` on a promoted `ArrayBuf` / `ArrayView`
@@ -13407,6 +13430,262 @@ pub fn eval_cfg_attr(raw_attr : String, pion_target : String) -> Option[Bool] {
   eval_cfg_expr(s.slice(5, s.length() - 1), pion_target)
 }
 
+struct InterpScanState {
+  src : String
+  len : Int
+  mut pos : Int
+  mut line : Int
+  mut col : Int
+}
+
+fn interp_scan_peek(st : InterpScanState, offset : Int) -> Int {
+  let idx = st.pos + offset
+  if idx < st.len {
+    st.src.code_unit_at(idx)
+  } else {
+    -1
+  }
+}
+
+fn interp_scan_advance(st : InterpScanState) -> Int {
+  let c = st.src.code_unit_at(st.pos)
+  st.pos = st.pos + 1
+  if c == 10 {
+    st.line = st.line + 1
+    st.col = 1
+  } else {
+    st.col = st.col + 1
+  }
+  c
+}
+
+fn skip_interp_char_pos(st : InterpScanState) -> Unit {
+  while st.pos < st.len {
+    let c = interp_scan_advance(st)
+    if c == 39 {
+      return
+    }
+    if c == 92 && st.pos < st.len {
+      let _ = interp_scan_advance(st)
+    }
+  }
+}
+
+fn skip_interp_brace_body_pos(st : InterpScanState) -> Int {
+  let mut depth = 1
+  while st.pos < st.len && depth > 0 {
+    let ic = interp_scan_advance(st)
+    if ic == 123 {
+      depth = depth + 1
+    } else if ic == 125 {
+      depth = depth - 1
+      if depth == 0 {
+        return st.pos - 1
+      }
+    } else if ic == 34 {
+      skip_interp_string_pos(st)
+    } else if ic == 39 {
+      skip_interp_char_pos(st)
+    } else if ic == 47 && interp_scan_peek(st, 0) == 47 {
+      while st.pos < st.len && interp_scan_peek(st, 0) != 10 {
+        let _ = interp_scan_advance(st)
+      }
+    } else if ic == 47 && interp_scan_peek(st, 0) == 42 {
+      let _ = interp_scan_advance(st)
+      let mut cdepth = 1
+      while st.pos < st.len && cdepth > 0 {
+        let cc = interp_scan_advance(st)
+        if cc == 47 && interp_scan_peek(st, 0) == 42 {
+          let _ = interp_scan_advance(st)
+          cdepth = cdepth + 1
+        } else if cc == 42 && interp_scan_peek(st, 0) == 47 {
+          let _ = interp_scan_advance(st)
+          cdepth = cdepth - 1
+        }
+      }
+    }
+  }
+  -1
+}
+
+fn skip_interp_string_pos(st : InterpScanState) -> Unit {
+  while st.pos < st.len {
+    let c = interp_scan_advance(st)
+    if c == 34 {
+      return
+    }
+    if c == 92 {
+      if interp_scan_peek(st, 0) == 123 {
+        let _ = interp_scan_advance(st)
+        let _ = skip_interp_brace_body_pos(st)
+      } else if st.pos < st.len {
+        let _ = interp_scan_advance(st)
+      }
+    }
+  }
+}
+
+///| Extract interpolation holes `\{...}` from an `InterpString` / `InterpMultiline` raw token,
+///| returning `(hole_source, abs_start_line, abs_start_col)` relative to `(base_line, base_col)`.
+fn extract_interp_holes_with_pos(
+  raw : String,
+  base_line : Int,
+  base_col : Int,
+) -> Array[(String, Int, Int)] {
+  let out : Array[(String, Int, Int)] = []
+  let st = InterpScanState::{
+    src: raw,
+    len: raw.length(),
+    pos: 0,
+    line: base_line,
+    col: base_col,
+  }
+  while st.pos < st.len {
+    let ch = interp_scan_advance(st)
+    if ch == 92 && st.pos < st.len {
+      if interp_scan_peek(st, 0) == 123 {
+        let _ = interp_scan_advance(st)
+        let hole_start = st.pos
+        let hole_line = st.line
+        let hole_col = st.col
+        let hole_end = skip_interp_brace_body_pos(st)
+        if hole_end >= hole_start {
+          out.push((raw.slice(hole_start, hole_end), hole_line, hole_col))
+        }
+      } else {
+        let _ = interp_scan_advance(st)
+      }
+    }
+  }
+  out
+}
+
+///| Recursively collect all `<Ident|Keyword> ~ : for|while|loop` hits in `tokens[s..e)`,
+///| including inside `InterpString` / `InterpMultiline` interpolation holes.
+fn collect_labeled_loop_hits_in_tokens(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  base_line : Int,
+  base_col : Int,
+  out : Array[(String, String, Int, Int)],
+) -> Unit {
+  let mut i = s
+  while i < e {
+    let tk = tokens[i]
+    let kk = tk.kind
+    let abs_line = base_line + tk.line - 1
+    let abs_col = if tk.line == 1 { base_col + tk.col - 1 } else { tk.col }
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline {
+      let holes = extract_interp_holes_with_pos(tk.raw, abs_line, abs_col)
+      for h in holes {
+        let htoks = lex_moonbit(h.0)
+        let hn = htoks.length() - 1
+        if hn > 0 {
+          collect_labeled_loop_hits_in_tokens(htoks, 0, hn, h.1, h.2, out)
+        }
+      }
+    } else if (kk == TokenKind::Ident || kk == TokenKind::Keyword) &&
+    !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
+    i + 3 < e &&
+    tokens[i + 1].kind == TokenKind::Tilde &&
+    tokens[i + 2].kind == TokenKind::Colon &&
+    tokens[i + 3].kind == TokenKind::Keyword &&
+    (tokens[i + 3].raw == "for" || tokens[i + 3].raw == "while" || tokens[i + 3].raw == "loop") {
+      out.push((tk.raw, tokens[i + 3].raw, abs_line, abs_col))
+      i = i + 3
+      continue
+    }
+    i = i + 1
+  }
+}
+
+///| Pre-pass: record exact original `.mbt` `(line, col)` for every labeled loop in active
+///| top-level declarations (honoring `#cfg(...)` exclusions) before pre-passes compress lines.
+pub fn collect_orig_labeled_loop_locs(
+  ctx : StageAContext,
+  sources : Array[SourceFile],
+  target : String,
+) -> Unit {
+  for sf in sources {
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut cfg_excluded = false
+    let mut i = 0
+    while i < n {
+      let tk = tokens[i]
+      if tk.kind == TokenKind::Attr {
+        if tk.raw.trim().starts_with("#cfg(") {
+          match eval_cfg_attr(tk.raw, target) {
+            Some(false) => cfg_excluded = true
+            None => cfg_excluded = true
+            Some(true) => ()
+          }
+        }
+        i = i + 1
+        continue
+      }
+      if cfg_excluded {
+        cfg_excluded = false
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+      let decl_end = skip_top_level_decl(tokens, i, n)
+      let next_i = if decl_end > i { decl_end } else { i + 1 }
+      let hits : Array[(String, String, Int, Int)] = []
+      collect_labeled_loop_hits_in_tokens(tokens, i, next_i, 1, 1, hits)
+      for hit in hits {
+        let key = sf.rel_path + "::" + hit.0 + "::" + hit.1
+        let arr = match ctx.orig_labeled_loop_locs.get(key) {
+          Some(a) => a
+          None => []
+        }
+        arr.push((hit.2, hit.3))
+        ctx.orig_labeled_loop_locs[key] = arr
+      }
+      i = next_i
+    }
+  }
+}
+
+///| Emit `MBT2PION_UNSUPPORTED_SYNTAX` for any labeled loop in `tokens[s..e)` using exact
+///| pre-pass original `(line, col)` coordinates, inside the enclosing declaration's `decl_err_before` window.
+fn scan_and_emit_labeled_loops_in_span(
+  ctx : StageAContext,
+  rel_path : String,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+) -> Unit {
+  let hits : Array[(String, String, Int, Int)] = []
+  collect_labeled_loop_hits_in_tokens(tokens, s, e, 1, 1, hits)
+  for hit in hits {
+    let key = rel_path + "::" + hit.0 + "::" + hit.1
+    let cur = match ctx.orig_labeled_loop_cursor.get(key) {
+      Some(c) => c
+      None => 0
+    }
+    let mut use_line = hit.2
+    let mut use_col = hit.3
+    match ctx.orig_labeled_loop_locs.get(key) {
+      Some(arr) =>
+      if cur < arr.length() {
+        use_line = arr[cur].0
+        use_col = arr[cur].1
+        ctx.orig_labeled_loop_cursor[key] = cur + 1
+      }
+      None => ()
+    }
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      rel_path,
+      use_line,
+      use_col,
+      "labeled loop `" + hit.0 + "~:` is unsupported (fail-closed)",
+    ))
+  }
+}
+
 ///| Return true if token `k` starts a new top-level declaration.
 fn is_top_level_decl_start(tokens : Array[Token], k : Int) -> Bool {
   let tk = tokens[k]
@@ -13418,7 +13697,7 @@ fn is_top_level_decl_start(tokens : Array[Token], k : Int) -> Bool {
     return r == "pub" || r == "priv" || r == "fn" || r == "struct" || r == "enum" ||
     r == "let" || r == "const" || r == "type" || r == "trait" || r == "impl" ||
     r == "test" || r == "extern" || r == "async" || r == "typealias" || r == "fnalias" ||
-    r == "suberror" || r == "using"
+    r == "suberror" || r == "using" || r == "init"
   }
   false
 }
@@ -13459,7 +13738,7 @@ fn skip_top_level_decl(tokens : Array[Token], start_i : Int, n : Int) -> Int {
         return eq_i
       }
       if depth == 0 && ek == TokenKind::Eq {
-        return find_expr_end(tokens, eq_i + 1, n)
+        return find_top_level_let_expr_end(tokens, eq_i + 1, n)
       }
       if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace {
         depth = depth + 1
@@ -13489,7 +13768,7 @@ fn skip_top_level_decl(tokens : Array[Token], start_i : Int, n : Int) -> Int {
     }
     return k
   }
-  if is_kw && (kw.raw == "fn" || kw.raw == "impl" || kw.raw == "test" || kw.raw == "trait") {
+  if is_kw && (kw.raw == "fn" || kw.raw == "impl" || kw.raw == "test" || kw.raw == "trait" || kw.raw == "init") {
     let mut k = i + 1
     let mut depth = 0
     while k < n {
@@ -15181,6 +15460,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
     }
 
     let decl_err_before = count_error_diags(ctx.diags)
+    let decl_scan_end = skip_top_level_decl(tokens, i, n)
+    if decl_scan_end > i {
+      scan_and_emit_labeled_loops_in_span(ctx, sf.rel_path, tokens, i, decl_scan_end)
+    }
 
     // Parse visibility (`pub`, `pub(all)`, `pub(open)`, `priv`)
     let mut vis = ""

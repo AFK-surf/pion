@@ -8,6 +8,15 @@ CC="${CC:-gcc}"
 
 mkdir -p "$OUT_DIR"
 
+MODE="full"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bootstrap-only) MODE="bootstrap"; shift ;;
+    --e2e-only) MODE="e2e"; shift ;;
+    *) echo "usage: test-windows.sh [--bootstrap-only | --e2e-only]" >&2; exit 2 ;;
+  esac
+done
+
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
 }
@@ -163,6 +172,7 @@ PYEOF
   fi
   echo "[PASS] bg-lib Windows Job Object assign-failure fail-closed verified (rc=$_inj_rc, winerr=5, workload not started)"
 }
+if [ "$MODE" != "e2e" ]; then
 verify_bg_win_job
 
 echo "=== [1/5] Windows x86_64 Environment & QBE (T_amd64_win) Build ==="
@@ -299,6 +309,31 @@ FP_ASM_PID="$BG_PID"
 
 cp "$TMP_DIR/pionc_win_s4.exe" "$OUT_DIR/pionc_win.exe"
 PIONC="$OUT_DIR/pionc_win.exe"
+
+if [ "$MODE" = "bootstrap" ]; then
+  bg_finish "Stage ${FP_A} == Stage ${FP_B} assembly" "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"
+  FP_ASM_PID=""
+  echo "[PASS] Windows x86_64 (amd64_win) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+  echo "ALL WINDOWS X86_64 (amd64_win) BOOTSTRAP GATES PASSED!"
+  GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+  echo "test-windows.sh --bootstrap-only duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::test-windows.sh --bootstrap-only took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] test-windows.sh --bootstrap-only took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
+fi
+else
+  PIONC="$OUT_DIR/pionc_win.exe"
+  [ -x "$PIONC" ] || { echo "FAIL: --e2e-only requires prebuilt $PIONC" >&2; exit 1; }
+  [ -x "$OUT_DIR/qbe.exe" ] || { echo "FAIL: --e2e-only requires prebuilt $OUT_DIR/qbe.exe" >&2; exit 1; }
+  export PION_QBE="$OUT_DIR/qbe.exe"
+  export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+  export PION_CACHE_DIR="$TMP_DIR/cas_win"
+  mkdir -p "$PION_CACHE_DIR"
+fi
 
 echo "=== [5/5] Native Windows x86_64 pionc: core / std / e2e / V1 Benchmark Checksums ==="
 # The long, independent steps (each with its own CAS) overlap the rest of [5/5]:
@@ -473,9 +508,11 @@ if [ -n "$TLS_PID" ]; then
 fi
 bg_finish "compiler core unit tests" "$CORE_PID" "$TMP_DIR/core_test.log"
 CORE_PID=""
-bg_finish "Stage ${FP_A} == Stage ${FP_B} assembly" "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"
-FP_ASM_PID=""
-echo "[PASS] Windows x86_64 (amd64_win) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+if [ -n "$FP_ASM_PID" ]; then
+  bg_finish "Stage ${FP_A} == Stage ${FP_B} assembly" "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"
+  FP_ASM_PID=""
+  echo "[PASS] Windows x86_64 (amd64_win) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+fi
 bg_finish "tests/e2e/p98_section_gc/run_e2e.sh" "$P98_PID" "$TMP_DIR/p98.log"
 P98_PID=""
 

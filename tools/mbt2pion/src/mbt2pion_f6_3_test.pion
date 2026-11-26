@@ -1,0 +1,466 @@
+///| Wave F6-3a unit tests:
+///| 1. `mutation_summary.pion` fixed-point transitive array mutation analysis across all 7 soundness classes.
+///| 2. Gates A / B / C / D positive allow + drift_ledger accounting + fail-closed negative enforcement.
+
+test "F6-3a: mutation_summary pure transitive & mutual recursion fixed point" {
+  let src = "struct View {\n  id : Int\n}\n\nfn View::same(self : View, other : View) -> Bool {\n  self.id == other.id\n}\n\nfn live(v : View) -> Bool {\n  v.id > 0\n}\n\nfn View::alive(self : View) -> Bool {\n  live(self)\n}\n\nfn ping(n : Int) -> Bool {\n  if n <= 0 { true } else { pong(n - 1) }\n}\n\nfn pong(n : Int) -> Bool {\n  if n <= 0 { false } else { ping(n - 1) }\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "View::same") {
+    Some(s) => {
+      assert_true(!s.unknown && !s.mutates_any_array && !s.reaches_shrink && s.mutated_elem_types.length() == 0, "View::same is pure")
+      assert_true(!summary_may_mutate_array(s, "View"), "View::same cannot mutate Array[View]")
+    }
+    None => assert_true(false, "View::same summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "View::alive") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "View::alive -> live is pure")
+    None => assert_true(false, "View::alive summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "ping") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "mutual recursion ping/pong pure")
+    None => assert_true(false, "ping summary must exist")
+  }
+}
+
+test "F6-3a: mutation_summary transitive mutation & shrink reachability across mutual recursion" {
+  let src = "struct Item { id : Int }\n\nfn mutate_items(xs : Array[Item]) -> Unit {\n  xs.clear()\n}\n\nfn shrink_items(xs : Array[Item]) -> Unit {\n  xs.shrink_to_fit()\n}\n\nfn step_a(xs : Array[Item], n : Int) -> Unit {\n  if n > 0 { step_b(xs, n - 1) }\n}\n\nfn step_b(xs : Array[Item], n : Int) -> Unit {\n  if n == 0 { mutate_items(xs) } else { step_a(xs, n - 1) }\n}\n\nfn call_shrink(xs : Array[Item]) -> Unit {\n  shrink_items(xs)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "step_a") {
+    Some(s) => {
+      assert_true(!s.unknown, "step_a is known")
+      assert_true(summary_may_mutate_array(s, "Item"), "step_a transitively mutates Array[Item]")
+      assert_true(!summary_may_mutate_array(s, "String"), "step_a does not mutate Array[String]")
+    }
+    None => assert_true(false, "step_a summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "call_shrink") {
+    Some(s) => {
+      assert_true(s.reaches_shrink, "call_shrink reaches shrink_to_fit")
+      assert_true(summary_may_mutate_array(s, "Item"), "call_shrink mutates Array[Item]")
+    }
+    None => assert_true(false, "call_shrink summary must exist")
+  }
+}
+
+test "F6-3a: mutation_summary all 7 fail-closed soundness classes" {
+  // Class 1: trait object / trait method / derive method
+  let c1 = "trait Checker {\n  check(self : Self) -> Bool\n}\n\nfn call_dyn(c : dyn Checker) -> Bool {\n  c.check()\n}\n\nfn call_gen[T : Checker](c : T) -> Bool {\n  c.check()\n}\n\nstruct Tag { n : Int } derive(Show)\n\nfn show_tag(t : Tag) -> String {\n  t.to_string()\n}\n"
+  let pkg1 = collect_pkg_mutation_summary_tokens([lex_moonbit(c1)])
+  assert_true(match lookup_fn_mutation_summary(pkg1, "call_dyn") { Some(s) => s.unknown, None => false }, "Class 1: dyn trait sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg1, "call_gen") { Some(s) => s.unknown, None => false }, "Class 1: generic trait bound sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg1, "show_tag") { Some(s) => s.unknown, None => false }, "Class 1: derive method sets unknown")
+
+  // Class 2: operator impl (`impl Add`, `Show` interpolation)
+  let c2 = "struct Evil { xs : Array[Int] }\n\nimpl Add for Evil {\n  fn op_add(self : Evil, other : Evil) -> Evil {\n    self.xs.clear()\n    other\n  }\n}\n\nfn use_add(a : Evil, b : Evil) -> Evil {\n  a + b\n}\n\nfn use_interp(a : Evil) -> String {\n  \"val=\\{a}\"\n}\n"
+  let pkg2 = collect_pkg_mutation_summary_tokens([lex_moonbit(c2)])
+  assert_true(match lookup_fn_mutation_summary(pkg2, "use_add") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 2: impl Add mutating array propagates")
+  assert_true(match lookup_fn_mutation_summary(pkg2, "use_interp") { Some(s) => s.unknown, None => false }, "Class 2: non-scalar interpolation sets unknown")
+
+  // Class 3: function-value / closure calls (param, struct field, tuple field, array element)
+  let c3 = "struct Holder { cb : () -> Bool }\n\nfn call_param(has : (String) -> Bool) -> Bool {\n  has(\"k\")\n}\n\nfn call_field(h : Holder) -> Bool {\n  h.cb()\n}\n\nfn call_tuple(b : (Int, () -> Bool)) -> Bool {\n  (b.1)()\n}\n\nfn call_arr(fs : Array[() -> Bool]) -> Bool {\n  fs[0]()\n}\n"
+  let pkg3 = collect_pkg_mutation_summary_tokens([lex_moonbit(c3)])
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_param") { Some(s) => s.unknown, None => false }, "Class 3: param closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_field") { Some(s) => s.unknown, None => false }, "Class 3: struct field closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_tuple") { Some(s) => s.unknown, None => false }, "Class 3: tuple field closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_arr") { Some(s) => s.unknown, None => false }, "Class 3: array element closure call sets unknown")
+
+  // Class 4: cross-package / external calls default to unknown
+  let c4 = "fn call_ext(x : Int) -> Int {\n  other_pkg::mystery(x)\n}\n"
+  let pkg4 = collect_pkg_mutation_summary_tokens([lex_moonbit(c4)])
+  assert_true(match lookup_fn_mutation_summary(pkg4, "call_ext") { Some(s) => s.unknown, None => false }, "Class 4: unknown external call sets unknown")
+
+  // Class 5: generic `fn[T]` writing `Array[T]` -> `mutates_any_array = true`
+  let c5 = "fn[T] push_any(xs : Array[T], v : T) -> Unit {\n  xs.push(v)\n}\n"
+  let pkg5 = collect_pkg_mutation_summary_tokens([lex_moonbit(c5)])
+  assert_true(match lookup_fn_mutation_summary(pkg5, "push_any") { Some(s) => s.mutates_any_array && summary_may_mutate_array(s, "String"), None => false }, "Class 5: generic Array[T] write sets mutates_any_array")
+
+  // Class 6: field reassignment `self.items = []` & Map/Ref holding arrays
+  let c6 = "struct Bag { mut items : Array[Int] }\n\nfn Bag::reset(self : Bag) -> Unit {\n  self.items = []\n}\n\nfn set_map_arr(m : Map[String, Array[String]], k : String) -> Unit {\n  m[k] = []\n}\n\nfn set_ref_arr(r : Ref[Array[Int]]) -> Unit {\n  r.v = []\n}\n"
+  let pkg6 = collect_pkg_mutation_summary_tokens([lex_moonbit(c6)])
+  assert_true(match lookup_fn_mutation_summary(pkg6, "Bag::reset") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 6: field reassignment records Int array mutation")
+  assert_true(match lookup_fn_mutation_summary(pkg6, "set_map_arr") { Some(s) => summary_may_mutate_array(s, "String"), None => false }, "Class 6: Map[K, Array[String]] write records String array mutation")
+  assert_true(match lookup_fn_mutation_summary(pkg6, "set_ref_arr") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 6: Ref[Array[Int]] write records Int array mutation")
+
+  // Class 7: mutating Array methods, index write `arr[i] = ...`, UFCS `Array::push(...)`
+  let c7 = "fn write_idx(xs : Array[Int]) -> Unit {\n  xs[0] = 9\n}\n\nfn write_ufcs(xs : Array[String]) -> Unit {\n  Array::push(xs, \"a\")\n}\n\nfn write_swap(xs : Array[Int]) -> Unit {\n  xs.swap(0, 1)\n}\n"
+  let pkg7 = collect_pkg_mutation_summary_tokens([lex_moonbit(c7)])
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_idx") { Some(s) => summary_may_mutate_array(s, "Int") && !summary_may_mutate_array(s, "String"), None => false }, "Class 7: index assignment mutates Array[Int]")
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_ufcs") { Some(s) => summary_may_mutate_array(s, "String") && !summary_may_mutate_array(s, "Int"), None => false }, "Class 7: UFCS Array::push mutates Array[String]")
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_swap") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 7: swap mutates Array[Int]")
+}
+
+test "F6-3a: Gate A shrink_to_fit non-escaping local vs kept-iter fail-closed" {
+  // Positive: non-escaping local array iterated then cleared & shrunk
+  let ok_src = "fn helper(x : Int) -> Int { x + 1 }\n\nfn run_ok() -> Int {\n  let faded : Array[Int] = Array::make(3, 1)\n  let mut acc = 0\n  for v in faded {\n    acc = acc + helper(v)\n  }\n  faded.clear()\n  faded.shrink_to_fit()\n  acc\n}\n"
+  let ok_toks = lex_moonbit(ok_src)
+  let ok_ms = collect_pkg_mutation_summary_tokens([ok_toks])
+  let ok_base = collect_shrink_pkg_tokens([ok_toks])
+  let ok_sp = collect_shrink_pkg_tokens_with_summary([ok_toks], [], [], empty_pkg_query_types(), ok_ms)
+  let mut shrink_i = -1
+  for idx, tk in ok_toks {
+    if tk.raw == "shrink_to_fit" { shrink_i = idx }
+  }
+  let (why_ok, allowed_ms) = shrink_snapshot_hazard_with_summary(ok_toks, shrink_i, ok_base, ok_sp, ok_ms, ok_src, None)
+  assert_true(why_ok.length() == 0 && allowed_ms, "Gate A: non-escaping Array::make local shrink allowed by mutation_summary")
+
+  // Negative: capacity 8, push(1), let it = a.iter(), a.shrink_to_fit(), a[0] = 9 -> MUST stay fail-closed!
+  let bad_src = "fn run_bad() -> Int {\n  let a : Array[Int] = Array::new(capacity=8)\n  a.push(1)\n  let it = a.iter()\n  a.shrink_to_fit()\n  a[0] = 9\n  match it.head() { Some(v) => v, None => -1 }\n}\n"
+  let bad_toks = lex_moonbit(bad_src)
+  let bad_ms = collect_pkg_mutation_summary_tokens([bad_toks])
+  let bad_base = collect_shrink_pkg_tokens([bad_toks])
+  let bad_sp = collect_shrink_pkg_tokens_with_summary([bad_toks], [], [], empty_pkg_query_types(), bad_ms)
+  let mut bad_si = -1
+  for idx, tk in bad_toks {
+    if tk.raw == "shrink_to_fit" { bad_si = idx }
+  }
+  let (why_bad, _) = shrink_snapshot_hazard_with_summary(bad_toks, bad_si, bad_base, bad_sp, bad_ms, bad_src, None)
+  assert_true(why_bad.length() > 0, "Gate A negative: kept iter before shrink_to_fit + write slot 0 MUST fail closed")
+}
+
+test "F6-3a: Gate B search_by & Gate C immediate .iter().(any|all|find_first) positive & negative" {
+  let src = "struct View { id : Int }\n\nfn View::same(self : View, other : View) -> Bool {\n  self.id == other.id\n}\n\nfn live(v : View) -> Bool {\n  v.id > 0\n}\n\nfn View::alive(self : View) -> Bool {\n  live(self)\n}\n\nfn check_pure_search(xs : Array[(View, Int)], target : View) -> Option[Int] {\n  xs.search_by(fn(e) { e.0.same(target) })\n}\n\nfn check_pure_any(xs : Array[View]) -> Bool {\n  let dead_sibling = fn() { xs.clear() }\n  let _ = dead_sibling\n  xs.iter().any(fn(o) { o.alive() })\n}\n\nfn check_bad_param_cb(xs : Array[String], has : (String) -> Bool) -> Bool {\n  xs.iter().all(fn(k) { has(k) })\n}\n\nfn check_bad_reentrant(xs : Array[View]) -> Bool {\n  let killer = fn() { xs.clear() }\n  let box_fn : Array[() -> Unit] = [killer]\n  xs.iter().any(fn(o) {\n    box_fn[0]()\n    o.alive()\n  })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+
+  // Gate B positive: `xs.search_by(fn(e) { e.0.same(target) })`
+  let dl_b : Array[DriftEntry] = []
+  let mut sb_line = 0
+  let mut sb_col = 0
+  for tk in toks {
+    if tk.raw == "search_by" { sb_line = tk.line; sb_col = tk.col }
+  }
+  let b_ok = stage_b_check_search_by_with_summary(toks, ms, "t.pion", src, None, "(View, Int)", sb_line, sb_col, true, dl_b)
+  assert_true(b_ok && dl_b.length() == 1 && dl_b[0].category == "mutation_summary_allow_b", "Gate B allows pure search_by penetrating View::same and logs ledger")
+
+  // Gate C positive & negatives
+  let iter_dots : Array[Int] = []
+  for idx, tk in toks {
+    if idx + 1 < toks.length() && tk.kind == TokenKind::Dot && toks[idx + 1].raw == "iter" {
+      iter_dots.push(idx)
+    }
+  }
+  assert_true(iter_dots.length() == 3, "found 3 .iter() sites")
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[0], ms, src, None, "View") {
+    Some(_) => ()
+    None => assert_true(false, "Gate C allows pure immediate .iter().any penetrating View::alive -> live even with uncalled sibling closure")
+  }
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[1], ms, src, None, "String") {
+    Some(_) => assert_true(false, "Gate C MUST fail-closed on param closure `has(k)`")
+    None => ()
+  }
+  match immediate_iter_consumer_allow_with_summary(toks, iter_dots[2], ms, src, None, "View") {
+    Some(_) => assert_true(false, "Gate C MUST fail-closed on re-entrant stored closure `box_fn[0]()`")
+    None => ()
+  }
+}
+
+test "F6-3a: Gate D borrowed slice for-loop clamped rewrite & fail-closed on mutation" {
+  let ok_src = "struct Row { id : Int }\n\nfn Row::ok(self : Row) -> Bool { self.id > 0 }\n\nfn scan(visible : Array[Row]) -> Int {\n  let mut found = -1\n  for k in mbt_compat::__mbt_slice_borrow(visible, 1, visible.length()) {\n    if !k.ok() { break }\n    if k.id == 5 { found = k.id; break }\n  }\n  found\n}\n"
+  let ok_toks = lex_moonbit(ok_src)
+  let ok_ms = collect_pkg_mutation_summary_tokens([ok_toks])
+  let ok_lines = ok_src.split("\n")
+  let ok_used = collect_used_idents_from_tokens(ok_toks)
+  let ok_mut : Map[Int, Bool] = Map()
+  let ok_dl : Array[DriftEntry] = []
+  let ch_ok = stage_b_rewrite_borrowed_slice_for_loops(ok_lines, ok_toks, ok_ms, "scan.pion", ok_src, None, ok_used, ok_mut, ok_dl)
+  assert_true(ch_ok && ok_dl.length() == 1 && ok_dl[0].category == "mutation_summary_allow_d", "Gate D rewrites pure borrowed slice for-loop and logs ledger")
+  let joined = ok_lines.join("\n")
+  assert_true(!str_has(joined, "__mbt_slice_borrow") && str_has(joined, "while ") && str_has(joined, "break"), "Gate D emits clamped while loop preserving break")
+
+  // Negative: loop body mutates `visible` -> MUST NOT rewrite (stays `__mbt_slice_borrow` for fail-closed!)
+  let bad_src = "fn scan_bad(visible : Array[Int]) -> Int {\n  let mut s = 0\n  for k in mbt_compat::__mbt_slice_borrow(visible, 1, visible.length()) {\n    visible.push(k)\n    s = s + k\n  }\n  s\n}\n"
+  let bad_toks = lex_moonbit(bad_src)
+  let bad_ms = collect_pkg_mutation_summary_tokens([bad_toks])
+  let bad_lines = bad_src.split("\n")
+  let bad_used = collect_used_idents_from_tokens(bad_toks)
+  let bad_mut : Map[Int, Bool] = Map()
+  let bad_dl : Array[DriftEntry] = []
+  let ch_bad = stage_b_rewrite_borrowed_slice_for_loops(bad_lines, bad_toks, bad_ms, "bad.pion", bad_src, None, bad_used, bad_mut, bad_dl)
+  assert_true(!ch_bad && bad_dl.length() == 0, "Gate D negative: mutating loop body MUST fail closed")
+}
+
+test "F6-3a: R2 soundness & Gate D grammar boundary regressions" {
+  // 1. Gate D MUST NOT rewrite tuple-pattern `for (a, b)`, labeled `outer~: for`, or trailing `else`
+  let d_src = "fn bad_d(pairs : Array[(Int, Int)], xs : Array[Int]) -> Int {\n  let mut acc = 0\n  for (a, b) in mbt_compat::__mbt_slice_borrow(pairs, 1, pairs.length()) {\n    acc = acc + a + b\n  }\n  outer~: for x in mbt_compat::__mbt_slice_borrow(xs, 1, xs.length()) {\n    acc = acc + x\n  }\n  for x in mbt_compat::__mbt_slice_borrow(xs, 1, xs.length()) {\n    acc = acc + x\n  } else {\n    acc = acc + 1\n  }\n  acc\n}\n"
+  let d_toks = lex_moonbit(d_src)
+  let d_ms = collect_pkg_mutation_summary_tokens([d_toks])
+  let d_lines = d_src.split("\n")
+  let d_used = collect_used_idents_from_tokens(d_toks)
+  let d_mut : Map[Int, Bool] = Map()
+  let d_dl : Array[DriftEntry] = []
+  let ch_d = stage_b_rewrite_borrowed_slice_for_loops(d_lines, d_toks, d_ms, "d.pion", d_src, None, d_used, d_mut, d_dl)
+  assert_true(!ch_d && d_dl.length() == 0, "Gate D MUST refuse tuple-pattern, labeled, and else for-loops without corrupting syntax")
+
+  // 2. User-defined `MyWrap::clear` reaching `shrink_to_fit` MUST propagate `reaches_shrink`
+  let wrap_src = "struct MyWrap { xs : Array[Int] }\nfn MyWrap::clear(self : MyWrap) -> Unit { self.xs.shrink_to_fit() }\nfn call_wrap(w : MyWrap) -> Unit { w.clear() }\n"
+  let wrap_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(wrap_src)])
+  match wrap_ms.summaries.get("call_wrap") {
+    Some(s) => assert_true(s.reaches_shrink, "user MyWrap::clear MUST propagate reaches_shrink")
+    None => assert_true(false, "call_wrap summary missing")
+  }
+
+  // 3. Cross-block local shadowing `{ let x : Evil = ...; let _ = x + x } { let x : Int = 1 }` MUST fail-closed
+  let ambig_src = "struct Evil { xs : Array[Int] }\nimpl Add for Evil with add(self, other) { self.xs.clear(); other }\nfn shadow_test(e : Evil) -> Unit {\n  { let x : Evil = e; let _ = x + x }\n  { let x : Int = 1; let _ = x }\n}\n"
+  let ambig_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ambig_src)])
+  match ambig_ms.summaries.get("shadow_test") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "cross-block local shadowing MUST mark __AMBIG__ and fail-closed on x + x")
+    None => assert_true(false, "shadow_test summary missing")
+  }
+
+  // 4. Static `FixedArray::set` and `Map::set` MUST NOT be treated as pure
+  let ufcs_src = "fn fa_set(a : FixedArray[Int]) -> Unit { FixedArray::set(a, 0, 1) }\nfn map_set(m : Map[String, Array[Int]], xs : Array[Int]) -> Unit { Map::set(m, \"k\", xs) }\n"
+  let ufcs_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ufcs_src)])
+  match ufcs_ms.summaries.get("fa_set") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "FixedArray::set MUST record Int array mutation")
+    None => assert_true(false, "fa_set summary missing")
+  }
+  match ufcs_ms.summaries.get("map_set") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "Map::set on Map[String, Array[Int]] MUST record Int array mutation")
+    None => assert_true(false, "map_set summary missing")
+  }
+}
+
+test "F6-3a: R3 soundness regressions (IIFE, shadowing, struct pat, qualified pipe, omitted-hi slice)" {
+  // 1. Immediately-invoked bare closure `fn(){ xs.clear() }()` MUST NOT be skipped
+  let iife_src = "fn run_iife(xs : Array[Int]) -> Bool {\n  xs.iter().any(fn(_x) {\n    fn() { xs.clear() }()\n    false\n  })\n}\n"
+  let iife_toks = lex_moonbit(iife_src)
+  let iife_ms = collect_pkg_mutation_summary_tokens([iife_toks])
+  let mut iife_dot = -1
+  let mut k = 0
+  while k + 2 < iife_toks.length() {
+    if iife_toks[k].kind == TokenKind::Dot && iife_toks[k + 1].raw == "iter" { iife_dot = k; break }
+    k = k + 1
+  }
+  assert_true(iife_dot > 0, "found .iter() in IIFE test")
+  match immediate_iter_consumer_allow_with_summary(iife_toks, iife_dot, iife_ms, iife_src, None, "Int") {
+    Some(_) => assert_true(false, "IIFE `fn(){ xs.clear() }()` MUST fail-closed")
+    None => ()
+  }
+
+  // 2. Pattern / closure-param / unknown-let shadowing outer `a : Array[Int]` MUST mark `__AMBIG__`
+  let sh_src = "struct Item { id : Int }\nfn sh_for(a : Array[Int], groups : Array[Array[Item]], it : Item) -> Unit {\n  for a in groups { a.push(it) }\n}\nfn sh_match(a : Array[Int], opt : Option[Array[Item]]) -> Unit {\n  match opt { Some(a) => a.clear(); None => () }\n}\nfn sh_let(a : Array[Int], cond : Bool, items : Array[Item], it : Item) -> Unit {\n  let a = if cond { items } else { items }\n  a.push(it)\n}\n"
+  let sh_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(sh_src)])
+  for fn_nm in ["sh_for", "sh_match", "sh_let"] {
+    match sh_ms.summaries.get(fn_nm) {
+      Some(s) => assert_true(summary_may_mutate_array(s, "Item"), fn_nm + " shadowing outer Array[Int] MUST fail-closed for Array[Item]")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 3. Struct pattern `{ cb: helper }` in match / let / is MUST shadow top-level pure `helper`
+  let sp_src = "struct Box { cb : () -> Unit }\nfn helper() -> Unit { () }\nfn pat_match(b : Box) -> Unit {\n  match b {\n    Box::{ cb: helper } => helper()\n  }\n}\nfn pat_let(b : Box) -> Unit {\n  let { cb: helper } = b\n  helper()\n}\nfn pat_is(b : Box) -> Unit {\n  if b is { cb: helper } { helper() }\n}\n"
+  let sp_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(sp_src)])
+  for fn_nm in ["pat_match", "pat_let", "pat_is"] {
+    match sp_ms.summaries.get(fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " struct pattern binding MUST mark helper unknown")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 4. Qualified pipe `xs |> W::grow` MUST propagate W::grow's mutation
+  let pipe_src = "struct W { n : Int }\nfn W::grow(xs : Array[Int]) -> Unit { xs.push(9) }\nfn use_pipe(xs : Array[Int]) -> Unit { xs |> W::grow }\n"
+  let pipe_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(pipe_src)])
+  match pipe_ms.summaries.get("use_pipe") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "qualified pipe `xs |> W::grow` MUST propagate Array[Int] mutation")
+    None => assert_true(false, "use_pipe summary missing")
+  }
+}
+
+test "F6-3a: R6/R7 labeled loop original line:col, top-level let, interp, #cfg, and report dispositions" {
+  let src =
+  "struct V { x : Int }\n" +
+  "impl Add for V with add(\n" +
+  "  self,\n" +
+  "  other,\n" +
+  ") {\n" +
+  "  { x: self.x + other.x }\n" +
+  "}\n" +
+  "\n" +
+  "pub fn run(xs : Array[Int]) -> Int {\n" +
+  "  outer~: for v in xs[1:] {\n" +
+  "    if v > 0 { break outer~ }\n" +
+  "  }\n" +
+  "  0\n" +
+  "}\n" +
+  "pub fn probe(x : Int) -> Int { x + 1 }\n"
+  let empty_check = fn(_fs : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut hit_exact = false
+  let mut labeled_count = 0
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "outer~:") {
+      labeled_count = labeled_count + 1
+      if d.file == "lib.mbt" && d.line == 10 && d.col == 3 {
+        hit_exact = true
+      }
+    }
+  }
+  assert_true(labeled_count == 1 && hit_exact, "labeled loop diagnostic must fire once at original lib.mbt:10:3")
+  let mut run_unsup = false
+  let mut probe_ok = false
+  for disp in res.dispositions {
+    if disp.decl == "fn:run" && disp.disposition == "unsupported" { run_unsup = true }
+    if disp.decl == "fn:probe" && disp.disposition == "transpiled" { probe_ok = true }
+  }
+  assert_true(run_unsup && probe_ok, "dispositions must mark fn:run unsupported and sibling fn:probe transpiled")
+
+  // Inactive `#cfg(target="js")` branch with labeled loop MUST NOT emit diagnostic on native target
+  let cfg_src =
+  "#cfg(target=\"js\")\n" +
+  "pub fn js_only(xs : Array[Int]) -> Int {\n" +
+  "  outer~: for v in xs[1:] {\n" +
+  "    if v > 0 { break outer~ }\n" +
+  "  }\n" +
+  "  0\n" +
+  "}\n" +
+  "pub fn native_ok(x : Int) -> Int { x + 1 }\n"
+  let cfg_res = transpile_package(
+    [SourceFile::{ rel_path: "cfg.mbt", content: cfg_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(cfg_res.diagnostics.length() == 0, "inactive #cfg(target=\"js\") labeled loop must not emit diagnostic on native")
+
+  // Top-level `let` initializer with labeled loop MUST report exact original 1:17 and mark `let:value` unsupported
+  let let_src = "let value:Int = outer~: for x in [3] {break outer~ x} nobreak {4}\n"
+  let let_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: let_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut let_exact = false
+  for d in let_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && d.file == "lib.mbt" && d.line == 1 && d.col == 17 {
+      let_exact = true
+    }
+  }
+  let mut let_unsup = false
+  for disp in let_res.dispositions {
+    if disp.decl == "let:value" && disp.disposition == "unsupported" { let_unsup = true }
+  }
+  assert_true(let_exact && let_unsup, "top-level let labeled loop must report lib.mbt:1:17 and mark let:value unsupported")
+
+  // String interpolation hole with labeled loop MUST report exact original line:col and mark fn:interp_fn unsupported
+  let interp_src = "pub fn interp_fn() -> Int {\n  \"\\{outer~: for x in [3] {break outer~ x} nobreak {4}}\".length()\n}\n"
+  let interp_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: interp_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut interp_exact = false
+  for d in interp_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && d.file == "lib.mbt" && d.line == 2 && d.col == 6 {
+      interp_exact = true
+    }
+  }
+  let mut interp_unsup = false
+  for disp in interp_res.dispositions {
+    if disp.decl == "fn:interp_fn" && disp.disposition == "unsupported" { interp_unsup = true }
+  }
+  assert_true(interp_exact && interp_unsup, "interp labeled loop must report lib.mbt:2:6 and mark fn:interp_fn unsupported")
+
+  // Nested interpolation with inner `"}"` must not break outer brace balance
+  let nested_rbrace_src = "fn pick(_s : String, x : Int) -> Int { x }\npub fn probe() -> Int {\n  \"\\{pick(\"\\{\"}\"}\", outer~: for x in [3] {break outer~ x} nobreak {4})}\".length()\n}\n"
+  let nr_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: nested_rbrace_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut nr_exact = false
+  for d in nr_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && d.file == "lib.mbt" && d.line == 3 && d.col == 21 {
+      nr_exact = true
+    }
+  }
+  let mut nr_unsup = false
+  for disp in nr_res.dispositions {
+    if disp.decl == "fn:probe" && disp.disposition == "unsupported" { nr_unsup = true }
+  }
+  assert_true(nr_exact && nr_unsup, "nested interp with inner `}` must report lib.mbt:3:21 and mark fn:probe unsupported")
+
+  // Nested interpolation with inner `"{"` must not break outer brace balance
+  let nested_lbrace_src = "fn pick(_s : String, x : Int) -> Int { x }\npub fn probe() -> Int {\n  \"\\{pick(\"\\{\"{\"}\", outer~: for x in [3] {break outer~ x} nobreak {4})}\".length()\n}\n"
+  let nl_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: nested_lbrace_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut nl_exact = false
+  for d in nl_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && d.file == "lib.mbt" && d.line == 3 && d.col == 21 {
+      nl_exact = true
+    }
+  }
+  let mut nl_unsup = false
+  for disp in nl_res.dispositions {
+    if disp.decl == "fn:probe" && disp.disposition == "unsupported" { nl_unsup = true }
+  }
+  assert_true(nl_exact && nl_unsup, "nested interp with inner `{` must report lib.mbt:3:21 and mark fn:probe unsupported")
+
+  // Keyword-lexed label name (`not~:`) must report exact lib.mbt:2:3 and mark fn:probe unsupported
+  let kw_label_src = "pub fn probe() -> Int {\n  not~: loop 3 { v => break not~ v }\n}\n"
+  let kw_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: kw_label_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let mut kw_exact = false
+  for d in kw_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && d.file == "lib.mbt" && d.line == 2 && d.col == 3 {
+      kw_exact = true
+    }
+  }
+  let mut kw_unsup = false
+  for disp in kw_res.dispositions {
+    if disp.decl == "fn:probe" && disp.disposition == "unsupported" { kw_unsup = true }
+  }
+  assert_true(kw_exact && kw_unsup, "keyword label `not~:` must report lib.mbt:2:3 and mark fn:probe unsupported")
+}
