@@ -810,7 +810,7 @@ fn case_compat_parse_numbers() -> Unit {
   trace("int_under", "\{iu1.unwrap_or(-1)},\{iu2.unwrap_or(-1)},\{iu3.unwrap_or(-1)},\{iub1 is None},\{iub2 is None},\{iub3 is None},\{iub4 is None},\{iub5 is None}")
   check("m2b.int_underscores", iu1 == Some(255) && iu2 == Some(10) && iu3 == Some(255) && iub1 is None && iub2 is None && iub3 is None && iub4 is None && iub5 is None)
 
-  // P1-3: JSON nesting depth 513 (Ok), 1024 (Ok), 1025 (Err)
+  // P1-3: JSON nesting depth 513 (Ok), 1024 (Ok) — invariant across MoonBit 0.1.20261119 (1024 cap) & 0.1.20261126+ (heap stack)
   let mk_nest = fn(d : Int) -> String {
     let sb = StringBuilder::new()
     for _i = 0; _i < d; _i = _i + 1 { sb.write_char('[') }
@@ -820,9 +820,8 @@ fn case_compat_parse_numbers() -> Unit {
   }
   let jd513 = try { let _ = @json.parse(mk_nest(513)); true } catch { _ => false }
   let jd1024 = try { let _ = @json.parse(mk_nest(1024)); true } catch { _ => false }
-  let jd1025 = try { let _ = @json.parse(mk_nest(1025)); true } catch { _ => false }
-  trace("json_depth", "\{jd513},\{jd1024},\{jd1025}")
-  check("m2b.json_depth_1024", jd513 && jd1024 && !jd1025)
+  trace("json_depth", "\{jd513},\{jd1024}")
+  check("m2b.json_depth_1024", jd513 && jd1024)
 
   // P1-4: String::view vs String::clamped_view
   let sv1 = "abc".view(start_offset=1).to_string()
