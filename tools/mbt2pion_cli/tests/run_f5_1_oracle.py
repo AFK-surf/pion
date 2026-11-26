@@ -78,6 +78,19 @@ pub fn probe_peq_after_block() -> Int {
   if physical_equal("ab".code_unit_at(1), 98) { a } else { 0 }
 }
 
+fn yes_bool(x : Bool) -> Bool { x }
+
+pub fn probe_peq_if_call_is() -> Int {
+  if yes_bool(Some(1) is Some(physical_equal)) {
+    if physical_equal("ab".code_unit_at(1), 98) { 10 } else { 0 }
+  } else { 0 }
+}
+
+pub fn probe_peq_guard_call_is() -> Int {
+  guard yes_bool(Some(1) is Some(physical_equal)) else { return 0 }
+  if physical_equal("ab".code_unit_at(1), 98) { 10 } else { 0 }
+}
+
 // 2. Match-arm sibling tuple inference for overlapping local enum ctors
 pub enum AnchorSide {
   Below
@@ -218,7 +231,7 @@ pub fn run_all() -> String {
   let _ = Debug::to_repr(b)
   let _ = Debug::to_repr(b,)
   let s6 = Show::to_string(b)
-  let s7 = probe_peq_after_let().to_string() + "," + probe_peq_after_block().to_string()
+  let s7 = probe_peq_after_let().to_string() + "," + probe_peq_after_block().to_string() + "," + probe_peq_if_call_is().to_string() + "," + probe_peq_guard_call_is().to_string()
   "F51-CU:" + s1 + "\nF51-CTOR:" + s2 + "\nF51-SU:" + s3 + "\nF51-JSON:" + s4 + "\nF51-RNG:" + s5 + "\nF51-DBG:" + s6 + "\nF51-PEQ:" + s7
 }
 '''
@@ -320,7 +333,7 @@ def main():
             "F51-JSON:13\n"
             "F51-RNG:1,2,3,0,1,1,0\n"
             "F51-DBG:Badge(ok:7)\n"
-            "F51-PEQ:10,9"
+            "F51-PEQ:10,9,10,10"
         )
         assert moon_native == expected and moon_wasm == expected and pion_native == expected and pion_wasm == expected, (
             f"4-TARGET MISMATCH:\nEXPECTED:\n{expected}\nMOON_NATIVE:\n{moon_native}\nMOON_WASM:\n{moon_wasm}\nPION_NATIVE:\n{pion_native}\nPION_WASM:\n{pion_wasm}"
@@ -464,6 +477,31 @@ def main():
             '  let f = first_for("a"[0])\n'
             '  let same = Some(f) is Some(physical_equal) && (physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1)) + 1).to_int() > 0\n'
             '  if same { 1 } else { 0 }\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_let_is_and_block_shadow_physical_equal",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n'
+            'pub fn probe() -> Int {\n'
+            '  let f = first_for("a"[0])\n'
+            '  let same = Some(f) is Some(physical_equal) && {\n'
+            '    let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '    (n + n).to_int() == 48128\n'
+            '  }\n'
+            '  if same { 1 } else { 0 }\n'
+            '}\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_if_is_and_cond_block_shadow_physical_equal",
+            'fn[T] first_for(_sample : T) -> (T, T) -> T { fn(x, _y) { x } }\n'
+            'pub fn probe() -> Int {\n'
+            '  let f = first_for("a"[0])\n'
+            '  if (Some(f) is Some(physical_equal)) && { true } {\n'
+            '    let n = physical_equal("\\u{1F600}".code_unit_at(1), "\\u{1F600}".code_unit_at(1))\n'
+            '    (n + n).to_int()\n'
+            '  } else { 0 }\n'
             '}\n',
             "MBT2PION_UINT16_ESCAPE",
         )
