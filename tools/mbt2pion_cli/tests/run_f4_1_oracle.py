@@ -996,6 +996,64 @@ pub fn f(v : NestPub) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_param_indexed_alias_write": (r'''
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      grid[0].push(4)
+      grid[0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_field_multi_indexed_alias_write": (r'''
+priv struct Box3D { grid : Array[Array[Array[Int]]]; other : Array[Int] }
+pub fn f(xs : Array[Int]) -> Int {
+  let v : Box3D = { grid: [[xs]], other: xs }
+  let mut s = 0
+  for x in v.other {
+    if x == 1 {
+      v.grid[0][0].push(4)
+      v.grid[0][0][1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_let_param_indexed_alias_write": (r'''
+pub fn f(xs : Array[Int], grid : Array[Array[Int]]) -> Int {
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      let row = grid[0]
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_let_field_multi_indexed_alias_write": (r'''
+priv struct Box3D { grid : Array[Array[Array[Int]]]; other : Array[Int] }
+pub fn f(xs : Array[Int]) -> Int {
+  let v : Box3D = { grid: [[xs]], other: xs }
+  let mut s = 0
+  for x in v.other {
+    if x == 1 {
+      let row = v.grid[0][0]
+      row.push(4)
+      row[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
 }
 
 
