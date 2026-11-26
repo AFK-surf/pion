@@ -406,6 +406,37 @@ def main():
             "--dep", f"leg={leg_dep}",
         ])
 
+        # 3b. Dual-alias identical published ABI (`--dep f43orig=... --dep f43orig_alias=...` in BOTH orders)
+        p_orig_alias = os.path.join(work, "p_f43orig_alias")
+        shutil.copytree(p_orig, p_orig_alias)
+        with open(os.path.join(p_orig_alias, "pion.toml"), "w") as fh:
+            fh.write(
+                f'[package]\nname = "f43orig_alias"\nversion = "0.1.0"\n'
+                f'[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        dual_src = os.path.join(work, "dual_alias_src")
+        os.makedirs(dual_src)
+        with open(os.path.join(dual_src, "d.mbt"), "w") as fh:
+            fh.write(
+                "pub fn use_dual(b : @f43mid1.Buffer) -> Int {\n"
+                "  let p = @f43mid1.InPlace::Phone(island=1)\n"
+                "  let b2 : @f43orig_alias.Buffer = { val: 2, cap: 3 }\n"
+                "  match p {\n"
+                "    @f43mid1.InPlace::Phone(island~) => island + @f43mid1.buf_sum(b) + b2.cap\n"
+                "    @f43mid1.InPlace::Desk(n) => n\n"
+                "  }\n"
+                "}\n"
+            )
+        for tag, dep_args in [
+            ("fwd", ["--dep", f"f43orig={p_orig}", "--dep", f"f43orig_alias={p_orig_alias}", "--dep", f"f43mid1={p_mid1}"]),
+            ("rev", ["--dep", f"f43orig_alias={p_orig_alias}", "--dep", f"f43orig={p_orig}", "--dep", f"f43mid1={p_mid1}"]),
+        ]:
+            dual_out = os.path.join(work, f"dual_alias_out_{tag}")
+            run_cmd([
+                bin_path, "--src", dual_src, "--out", dual_out,
+                "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
+            ] + dep_args)
+
         # 4. Negative fail-closed gates
         # 4a. Conflicting-origin diamond `pub using`
         p_mid_bad = os.path.join(work, "p_mid_bad")
