@@ -333,6 +333,16 @@ def main():
             'pub fn bad_cmp() -> Bool { "a".code_unit_at(0) == 65535 + 98 }\n',
             "MBT2PION_UINT16_ESCAPE",
         )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_compare_wrap_arg",
+            'pub fn bad_compare_arg() -> Int { "a".code_unit_at(0).compare(65535 + 98) }\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_compare_wrap_recv",
+            'pub fn bad_compare_recv() -> Int { (65535 + 98).compare("a".code_unit_at(0)) }\n',
+            "MBT2PION_UINT16_ESCAPE",
+        )
 
         print("PASS: Wave M2-F5 Track F5-1 4-Target Differential Oracle (Moon native == Moon wasm-gc == Pion native == Pion wasm32)")
     finally:
