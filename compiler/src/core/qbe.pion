@@ -222,6 +222,9 @@ pub struct QbeGen {
   mut i32_literal_next_id : Int
   mut entry_symbol : String
   mut extern_c_syms : Option[Map[String, Bool]]
+  /// Lazily built set of every `mname` for which `qbe_any_method_has_ret_default`
+  /// holds (see `qbe_ret_default_methods`).
+  mut ret_default_methods : Option[Map[String, Bool]]
   dyn_vtables : Array[String]
   extra_fns : Array[String]
   mono_seen : Map[String, Bool]
@@ -12977,56 +12980,80 @@ fn qbe_method_key_matches(mk : String, mname : String) -> Bool {
 }
 
 ///|
-fn qbe_tc_method_has_ret_default(tc : TypeChecker, mname : String) -> Bool {
+/// Adds to `out` every method name `mname` whose lookup in `tc` finds params with a
+/// `return`-capable default: for each such `method_names` key `mk`, `mk` itself and
+/// every suffix after a `::` (exactly the `mname`s `qbe_method_key_matches(mk, _)`
+/// accepts); for each such impl method, its name.
+fn qbe_collect_ret_default_methods(tc : TypeChecker, out : Map[String, Bool]) -> Unit {
   let mut i = 0
   while i < tc.method_names.length() {
     let mk = tc.method_names[i]
-    if qbe_method_key_matches(mk, mname) {
-      match tc.methods.get(mk) {
-        Some(mi) =>
-          if qbe_params_have_ret_default(mi.decl.params) {
-            return true
+    match tc.methods.get(mk) {
+      Some(mi) =>
+        if qbe_params_have_ret_default(mi.decl.params) {
+          out.set(mk, true)
+          let mlen = mk.length()
+          let mut p = 0
+          while p + 2 <= mlen {
+            if slice_str(mk, p, p + 2) == "::" {
+              out.set(slice_str(mk, p + 2, mlen), true)
+            }
+            p = p + 1
           }
-        None => ()
-      }
+        }
+      None => ()
     }
     i = i + 1
   }
   i = 0
   while i < tc.impl_keys.length() {
     match tc.impls.get(tc.impl_keys[i]) {
-      Some(ii) =>
-        match ii.methods.get(mname) {
-          Some(mi) =>
-            if qbe_params_have_ret_default(mi.decl.params) {
-              return true
-            }
-          None => ()
+      Some(ii) => {
+        let names = ii.methods.keys()
+        let mut j = 0
+        while j < names.length() {
+          match ii.methods.get(names[j]) {
+            Some(mi) =>
+              if qbe_params_have_ret_default(mi.decl.params) {
+                out.set(names[j], true)
+              }
+            None => ()
+          }
+          j = j + 1
         }
+      }
       None => ()
     }
     i = i + 1
   }
-  false
 }
 
 ///|
-fn qbe_any_method_has_ret_default(g : QbeGen, mname : String) -> Bool {
-  if qbe_tc_method_has_ret_default(g.tc, mname) {
-    return true
+/// Built once per `QbeGen`: the type checkers are complete before codegen starts,
+/// so the per-call scan over every package's methods and impls (hot on deeply
+/// nested call trees through `qbe_arg_guards`) becomes one map lookup.
+fn qbe_ret_default_methods(g : QbeGen) -> Map[String, Bool] {
+  match g.ret_default_methods {
+    Some(m) => return m
+    None => ()
   }
+  let m : Map[String, Bool] = Map([])
+  qbe_collect_ret_default_methods(g.tc, m)
   let mut pi = 0
   while pi < g.tc.all_imported_pkg_names.length() {
     match g.tc.all_imported_pkgs.get(g.tc.all_imported_pkg_names[pi]) {
-      Some(ipkg) =>
-        if qbe_tc_method_has_ret_default(ipkg.tc, mname) {
-          return true
-        }
+      Some(ipkg) => qbe_collect_ret_default_methods(ipkg.tc, m)
       None => ()
     }
     pi = pi + 1
   }
-  false
+  g.ret_default_methods = Some(m)
+  m
+}
+
+///|
+fn qbe_any_method_has_ret_default(g : QbeGen, mname : String) -> Bool {
+  qbe_ret_default_methods(g).contains(mname)
 }
 
 ///|
@@ -21329,7 +21356,7 @@ fn qbe_try_emit_opt_res_scalarized(
                       let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
                       qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
                       let guards = qbe_arg_guards(g, norm_args, order)
-                      qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_any_exit(g, norm_args))
+                      qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_exit_before_order(g, guards, norm_args, order))
                       let mut oi = 0
                       while oi < order.length() {
                         let i = order[oi]
@@ -22630,6 +22657,7 @@ fn qbe_new_for_target_name(
     i32_literal_next_id: 0,
     entry_symbol: "",
     extern_c_syms: None,
+    ret_default_methods: None,
     dyn_vtables: [],
     extra_fns: [],
     mono_seen: Map([]),
@@ -23954,7 +23982,47 @@ fn qbe_guard_callee(
   v : QbeVal,
   borrowed : Bool,
 ) -> Unit {
-  qbe_guard_val(g, gs, QbeArgVal::{ qv: v, borrowed: borrowed }, false, qbe_guards_any_exit(g, args))
+  qbe_guard_val(g, gs, QbeArgVal::{ qv: v, borrowed: borrowed }, false, qbe_guards_exit_before_all(g, gs, args))
+}
+
+///|
+/// `qbe_guards_any_exit(g, args)` for guards `gs` built by `qbe_arg_guards_in_order`
+/// over the same `args`: `gs.exits[0]` already covers `args[1..]`.
+fn qbe_guards_exit_before_all(g : QbeGen, gs : QbeArgGuards, args : Array[Expr]) -> Bool {
+  if args.length() == 0 || gs.exits.length() != args.length() {
+    return qbe_guards_any_exit(g, args)
+  }
+  gs.exits[0] || qbe_expr_may_early_exit(g, args[0])
+}
+
+///|
+/// `qbe_guards_any_exit(g, args)` for `gs = qbe_arg_guards(g, args, order)`: when
+/// `order` is a permutation of `args`, `gs.exits[0]` already covers every slot but
+/// `order[0]`.
+fn qbe_guards_exit_before_order(
+  g : QbeGen,
+  gs : QbeArgGuards,
+  args : Array[Expr],
+  order : Array[Int],
+) -> Bool {
+  let n = args.length()
+  if n == 0 || order.length() != n || gs.exits.length() != n {
+    return qbe_guards_any_exit(g, args)
+  }
+  let seen : Array[Bool] = []
+  while seen.length() < n {
+    seen.push(false)
+  }
+  let mut i = 0
+  while i < n {
+    let k = order[i]
+    if k < 0 || k >= n || seen[k] {
+      return qbe_guards_any_exit(g, args)
+    }
+    seen[k] = true
+    i = i + 1
+  }
+  gs.exits[0] || qbe_expr_may_early_exit(g, args[order[0]])
 }
 
 ///|
@@ -32792,7 +32860,7 @@ fn qbe_emit_impl_method_call(
   let arg_borrowed : Array[Bool] = [obj_borrowed]
   qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
   let guards = qbe_arg_guards(g, norm_args, order)
-  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_any_exit(g, norm_args))
+  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_exit_before_order(g, guards, norm_args, order))
   let empty_subst : Map[String, Ty] = Map([])
   let mut oi = 0
   while oi < order.length() {
@@ -36969,7 +37037,7 @@ fn qbe_emit_method_call_dispatch(
           qbe_preunify_reordered_args(g, minfo, 1, norm_args, order, subst, sp)
           qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
           let guards = qbe_arg_guards(g, norm_args, order)
-          qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_any_exit(g, norm_args))
+          qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_exit_before_order(g, guards, norm_args, order))
           let mut oi = 0
           while oi < order.length() {
             let i = order[oi]
@@ -46288,7 +46356,7 @@ fn qbe_emit_expr_inner(
           // `..base` fields are read before any override runs.
           match base_qv_opt {
             Some(bv) => {
-              let exits = qbe_guards_any_exit(g, field_exprs)
+              let exits = qbe_guards_exit_before_order(g, guards, field_exprs, order)
               let mut bi = 0
               while bi < n_fields {
                 let mut is_over = false
@@ -49648,7 +49716,7 @@ fn qbe_try_emit_stack_pod_let(
                   let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
                   qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
                   let guards = qbe_arg_guards(g, norm_args, order)
-                  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_any_exit(g, norm_args))
+                  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_exit_before_order(g, guards, norm_args, order))
                   let mut oi = 0
                   while oi < order.length() {
                     let i = order[oi]
