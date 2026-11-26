@@ -11,7 +11,13 @@
 #      Byte) is evaluated exactly once.
 #   2. loops.pion: `break` / `continue` in the condition of a nested `while`
 #      and C-style `for` leave / continue the enclosing loop, with an owned
-#      String operand in the condition.
+#      String operand in the condition. edge.pion: an operand of the test that
+#      leaves the function inside a value-context comparison (right side `||`
+#      / `if`), and `continue` / `break` in the step of a C-style `for` nested
+#      in `for ... in` range / array and `while` loops.
+#   divzero.pion: Int8 `% 256 == 0` (256 narrows to 0) is not folded: it
+#   panics with "division by zero" under `#verify` (native and Wasm32) and
+#   traps without it.
 #   For both, dev and --release (each build in its own empty PION_CACHE_DIR):
 #   exact stdout, exit 0 and empty stderr natively, with an AddressSanitizer
 #   runtime (LeakSanitizer on Linux) and on Wasm32.
@@ -56,7 +62,7 @@ check() {
 
 python3 -E "$DIR/gen.py" "$TMP_DIR"
 [ "$(wc -l < "$TMP_DIR/modpow.expected")" -eq 7 ] || { echo "FAIL: p132 gen.py reference" >&2; exit 1; }
-cp "$DIR/loops.pion" "$DIR/loops.expected" "$TMP_DIR/"
+cp "$DIR/loops.pion" "$DIR/loops.expected" "$DIR/edge.pion" "$DIR/edge.expected" "$TMP_DIR/"
 
 ASAN=0
 if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
@@ -74,7 +80,7 @@ HAVE_NODE=0
 command -v node >/dev/null 2>&1 && HAVE_NODE=1
 
 N=0
-for PROG in modpow loops; do
+for PROG in modpow loops edge; do
   SRC="$TMP_DIR/$PROG.pion"
   REF="$TMP_DIR/$PROG.expected"
   for MODE in dev release; do
@@ -114,7 +120,48 @@ for PROG in modpow loops; do
   done
   N=$((N + 1))
 done
-[ "$N" -eq 2 ]
+[ "$N" -eq 3 ]
+
+# Int8 `% 256 == 0`: a division by zero in both modes, never folded.
+for MODE in dev release; do
+  FLAG=""
+  [ "$MODE" = "release" ] && FLAG="--release"
+  BASE="$TMP_DIR/divzero_$MODE"
+  fresh_cas
+  "$PIONC" build $FLAG -o "$BASE" "$DIR/divzero.pion"
+  set +e
+  "$BASE" > "$BASE.out" 2> "$BASE.err"
+  RC=$?
+  set -e
+  if [ "$RC" -eq 0 ] || [ -s "$BASE.out" ] || ! grep -q "pion panic at divzero.pion:8: division by zero" "$BASE.err"; then
+    cat "$BASE.out" "$BASE.err" >&2
+    echo "FAIL: p132 divzero $MODE #verify: exit $RC, want the division-by-zero panic" >&2
+    exit 1
+  fi
+  set +e
+  ( exec "$BASE" plain > "$BASE.pout" 2> "$BASE.perr" ) 2> /dev/null
+  RC=$?
+  set -e
+  if [ "$RC" -eq 0 ] || [ -s "$BASE.pout" ]; then
+    cat "$BASE.pout" "$BASE.perr" >&2
+    echo "FAIL: p132 divzero $MODE plain: exit $RC, want an integer division trap" >&2
+    exit 1
+  fi
+  if [ "$HAVE_NODE" -eq 1 ]; then
+    fresh_cas
+    "$PIONC" build $FLAG --target wasm32 -o "$BASE.wasm" "$DIR/divzero.pion"
+    set +e
+    node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
+    RC=$?
+    set -e
+    if [ "$RC" -eq 0 ] || [ -s "$BASE.wout" ] || ! grep -q "division by zero" "$BASE.werr"; then
+      cat "$BASE.wout" "$BASE.werr" >&2
+      echo "FAIL: p132 divzero $MODE Wasm32 #verify: exit $RC, want the division-by-zero panic" >&2
+      exit 1
+    fi
+  fi
+  echo "p132 divzero $MODE: Int8 % 256 == 0 panics under #verify and traps otherwise (not folded)"
+done
 
 # 3. `break` / `continue` outside every loop body are rejected.
 mkdir -p "$TMP_DIR/neg"
