@@ -355,9 +355,10 @@ theorem emitExpr_stack_prefix {Val : Type} (e : PureExpr Val)
 
 /-- Model soundness for AA1-Z1 pure expression forwarding: assuming `hlive`
     (no intervening write to any leaf between producer `envP` and consumer `envQ`,
-    which the compiler enforces via its same-block intervening-def check in
-    `wasm_build_fwd_exprs`), evaluating the forwarded tree at `envQ` pushes the
-    exact same value as evaluating at `envP`. -/
+    which the compiler enforces via function-wide `def_counts[a] == 1`,
+    `!promoted_alloc_ty.contains(a)`, and `fwd_leaf_ext` leaf lifetime extension
+    prior to local coloring in `wasm_build_fwd_exprs`), evaluating the forwarded
+    tree at `envQ` pushes the exact same value as evaluating at `envP`. -/
 theorem forward_single_use_sound {Val : Type} (e : PureExpr Val)
     (envP envQ : Nat → Val) (stk : List Val)
     (hlive : ∀ x, x ∈ e.leaves → envP x = envQ x) :
