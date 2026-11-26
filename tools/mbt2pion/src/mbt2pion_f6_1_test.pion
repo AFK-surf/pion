@@ -1,0 +1,205 @@
+///| Wave M2-F6 Track F6-1 unit tests:
+///| 1. Cross-package `pub let` / `pub const` value type ABI export, roundtrip,
+///|    backward compatibility, alias remapping, and struct-update resolution.
+///| 2. Universal MoonBit checked-error lowering (`suberror`, `raise`, `try`, `catch`,
+///|    `noraise`, `try?`, `try!`) positive and fail-closed negative cases.
+
+test "F6-1: ABI v2 values serialization, backward compat & tamper rejection" {
+  // 1. Empty values MUST be omitted from JSON so existing ABI v2 SHA-256 hashes are 100% unchanged
+  let empty_abi = empty_package_abi("plain_pkg")
+  let empty_sha = compute_abi_payload_sha256(empty_abi)
+  let empty_pion = "// abi-sha256: " + empty_sha + "\npub fn f() -> Int { 1 }\n"
+  let empty_json = render_abi_json(empty_abi, [("lib.pion", empty_pion)])
+  assert_true(!str_has(empty_json, "\"values\""), "empty values omitted from ABI v2 JSON")
+  let d_empty : Array[Diag] = []
+  match verify_and_parse_dep_abi("plain_pkg", "/tmp/plain", [("lib.pion", empty_pion)], Some(empty_json), d_empty) {
+    Some(p) => assert_true(p.values.length() == 0 && d_empty.length() == 0, "legacy ABI v2 without values parses as empty")
+    None => assert_true(false, "valid ABI v2 without values must verify")
+  }
+
+  // 2. Non-empty values are sorted deterministically, roundtrip cleanly, and detect tampering
+  let val_abi = PackageAbi::{
+    package_name: "up",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [
+      AbiValueSchema::{ name: "z_const", ty: "Int" },
+      AbiValueSchema::{ name: "default_cfg", ty: "up::Cfg" },
+    ],
+    publishable: true,
+  }
+  let val_sha = compute_abi_payload_sha256(val_abi)
+  let val_pion = "// abi-sha256: " + val_sha + "\npub let default_cfg : Cfg = Cfg::{ x: 0 }\n"
+  let val_json = render_abi_json(val_abi, [("lib.pion", val_pion)])
+  assert_true(str_has(val_json, "\"values\""), "non-empty values included in ABI v2 JSON")
+  let d_ok : Array[Diag] = []
+  match verify_and_parse_dep_abi("up", "/tmp/up", [("lib.pion", val_pion)], Some(val_json), d_ok) {
+    Some(p) => {
+      assert_true(p.values.length() == 2, "2 exported values parsed")
+      assert_true(p.values[0].name == "default_cfg" && p.values[0].ty == "up::Cfg", "sorted first value")
+      assert_true(p.values[1].name == "z_const" && p.values[1].ty == "Int", "sorted second value")
+    }
+    None => assert_true(false, "valid values ABI must verify")
+  }
+  // Tampered value type MUST be rejected
+  let d_bad : Array[Diag] = []
+  match verify_and_parse_dep_abi("up", "/tmp/up", [("lib.pion", val_pion)], Some(str_replace_all(val_json, "\"up::Cfg\"", "\"up::Other\"")), d_bad) {
+    Some(_) => assert_true(false, "tampered values must fail")
+    None => assert_true(d_bad.length() > 0 && d_bad[0].code == "MBT2PION_DEP_ABI_ERROR", "tampered values rejected")
+  }
+}
+
+test "F6-1: cross-package pub let / pub const ABI export resolves downstream struct update" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  // Upstream package `up` defines `pub(all) struct Cfg`, `pub let default_cfg : Cfg`, `pub const MAX_STEP : Int`,
+  // plus private and untyped bindings that must NOT be exported.
+  let up_src = SourceFile::{
+    rel_path: "cfg.mbt",
+    content: "pub(all) struct Cfg {\n  x : Int\n  y : Int\n}\n\npub let default_cfg : Cfg = { x: 1, y: 2 }\npub const MAX_STEP : Int = 8\nlet hidden_cfg : Cfg = { x: 0, y: 0 }\npub let untyped_val = 99\n",
+    is_test: false,
+  }
+  let up_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "up",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let up_res = transpile_package([up_src], empty_api_map(), default_recipes(), [], [], up_opts, [], false, noop_check)
+  assert_true(up_res.blockers == 0, "upstream package transpiles cleanly")
+  assert_true(up_res.abi.values.length() == 2, "only typed pub let/pub const exported")
+  assert_true(up_res.abi.values[0].name == "MAX_STEP" && up_res.abi.values[0].ty == "Int", "pub const Int exported")
+  assert_true(up_res.abi.values[1].name == "default_cfg" && up_res.abi.values[1].ty == "up::Cfg", "pub let Cfg qualified with pkg prefix")
+
+  // Direct symbol table check (including import alias remapping `u` -> `up`)
+  let st = empty_symbol_table()
+  symtab_load_dep_abi(st, "up", up_res.abi)
+  assert_true(st.val_types.get("up::default_cfg") == Some("up::Cfg"), "symtab loads up::default_cfg -> up::Cfg")
+  assert_true(st.val_types.get("up::MAX_STEP") == Some("Int"), "symtab loads up::MAX_STEP -> Int")
+  let st_alias = empty_symbol_table()
+  symtab_load_dep_abi(st_alias, "u", up_res.abi)
+  assert_true(st_alias.val_types.get("u::default_cfg") == Some("u::Cfg"), "aliased dep remaps pkg prefix in val_types")
+
+  // Downstream package uses `{ ..@up.default_cfg, x: 10 }` -> MUST resolve to `up::Cfg::{ ... }` with 0 AMBIGUOUS_STRUCT_UPDATE!
+  let down_src = SourceFile::{
+    rel_path: "use_cfg.mbt",
+    content: "pub fn override_x() -> @up.Cfg {\n  { ..@up.default_cfg, x: 10 }\n}\n",
+    is_test: false,
+  }
+  let down_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "down",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let down_res = transpile_package_with_abis(
+    [down_src],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("up", up_res.abi)],
+    [],
+    down_opts,
+    [],
+    false,
+    noop_check,
+  )
+  let mut has_ambig = false
+  for d in down_res.diagnostics {
+    if str_has(d.code, "AMBIGUOUS_STRUCT_UPDATE") {
+      has_ambig = true
+    }
+  }
+  assert_true(!has_ambig, "downstream struct update on @up.default_cfg has 0 AMBIGUOUS_STRUCT_UPDATE")
+  assert_true(down_res.files.length() > 0 && str_has(down_res.files[0].content, "up::Cfg::{"), "downstream emits up::Cfg::{ ... }")
+}
+
+test "F6-1: lower_error suberror declarations" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "suberror SimpleErr String\npub suberror ApiErr Int\npriv suberror ParseErr {\n  ParseErr(String)\n} derive(Show)\nsuberror MultiErr {\n  BadCode(Int)\n  BadMsg(String)\n} derive(Show, Eq)\nsuberror UnitErr\n"
+  let out = lower_checked_errors_single(src, "errs.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "suberror lowering has 0 diagnostics")
+  assert_true(str_has(out, "enum SimpleErr { SimpleErr(String) }"), "payload suberror lowered")
+  assert_true(str_has(out, "pub enum ApiErr { ApiErr(Int) }"), "pub suberror preserves pub")
+  assert_true(str_has(out, "enum ParseErr {\n  ParseErr(String)\n} derive(Show)"), "braced suberror with derive preserved")
+  assert_true(str_has(out, "enum MultiErr {\n  BadCode(Int)\n  BadMsg(String)\n} derive(Show, Eq)"), "multi-variant suberror lowered")
+  assert_true(str_has(out, "enum UnitErr { UnitErr }"), "unit suberror lowered")
+}
+
+test "F6-1: lower_error local catch, try-catch, noraise, try? and try!" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "priv suberror ParseErr String\nfn parse_num(s : String) -> Int raise ParseErr {\n  if s == \"\" { raise ParseErr(\"empty\") }\n  42\n}\nfn helper(s : String) -> Unit {\n  let a = @json.parse(s) catch { _ => return }\n  let _ = a\n}\nfn loop_catch(xs : Array[String]) -> Int {\n  let mut n = 0\n  for s in xs {\n    let v = @json.parse(s) catch { _ => continue }\n    let _ = v\n    n = n + 1\n  }\n  n\n}\nfn try_some(s : String) -> Option[Json] {\n  try Some(@json.parse(s)) catch { _ => None }\n}\nfn try_noraise(s : String) -> Int {\n  try parse_num(s) catch { ParseErr(_) => -1 } noraise { v => v + 1 }\n}\nfn try_compound(s : String) -> Int {\n  try { let a = parse_num(s); a + 10 } catch { _ => 0 }\n}\nfn try_q(s : String) -> Result[Int, ParseErr] {\n  try? parse_num(s)\n}\nfn try_bang(s : String) -> Int {\n  try! parse_num(s)\n}\n"
+  let out = lower_checked_errors_single(src, "handlers.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "all supported catch/try forms lower with 0 diagnostics")
+  assert_true(str_has(out, "match mbt_compat::mbt_json_parse(s) { Ok(") && str_has(out, "Err(_) => return }"), "postfix catch with return lowered inline")
+  assert_true(str_has(out, "Err(_) => continue }"), "postfix catch with continue lowered inline")
+  assert_true(str_has(out, "=> Some(") && str_has(out, "Err(_) => None }"), "try Some(@json.parse(s)) zero-closure fast path")
+  assert_true(str_has(out, "match parse_num(s) { Ok(v) => v + 1, Err("), "try ... catch ... noraise lowered directly")
+  assert_true(str_has(out, "(fn() { Ok({ let a = (match parse_num(s) { Ok(") && str_has(out, "return Err("), "compound try body lowered via IIFE with match propagation")
+  assert_true(str_has(out, "fn try_q(s : String) -> Result[Int, ParseErr] {\n  parse_num(s)\n}"), "try? on direct call returns Result directly")
+  assert_true(str_has(out, "panic(\"try! failed\")"), "try! panics on Err")
+}
+
+test "F6-1: lower_error raise functions, methods, bare raise & non-try-op mode" {
+  let cfg = default_error_lower_config()
+  let diags : Array[Diag] = []
+  let src = "priv suberror ParseErr String\nstruct Scanner { mut pos : Int }\nfn[T] Scanner::fail(self : Scanner, msg : String) -> T raise ParseErr {\n  raise ParseErr(msg)\n}\nfn Scanner::step(self : Scanner) -> Unit raise ParseErr {\n  if self.pos < 0 { self.fail(\"neg\") }\n  self.pos = self.pos + 1\n}\nfn Scanner::read_int(self : Scanner) -> Int raise ParseErr {\n  self.step()\n  if self.pos == 0 { return 0 }\n  self.pos\n}\nfn bare_raise(x : Int) -> Int raise {\n  if x < 0 { raise \"negative\" }\n  x\n}\n"
+  let out = lower_checked_errors_single(src, "raising.mbt", cfg, diags)
+  assert_true(diags.length() == 0, "raising functions and methods lower cleanly")
+  assert_true(str_has(out, "fn[T] Scanner::fail(self : Scanner, msg : String) -> Result[T, ParseErr] {"), "generic raising method signature lowered")
+  assert_true(!str_has(out, "Ok({ return Err("), "tail raise is not double-wrapped in Ok")
+  assert_true(str_has(out, "self.fail(\"neg\")?"), "raising method call propagated with ?")
+  assert_true(str_has(out, "self.step()?"), "unit raising method call propagated with ?")
+  assert_true(str_has(out, "return Ok(0)"), "early return inside raising fn wrapped in Ok")
+  assert_true(str_has(out, "fn bare_raise(x : Int) -> Result[Int, String]"), "bare raise defaults to Result[T, String]")
+
+  // Verify `use_try_op: false` expands propagation to explicit `match`
+  let cfg_match = ErrorLowerConfig::{
+    known_raising_calls: cfg.known_raising_calls,
+    use_try_op: false,
+    default_err_type: "String",
+  }
+  let d2 : Array[Diag] = []
+  let out2 = lower_checked_errors_single(src, "raising_match.mbt", cfg_match, d2)
+  assert_true(d2.length() == 0, "match-expansion mode lowers cleanly")
+  assert_true(str_has(out2, "(match self.step() { Ok(") && str_has(out2, "=> return Err("), "match-expansion emits explicit match propagation")
+}
+
+test "F6-1: lower_error fail-closed negative cases" {
+  let cfg = default_error_lower_config()
+  let bad_cases : Array[(String, String)] = [
+    ("hof_raise_param", "suberror E String\nfn run(cb : (Int) -> Int raise E) -> Int { cb(1) }\n"),
+    ("inline_raise_closure", "suberror E String\nfn f() -> Unit { let g = fn(x : Int) -> Int raise E { raise E(\"x\") }; let _ = g }\n"),
+    ("unknown_ext_catch", "fn f(s : String) -> Int { @unknown.parse(s) catch { _ => 0 } }\n"),
+    ("unknown_ext_try", "fn f(s : String) -> Int { try @unknown.parse(s) catch { _ => 0 } }\n"),
+    ("first_class_raise_fn", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Unit { let g = boom; let _ = g }\n"),
+    ("uncaught_raise", "suberror E String\nfn f() -> Int { raise E(\"x\") }\n"),
+    ("uncaught_raising_call", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Int { boom() }\n"),
+    ("unresolved_method_recv", "suberror E String\nstruct S { x : Int }\nfn S::boom(self : S) -> Int raise E { raise E(\"x\") }\nfn get_s() -> S { S::{ x: 1 } }\nfn f() -> Int raise E { get_s().boom() }\n"),
+    ("return_in_compound_try", "suberror E String\nfn boom() -> Int raise E { raise E(\"x\") }\nfn f() -> Int { try { let a = boom(); return a } catch { _ => 0 } }\n"),
+  ]
+  for bc in bad_cases {
+    let ds : Array[Diag] = []
+    let _ = lower_checked_errors_single(bc.1, bc.0 + ".mbt", cfg, ds)
+    let mut hit = false
+    for d in ds {
+      if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" {
+        hit = true
+      }
+    }
+    assert_true(hit, "fail-closed case `" + bc.0 + "` MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
+}
