@@ -685,3 +685,59 @@ test "F6-2a: ABI raising_fns roundtrip, canonical package identity & explicit re
   assert_true(d_rt.length() == 0, "explicit rethrow, catch!, and nested try rethrow lower cleanly")
   assert_true(str_has(out_rt, "return Err(e)") && str_has(out_rt, "return Err(__mbt_rethrow_"), "rethrow emits enclosing Err return")
 }
+
+test "F6-2a R2: Category A soundness, load-order invariance, opaque catch, unannotated closure & struct is-pat" {
+  // 1. P0-1: Category A rejects `fail(...)`, external raising calls, raising methods, and postfix `catch` on helper
+  let cat_a_bads : Array[(String, String)] = [
+    ("cat_a_fail", "fn h() -> Int raise { fail(\"boom\") }\ntest { let _ = h() }\n"),
+    ("cat_a_ext", "fn h(s : String) -> Int raise { let _ = @json.parse(s); 1 }\ntest { let _ = h(\"1\") }\n"),
+    ("cat_a_postfix", "fn h(x : Int) -> Int raise { assert_eq(x, 1); x }\ntest { let _ = h(2) catch { _ => 0 } }\n"),
+    ("cat_a_method", "struct T { x : Int }\nfn T::h(self : T) -> Unit raise { assert_eq(self.x, 1) }\ntest { T::{ x: 1 }.h() }\n"),
+  ]
+  for bc in cat_a_bads {
+    let ds : Array[Diag] = []
+    let _ = preprocess_controlled_errors([SourceFile::{ rel_path: bc.0 + "_test.mbt", content: bc.1, is_test: true }], ds)
+    let mut hit = false
+    for d in ds { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit = true } }
+    assert_true(hit, "R2 P0-1 `" + bc.0 + "` MUST fail closed")
+  }
+
+  // 2. P0-2: Load-order invariance when two dep aliases share/collide on package_name
+  let abi_one = PackageAbi::{ package_name: "one", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [], raising_fns: [AbiRaisingFn::{ name: "f", err_ty: "one::E1" }], publishable: true }
+  let abi_two = PackageAbi::{ package_name: "two", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [], raising_fns: [AbiRaisingFn::{ name: "f", err_ty: "two::E2" }], publishable: true }
+  let st_lo = empty_symbol_table()
+  let env_ab = build_external_error_env(st_lo, [("one", abi_two), ("renamed", abi_one)], Map())
+  let env_ba = build_external_error_env(st_lo, [("renamed", abi_one), ("one", abi_two)], Map())
+  assert_true(
+    le_resolve_external_call_raw(default_error_lower_config(), env_ab, "one", "f") == Some(("@one.f", "two::E2")) &&
+    le_resolve_external_call_raw(default_error_lower_config(), env_ba, "one", "f") == Some(("@one.f", "two::E2")),
+    "R2 P0-2 alias lookup is 100% load-order invariant",
+  )
+
+  // 3. Opaque catch, local raising closure, public Failure/method, unannotated closure & postfix catch arg fail-closed cases
+  let r2_bads : Array[(String, String)] = [
+    ("paren_opaque_bind", "fn f(s : String) -> Int { @json.parse(s) catch { (e) => { let _ = e; 0 } } }\n"),
+    ("or_opaque_bind", "fn f(s : String) -> Int { @json.parse(s) catch { _ | e => { let _ = e; 0 } } }\n"),
+    ("ctor_stdlib_catch", "fn f(s : String) -> Int { @json.parse(s) catch { ParseError(_) => 1; _ => 2 } }\n"),
+    ("mut_local_raise_closure", "suberror E { A }\nfn f() -> Int { let mut g = fn(x : Int) -> Int raise E { if x < 0 { raise A }; x }; try { g(1) } catch { A => 0 } }\n"),
+    ("ann_local_raise_closure", "suberror E { A }\nfn f() -> Int { let g : (Int) -> Int raise E = fn(x : Int) -> Int raise E { if x < 0 { raise A }; x }; try { g(1) } catch { A => 0 } }\n"),
+    ("pub_raise_failure", "pub fn f() -> Int raise Failure { fail(\"x\") }\n"),
+    ("pub_raise_method", "pub suberror E { A }\npub struct S { x : Int }\npub fn S::boom(self : S) -> Int raise E { raise A }\n"),
+    ("arrow_try_return", "suberror E { A }\nfn boom() -> Int raise E { raise A }\nfn f() -> Unit { let g = x => { try { if x > 0 { return 1 }; boom() } catch { A => 0 } }; let _ = g }\n"),
+    ("unann_fn_try_return", "suberror E { A }\nfn boom() -> Int raise E { raise A }\nfn f() -> Unit { let g = fn(x : Int) { try { if x > 0 { return 1 }; boom() } catch { A => 0 } }; let _ = g }\n"),
+    ("postfix_catch_arg_mixed", "suberror E1 { A1 }\nsuberror E2 { A2 }\nfn g1(x : Int) -> Int raise E1 { if x < 0 { raise A1 }; x }\nfn g2() -> Int raise E2 { raise A2 }\nfn f() -> Int { try { g1(g2()) catch { A1 => 1 } } catch { A1 => 2 } }\n"),
+  ]
+  for bc in r2_bads {
+    let ds : Array[Diag] = []
+    let _ = lower_checked_errors_single(bc.1, bc.0 + ".mbt", default_error_lower_config(), ds)
+    let mut hit = false
+    for d in ds { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit = true } }
+    assert_true(hit, "R2 fail-closed case `" + bc.0 + "` MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
+
+  // 4. Struct `is`-pattern: `if s is { field: f } { ... }` shadows `f` cleanly inside the `if` scope
+  let d_is : Array[Diag] = []
+  let src_is = "suberror E { A }\nstruct Box { field : Int }\nfn f() -> Int raise E { raise A }\nfn check_box(b : Box) -> Int {\n  let mut acc = 0\n  if b is { field: f } { acc = acc + f }\n  acc + (f() catch { A => 5 })\n}\n"
+  let out_is = lower_checked_errors_single(src_is, "is_struct.mbt", default_error_lower_config(), d_is)
+  assert_true(d_is.length() == 0 && str_has(out_is, "acc = acc + f"), "R2 struct is-pattern shadows f inside if without affecting outer f()")
+}

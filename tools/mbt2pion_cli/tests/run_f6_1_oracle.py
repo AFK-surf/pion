@@ -46,6 +46,20 @@ pub fn parse(s : String) -> Int {
 }
 '''
 
+UP2_MBT = r'''
+pub suberror UErr {
+  BadU(Int)
+  OtherU
+}
+
+pub fn fail_u(x : Int) -> Int raise UErr {
+  if x < 0 {
+    raise BadU(x * 3)
+  }
+  x + 1
+}
+'''
+
 DOWN_MBT = r'''
 priv suberror LocalErr {
   Empty
@@ -227,11 +241,25 @@ pub fn case_headers_in_try() -> String {
   h1.to_string() + "," + h2.to_string() + "," + h3.to_string() + "," + h4.to_string()
 }
 
+pub fn case_renamed_dep_compound_return(stop : Bool) -> Int {
+  try {
+    if stop {
+      return 77
+    }
+    let v = @u.fail_u(-7)
+    v + 1
+  } catch {
+    @u.UErr::BadU(c) => c
+    @u.UErr::OtherU => -99
+  }
+}
+
 pub fn run_all() -> String {
   "X:" + case_cross_pkg() +
     "\nR:" + case_rethrow_and_nested() +
     "\nI:" + case_interp_and_struct_update() +
-    "\nH:" + case_headers_in_try()
+    "\nH:" + case_headers_in_try() +
+    "\nU:" + case_renamed_dep_compound_return(true).to_string() + "," + case_renamed_dep_compound_return(false).to_string()
 }
 '''
 
@@ -284,17 +312,19 @@ def main():
 
         # 1. Build MoonBit multi-package project and run native + wasm-gc
         md = os.path.join(work, "moon_proj")
-        for sub in ("up", "custom_json", "down", "cmd"):
+        for sub in ("up", "up2", "custom_json", "down", "cmd"):
             os.makedirs(os.path.join(md, sub))
         files = [
             ("moon.mod", 'name = "f6/oracle"\n'),
             ("up/moon.pkg", "\n"),
             ("up/up.mbt", UP_MBT),
+            ("up2/moon.pkg", "\n"),
+            ("up2/up2.mbt", UP2_MBT),
             ("custom_json/moon.pkg", "\n"),
             ("custom_json/cj.mbt", CUSTOM_JSON_MBT),
             (
                 "down/moon.pkg",
-                'import { "f6/oracle/up", "f6/oracle/custom_json" @json, "moonbitlang/core/json" @j }\n',
+                'import { "f6/oracle/up", "f6/oracle/up2" @u, "f6/oracle/custom_json" @json, "moonbitlang/core/json" @j }\n',
             ),
             ("down/down.mbt", DOWN_MBT),
             ("cmd/moon.pkg", 'import { "f6/oracle/down" }\noptions("is-main": true)\n'),
@@ -308,11 +338,12 @@ def main():
         moon_wgc = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=md).stdout.strip()
         assert moon_nat == moon_wgc, f"Moon native vs wasm-gc mismatch:\n{moon_nat}\nvs\n{moon_wgc}"
 
-        # 2. Transpile `up`, `custom_json`, `down` via real `mbt2pion_cli --mode publish`
+        # 2. Transpile `up`, `up2`, `custom_json`, `down` via real `mbt2pion_cli --mode publish`
         p_up = os.path.join(work, "p_up")
+        p_up2 = os.path.join(work, "p_up2")
         p_cj = os.path.join(work, "p_cj")
         p_dn = os.path.join(work, "p_dn")
-        for d in (p_up, p_cj, p_dn):
+        for d in (p_up, p_up2, p_cj, p_dn):
             os.makedirs(os.path.join(d, "src"))
 
         with open(os.path.join(p_up, "pion.toml"), "w") as f:
@@ -321,13 +352,17 @@ def main():
         up_abi_txt = open(os.path.join(p_up, "src", "mbt2pion_abi.json")).read()
         assert '"raising_fns"' in up_abi_txt and '"parse_code"' in up_abi_txt, f"missing raising_fns in up ABI: {up_abi_txt}"
 
+        with open(os.path.join(p_up2, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "up2"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(md, "up2"), "--out", os.path.join(p_up2, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+
         with open(os.path.join(p_cj, "pion.toml"), "w") as f:
             f.write(f'[package]\nname = "custom_json"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
         run_cmd([bin_path, "--src", os.path.join(md, "custom_json"), "--out", os.path.join(p_cj, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
 
         with open(os.path.join(p_dn, "pion.toml"), "w") as f:
             f.write(
-                f'[package]\nname = "down"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nup = {{ path = "{p_up}" }}\ncustom_json = {{ path = "{p_cj}" }}\n'
+                f'[package]\nname = "down"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nup = {{ path = "{p_up}" }}\nup2 = {{ path = "{p_up2}" }}\ncustom_json = {{ path = "{p_cj}" }}\n'
             )
         run_cmd([
             bin_path,
@@ -337,6 +372,7 @@ def main():
             "--mode", "publish",
             "--mbt-compat", COMPAT_DIR,
             "--dep", f"up={p_up}",
+            "--dep", f"up2={p_up2}",
             "--dep", f"custom_json={p_cj}",
             "--pionc", args.pionc,
         ])
@@ -346,7 +382,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"

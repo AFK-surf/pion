@@ -3205,13 +3205,15 @@ fn cat_a_try_body_end(toks : Array[Token], ti : Int, lim : Int) -> Int {
   -1
 }
 
-///| Phase 1 of checked-error lowering: strip bare `raise` from private test helper functions
-///| (`is_test: true`, no `raise`/`try`/`catch` in body, no indirect call or value escape,
-///| never called directly or transitively inside `try`, and never calling raising functions).
-///| Returns `(rewritten_sources, rewritten_fn_names)`. Each rewritten declaration is verified
-///| to no longer carry `raise` so Phase 2 (`lower_checked_errors_with_env`) never reprocesses it.
-pub fn preprocess_test_helper_raises(
+///| Phase 1 of checked-error lowering: strip bare `raise` from private top-level test helper functions
+///| (`is_test: true`, non-method, no `raise`/`try`/`catch`/`fail(...)`/external raising calls/raising
+///| methods in body, no indirect call or value escape, never called directly or transitively inside
+///| `try` or with postfix `catch`, and never calling raising functions).
+///| Returns `(rewritten_sources, rewritten_fn_keys)` keyed by `rel_path + "::" + fn_name`.
+pub fn preprocess_test_helper_raises_with_env(
   sources : Array[SourceFile],
+  cfg : ErrorLowerConfig,
+  env : ExternalErrorEnv,
   _diags : Array[Diag],
 ) -> (Array[SourceFile], Map[String, Bool]) {
   let all_toks : Array[Array[Token]] = []
@@ -3234,9 +3236,11 @@ pub fn preprocess_test_helper_raises(
   }
 
   let pkg_raise_fns : Map[String, Bool] = Map()
+  let pkg_raise_method_names : Map[String, Bool] = Map()
   let cat_a_cands : Map[String, Bool] = Map()
   let cat_a_rejected : Map[String, Bool] = Map()
   let fn_callees : Map[String, Array[String]] = Map()
+  let fn_method_callees : Map[String, Array[String]] = Map()
   let called_in_try : Map[String, Bool] = Map()
 
   let mut fi = 0
@@ -3258,6 +3262,7 @@ pub fn preprocess_test_helper_raises(
           Some((fname, _, _, _, has_r, ety, has_rp, lb)) => {
             let rb = find_matching_delim(toks, lb)
             let callees : Array[String] = []
+            let mcallees : Array[String] = []
             let mut k = lb + 1
             let mut td = 0
             let t_ends : Array[Int] = []
@@ -3271,6 +3276,19 @@ pub fn preprocess_test_helper_raises(
               if is_kw_or_id(kt, "raise") || is_kw_or_id(kt, "try") || is_kw_or_id(kt, "catch") {
                 body_err = true
               }
+              // Builtin `fail(...)` disqualifies Category A
+              if kt.kind == TokenKind::Ident && kt.raw == "fail" && k + 1 < rb && toks[k + 1].kind == TokenKind::LParen &&
+              !(k > lb + 1 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) {
+                body_err = true
+              }
+              // External raising call `@pkg.fn(...)` disqualifies Category A
+              if kt.kind == TokenKind::PkgRef && k + 3 < rb && toks[k + 1].kind == TokenKind::Dot && toks[k + 3].kind == TokenKind::LParen {
+                let raw_pkg = kt.raw.slice(1, kt.raw.length())
+                match le_resolve_external_call_raw(cfg, env, raw_pkg, toks[k + 2].raw) {
+                  Some(_) => body_err = true
+                  None => ()
+                }
+              }
               if is_kw_or_id(kt, "try") {
                 let te = cat_a_try_body_end(toks, k, rb)
                 if te > k {
@@ -3278,18 +3296,37 @@ pub fn preprocess_test_helper_raises(
                   t_ends.push(te)
                 }
               }
+              // Track `.method(` and `Type::method(` calls
+              if kt.kind == TokenKind::Dot && k + 2 < rb && toks[k + 1].kind == TokenKind::Ident && toks[k + 2].kind == TokenKind::LParen {
+                mcallees.push(toks[k + 1].raw)
+              } else if kt.kind == TokenKind::UpperIdent && k + 3 < rb && toks[k + 1].kind == TokenKind::ColonColon &&
+              toks[k + 2].kind == TokenKind::Ident && toks[k + 3].kind == TokenKind::LParen {
+                mcallees.push(toks[k + 2].raw)
+              }
               if kt.kind == TokenKind::Ident && k + 1 < rb && toks[k + 1].kind == TokenKind::LParen &&
               !(k > lb + 1 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) {
                 callees.push(kt.raw)
-                if td > 0 { called_in_try[kt.raw] = true }
+                let rp = find_matching_delim(toks, k + 1)
+                let has_postfix_catch = match le_match_postfix_catch(toks, rp, rb) {
+                  Some(_) => true
+                  None => false
+                }
+                if td > 0 || has_postfix_catch {
+                  called_in_try[kt.raw] = true
+                }
               }
               k = k + 1
             }
             if fname.length() > 0 {
               fn_callees[fname] = callees
+              fn_method_callees[fname] = mcallees
             }
             if has_r || has_rp {
-              if !is_pub && sf.is_test && !has_rp && ety.length() == 0 && !body_err && fname.length() > 0 {
+              let cc = fname.index_of("::")
+              if cc > 0 {
+                pkg_raise_method_names[fname.slice(cc + 2, fname.length())] = true
+                cat_a_rejected[fname] = true
+              } else if !is_pub && sf.is_test && !has_rp && ety.length() == 0 && !body_err && fname.length() > 0 {
                 cat_a_cands[fname] = true
               } else if fname.length() > 0 {
                 if has_r && ety.length() > 0 && ety != "Error" {
@@ -3317,6 +3354,15 @@ pub fn preprocess_test_helper_raises(
             }
             k = k + 1
           }
+        }
+      }
+      // Postfix `helper(...) catch[!] { ... }` inside top-level `test { ... }` blocks
+      if t.kind == TokenKind::Ident && i + 1 < n && toks[i + 1].kind == TokenKind::LParen &&
+      !(i > 0 && (toks[i - 1].kind == TokenKind::Dot || toks[i - 1].kind == TokenKind::ColonColon)) {
+        let rp = find_matching_delim(toks, i + 1)
+        match le_match_postfix_catch(toks, rp, n) {
+          Some(_) => called_in_try[t.raw] = true
+          None => ()
         }
       }
       i = i + 1
@@ -3389,6 +3435,19 @@ pub fn preprocess_test_helper_raises(
       }
     }
     if ok {
+      match fn_method_callees.get(cname) {
+        Some(ms) => {
+          for m in ms {
+            if pkg_raise_method_names.contains(m) {
+              ok = false
+              break
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    if ok {
       cat_a_approved[cname] = true
     } else {
       cat_a_rejected[cname] = true
@@ -3435,11 +3494,11 @@ pub fn preprocess_test_helper_raises(
           Some((fname, _, cp, rty, has_r, ety, _, lb)) => {
             let rb = find_matching_delim(toks, lb)
             if has_r && ety.length() == 0 && cat_a_approved.contains(fname) && !cat_a_rejected.contains(fname) {
-              let new_hdr = src.slice(t.start_byte, toks[cp].end_byte) + " -> " + rty + " "
-              // Invariant: rewritten Category A header must never retain `raise`
+              let eff_rty = if rty.length() > 0 { rty } else { "Unit" }
+              let new_hdr = src.slice(t.start_byte, toks[cp].end_byte) + " -> " + eff_rty + " "
               if !str_has(new_hdr, "raise") {
                 edits.push((t.start_byte, toks[lb].start_byte, new_hdr))
-                rewritten[fname] = true
+                rewritten[sf.rel_path + "::" + fname] = true
               }
             }
             i = rb + 1
@@ -3460,19 +3519,19 @@ pub fn preprocess_test_helper_raises(
   (out_sources, rewritten)
 }
 
-///| Compatibility wrapper: runs Phase 1 (`preprocess_test_helper_raises`) followed by
+pub fn preprocess_test_helper_raises(
+  sources : Array[SourceFile],
+  diags : Array[Diag],
+) -> (Array[SourceFile], Map[String, Bool]) {
+  preprocess_test_helper_raises_with_env(sources, default_error_lower_config(), empty_external_error_env(), diags)
+}
+
+///| Compatibility wrapper: runs Phase 1 (`preprocess_test_helper_raises_with_env`) followed by
 ///| Phase 2 (`lower_checked_errors_with_env`) through the single unified checked-error pipeline.
 pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[Diag]) -> Array[SourceFile] {
-  let (step1, cat_a_rewritten) = preprocess_test_helper_raises(sources, diags)
+  let cfg = default_error_lower_config()
   let base_env = empty_external_error_env()
-  let env = ExternalErrorEnv::{
-    pkg_aliases: base_env.pkg_aliases,
-    moon_import_paths: base_env.moon_import_paths,
-    dep_pkg_names: base_env.dep_pkg_names,
-    dep_raising_fns: base_env.dep_raising_fns,
-    dep_error_ctors: base_env.dep_error_ctors,
-    dep_ctor_to_err: base_env.dep_ctor_to_err,
-    cat_a_rewritten: cat_a_rewritten,
-  }
-  lower_checked_errors_with_env(step1, default_error_lower_config(), env, diags)
+  let (step1, cat_a_rewritten) = preprocess_test_helper_raises_with_env(sources, cfg, base_env, diags)
+  let env = external_error_env_with_cat_a(base_env, cat_a_rewritten)
+  lower_checked_errors_with_env(step1, cfg, env, diags)
 }
