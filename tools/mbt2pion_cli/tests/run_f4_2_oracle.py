@@ -43,6 +43,10 @@ pub(all) struct PrivS {
 pub fn make_priv(x : Int, s : Int) -> PrivS {
   PrivS::{ x: x, secret: s }
 }
+
+pub(all) struct Color {
+  r : Int
+}
 '''
 
 DEP2_MBT = r'''
@@ -57,6 +61,13 @@ pub enum Kind {
   A(Int)
   B(Int)
 }
+
+pub enum MyVal {
+  Number(Int)
+  Other
+}
+
+pub type Color = @f42dep1.Color
 
 fn run_json_show() -> String {
   let j0 : Json = null
@@ -100,8 +111,10 @@ fn run_repr_and_iter() -> String {
   let h4 = it.head().unwrap_or(-1)
   let m : Map[String, Int] = { "alpha": 1, "beta": 2 }
   let kh = m.keys().head().unwrap_or("none")
+  let kn = m.keys().next().unwrap_or("none")
   let ka = m.keys().any(fn(k) { k == "beta" })
-  r_str + "|" + h1.to_string() + "," + h2.to_string() + "," + h3.to_string() + "," + h4.to_string() + "|" + kh + "|" + ka.to_string()
+  let c_alias : Color = { r: 7 }
+  r_str + "|" + h1.to_string() + "," + h2.to_string() + "," + h3.to_string() + "," + h4.to_string() + "|" + kh + "|" + kn + "|" + ka.to_string() + "|" + c_alias.r.to_string()
 }
 
 fn run_map_kv_and_json_index() -> String {
@@ -141,7 +154,25 @@ fn run_match_as() -> String {
       tag + ":" + n.to_string()
     }
   }
-  r1 + "|" + r2 + "|" + r3 + "|" + log.join(",")
+  let r4 = match (Some(MyVal::Number(42)) : MyVal?) {
+    Some(Number(_) as x) => match x {
+      Number(n) => n.to_string()
+      Other => "other"
+    }
+    _ => "none"
+  }
+  let check_opt = fn(o : Int?) -> Int {
+    match o {
+      Some(1) => 10
+      (Some(2) as y) => match y {
+        Some(n) => 20 + n
+        None => -1
+      }
+      _ => 30
+    }
+  }
+  let r5 = check_opt(None).to_string() + "," + check_opt(Some(1)).to_string() + "," + check_opt(Some(2)).to_string()
+  r1 + "|" + r2 + "|" + r3 + "|" + r4 + "|" + r5 + "|" + log.join(",")
 }
 
 fn patch_all(dst : Array[Int], ops : ArrayView[Int]) -> Int {
@@ -355,6 +386,46 @@ def main():
         assert_publish_blocked(
             bin_path, args.pionc, work, "repr_custom_struct",
             "priv struct Opaque { a : Int }\npub fn f(o : Opaque) -> String { \"\\{Repr(o)}\" }\n",
+            "MBT2PION_UNSUPPORTED_SYNTAX",
+        )
+
+        # 3f. Aliased array slice passed as ArrayView MUST fail closed
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "alias_ro_view",
+            "fn use_v(v : ArrayView[Int]) -> Int { v.length() }\npub fn f(ops : Array[Int]) -> Int { let alias = ops; alias[0] = 99; use_v(ops[0:2]) }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+        )
+
+        # 3g. Same-call other-arg mutation with ArrayView slice MUST fail closed
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "mutate_and_read_view",
+            "fn mutate_and_read(a : Array[Int], v : ArrayView[Int]) -> Int { a[0] = 99; v.length() }\npub fn f(ops : Array[Int]) -> Int { mutate_and_read(ops, ops[0:2]) }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+        )
+
+        # 3h. Callee writing to ArrayView param MUST fail closed
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "write_view",
+            "fn write_view(v : ArrayView[Int]) -> Int { v[0] = 99; v.length() }\npub fn f(ops : Array[Int]) -> Int { write_view(ops[0:2]) }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+        )
+
+        # 3i. Aliased array mutated inside `for v in xs[1:]` MUST fail closed
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "alias_for_ro_slice",
+            "pub fn f(xs : Array[Int]) -> Int { let ys = xs; let mut s = 0; for v in xs[1:] { ys[0] = 99; s = s + v }; s }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+        )
+
+        # 3j. Labeled ctor arg `as` and array pattern `as` MUST fail closed
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "labeled_as",
+            "priv enum E { A(Int) }\npriv enum W { Ctor(x~ : E) }\npub fn f(w : W) -> Int { match w { Ctor(x=A(n) as y) => n; _ => 0 } }\n",
+            "MBT2PION_UNSUPPORTED_SYNTAX",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "array_as",
+            "priv enum E { A(Int) }\npub fn f(xs : Array[E]) -> Int { match xs { [A(n) as x, ..] => n; _ => 0 } }\n",
             "MBT2PION_UNSUPPORTED_SYNTAX",
         )
 

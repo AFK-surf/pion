@@ -1206,7 +1206,8 @@ fn lower_struct_update_expr(
         return sname + "::" + lower_struct_brace(ctx, sname, tokens, open_b, close_b, file, false)
       }
       ForeignStructUpdateInfo::Unknown(reason) => {
-        if str_has(reason, "legacy ABI") || !all_pure {
+        if !all_pure || str_has(reason, "legacy ABI") || str_has(reason, "ambiguous") ||
+        str_has(reason, "incomplete") || ctx.symtab.dep_pkg_names.length() > 0 {
           ctx.diags.push(diag_error(
             "MBT2PION_DEP_ABI_ERROR",
             file,
@@ -6686,7 +6687,7 @@ fn lower_one_token_or_form(
         tokens[in_idx + 1].kind == TokenKind::Ident && tokens[in_idx + 2].kind == TokenKind::LBracket &&
         find_matching_delim(tokens, in_idx + 2) == lb - 1 {
           let sl_recv = tokens[in_idx + 1].raw
-          if for_slice_body_is_ro_safe_f42(tokens, lb + 1, close_b, sl_recv) {
+          if for_slice_body_is_ro_safe_f42(ctx, tokens, lb + 1, close_b, sl_recv) {
             let b_idx = iter_s.index_of("mbt_compat::__mbt_slice_borrow(")
             if b_idx >= 0 {
               let mut rp_idx = -1
@@ -7049,7 +7050,17 @@ fn lower_one_token_or_form(
       ctx.in_closure_depth = ctx.in_closure_depth + 1
       if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
         let body_close = find_matching_delim(tokens, body_start)
-        let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+        let mut body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+        if exp_arr_ret == "Double" {
+          let bt = body.trim()
+          if bt.starts_with("{") && bt.ends_with("}") && bt.length() >= 3 {
+            let inner_b = bt.slice(1, bt.length() - 1).trim()
+            let coerced_b = coerce_standalone_int_to_double_f42(inner_b)
+            if coerced_b != inner_b {
+              body = "{ " + coerced_b + " }"
+            }
+          }
+        }
         ctx.in_closure_depth = ctx.in_closure_depth - 1
         restore_expected_type_stack(ctx, saved_arr_exp)
         restore_scope_vars(ctx, saved_arr_sc)
@@ -7057,7 +7068,12 @@ fn lower_one_token_or_form(
         return (trivia + "fn(" + p_str + ") " + body, body_close + 1)
       }
       let body_end = find_expr_end(tokens, body_start, end)
-      let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+      let raw_body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+      let body_expr = if exp_arr_ret == "Double" {
+        coerce_standalone_int_to_double_f42(raw_body_expr)
+      } else {
+        raw_body_expr
+      }
       ctx.in_closure_depth = ctx.in_closure_depth - 1
       restore_expected_type_stack(ctx, saved_arr_exp)
       restore_scope_vars(ctx, saved_arr_sc)
@@ -10116,12 +10132,13 @@ fn classify_slice_consumer(
       return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__CONTAINS__\"")
     }
   }
-  // Read-only `ArrayView[T]` argument slice of an unmutated plain-ident array passed directly to a
-  // local non-ArrayView-returning function (e.g. `patch_all(list, ops[i:i+run])`).
+  // Read-only `ArrayView[T]` argument slice of a strictly read-only plain-ident array passed directly
+  // to a same-file local function whose corresponding parameter is strictly read-only & non-escaping
+  // and which does not mutate any other parameter (e.g. `patch_all(list, ops[i:i+run], o)`).
   if !has_chained_slice && recv_root.length() > 0 {
     let exp_t = current_expected_type(ctx).trim()
     if (exp_t.starts_with("ArrayView[") || exp_t.starts_with("mbt_compat::ArrayView[")) &&
-    !ident_mutated_in_enclosing_fn_f42(tokens, close_br, recv_root) {
+    ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, close_br, recv_root, 0) {
       // Verify receiver is a plain ident (not a call result like `xs.map(...)[1:3]`)
       let mut ob_scan = close_br - 1
       let mut br_d = 1
@@ -10137,10 +10154,11 @@ fn classify_slice_consumer(
       tokens[ob_scan - 1].raw == recv_root &&
       !(ob_scan >= 2 && tokens[ob_scan - 2].kind == TokenKind::Dot)
       if is_plain_ident_recv {
-        // Verify direct call argument to a local fn whose return type does NOT escape ArrayView
+        // Verify direct call argument to a same-file local fn whose return type does NOT escape ArrayView
         let mut p_scan = ob_scan - 2
         let mut p_d = 0
         let mut enclosing_lp = -1
+        let mut arg_pos = 0
         while p_scan >= 0 {
           let kk = tokens[p_scan].kind
           if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { p_d = p_d + 1 }
@@ -10153,19 +10171,40 @@ fn classify_slice_consumer(
           } else if kk == TokenKind::LBracket || kk == TokenKind::LBrace {
             if p_d == 0 { break }
             p_d = p_d - 1
+          } else if p_d == 0 && kk == TokenKind::Comma {
+            arg_pos = arg_pos + 1
           }
           p_scan = p_scan - 1
         }
         if enclosing_lp >= 1 && tokens[enclosing_lp - 1].kind == TokenKind::Ident &&
         !(enclosing_lp >= 2 && tokens[enclosing_lp - 2].kind == TokenKind::Dot) &&
         (close_br + 1 == end || (close_br + 1 < end && (tokens[close_br + 1].kind == TokenKind::RParen || tokens[close_br + 1].kind == TokenKind::Comma))) {
-          let callee_name = tokens[enclosing_lp - 1].raw
-          match ctx.symtab.fn_ret_types.get(callee_name) {
-            Some(ret_ty) =>
-            if !str_has(ret_ty, "ArrayView") {
-              return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
+          let call_rp = find_matching_delim(tokens, enclosing_lp)
+          // Reject if `recv_root` is also referenced in any OTHER argument of the same call
+          let mut other_arg_refs_recv = false
+          let mut ak = enclosing_lp + 1
+          while ak < call_rp {
+            if ak >= ob_scan - 1 && ak <= close_br {
+              ak = close_br + 1
+              continue
             }
-            None => ()
+            if tokens[ak].kind == TokenKind::Ident && tokens[ak].raw == recv_root &&
+            !(ak > enclosing_lp && tokens[ak - 1].kind == TokenKind::Dot) {
+              other_arg_refs_recv = true
+              break
+            }
+            ak = ak + 1
+          }
+          if !other_arg_refs_recv {
+            let callee_name = tokens[enclosing_lp - 1].raw
+            match ctx.symtab.fn_ret_types.get(callee_name) {
+              Some(ret_ty) =>
+              if !str_has(ret_ty, "ArrayView") &&
+              callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, 0) {
+                return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
+              }
+              None => ()
+            }
           }
         }
       }
@@ -11876,19 +11915,18 @@ fn lower_match_arms_with_ty(
     if !handled_special && !pattern_contains_struct_pat(tokens, i, pat_end) &&
     pattern_contains_as_kw_f42(tokens, i, pat_end) {
       let (outer_pat, as_obls, bad_or_as) = peel_as_patterns_in_pat(ctx, tokens, i, pat_end, file)
-      if bad_or_as {
+      if bad_or_as || as_obls.length() == 0 {
         ctx.diags.push(diag_error(
           "MBT2PION_UNSUPPORTED_SYNTAX",
           file,
           tokens[i].line,
           tokens[i].col,
-          "nested `as` binding inside an or-pattern branch is not supported (fail-closed)",
+          "`as` pattern in unsupported position (or-branch, labeled arg, or array pattern) is not supported (fail-closed)",
         ))
         handled_special = true
-      } else if as_obls.length() > 0 {
-        let (full_g, full_b) = expand_as_pat_obligations(as_obls, 0, guard_str, body_raw.trim())
-        let is_last_irref_as = next_i >= end && guard_str.length() == 0 && is_irrefutable_simple_pat(outer_pat.trim())
-        let g_suffix = if full_g == "true" || is_last_irref_as { "" } else { " if " + full_g }
+      } else {
+        let (full_g, full_b) = expand_as_pat_obligations(ctx, as_obls, 0, guard_str, body_raw.trim())
+        let g_suffix = if full_g == "true" { "" } else { " if " + full_g }
         sb.write_string(lead_triv + outer_pat.trim() + g_suffix + tokens[fa].leading_trivia + "=> " + full_b + trail_sep)
         handled_special = true
       }
@@ -13471,7 +13509,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         while k < rn {
           let tk = rtoks[k]
           if tk.kind == TokenKind::UpperIdent &&
-          !(k > 0 && rtoks[k - 1].kind == TokenKind::Dot) &&
+          !(k > 0 && (rtoks[k - 1].kind == TokenKind::Dot || rtoks[k - 1].kind == TokenKind::ColonColon)) &&
           !(k + 1 < rn && rtoks[k + 1].kind == TokenKind::LBracket) &&
           (tk.raw == aname || (ta_iter == 16 && raw_type_aliases.contains(tk.raw))) {
             has_unresolved_alias = true
@@ -17194,9 +17232,10 @@ fn peel_as_patterns_in_pat(
   if a >= b {
     return ("", [], false)
   }
-  // 2. Check for top-level `as <ident>` at `[a, b)`
+  // 2. Check for top-level `as <ident>`, `|`, or `=` (labeled ctor arg) at `[a, b)`
   let mut top_as = -1
   let mut has_top_pipe = false
+  let mut has_top_eq = false
   let mut d = 0
   let mut k = a
   while k < b {
@@ -17208,9 +17247,14 @@ fn peel_as_patterns_in_pat(
         top_as = k
       } else if kk == TokenKind::Pipe {
         has_top_pipe = true
+      } else if kk == TokenKind::Eq {
+        has_top_eq = true
       }
     }
     k = k + 1
+  }
+  if has_top_eq && pattern_contains_as_kw_f42(tokens, a, b) {
+    return ("", [], true)
   }
   if top_as > a && top_as + 1 < b && top_as + 2 == b &&
   (tokens[top_as + 1].kind == TokenKind::Ident || tokens[top_as + 1].kind == TokenKind::Keyword) {
@@ -17220,9 +17264,24 @@ fn peel_as_patterns_in_pat(
       return ("", [], true)
     }
     let raw_inner = inner_pat.trim()
-    let norm_inner = if raw_inner.starts_with("Object(") || raw_inner.starts_with("Array(") ||
-    raw_inner.starts_with("String(") || raw_inner.starts_with("Number(") ||
-    raw_inner == "Null" || raw_inner == "True" || raw_inner == "False" {
+    let json_ctor_head = if raw_inner.starts_with("Object(") {
+      "Object"
+    } else if raw_inner.starts_with("Array(") {
+      "Array"
+    } else if raw_inner.starts_with("String(") {
+      "String"
+    } else if raw_inner.starts_with("Number(") {
+      "Number"
+    } else if raw_inner == "Null" {
+      "Null"
+    } else if raw_inner == "True" {
+      "True"
+    } else if raw_inner == "False" {
+      "False"
+    } else {
+      ""
+    }
+    let norm_inner = if json_ctor_head.length() > 0 && !ctx.symtab.ctors.contains(json_ctor_head) {
       "mbt_compat::MbtJson::" + raw_inner
     } else {
       raw_inner
@@ -17253,7 +17312,7 @@ fn peel_as_patterns_in_pat(
     if tokens[p].kind == TokenKind::UpperIdent || tokens[p].kind == TokenKind::Ident || tokens[p].kind == TokenKind::PkgRef {
       let mut q = p
       while q < b && (tokens[q].kind == TokenKind::UpperIdent || tokens[q].kind == TokenKind::Ident ||
-      tokens[q].kind == TokenKind::PkgRef || tokens[q].kind == TokenKind::Dot || tokens[q].kind == TokenKind::ColonColon) {
+        tokens[q].kind == TokenKind::PkgRef || tokens[q].kind == TokenKind::Dot || tokens[q].kind == TokenKind::ColonColon) {
         q = q + 1
       }
       if q > p && q < b && tokens[q].kind == TokenKind::LParen {
@@ -17306,37 +17365,181 @@ fn peel_as_patterns_in_pat(
   (sb.to_string().trim(), obls, false)
 }
 
-///| True iff `recv_ident` is never referenced and no potentially mutating function/method calls occur
-///| inside `for ... in recv_ident[lo:hi] { body }`.
-fn for_slice_body_is_ro_safe_f42(tokens : Array[Token], start : Int, end : Int, recv_ident : String) -> Bool {
+///| True iff `m` is shadowed by a user-defined local type method in `ctx.symtab`.
+fn is_method_shadowed_f42(ctx : StageAContext, m : String) -> Bool {
+  if ctx.symtab.local_types.contains("Array") || ctx.symtab.local_types.contains("ArrayView") {
+    return true
+  }
+  let suffix = "::" + m
+  for lt in ctx.symtab.local_types.keys() {
+    if ctx.symtab.fn_ret_types.contains(lt + suffix) {
+      return true
+    }
+  }
+  false
+}
+
+///| True iff `m` is a strictly pure read-only method name (and not shadowed by user/dep code).
+fn is_pure_ro_method_f42(ctx : StageAContext, m : String) -> Bool {
+  if !(m == "length" || m == "is_empty" || m == "get" || m == "contains" || m == "copy" ||
+    m == "unwrap_or" || m == "is_some" || m == "is_none") {
+    return false
+  }
+  !is_method_shadowed_f42(ctx, m)
+}
+
+///| True iff `recv_ident` is strictly read-only in its enclosing `fn`, never referenced inside
+///| `for ... in recv_ident[lo:hi] { body }`, and `body` contains no index writes, indirect calls,
+///| pipes, string interpolations, or unwhitelisted/shadowed calls.
+fn for_slice_body_is_ro_safe_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  recv_ident : String,
+) -> Bool {
   let mut k = start
   while k < end {
     let tk = tokens[k]
+    if tk.kind == TokenKind::PipeGt || tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline {
+      return false
+    }
+    // Reject any index assignment `arr[i] = ...` inside the loop body
+    if tk.kind == TokenKind::RBracket && k + 1 < end &&
+    (tokens[k + 1].kind == TokenKind::Eq || tokens[k + 1].kind == TokenKind::AssignOp) {
+      return false
+    }
+    // Reject any indirect call `f()(...)` or `arr[i](...)`
+    if (tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket) &&
+    k + 1 < end && tokens[k + 1].kind == TokenKind::LParen {
+      return false
+    }
     if tk.kind == TokenKind::Ident {
       if tk.raw == recv_ident && !(k > start && tokens[k - 1].kind == TokenKind::Dot) {
         return false
       }
-      // Reject any call `f(...)` or `.m(...)` except strictly whitelisted pure read methods
+      // Reject any call `f(...)` or `.m(...)` except strictly whitelisted, unshadowed pure read methods
       if k + 1 < end && tokens[k + 1].kind == TokenKind::LParen {
         let is_dot = k > start && tokens[k - 1].kind == TokenKind::Dot
         if !is_dot {
           return false
         }
-        let m = tk.raw
-        if !(m == "get" || m == "length" || m == "is_empty" || m == "contains" ||
-          m == "unwrap_or" || m == "is_some" || m == "is_none") {
+        if !is_pure_ro_method_f42(ctx, tk.raw) {
           return false
         }
       }
     }
     k = k + 1
   }
-  true
+  ident_is_strictly_ro_in_enclosing_fn_f42(ctx, tokens, start, recv_ident, 0)
 }
 
-///| True iff `recv_ident` may be mutated (method mutation, index assign, reassignment) anywhere in its enclosing top-level `fn`.
-fn ident_mutated_in_enclosing_fn_f42(tokens : Array[Token], pos : Int, recv_ident : String) -> Bool {
-  // Walk back to enclosing top-level `fn` header brace
+///| Check whether token `i` is a direct argument to a same-file local call `callee(...)`, returning
+///| `Some((callee_name, arg_idx))` if so.
+fn direct_local_call_arg_info_f42(tokens : Array[Token], i : Int, bound_start : Int) -> Option[(String, Int)] {
+  if i <= bound_start || i + 1 >= tokens.length() {
+    return None
+  }
+  let prev_k = tokens[i - 1].kind
+  let next_k = tokens[i + 1].kind
+  if !(prev_k == TokenKind::LParen || prev_k == TokenKind::Comma) {
+    return None
+  }
+  if !(next_k == TokenKind::RParen || next_k == TokenKind::Comma) {
+    return None
+  }
+  let mut p_scan = i - 1
+  let mut p_d = 0
+  let mut arg_pos = 0
+  let mut lp = -1
+  while p_scan >= bound_start {
+    let kk = tokens[p_scan].kind
+    if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      p_d = p_d + 1
+    } else if kk == TokenKind::LParen {
+      if p_d == 0 {
+        lp = p_scan
+        break
+      }
+      p_d = p_d - 1
+    } else if kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      if p_d == 0 { return None }
+      p_d = p_d - 1
+    } else if p_d == 0 && kk == TokenKind::Comma {
+      arg_pos = arg_pos + 1
+    }
+    p_scan = p_scan - 1
+  }
+  if lp >= 1 && tokens[lp - 1].kind == TokenKind::Ident &&
+  !(lp >= 2 && (tokens[lp - 2].kind == TokenKind::Dot || tokens[lp - 2].kind == TokenKind::ColonColon)) {
+    return Some((tokens[lp - 1].raw, arg_pos))
+  }
+  None
+}
+
+///| True iff `tokens[i]` (an ident `name`) is used strictly in a read-only, non-aliasing,
+///| non-escaping position inside `[fn_open + 1, fn_close)`.
+fn ident_occ_is_strictly_ro_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  i : Int,
+  fn_open : Int,
+  fn_close : Int,
+  allow_let_decl : Bool,
+  depth : Int,
+) -> Bool {
+  // Form A: immutable `let <name> = ...` declaration (rejects `let mut <name>`)
+  if allow_let_decl && i > fn_open && tokens[i - 1].kind == TokenKind::Keyword && tokens[i - 1].raw == "let" {
+    return true
+  }
+  // Form B: `for x in <name>`
+  if i > fn_open && tokens[i - 1].kind == TokenKind::Keyword && tokens[i - 1].raw == "in" {
+    return true
+  }
+  // Form C: pure read-only method `<name>.<ro_method>(...)`
+  if i + 3 < fn_close && tokens[i + 1].kind == TokenKind::Dot &&
+  tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen &&
+  is_pure_ro_method_f42(ctx, tokens[i + 2].raw) {
+    return true
+  }
+  // Form D: read-only index or slice `<name>[...]` (not assigned, not followed by mutating method)
+  if i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBracket {
+    let cb = find_matching_delim(tokens, i + 1)
+    if cb > i + 1 && cb < fn_close {
+      if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+        return false
+      }
+      if cb + 3 < fn_close && tokens[cb + 1].kind == TokenKind::Dot &&
+      tokens[cb + 2].kind == TokenKind::Ident && tokens[cb + 3].kind == TokenKind::LParen &&
+      !is_pure_ro_method_f42(ctx, tokens[cb + 2].raw) {
+        return false
+      }
+      return true
+    }
+    return false
+  }
+  // Form E: direct argument to a same-file local fn whose corresponding parameter is strictly RO & non-escaping
+  if depth < 2 {
+    match direct_local_call_arg_info_f42(tokens, i, fn_open) {
+      Some((callee_name, arg_pos)) =>
+      if callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, depth + 1) {
+        return true
+      }
+      None => ()
+    }
+  }
+  false
+}
+
+///| True iff `recv_ident` is strictly read-only, never aliased, never escaped, and never mutated
+///| anywhere in its enclosing top-level `fn`.
+fn ident_is_strictly_ro_in_enclosing_fn_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  pos : Int,
+  recv_ident : String,
+  depth : Int,
+) -> Bool {
   let mut fn_open = -1
   let mut k = pos
   let mut d = 0
@@ -17349,48 +17552,161 @@ fn ident_mutated_in_enclosing_fn_f42(tokens : Array[Token], pos : Int, recv_iden
       } else {
         d = d - 1
       }
-    } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "fn" && fn_open >= 0 {
+    } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "fn" && fn_open >= 0 &&
+    k + 1 < tokens.length() && tokens[k + 1].kind == TokenKind::Ident {
       break
     }
     k = k - 1
   }
   if fn_open < 0 {
-    return true
+    return false
   }
   let fn_close = find_matching_delim(tokens, fn_open)
   if fn_close <= fn_open {
-    return true
+    return false
   }
   let mut i = fn_open + 1
   while i < fn_close {
     let tk = tokens[i]
     if tk.kind == TokenKind::Ident && tk.raw == recv_ident &&
-    !(i > fn_open && tokens[i - 1].kind == TokenKind::Dot) {
-      // Check `recv_ident = ...`
-      if i + 1 < fn_close && (tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::AssignOp) {
-        return true
+    !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, true, depth) {
+        return false
       }
-      // Check `recv_ident[idx] = ...`
-      if i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBracket {
-        let cb = find_matching_delim(tokens, i + 1)
-        if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
-          return true
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| True iff `callee_name` is a same-file top-level `fn` whose `arg_pos`-th parameter is strictly
+///| read-only and non-escaping (zero index writes, zero mutating methods, zero aliasing/return/storage),
+///| and which does not mutate any of its other parameters.
+fn callee_param_is_ro_non_escaping_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  callee_name : String,
+  arg_pos : Int,
+  depth : Int,
+) -> Bool {
+  if arg_pos < 0 || !ctx.symtab.local_fn_names.contains(callee_name) {
+    return false
+  }
+  // Locate top-level `fn <callee_name>(...)` in `tokens`
+  let n = tokens.length()
+  let mut bd = 0
+  let mut fn_lp = -1
+  let mut k = 0
+  while k < n {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LBrace { bd = bd + 1 }
+    else if kk == TokenKind::RBrace { if bd > 0 { bd = bd - 1 } }
+    else if bd == 0 && kk == TokenKind::Keyword && tokens[k].raw == "fn" {
+      if k + 2 < n && tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == callee_name {
+        let mut scan = k + 2
+        if scan < n && tokens[scan].kind == TokenKind::LBracket {
+          scan = find_matching_delim(tokens, scan) + 1
+        }
+        if scan < n && tokens[scan].kind == TokenKind::LParen {
+          fn_lp = scan
+          break
         }
       }
-      // Check `recv_ident.<mutating_method>(...)`
-      if i + 2 < fn_close && tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident {
-        let m = tokens[i + 2].raw
-        if m == "push" || m == "pop" || m == "set" || m == "unsafe_set" || m == "clear" ||
-        m == "remove" || m == "append" || m == "insert" || m == "truncate" || m == "drain" ||
-        m == "retain" || m == "resize" || m == "shrink_to_fit" || m == "swap" || m == "reverse" ||
-        m == "sort" || m == "sort_by" || m == "sort_by_key" {
-          return true
+    }
+    k = k + 1
+  }
+  if fn_lp < 0 {
+    return false
+  }
+  let fn_rp = find_matching_delim(tokens, fn_lp)
+  if fn_rp <= fn_lp {
+    return false
+  }
+  // Extract parameter names from `( ... )`
+  let param_names : Array[String] = []
+  let mut ps = fn_lp + 1
+  while ps < fn_rp {
+    if tokens[ps].kind == TokenKind::Comma { ps = ps + 1; continue }
+    let mut pe = ps
+    let mut pd = 0
+    while pe < fn_rp {
+      let pk = tokens[pe].kind
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+      else if pd == 0 && pk == TokenKind::Comma { break }
+      pe = pe + 1
+    }
+    // Parameter name is first ident (skipping `mut` / `~`)
+    let mut pn_idx = ps
+    while pn_idx < pe && (tokens[pn_idx].kind == TokenKind::Tilde ||
+      (tokens[pn_idx].kind == TokenKind::Keyword && tokens[pn_idx].raw == "mut")) {
+      pn_idx = pn_idx + 1
+    }
+    if pn_idx < pe && tokens[pn_idx].kind == TokenKind::Ident {
+      param_names.push(tokens[pn_idx].raw)
+    } else {
+      param_names.push("")
+    }
+    ps = pe + 1
+  }
+  if arg_pos >= param_names.length() || param_names[arg_pos].length() == 0 {
+    return false
+  }
+  let target_param = param_names[arg_pos]
+  // Find body `{ ... }`
+  let mut fn_open = fn_rp + 1
+  while fn_open < n && tokens[fn_open].kind != TokenKind::LBrace {
+    fn_open = fn_open + 1
+  }
+  if fn_open >= n {
+    return false
+  }
+  let fn_close = find_matching_delim(tokens, fn_open)
+  if fn_close <= fn_open {
+    return false
+  }
+  // Scan body: target_param must be strictly RO & non-escaping; other params must not be mutated.
+  let mut i = fn_open + 1
+  while i < fn_close {
+    let tk = tokens[i]
+    if tk.kind == TokenKind::Ident &&
+    !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      if tk.raw == target_param {
+        if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, false, depth) {
+          return false
+        }
+      } else {
+        let mut is_other_param = false
+        for pn in param_names {
+          if pn == tk.raw {
+            is_other_param = true
+            break
+          }
+        }
+        if is_other_param {
+          // Reject reassignment `p = ...`
+          if i + 1 < fn_close && (tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::AssignOp) {
+            return false
+          }
+          // Reject index assignment `p[...] = ...`
+          if i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, i + 1)
+            if cb + 1 < fn_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+              return false
+            }
+          }
+          // Reject non-pure method calls `p.<method>(...)`
+          if i + 3 < fn_close && tokens[i + 1].kind == TokenKind::Dot &&
+          tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen &&
+          !is_pure_ro_method_f42(ctx, tokens[i + 2].raw) {
+            return false
+          }
         }
       }
     }
     i = i + 1
   }
-  false
+  true
 }
 
 ///| True iff `m` is an `Iter` consumer/combinator method name on MoonBit `Map::keys()`.
@@ -17403,7 +17719,7 @@ fn is_iter_chain_method_f42(m : String) -> Bool {
 
 ///| Lower `<map_expr>.keys().<iter_method>(...)` to `mbt_compat::ordered_map_keys_iter(<map_expr>).<iter_method>(...)`
 ///| when `<map_expr>` has known `OrderedMap[K, V]` / `Map[K, V]` type, preserving MoonBit's lazy `Iter[K]` semantics
-///| (including consuming `Iter::head()`).
+///| (including consuming `Iter::head()` and rewriting `.next()` to `.head()`).
 fn try_lower_map_keys_iter_chain_f42(
   ctx : StageAContext,
   trivia : String,
@@ -17443,6 +17759,9 @@ fn try_lower_map_keys_iter_chain_f42(
               return None
             }
           }
+          if tokens[cur + 5].raw == "next" && cur + 7 < end && tokens[cur + 7].kind == TokenKind::RParen {
+            return Some((trivia + "mbt_compat::ordered_map_keys_iter(" + recv_sb.to_string() + ").head()", cur + 8))
+          }
           return Some((trivia + "mbt_compat::ordered_map_keys_iter(" + recv_sb.to_string() + ")", cur + 4))
         }
       }
@@ -17464,8 +17783,184 @@ fn try_lower_map_keys_iter_chain_f42(
   None
 }
 
+///| Strip balanced outer grouping parens `( ... )` (with no top-level comma) from a pattern string.
+fn strip_outer_parens_pat_f42(s : String) -> String {
+  let mut p = s.trim()
+  while p.length() >= 2 && p.starts_with("(") && p.ends_with(")") {
+    let mut d = 0
+    let mut matched_end = true
+    let mut has_comma = false
+    let mut i = 0
+    while i < p.length() {
+      let c = p.code_unit_at(i)
+      if c == 40 || c == 91 || c == 123 { d = d + 1 }
+      else if c == 41 || c == 93 || c == 125 {
+        d = d - 1
+        if d == 0 && i < p.length() - 1 {
+          matched_end = false
+          break
+        }
+      } else if d == 1 && c == 44 {
+        has_comma = true
+      }
+      i = i + 1
+    }
+    if matched_end && !has_comma {
+      p = p.slice(1, p.length() - 1).trim()
+    } else {
+      break
+    }
+  }
+  p
+}
+
+///| Split `s` on top-level `sep_byte` (ignoring nested `()`, `[]`, `{}`).
+fn split_top_level_byte_f42(s : String, sep_byte : Int) -> Array[String] {
+  let out : Array[String] = []
+  let mut d = 0
+  let mut start = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c == 40 || c == 91 || c == 123 { d = d + 1 }
+    else if c == 41 || c == 93 || c == 125 { if d > 0 { d = d - 1 } }
+    else if d == 0 && c == sep_byte {
+      out.push(s.slice(start, i).trim())
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(s.slice(start, s.length()).trim())
+  out
+}
+
+///| True iff `pat` is provably irrefutable (either a simple irrefutable pattern or a top-level
+///| or-pattern covering ALL variants of a single known enum with irrefutable sub-patterns).
+fn is_irrefutable_as_inner_pat_f42(ctx : StageAContext, pat : String) -> Bool {
+  let p = strip_outer_parens_pat_f42(pat)
+  if is_irrefutable_simple_pat(p) {
+    return true
+  }
+  let alts = split_top_level_byte_f42(p, 124) // '|'
+  if alts.length() < 2 {
+    return false
+  }
+  let seen_variants : Map[String, Bool] = Map()
+  let mut qual = ""
+  let mut has_qual = false
+  let mut first_variant = ""
+  for raw_alt in alts {
+    let alt = strip_outer_parens_pat_f42(raw_alt)
+    if alt.length() == 0 {
+      return false
+    }
+    let lp = alt.index_of("(")
+    let head = if lp >= 0 {
+      if !alt.ends_with(")") {
+        return false
+      }
+      let args_str = alt.slice(lp + 1, alt.length() - 1).trim()
+      if args_str.length() > 0 {
+        let args = split_top_level_byte_f42(args_str, 44) // ','
+        for arg in args {
+          if arg != ".." && !is_irrefutable_simple_pat(arg) {
+            return false
+          }
+        }
+      }
+      alt.slice(0, lp).trim()
+    } else {
+      alt
+    }
+    // Split `head` on last `::`
+    let mut last_cc = -1
+    let mut scan = 0
+    while scan + 1 < head.length() {
+      if head.code_unit_at(scan) == 58 && head.code_unit_at(scan + 1) == 58 {
+        last_cc = scan
+        scan = scan + 2
+      } else {
+        scan = scan + 1
+      }
+    }
+    let (aq, av) = if last_cc >= 0 {
+      (head.slice(0, last_cc).trim(), head.slice(last_cc + 2, head.length()).trim())
+    } else {
+      ("", head)
+    }
+    if av.length() == 0 {
+      return false
+    }
+    if aq.length() > 0 {
+      if has_qual && qual != aq {
+        return false
+      }
+      qual = aq
+      has_qual = true
+    }
+    if first_variant.length() == 0 {
+      first_variant = av
+    }
+    seen_variants[av] = true
+  }
+  // Builtin Option / Result / Bool exhaustiveness
+  if (!has_qual || qual == "Option") && seen_variants.contains("Some") && seen_variants.contains("None") {
+    return true
+  }
+  if (!has_qual || qual == "Result") && seen_variants.contains("Ok") && seen_variants.contains("Err") {
+    return true
+  }
+  if !has_qual && seen_variants.contains("true") && seen_variants.contains("false") {
+    return true
+  }
+  // Enum schema exhaustiveness
+  let schema_opt : Option[AbiEnumSchema] = if has_qual {
+    match ctx.symtab.enum_schemas.get(qual) {
+      Some(s) => Some(s)
+      None => {
+        let cc = qual.index_of("::")
+        if cc > 0 {
+          symtab_lookup_enum_schema(ctx.symtab, qual.slice(0, cc), qual.slice(cc + 2, qual.length()))
+        } else {
+          None
+        }
+      }
+    }
+  } else {
+    match ctx.symtab.ctors.get(first_variant) {
+      Some(targets) =>
+      if targets.length() == 1 {
+        let t = targets[0]
+        match ctx.symtab.enum_schemas.get(t.enum_name) {
+          Some(s) => Some(s)
+          None => symtab_lookup_enum_schema(ctx.symtab, t.pkg, t.enum_name)
+        }
+      } else {
+        None
+      }
+      None => None
+    }
+  }
+  match schema_opt {
+    Some(en) => {
+      if en.variants.length() == 0 {
+        return false
+      }
+      for v in en.variants {
+        if !seen_variants.contains(v.name) {
+          return false
+        }
+      }
+      true
+    }
+    None => false
+  }
+}
+
 ///| Expand peeled `as`-pattern obligations recursively into `(guard_bool_expr, body_expr)`.
+///| Only produces `full_g == "true"` when `inner_pat` is provably irrefutable and `ng == "true"`.
 fn expand_as_pat_obligations(
+  ctx : StageAContext,
   obls : Array[(String, String, Bool)],
   idx : Int,
   guard_str : String,
@@ -17476,10 +17971,19 @@ fn expand_as_pat_obligations(
     return (g, body_str)
   }
   let (as_var, inner_pat, has_binders) = obls[idx]
-  let (ng, nb) = expand_as_pat_obligations(obls, idx + 1, guard_str, body_str)
-  let full_g = "(match " + as_var + " { " + inner_pat + " => " + ng + ", _ => false })"
+  let (ng, nb) = expand_as_pat_obligations(ctx, obls, idx + 1, guard_str, body_str)
+  let irref = is_irrefutable_as_inner_pat_f42(ctx, inner_pat)
+  let full_g = if irref && ng == "true" {
+    "true"
+  } else {
+    "(match " + as_var + " { " + inner_pat + " => " + ng + ", _ => false })"
+  }
   let full_b = if has_binders {
-    "match " + as_var + " { " + inner_pat + " => " + nb + ", _ => panic(\"unreachable\") }"
+    if irref {
+      "match " + as_var + " { " + inner_pat + " => " + nb + " }"
+    } else {
+      "match " + as_var + " { " + inner_pat + " => " + nb + ", _ => panic(\"unreachable\") }"
+    }
   } else {
     nb
   }
