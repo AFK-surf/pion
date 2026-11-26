@@ -185,6 +185,10 @@ FFI_SHADOW_MBT = r'''
 pub fn[T] cstr_to_str(_x : T) -> String {
   "custom"
 }
+
+pub fn unrelated(mbt_compat : Int) -> Int {
+  mbt_compat
+}
 '''
 
 FFI_COLLIDE_MBT = r'''

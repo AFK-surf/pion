@@ -579,8 +579,24 @@ pub fn canonical_c_abi_sig(p_str : String, ret_str : String) -> String {
   "(" + ptys.join(",") + ")->" + rty
 }
 
-///| Scan a `.pion` companion file for top-level `extern "C" fn <name>(<params>)[-> <ret>] = "<sym>"`
-///| declarations, returning `(fn_name, c_symbol, canonical_sig)` tuples.
+///| True if `tok` starts a new top-level Pion declaration (used to terminate body-less `extern "C"` decls
+///| that omit `= "<sym>"`).
+fn is_pion_top_level_decl_starter(tok : Token) -> Bool {
+  if tok.kind == TokenKind::Attr {
+    return true
+  }
+  if tok.kind == TokenKind::Keyword || tok.kind == TokenKind::Ident {
+    let r = tok.raw
+    return r == "pub" || r == "priv" || r == "fn" || r == "extern" || r == "struct" ||
+    r == "enum" || r == "type" || r == "trait" || r == "impl" || r == "let" ||
+    r == "const" || r == "import" || r == "test"
+  }
+  false
+}
+
+///| Scan a `.pion` file for top-level `extern "C" fn <name>(<params>)[-> <ret>][= "<sym>"]`
+///| declarations (supporting multiline return annotations and omitted `= "<sym>"`, which defaults
+///| to `<name>` per Pion parser semantics), returning `(fn_name, c_symbol, canonical_sig)` tuples.
 pub fn collect_pion_extern_c_decls(content : String) -> Array[(String, String, String)] {
   let out : Array[(String, String, String)] = []
   let tokens = lex_moonbit(content)
@@ -612,28 +628,168 @@ pub fn collect_pion_extern_c_decls(content : String) -> Array[(String, String, S
       } else {
         ""
       }
-      let mut eq_i = close_p + 1
-      while eq_i < n && tokens[eq_i].kind != TokenKind::Eq && tokens[eq_i].kind != TokenKind::LBrace && !tokens[eq_i].newline_before {
-        eq_i = eq_i + 1
+      let mut cur = close_p + 1
+      let mut pd = 0
+      let mut found_eq = false
+      let mut found_lbrace = false
+      while cur < n {
+        let tk = tokens[cur]
+        if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket {
+          pd = pd + 1
+          cur = cur + 1
+          continue
+        }
+        if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket {
+          if pd > 0 { pd = pd - 1 }
+          cur = cur + 1
+          continue
+        }
+        if pd == 0 {
+          if tk.kind == TokenKind::Eq {
+            found_eq = true
+            break
+          }
+          if tk.kind == TokenKind::LBrace {
+            found_lbrace = true
+            break
+          }
+          if tk.kind == TokenKind::Semi || is_pion_top_level_decl_starter(tk) {
+            break
+          }
+        }
+        cur = cur + 1
       }
-      if eq_i + 1 < n && tokens[eq_i].kind == TokenKind::Eq && tokens[eq_i + 1].kind == TokenKind::StringLit {
-        let ret_str = if eq_i > close_p + 1 {
-          content.slice(tokens[close_p].end_byte, tokens[eq_i].start_byte).trim()
+      if found_eq && cur + 1 < n && tokens[cur + 1].kind == TokenKind::StringLit {
+        let ret_str = if cur > close_p + 1 {
+          content.slice(tokens[close_p].end_byte, tokens[cur].start_byte).trim()
         } else {
           ""
         }
-        let sym_lit = tokens[eq_i + 1].raw.trim()
+        let sym_lit = tokens[cur + 1].raw.trim()
         let sym = if sym_lit.length() >= 2 && sym_lit.starts_with("\"") && sym_lit.ends_with("\"") {
           sym_lit.slice(1, sym_lit.length() - 1)
         } else {
           sym_lit
         }
         out.push((fn_name, sym, canonical_c_abi_sig(p_str, ret_str)))
-        i = eq_i + 2
+        i = cur + 2
+        continue
+      } else if !found_lbrace {
+        // Omitted `= "<sym>"`: Pion defaults the C symbol to `fn_name`.
+        let ret_end_byte = if cur < n { tokens[cur].start_byte } else { content.length() }
+        let ret_str = if ret_end_byte > tokens[close_p].end_byte {
+          content.slice(tokens[close_p].end_byte, ret_end_byte).trim()
+        } else {
+          ""
+        }
+        out.push((fn_name, fn_name, canonical_c_abi_sig(p_str, ret_str)))
+        i = if cur < n && tokens[cur].kind == TokenKind::Semi { cur + 1 } else { cur }
         continue
       }
     }
     i = i + 1
   }
   out
+}
+
+///| Reconcile `ffi_symbols` against final post-overlay `.pion` files (preserving `.mbt` `raw_c_symbol`
+///| while updating `emitted_c_symbol` / `bridged` after overlays) and run a final package-wide C symbol
+///| collision check across all generated `.pion` files and `[[abi.companions]]`.
+pub fn reconcile_final_ffi_symbols_and_check_collisions(
+  gen_files : Array[GeneratedFile],
+  companion_files : Array[(String, String, String)],
+  initial_symbols : Array[FfiSymbolMapping],
+  diags : Array[Diag],
+) -> Array[FfiSymbolMapping] {
+  let final_symbols : Array[FfiSymbolMapping] = []
+  let final_c_syms : Map[String, (String, String, String, Bool)] = Map()
+
+  let has_existing_sym_diag = fn(sym : String) -> Bool {
+    let needle = "`" + sym + "`"
+    for d in diags {
+      if d.code == "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" && str_has(d.message, needle) {
+        return true
+      }
+    }
+    false
+  }
+
+  let check_and_record = fn(file : String, fn_name : String, sym : String, sig : String, is_bridged : Bool) -> Unit {
+    match final_c_syms.get(sym) {
+      Some(prev) =>
+      if prev.3 || is_bridged || prev.2 != sig {
+        if !has_existing_sym_diag(sym) {
+          diags.push(diag_error(
+            "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+            file,
+            1,
+            1,
+            "extern \"C\" symbol `" + sym + "` on `" + file + "` fn `" + fn_name + "` collides with `" + prev.0 + "` fn `" + prev.1 + "`",
+          ))
+        }
+      }
+      None => final_c_syms[sym] = (file, fn_name, sig, is_bridged)
+    }
+  }
+
+  for gf in gen_files {
+    let decls = collect_pion_extern_c_decls(gf.content)
+    let matched_init : Map[Int, Bool] = Map()
+    for d in decls {
+      let pion_fn = d.0
+      let c_sym = d.1
+      let c_sig = d.2
+      let mut found_idx = -1
+      let mut is_bridged = false
+      let mut logical_fn = pion_fn
+      let mut raw_sym = c_sym
+      let mut idx = 0
+      while idx < initial_symbols.length() {
+        if !matched_init.contains(idx) {
+          let fm = initial_symbols[idx]
+          if fm.file == gf.source_file {
+            let bridge_pfx = "__mbt_c_ffi_" + fm.fn_name
+            if pion_fn == fm.fn_name {
+              found_idx = idx
+              is_bridged = false
+              logical_fn = fm.fn_name
+              raw_sym = fm.raw_c_symbol
+              break
+            } else if pion_fn == bridge_pfx || pion_fn.starts_with(bridge_pfx + "_") {
+              found_idx = idx
+              is_bridged = true
+              logical_fn = fm.fn_name
+              raw_sym = fm.raw_c_symbol
+              break
+            }
+          }
+        }
+        idx = idx + 1
+      }
+      if found_idx >= 0 {
+        matched_init[found_idx] = true
+      } else if pion_fn.starts_with("__mbt_c_ffi_") {
+        is_bridged = true
+      }
+      check_and_record(gf.source_file, logical_fn, c_sym, c_sig, is_bridged)
+      final_symbols.push(FfiSymbolMapping::{
+        file: gf.source_file,
+        fn_name: logical_fn,
+        raw_c_symbol: raw_sym,
+        emitted_c_symbol: c_sym,
+        bridged: is_bridged,
+      })
+    }
+  }
+
+  for cf in companion_files {
+    let cname = cf.0
+    let ctxt = cf.1
+    let cdecls = collect_pion_extern_c_decls(ctxt)
+    for cd in cdecls {
+      check_and_record(cname, cd.0, cd.1, cd.2, false)
+    }
+  }
+
+  final_symbols
 }
