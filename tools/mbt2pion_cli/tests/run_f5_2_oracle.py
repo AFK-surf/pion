@@ -177,6 +177,14 @@ pub extern "C" fn ffi_read_buf(tag : String) -> Bytes = "demo_read_buf"
 
 #borrow(a, b)
 pub extern "C" fn ffi_mutate_and_alias(a : Bytes, b : Bytes) -> Int = "demo_mutate_and_alias"
+
+pub extern "C" fn greeting() -> String = "greeting"
+'''
+
+FFI_SHADOW_MBT = r'''
+pub fn[T] cstr_to_str(_x : T) -> String {
+  "custom"
+}
 '''
 
 FFI_COLLIDE_MBT = r'''
@@ -249,6 +257,10 @@ int32_t pion_demo_mutate_and_alias(uint8_t *a_ptr, int32_t a_len, const uint8_t 
   }
   return same_ptr * 100 + a_len * 10 + b_len;
 }
+
+const char *pion_greeting(void) {
+  return "ok";
+}
 '''
 
 FFI_E2E_MAIN_PION = r'''
@@ -272,13 +284,14 @@ pub fn main(w : World) -> Int {
   let b0 = out[0].to_int()
   let b1 = out[1].to_int()
   let b2 = out[2].to_int()
+  let gr = greeting()
   io_println(
     w,
     sc.to_string() + "|" + s.to_string() + "|" + u.to_string() + "|" + e_str.to_string() + "|" +
     send_rc.to_string() + "|" + empty_send.to_string() + "|" + ffi_scheme() + "|" +
     null_s.length().to_string() + "|" + nul_trunc + ":" + nul_trunc.length().to_string() + "|" +
     empty_b.length().to_string() + "|" + picked.to_string() + "|" + picked_empty.to_string() + "|" +
-    alias_rc.to_string() + ":" + orig0.to_string() + "|" +
+    alias_rc.to_string() + ":" + orig0.to_string() + "|" + gr + "|" +
     out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string(),
   )
   0
@@ -333,6 +346,8 @@ int32_t pion_demo_pick(const uint8_t *data_ptr, int32_t data_len, int32_t tag) {
 '''
 
 FFI_BRIDGE_PION = r'''
+import "mbt_compat" as mbt_compat
+
 extern "C" fn __mbt_c_ffi_ffi_start(data_dir_ptr : Ptr, data_dir_len : Int, cloud_ptr : Ptr, cloud_len : Int, beta : Int) -> Int = "pion_demo_start"
 fn ffi_start(data_dir : String, cloud : String, beta : Int) -> Int {
   let __ffi_res = __mbt_c_ffi_ffi_start(data_dir.as_cstr(), data_dir.to_bytes().length(), cloud.as_cstr(), cloud.to_bytes().length(), beta)
@@ -342,44 +357,44 @@ fn ffi_start(data_dir : String, cloud : String, beta : Int) -> Int {
 extern "C" fn __mbt_c_ffi_ffi_send_bytes(msg_ptr : Ptr, msg_len : Int, data_ptr : Ptr, data_len : Int) -> Unit = "pion_demo_send_bytes"
 fn ffi_send_bytes(msg : String, data : Bytes) -> Unit {
   let __ffi_data_len = data.length()
-  let __ffi_data_buf = ptr_alloc(if __ffi_data_len > 0 { __ffi_data_len.to_int64() } else { 1L })
-  if __ffi_data_len > 0 { bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len) }
+  let __ffi_data_buf = mbt_compat::mbt_ffi_ptr_alloc(if __ffi_data_len > 0 { __ffi_data_len.to_int64() } else { 1L })
+  if __ffi_data_len > 0 { mbt_compat::mbt_ffi_bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len) }
   __mbt_c_ffi_ffi_send_bytes(msg.as_cstr(), msg.to_bytes().length(), __ffi_data_buf, __ffi_data_len)
-  ptr_free(__ffi_data_buf)
+  mbt_compat::mbt_ffi_ptr_free(__ffi_data_buf)
 }
 
 extern "C" fn __mbt_c_ffi_ffi_scheme() -> Ptr = "pion_demo_scheme"
 fn ffi_scheme() -> String {
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_scheme()
-  let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
+  let __ffi_ret_str = if mbt_compat::mbt_ffi_ptr_is_null(__ffi_ret_ptr) { "" } else { mbt_compat::mbt_ffi_cstr_to_str(__ffi_ret_ptr) }
   __ffi_ret_str
 }
 
 extern "C" fn __mbt_c_ffi_ffi_null_str() -> Ptr = "pion_demo_null_str"
 fn ffi_null_str() -> String {
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_null_str()
-  let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
+  let __ffi_ret_str = if mbt_compat::mbt_ffi_ptr_is_null(__ffi_ret_ptr) { "" } else { mbt_compat::mbt_ffi_cstr_to_str(__ffi_ret_ptr) }
   __ffi_ret_str
 }
 
 extern "C" fn __mbt_c_ffi_ffi_read_buf(tag_ptr : Ptr, tag_len : Int, __out_len : Ptr) -> Ptr = "pion_demo_read_buf"
 fn ffi_read_buf(tag : String) -> Bytes {
-  let __ffi_out_len = ptr_alloc(4L)
-  ptr_write_i32(__ffi_out_len, 0L, 0)
+  let __ffi_out_len = mbt_compat::mbt_ffi_ptr_alloc(4L)
+  mbt_compat::mbt_ffi_ptr_write_i32(__ffi_out_len, 0L, 0)
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_read_buf(tag.as_cstr(), tag.to_bytes().length(), __ffi_out_len)
-  let __ffi_ret_len = ptr_read_i32(__ffi_out_len, 0L)
-  ptr_free(__ffi_out_len)
-  let __ffi_ret_bytes = if ptr_is_null(__ffi_ret_ptr) || __ffi_ret_len <= 0 { "".to_bytes() } else { bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len) }
+  let __ffi_ret_len = mbt_compat::mbt_ffi_ptr_read_i32(__ffi_out_len, 0L)
+  mbt_compat::mbt_ffi_ptr_free(__ffi_out_len)
+  let __ffi_ret_bytes = if mbt_compat::mbt_ffi_ptr_is_null(__ffi_ret_ptr) || __ffi_ret_len <= 0 { "".to_bytes() } else { mbt_compat::mbt_ffi_bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len) }
   __ffi_ret_bytes
 }
 
 extern "C" fn __mbt_c_ffi_pick(data_ptr : Ptr, data_len : Int, __ffi_data_len : Int) -> Int = "pion_demo_pick"
 fn pick(data : Bytes, __ffi_data_len : Int) -> Int {
   let __ffi_data_len_1 = data.length()
-  let __ffi_data_buf = ptr_alloc(if __ffi_data_len_1 > 0 { __ffi_data_len_1.to_int64() } else { 1L })
-  if __ffi_data_len_1 > 0 { bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len_1) }
+  let __ffi_data_buf = mbt_compat::mbt_ffi_ptr_alloc(if __ffi_data_len_1 > 0 { __ffi_data_len_1.to_int64() } else { 1L })
+  if __ffi_data_len_1 > 0 { mbt_compat::mbt_ffi_bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len_1) }
   let __ffi_res = __mbt_c_ffi_pick(__ffi_data_buf, __ffi_data_len_1, __ffi_data_len)
-  ptr_free(__ffi_data_buf)
+  mbt_compat::mbt_ffi_ptr_free(__ffi_data_buf)
   __ffi_res
 }
 
@@ -444,14 +459,36 @@ def main():
         ])
         with open(os.path.join(pion_out, "pion.toml"), "w") as f:
             f.write(f'[package]\nname = "map_is_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        # Generate split-next Pion expressions via the real production `mbt2pion::lower_string_split_next` helper
+        split_gen_pkg = os.path.join(tmp, "split_gen_pkg")
+        os.makedirs(split_gen_pkg)
+        mbt2pion_dir = os.path.join(REPO_ROOT, "tools", "mbt2pion")
+        with open(os.path.join(split_gen_pkg, "pion.toml"), "w") as f:
+            f.write(
+                f'[package]\nname = "split_gen"\nversion = "0.1.0"\n\n'
+                f'[dependencies]\nmbt2pion = {{ path = "{mbt2pion_dir}" }}\n'
+            )
+        with open(os.path.join(split_gen_pkg, "main.pion"), "w") as f:
+            f.write(
+                'import "mbt2pion" as m2p\n\n'
+                'pub fn main(w : World) -> Int {\n'
+                '  io_println(w, m2p::lower_string_split_next("\\"\\"", "\\",\\"", "__sp1"))\n'
+                '  io_println(w, m2p::lower_string_split_next("\\"ab,cd\\"", "\\",\\"", "__sp2"))\n'
+                '  0\n'
+                '}\n'
+            )
+        split_exprs = run_cmd([args.pionc, "run", split_gen_pkg]).splitlines()
+        assert len(split_exprs) == 2, f"expected 2 lowered split expressions, got: {split_exprs!r}"
+        empty_split_expr, non_empty_split_expr = split_exprs[0], split_exprs[1]
+
         with open(os.path.join(pion_out, "main.pion"), "w") as f:
             f.write(
                 'fn run_split_next() -> String {\n'
-                '  let e = match ({ let __sp = ("").split(","); if __sp.length() > 0 { Some(__sp[0]) } else { None } }) {\n'
+                f'  let e = match ({empty_split_expr}) {{\n'
                 '    Some(s) => "Some(" + s.length().to_string() + ":" + s + ")"\n'
                 '    None => "None"\n'
                 '  }\n'
-                '  let ne = match ({ let __sp = ("ab,cd").split(","); if __sp.length() > 0 { Some(__sp[0]) } else { None } }) {\n'
+                f'  let ne = match ({non_empty_split_expr}) {{\n'
                 '    Some(s) => "Some(" + s.length().to_string() + ":" + s + ")"\n'
                 '    None => "None"\n'
                 '  }\n'
@@ -514,7 +551,7 @@ def main():
         with open(os.path.join(ffi_pkg, "csrc", "bridge.c"), "w") as f:
             f.write(FFI_BRIDGE_C)
         with open(os.path.join(ffi_pkg, "pion.toml"), "w") as f:
-            f.write('[package]\nname = "ffi_bridge_oracle"\nversion = "0.1.0"\n\n[link.macos]\nc_sources = ["csrc/bridge.c"]\n\n[link.linux]\nc_sources = ["csrc/bridge.c"]\n')
+            f.write(f'[package]\nname = "ffi_bridge_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n\n[link.macos]\nc_sources = ["csrc/bridge.c"]\n\n[link.linux]\nc_sources = ["csrc/bridge.c"]\n')
         with open(os.path.join(ffi_pkg, "main.pion"), "w") as f:
             f.write(FFI_BRIDGE_PION)
         ffi_bin = os.path.join(tmp, "ffi_bridge_nat")
@@ -532,6 +569,8 @@ def main():
         os.makedirs(ffi_src_dir)
         with open(os.path.join(ffi_src_dir, "ffi_e2e.mbt"), "w") as f:
             f.write(FFI_E2E_MBT)
+        with open(os.path.join(ffi_src_dir, "shadow.mbt"), "w") as f:
+            f.write(FFI_SHADOW_MBT)
         with open(os.path.join(ffi_src_dir, "moon.pkg.json"), "w") as f:
             f.write("{}\n")
 
@@ -635,9 +674,9 @@ def main():
         e2e_out = run_cmd([e2e_bin])
         # sc=42, s=504, u=1113, e_str=5, send_rc=403, empty_send=0, scheme=pion-scheme, null_s_len=0,
         # nul_trunc="ab":2, empty_b_len=0, picked=7025 (7*1000+2*10+5), picked_empty=3000 (3*1000+0+0),
-        # alias_rc=22 (same_ptr=0, a_len=2, b_len=2) & orig0=42 (0x2a unchanged!),
+        # alias_rc=22 (same_ptr=0, a_len=2, b_len=2) & orig0=42 (0x2a unchanged!), gr="ok" (not hijacked by shadow.mbt cstr_to_str),
         # out="3:20,4,52" (0x10^4=20, 0x00^4=4, 0x30^4=52)
-        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|3:20,4,52"
+        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|ok|3:20,4,52"
         assert e2e_out == expected_e2e, f"CLI E2E C-linked FFI mismatch: {e2e_out!r} != {expected_e2e!r}"
         print(f"[PASS] CLI E2E C-linked FFI execution: {e2e_out}")
 
