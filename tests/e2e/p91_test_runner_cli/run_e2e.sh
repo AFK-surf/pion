@@ -543,10 +543,11 @@ REAL_CC_ABS="$(command -v "$REAL_CC_BIN")"
 CAS_CS1="$TMP_DIR/cas_cs1"
 CAS_CS4="$TMP_DIR/cas_cs4"
 BARRIER_DIR="$TMP_DIR/barrier"
-mkdir -p "$CAS_CS1" "$CAS_CS4" "$BARRIER_DIR"
+CCLOG_DIR="$TMP_DIR/cclogs"
+mkdir -p "$CAS_CS1" "$CAS_CS4" "$BARRIER_DIR" "$CCLOG_DIR"
 
 # --jobs 1 cold run (no barrier): strict non-overlapping cstub compiles
-REAL_CC="$REAL_CC_ABS" CC="$CC_WRAP" P91_CC_LOG="$TMP_DIR/cc_j1.log" P91_ARRIVE_FIFO="" \
+REAL_CC="$REAL_CC_ABS" CC="$CC_WRAP" P91_CC_LOG="$CCLOG_DIR/cc_j1.log" P91_ARRIVE_FIFO="" \
   PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_CS1" "$PIONC" test --jobs 1 --json "$CS" \
   > "$TMP_DIR/cs_j1.json" 2>"$TMP_DIR/cs_j1.trace"
 
@@ -556,7 +557,7 @@ REL_A_FIFO="$BARRIER_DIR/release_lib_a.fifo"
 REL_B_FIFO="$BARRIER_DIR/release_lib_b.fifo"
 mkfifo "$ARRIVE_FIFO" "$REL_A_FIFO" "$REL_B_FIFO"
 
-REAL_CC="$REAL_CC_ABS" CC="$CC_WRAP" P91_CC_LOG="$TMP_DIR/cc_j4.log" \
+REAL_CC="$REAL_CC_ABS" CC="$CC_WRAP" P91_CC_LOG="$CCLOG_DIR/cc_j4.log" \
   P91_ARRIVE_FIFO="$ARRIVE_FIFO" P91_RELEASE_A_FIFO="$REL_A_FIFO" P91_RELEASE_B_FIFO="$REL_B_FIFO" \
   PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_CS4" \
   python3 "$FIFO_COORD" "$ARRIVE_FIFO" "$REL_A_FIFO" "$REL_B_FIFO" "$BARRIER_DIR/overlap_ok" "$BARRIER_DIR/arrived.txt" 10 \
@@ -592,7 +593,7 @@ if [ "$TO_RC" -ne 124 ] || [ -f "$BARRIER_TO/overlap_ok" ] || [ "$(cat "$BARRIER
   exit 1
 fi
 
-python3 - "$TMP_DIR/cs_j4.json" "$TMP_DIR/cc_j1.log" "$TMP_DIR/cc_j4.log" "$TMP_DIR/cs_j1.trace" "$TMP_DIR/cs_j4.trace" <<'PYEOF'
+python3 - "$TMP_DIR/cs_j4.json" "$CCLOG_DIR/cc_j1.log" "$CCLOG_DIR/cc_j4.log" "$TMP_DIR/cs_j1.trace" "$TMP_DIR/cs_j4.trace" <<'PYEOF'
 import glob, json, re, sys
 
 d = json.load(open(sys.argv[1]))
@@ -605,8 +606,10 @@ assert j1_events[0].startswith("START ") and j1_events[1] == "END " + j1_events[
 assert j1_events[2].startswith("START ") and j1_events[3] == "END " + j1_events[2].split()[1], j1_events
 
 def map_cstub_keys(trace_path):
+    txt = open(trace_path).read()
+    assert "(local:" not in txt, f"unexpected local fallback in {trace_path}:\n{txt}"
     m = {}
-    for line in open(trace_path):
+    for line in txt.splitlines():
         hit = re.search(r"\[cas\] cstub=(\S+) MISS key=([0-9a-f]+)", line)
         if hit:
             src, prefix = hit.group(1), hit.group(2)

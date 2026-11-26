@@ -7,11 +7,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 WS="$TMP_DIR/ws"
 CAS="$TMP_DIR/cas"
-mkdir -p "$WS/extlib/src" "$WS/extlib/csrc" "$WS/app/src" "$CAS"
+mkdir -p "$WS/extlib/src" "$WS/extlib/csrc" "$WS/mid/src" "$WS/decoy/src" "$WS/app/src" "$CAS"
 
 cat > "$WS/pion.toml" <<'EOF'
 [workspace]
-members = ["extlib", "app"]
+members = ["extlib", "mid", "decoy", "app"]
 EOF
 
 cat > "$WS/extlib/csrc/ext_ops.c" <<'EOF'
@@ -56,6 +56,12 @@ pub extern "C" fn c_add_u64(a : UInt64, b : UInt64) -> UInt64 = "ext_add_u64"
 pub extern "C" fn c_bump_void(delta : Int) -> Unit = "ext_bump_void"
 pub extern "C" fn c_get_void_acc() -> Int = "ext_get_void_acc"
 pub extern "C" fn c_ptr_id(p : Ptr) -> Ptr = "ext_ptr_id"
+pub extern "C" fn cb_next_char(c : Char) -> Char = "pion_cb_next_char" {
+  if c == 'A' { 'B' } else { c }
+}
+pub extern "C" fn cb_echo_str(s : String) -> String = "pion_cb_echo_str" {
+  s + "!"
+}
 
 pub fn apply_via_mono_pkg[T](x : T, y : T, f : (T, T) -> T) -> T {
   let _ = c_bump_void
@@ -70,6 +76,33 @@ pub fn run_mono_extern_val[T](_tag : T, a : Int, b : Int) -> Int {
 }
 EOF
 
+cat > "$WS/mid/pion.toml" <<'EOF'
+[package]
+name = "mid"
+version = "0.1.0"
+
+[dependencies]
+extlib = { path = "../extlib" }
+EOF
+
+cat > "$WS/mid/src/lib.pion" <<'EOF'
+import "extlib" as e
+
+pub fn run_def(a : Int, b : Int, f : (Int, Int) -> Int = e::c_add_i32) -> Int {
+  f(a, b)
+}
+EOF
+
+cat > "$WS/decoy/pion.toml" <<'EOF'
+[package]
+name = "decoy"
+version = "0.1.0"
+EOF
+
+cat > "$WS/decoy/src/lib.pion" <<'EOF'
+pub fn decoy_val() -> Int { 7 }
+EOF
+
 cat > "$WS/app/pion.toml" <<'EOF'
 [package]
 name = "app"
@@ -77,10 +110,14 @@ version = "0.1.0"
 
 [dependencies]
 extlib = { path = "../extlib" }
+mid = { path = "../mid" }
+decoy = { path = "../decoy" }
 EOF
 
 cat > "$WS/app/src/main.pion" <<'EOF'
 import "extlib" as ext
+import "mid"
+import "decoy" as e
 
 extern "C" fn local_add_i32(a : Int, b : Int) -> Int = "ext_add_i32"
 extern "C" fn local_bump_void(delta : Int) -> Unit = "ext_bump_void"
@@ -127,6 +164,16 @@ fn main(world : World) -> Unit {
 
   let r_u64 = apply2(ext::c_add_u64, 1000000000000UL, 42UL)
   debug_assert(r_u64 == 1000000000042UL, "u64")
+
+  // Char & String extern "C" fn (with body) as first-class function values
+  let f_ch : (Char) -> Char = ext::cb_next_char
+  debug_assert(f_ch('A') == 'B' && apply1(ext::cb_next_char, 'Z') == 'Z', "char extuw")
+  let f_str : (String) -> String = ext::cb_echo_str
+  debug_assert(f_str("pion") == "pion!" && apply1(ext::cb_echo_str, "ok") == "ok!", "string extern fn val")
+
+  // Three-package default argument referencing third-party extern "C" fn under conflicting caller alias `e`
+  debug_assert(e::decoy_val() == 7, "decoy alias")
+  debug_assert(mid::run_def(19, 23) == 42, "3-pkg default arg @canon extern fn val")
 
   // Unit/void return via both local and cross-package extern fn values
   let _ = apply1(local_bump_void, 7)

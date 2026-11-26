@@ -673,15 +673,20 @@ char *pion_fs_readlink(const char *path) {
         return NULL;
     }
     const PionReparseDataBuffer *rdb = (const PionReparseDataBuffer *)buf;
+    size_t data_end = 8u + (size_t)rdb->ReparseDataLength;
+    if (data_end > (size_t)bytes_ret) {
+        free(buf);
+        return NULL;
+    }
     const unsigned char *pbuf = NULL;
     size_t avail = 0;
     USHORT off = 0;
     USHORT len_bytes = 0;
     if (rdb->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
         size_t hdr = offsetof(PionReparseDataBuffer, u.SymbolicLinkReparseBuffer.PathBuffer);
-        if ((size_t)bytes_ret < hdr) { free(buf); return NULL; }
+        if (data_end < hdr) { free(buf); return NULL; }
         pbuf = buf + hdr;
-        avail = (size_t)bytes_ret - hdr;
+        avail = data_end - hdr;
         if (rdb->u.SymbolicLinkReparseBuffer.PrintNameLength > 0) {
             off = rdb->u.SymbolicLinkReparseBuffer.PrintNameOffset;
             len_bytes = rdb->u.SymbolicLinkReparseBuffer.PrintNameLength;
@@ -691,9 +696,9 @@ char *pion_fs_readlink(const char *path) {
         }
     } else if (rdb->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
         size_t hdr = offsetof(PionReparseDataBuffer, u.MountPointReparseBuffer.PathBuffer);
-        if ((size_t)bytes_ret < hdr) { free(buf); return NULL; }
+        if (data_end < hdr) { free(buf); return NULL; }
         pbuf = buf + hdr;
-        avail = (size_t)bytes_ret - hdr;
+        avail = data_end - hdr;
         if (rdb->u.MountPointReparseBuffer.PrintNameLength > 0) {
             off = rdb->u.MountPointReparseBuffer.PrintNameOffset;
             len_bytes = rdb->u.MountPointReparseBuffer.PrintNameLength;
@@ -727,6 +732,17 @@ char *pion_fs_readlink(const char *path) {
     } else if (wlen >= 4 && memcmp(wsrc, L"\\??\\", 4 * sizeof(wchar_t)) == 0) {
         wsrc += 4;
         wlen -= 4;
+        if (wlen >= 7 &&
+            (wsrc[0] == L'V' || wsrc[0] == L'v') &&
+            (wsrc[1] == L'O' || wsrc[1] == L'o') &&
+            (wsrc[2] == L'L' || wsrc[2] == L'l') &&
+            (wsrc[3] == L'U' || wsrc[3] == L'u') &&
+            (wsrc[4] == L'M' || wsrc[4] == L'm') &&
+            (wsrc[5] == L'E' || wsrc[5] == L'e') &&
+            wsrc[6] == L'{') {
+            free(wtmp);
+            return NULL;
+        }
     }
     if (wlen == 0 || wlen > (size_t)INT_MAX) {
         free(wtmp);
