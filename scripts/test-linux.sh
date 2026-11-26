@@ -854,6 +854,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC"
 # CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/cas_pin_and_cstub_deps/run_e2e.sh" "$PIONC"
+# First-class extern "C" fn values (local, cross-package, mono_pkg, all C ABI types + void return).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/extern_fn_value/run_e2e.sh" "$PIONC"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.

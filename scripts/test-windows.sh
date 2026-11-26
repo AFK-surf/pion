@@ -487,6 +487,76 @@ if [ "$WINPAR_OUT1" != "winpar=42" ] || [ "$WINPAR_OUT4" != "winpar=42" ]; then
 fi
 echo "[PASS] Windows multi-package parallel build smoke (--jobs 1 vs --jobs 4)"
 
+# Lightweight Windows cstub CAS (cold -> warm HIT with 0 obj/ bloat -> header edit MISS) + extern "C" fn value smoke (< 3s)
+WIN_CSTUB_WS="$TMP_DIR/win_cstub_ws"
+WIN_CSTUB_CAS="$TMP_DIR/cas_win_cstub"
+mkdir -p "$WIN_CSTUB_WS/pkg/src" "$WIN_CSTUB_WS/pkg/csrc" "$WIN_CSTUB_CAS"
+cat <<'EOF' > "$WIN_CSTUB_WS/pkg/csrc/win_hdr.h"
+#define WIN_CSTUB_BASE 100
+EOF
+cat <<'EOF' > "$WIN_CSTUB_WS/pkg/csrc/win_stub.c"
+#include <stdint.h>
+#include "win_hdr.h"
+static int32_t g_win_acc = 0;
+int32_t win_cstub_base(void) { return WIN_CSTUB_BASE; }
+int32_t win_add_i32(int32_t a, int32_t b) { return a + b; }
+void win_bump_void(int32_t d) { g_win_acc += d; }
+int32_t win_get_acc(void) { return g_win_acc; }
+double win_half_f64(double x) { return x * 0.5; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_WS/pkg/pion.toml"
+[package]
+name = "win_cstub_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/win_stub.c"]
+EOF
+cat <<'EOF' > "$WIN_CSTUB_WS/pkg/src/main.pion"
+extern "C" fn win_cstub_base() -> Int = "win_cstub_base"
+extern "C" fn win_add_i32(a : Int, b : Int) -> Int = "win_add_i32"
+extern "C" fn win_bump_void(d : Int) -> Unit = "win_bump_void"
+extern "C" fn win_get_acc() -> Int = "win_get_acc"
+extern "C" fn win_half_f64(x : Double) -> Double = "win_half_f64"
+
+fn apply2(f : (Int, Int) -> Int, a : Int, b : Int) -> Int { f(a, b) }
+fn apply_v(f : (Int) -> Unit, d : Int) -> Unit { f(d) }
+
+pub fn main(w : World) -> Int {
+  let f_add : (Int, Int) -> Int = win_add_i32
+  let f_half : (Double) -> Double = win_half_f64
+  apply_v(win_bump_void, 7)
+  let sum = apply2(f_add, win_cstub_base(), win_get_acc())
+  let h = f_half(10.0)
+  io_println(w, "win_cstub=" + sum.to_string() + ",half=" + h.to_int().to_string())
+  0
+}
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_CAS" "$PIONC" build -o "$TMP_DIR/win_cstub_1.exe" "$WIN_CSTUB_WS/pkg" 2>"$TMP_DIR/win_cstub_1.trace"
+WIN_CSTUB_OUT1="$("$TMP_DIR/win_cstub_1.exe" | tr -d '\r')"
+[ "$WIN_CSTUB_OUT1" = "win_cstub=107,half=5" ] || { echo "FAIL: Windows cstub cold output mismatch: '$WIN_CSTUB_OUT1'" >&2; exit 1; }
+if grep -q "(local:" "$TMP_DIR/win_cstub_1.trace"; then
+  echo "FAIL: Windows cstub cold build fell back to local:" >&2
+  cat "$TMP_DIR/win_cstub_1.trace" >&2
+  exit 1
+fi
+WIN_CSTUB_OBJS_1="$(find "$WIN_CSTUB_CAS/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+[ "$WIN_CSTUB_OBJS_1" = "1" ] || { echo "FAIL: Windows cstub cold expected 1 cstub_*.o, got $WIN_CSTUB_OBJS_1" >&2; exit 1; }
+
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_CAS" "$PIONC" build -o "$TMP_DIR/win_cstub_2.exe" "$WIN_CSTUB_WS/pkg" 2>"$TMP_DIR/win_cstub_2.trace"
+grep -q "cstub=.*win_stub\.c HIT key=" "$TMP_DIR/win_cstub_2.trace" || { echo "FAIL: Windows cstub warm build did not HIT:" >&2; cat "$TMP_DIR/win_cstub_2.trace" >&2; exit 1; }
+WIN_CSTUB_OBJS_2="$(find "$WIN_CSTUB_CAS/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+[ "$WIN_CSTUB_OBJS_2" = "1" ] || { echo "FAIL: Windows cstub warm build bloated obj/ ($WIN_CSTUB_OBJS_1 -> $WIN_CSTUB_OBJS_2)" >&2; exit 1; }
+
+cat <<'EOF' > "$WIN_CSTUB_WS/pkg/csrc/win_hdr.h"
+#define WIN_CSTUB_BASE 200
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_CAS" "$PIONC" build -o "$TMP_DIR/win_cstub_3.exe" "$WIN_CSTUB_WS/pkg" 2>"$TMP_DIR/win_cstub_3.trace"
+grep -q "cstub=.*win_stub\.c MISS key=" "$TMP_DIR/win_cstub_3.trace" || { echo "FAIL: Windows cstub header-edit build did not MISS:" >&2; cat "$TMP_DIR/win_cstub_3.trace" >&2; exit 1; }
+WIN_CSTUB_OUT3="$("$TMP_DIR/win_cstub_3.exe" | tr -d '\r')"
+[ "$WIN_CSTUB_OUT3" = "win_cstub=207,half=5" ] || { echo "FAIL: Windows cstub header-edit output mismatch: '$WIN_CSTUB_OUT3'" >&2; exit 1; }
+echo "[PASS] Windows cstub CAS (cold -> warm HIT -> header edit MISS) + extern \"C\" fn value smoke"
+
 verify_bench() {
   name="$1"
   expected="$2"

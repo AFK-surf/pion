@@ -596,6 +596,8 @@ sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC2"
 # CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.
 sh "$ROOT_DIR/tests/e2e/cas_pin_and_cstub_deps/run_e2e.sh" "$PIONC2"
+# First-class extern "C" fn values (local, cross-package, mono_pkg, all C ABI types + void return).
+sh "$ROOT_DIR/tests/e2e/extern_fn_value/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 E2E
 if [ -n "$E2E_SHARD" ]; then

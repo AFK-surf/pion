@@ -738,8 +738,11 @@ chmod +x "$RACY_CC"
 CAS_RACY="$TMP_DIR/cas_racy"
 mkdir -p "$CAS_RACY"
 REAL_CC_BIN="$REAL_CC_ABS" INJECT_RACE=1 RACY_HDR="$WS_RACY/pkg/racy.h" CC="$RACY_CC" \
-  PION_CACHE_DIR="$CAS_RACY" "$PIONC" build -o "$TMP_DIR/racy_bin1" "$WS_RACY/pkg"
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_RACY" "$PIONC" build -o "$TMP_DIR/racy_bin1" "$WS_RACY/pkg" 2>"$TMP_DIR/racy1.trace"
 [ "$("$TMP_DIR/racy_bin1")" = "10" ] || fail "Scenario G3 racy run 1 expected 10"
+grep -q "cstub=.*stub\.c MISS key=.*(local: racy_" "$TMP_DIR/racy1.trace" || fail "Scenario G3 expected (local: racy_*) on racy run 1: $(cat "$TMP_DIR/racy1.trace")"
+RACY_CSTUB_OBJS="$(find "$CAS_RACY/obj" -maxdepth 1 -name 'cstub_*.o' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$RACY_CSTUB_OBJS" = "0" ] || fail "Scenario G3 racy run 1 must NOT publish any cstub_*.o into CAS/obj (found $RACY_CSTUB_OBJS)"
 # Next run (no race) MUST MISS and pick up 20 because run 1 refused to publish racy .deps!
 REAL_CC_BIN="$REAL_CC_ABS" INJECT_RACE=0 RACY_HDR="$WS_RACY/pkg/racy.h" CC="$RACY_CC" \
   PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_RACY" "$PIONC" build -o "$TMP_DIR/racy_bin2" "$WS_RACY/pkg" 2>"$TMP_DIR/racy2.trace"
@@ -1261,5 +1264,39 @@ TMPDIR="$CUSTOM_TMP" REAL_CC_BIN="$REAL_CC_ABS" TOUCH_TMPDIR=0 CC="$SIBLING_TMP_
   PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M4" "$PIONC" build -o "$TMP_DIR/m4_bin2" "$WS_M4/pkg" 2>"$TMP_DIR/m4_hot.trace"
 grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/m4_hot.trace" || fail "Scenario M4 expected warm HIT despite sibling creation in TMPDIR"
 echo "(M4) active sibling creation in \$TMPDIR does not trigger false racy-skip -> OK"
+
+# M5 (Windows MSVC / cross-compile rt_lib inside $PION_CACHE_DIR/obj/ regression):
+# When PION_RT_LIB resides in $PION_CACHE_DIR/obj/, drv_cstub_rt_inc_dirs MUST NOT
+# add $PION_CACHE_DIR/obj as an -I search_dir (otherwise creating cstub_stage_* inside
+# $PION_CACHE_DIR/obj makes it racy, causing 100% warm MISS and obj/ bloat).
+CAS_M5="$TMP_DIR/cas_m5"
+mkdir -p "$CAS_M5/obj"
+RT_LIB_SRC="${PION_RT_LIB:-}"
+if [ -z "$RT_LIB_SRC" ] || [ ! -f "$RT_LIB_SRC" ]; then
+  RT_LIB_SRC="$(dirname -- "$PIONC")/libpionrt.a"
+fi
+[ -f "$RT_LIB_SRC" ] || fail "Scenario M5: could not locate libpionrt.a (PION_RT_LIB='$RT_LIB_SRC')"
+cp "$RT_LIB_SRC" "$CAS_M5/obj/libpionrt_sim.a"
+
+PION_RT_LIB="$CAS_M5/obj/libpionrt_sim.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M5" \
+  "$PIONC" build -o "$TMP_DIR/m5_bin1" "$WS_M4/pkg" 2>"$TMP_DIR/m5_cold.trace"
+[ "$("$TMP_DIR/m5_bin1")" = "88" ] || fail "Scenario M5 cold expected 88"
+if grep -q "(local:" "$TMP_DIR/m5_cold.trace"; then
+  fail "Scenario M5 cold unexpectedly fell back to local: $(cat "$TMP_DIR/m5_cold.trace")"
+fi
+M5_DEPS_COUNT="$(find "$CAS_M5/obj" -maxdepth 1 -name 'cstub_dep_*.deps' | wc -l | tr -d ' ')"
+M5_OBJS_COLD="$(find "$CAS_M5/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+[ "$M5_DEPS_COUNT" = "1" ] && [ "$M5_OBJS_COLD" = "1" ] || \
+  fail "Scenario M5 expected 1 .deps and 1 cstub_*.o after cold build (got deps=$M5_DEPS_COUNT objs=$M5_OBJS_COLD)"
+
+PION_RT_LIB="$CAS_M5/obj/libpionrt_sim.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M5" \
+  "$PIONC" build -o "$TMP_DIR/m5_bin2" "$WS_M4/pkg" 2>"$TMP_DIR/m5_hot.trace"
+[ "$("$TMP_DIR/m5_bin2")" = "88" ] || fail "Scenario M5 warm expected 88"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/m5_hot.trace" || \
+  fail "Scenario M5 expected 100% warm HIT when PION_RT_LIB is in CAS/obj: $(cat "$TMP_DIR/m5_hot.trace")"
+M5_OBJS_HOT="$(find "$CAS_M5/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+[ "$M5_OBJS_HOT" = "$M5_OBJS_COLD" ] || \
+  fail "Scenario M5 warm build bloated CAS/obj cstub_*.o count ($M5_OBJS_COLD -> $M5_OBJS_HOT)"
+echo "(M5) PION_RT_LIB in \$CAS/obj -> cold publish + 100% warm HIT + 0 obj/ bloat -> OK"
 
 echo "PASS: cas_pin_and_cstub_deps"
