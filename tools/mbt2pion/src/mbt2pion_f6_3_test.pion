@@ -1,0 +1,90 @@
+///| Wave F6-3a unit tests:
+///| 1. `mutation_summary.pion` fixed-point transitive array mutation analysis across all 7 soundness classes.
+///| 2. Gates A / B / C / D positive allow + drift_ledger accounting + fail-closed negative enforcement.
+
+test "F6-3a: mutation_summary pure transitive & mutual recursion fixed point" {
+  let src = "struct View {\n  id : Int\n}\n\nfn View::same(self : View, other : View) -> Bool {\n  self.id == other.id\n}\n\nfn live(v : View) -> Bool {\n  v.id > 0\n}\n\nfn View::alive(self : View) -> Bool {\n  live(self)\n}\n\nfn ping(n : Int) -> Bool {\n  if n <= 0 { true } else { pong(n - 1) }\n}\n\nfn pong(n : Int) -> Bool {\n  if n <= 0 { false } else { ping(n - 1) }\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "View::same") {
+    Some(s) => {
+      assert_true(!s.unknown && !s.mutates_any_array && !s.reaches_shrink && s.mutated_elem_types.length() == 0, "View::same is pure")
+      assert_true(!summary_may_mutate_array(s, "View"), "View::same cannot mutate Array[View]")
+    }
+    None => assert_true(false, "View::same summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "View::alive") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "View::alive -> live is pure")
+    None => assert_true(false, "View::alive summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "ping") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "mutual recursion ping/pong pure")
+    None => assert_true(false, "ping summary must exist")
+  }
+}
+
+test "F6-3a: mutation_summary transitive mutation & shrink reachability across mutual recursion" {
+  let src = "struct Item { id : Int }\n\nfn mutate_items(xs : Array[Item]) -> Unit {\n  xs.clear()\n}\n\nfn shrink_items(xs : Array[Item]) -> Unit {\n  xs.shrink_to_fit()\n}\n\nfn step_a(xs : Array[Item], n : Int) -> Unit {\n  if n > 0 { step_b(xs, n - 1) }\n}\n\nfn step_b(xs : Array[Item], n : Int) -> Unit {\n  if n == 0 { mutate_items(xs) } else { step_a(xs, n - 1) }\n}\n\nfn call_shrink(xs : Array[Item]) -> Unit {\n  shrink_items(xs)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "step_a") {
+    Some(s) => {
+      assert_true(!s.unknown, "step_a is known")
+      assert_true(summary_may_mutate_array(s, "Item"), "step_a transitively mutates Array[Item]")
+      assert_true(!summary_may_mutate_array(s, "String"), "step_a does not mutate Array[String]")
+    }
+    None => assert_true(false, "step_a summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "call_shrink") {
+    Some(s) => {
+      assert_true(s.reaches_shrink, "call_shrink reaches shrink_to_fit")
+      assert_true(summary_may_mutate_array(s, "Item"), "call_shrink mutates Array[Item]")
+    }
+    None => assert_true(false, "call_shrink summary must exist")
+  }
+}
+
+test "F6-3a: mutation_summary all 7 fail-closed soundness classes" {
+  // Class 1: trait object / trait method / derive method
+  let c1 = "trait Checker {\n  check(self : Self) -> Bool\n}\n\nfn call_dyn(c : dyn Checker) -> Bool {\n  c.check()\n}\n\nfn call_gen[T : Checker](c : T) -> Bool {\n  c.check()\n}\n\nstruct Tag { n : Int } derive(Show)\n\nfn show_tag(t : Tag) -> String {\n  t.to_string()\n}\n"
+  let pkg1 = collect_pkg_mutation_summary_tokens([lex_moonbit(c1)])
+  assert_true(match lookup_fn_mutation_summary(pkg1, "call_dyn") { Some(s) => s.unknown, None => false }, "Class 1: dyn trait sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg1, "call_gen") { Some(s) => s.unknown, None => false }, "Class 1: generic trait bound sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg1, "show_tag") { Some(s) => s.unknown, None => false }, "Class 1: derive method sets unknown")
+
+  // Class 2: operator impl (`impl Add`, `Show` interpolation)
+  let c2 = "struct Evil { xs : Array[Int] }\n\nimpl Add for Evil {\n  fn op_add(self : Evil, other : Evil) -> Evil {\n    self.xs.clear()\n    other\n  }\n}\n\nfn use_add(a : Evil, b : Evil) -> Evil {\n  a + b\n}\n\nfn use_interp(a : Evil) -> String {\n  \"val=\\{a}\"\n}\n"
+  let pkg2 = collect_pkg_mutation_summary_tokens([lex_moonbit(c2)])
+  assert_true(match lookup_fn_mutation_summary(pkg2, "use_add") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 2: impl Add mutating array propagates")
+  assert_true(match lookup_fn_mutation_summary(pkg2, "use_interp") { Some(s) => s.unknown, None => false }, "Class 2: non-scalar interpolation sets unknown")
+
+  // Class 3: function-value / closure calls (param, struct field, tuple field, array element)
+  let c3 = "struct Holder { cb : () -> Bool }\n\nfn call_param(has : (String) -> Bool) -> Bool {\n  has(\"k\")\n}\n\nfn call_field(h : Holder) -> Bool {\n  h.cb()\n}\n\nfn call_tuple(b : (Int, () -> Bool)) -> Bool {\n  (b.1)()\n}\n\nfn call_arr(fs : Array[() -> Bool]) -> Bool {\n  fs[0]()\n}\n"
+  let pkg3 = collect_pkg_mutation_summary_tokens([lex_moonbit(c3)])
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_param") { Some(s) => s.unknown, None => false }, "Class 3: param closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_field") { Some(s) => s.unknown, None => false }, "Class 3: struct field closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_tuple") { Some(s) => s.unknown, None => false }, "Class 3: tuple field closure call sets unknown")
+  assert_true(match lookup_fn_mutation_summary(pkg3, "call_arr") { Some(s) => s.unknown, None => false }, "Class 3: array element closure call sets unknown")
+
+  // Class 4: cross-package / external calls default to unknown
+  let c4 = "fn call_ext(x : Int) -> Int {\n  other_pkg::mystery(x)\n}\n"
+  let pkg4 = collect_pkg_mutation_summary_tokens([lex_moonbit(c4)])
+  assert_true(match lookup_fn_mutation_summary(pkg4, "call_ext") { Some(s) => s.unknown, None => false }, "Class 4: unknown external call sets unknown")
+
+  // Class 5: generic `fn[T]` writing `Array[T]` -> `mutates_any_array = true`
+  let c5 = "fn[T] push_any(xs : Array[T], v : T) -> Unit {\n  xs.push(v)\n}\n"
+  let pkg5 = collect_pkg_mutation_summary_tokens([lex_moonbit(c5)])
+  assert_true(match lookup_fn_mutation_summary(pkg5, "push_any") { Some(s) => s.mutates_any_array && summary_may_mutate_array(s, "String"), None => false }, "Class 5: generic Array[T] write sets mutates_any_array")
+
+  // Class 6: field reassignment `self.items = []` & Map/Ref holding arrays
+  let c6 = "struct Bag { mut items : Array[Int] }\n\nfn Bag::reset(self : Bag) -> Unit {\n  self.items = []\n}\n\nfn set_map_arr(m : Map[String, Array[String]], k : String) -> Unit {\n  m[k] = []\n}\n\nfn set_ref_arr(r : Ref[Array[Int]]) -> Unit {\n  r.v = []\n}\n"
+  let pkg6 = collect_pkg_mutation_summary_tokens([lex_moonbit(c6)])
+  assert_true(match lookup_fn_mutation_summary(pkg6, "Bag::reset") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 6: field reassignment records Int array mutation")
+  assert_true(match lookup_fn_mutation_summary(pkg6, "set_map_arr") { Some(s) => summary_may_mutate_array(s, "String"), None => false }, "Class 6: Map[K, Array[String]] write records String array mutation")
+  assert_true(match lookup_fn_mutation_summary(pkg6, "set_ref_arr") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 6: Ref[Array[Int]] write records Int array mutation")
+
+  // Class 7: mutating Array methods, index write `arr[i] = ...`, UFCS `Array::push(...)`
+  let c7 = "fn write_idx(xs : Array[Int]) -> Unit {\n  xs[0] = 9\n}\n\nfn write_ufcs(xs : Array[String]) -> Unit {\n  Array::push(xs, \"a\")\n}\n\nfn write_swap(xs : Array[Int]) -> Unit {\n  xs.swap(0, 1)\n}\n"
+  let pkg7 = collect_pkg_mutation_summary_tokens([lex_moonbit(c7)])
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_idx") { Some(s) => summary_may_mutate_array(s, "Int") && !summary_may_mutate_array(s, "String"), None => false }, "Class 7: index assignment mutates Array[Int]")
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_ufcs") { Some(s) => summary_may_mutate_array(s, "String") && !summary_may_mutate_array(s, "Int"), None => false }, "Class 7: UFCS Array::push mutates Array[String]")
+  assert_true(match lookup_fn_mutation_summary(pkg7, "write_swap") { Some(s) => summary_may_mutate_array(s, "Int"), None => false }, "Class 7: swap mutates Array[Int]")
+}

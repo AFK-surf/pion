@@ -1,0 +1,1753 @@
+///| Package-wide transitive array mutation summary (`mutation_summary.pion`).
+///|
+///| Computes a monotone fixed-point summary `FnMutationSummary` for every top-level
+///| function and method in a package, and provides `summarize_expr_span` /
+///| `summarize_callback_arg` for checking loop bodies and callbacks.
+///|
+///| Soundness invariants (all 7 classes are fail-closed):
+///|   1. Trait objects (`dyn Trait`), trait-bounded generics, trait methods, and
+///|      unresolved `derive(...)` methods set `unknown = true`.
+///|   2. Operator impls (`+ - * / % == != < <= > >= []`, `op_get`, `op_set`,
+///|      `Show` interpolation) either follow all local impl edges or set `unknown = true`
+///|      whenever operands are not proven built-in scalars/String.
+///|   3. Any function-value / closure call (parameter, struct/tuple field, `Ref`,
+///|      array element, indirect `(e)(...)`, `let mut` closure) sets `unknown = true`.
+///|   4. Cross-package / external calls default to `unknown = true`, except a minimal
+///|      provably read-only built-in / `mbt_compat` allowlist.
+///|   5. Generic `fn[T]` writing `Array[T]` sets `mutates_any_array = true`.
+///|   6. Reassigning array-typed fields/variables (`self.items = []`) and mutating
+///|      `Map`/`Ref` holding arrays merges the corresponding element-type mutation.
+///|   7. Complete built-in + `mbt_compat` mutating `Array` method list, index writes
+///|      `arr[i] = ...`, and UFCS `Array::push(...)` calls are all tracked.
+
+pub struct FnMutationSummary {
+  mutated_elem_types : Map[String, Bool]
+  mut mutates_any_array : Bool
+  mut reaches_shrink : Bool
+  mut unknown : Bool
+}
+
+pub fn FnMutationSummary::empty() -> FnMutationSummary {
+  FnMutationSummary::{
+    mutated_elem_types: Map(),
+    mutates_any_array: false,
+    reaches_shrink: false,
+    unknown: false,
+  }
+}
+
+pub fn FnMutationSummary::unknown_summary() -> FnMutationSummary {
+  FnMutationSummary::{
+    mutated_elem_types: Map(),
+    mutates_any_array: false,
+    reaches_shrink: false,
+    unknown: true,
+  }
+}
+
+///| Clone a `FnMutationSummary`.
+pub fn fn_mutation_summary_clone(s : FnMutationSummary) -> FnMutationSummary {
+  let m : Map[String, Bool] = Map()
+  for k in s.mutated_elem_types.keys() {
+    m[k] = true
+  }
+  FnMutationSummary::{
+    mutated_elem_types: m,
+    mutates_any_array: s.mutates_any_array,
+    reaches_shrink: s.reaches_shrink,
+    unknown: s.unknown,
+  }
+}
+
+///| Merge `src` into `dst`; returns true iff `dst` grew.
+pub fn fn_mutation_summary_merge(dst : FnMutationSummary, src : FnMutationSummary) -> Bool {
+  let mut changed = false
+  for k in src.mutated_elem_types.keys() {
+    if !dst.mutated_elem_types.contains(k) {
+      dst.mutated_elem_types[k] = true
+      changed = true
+    }
+  }
+  if src.mutates_any_array && !dst.mutates_any_array {
+    dst.mutates_any_array = true
+    changed = true
+  }
+  if src.reaches_shrink && !dst.reaches_shrink {
+    dst.reaches_shrink = true
+    changed = true
+  }
+  if src.unknown && !dst.unknown {
+    dst.unknown = true
+    changed = true
+  }
+  changed
+}
+
+///| True iff `sum` may mutate an `Array[target_elem_ty]` (fail-closed on `unknown`,
+///| `mutates_any_array`, or empty/unknown `target_elem_ty` when any array is mutated).
+pub fn summary_may_mutate_array(sum : FnMutationSummary, target_elem_ty : String) -> Bool {
+  if sum.unknown || sum.mutates_any_array {
+    return true
+  }
+  let t = target_elem_ty.trim()
+  if t.length() == 0 {
+    return sum.mutated_elem_types.length() > 0
+  }
+  sum.mutated_elem_types.contains(t)
+}
+
+pub struct PkgMutationSummary {
+  summaries : Map[String, FnMutationSummary]
+  declared_types : Map[String, Bool]
+  declared_traits : Map[String, Bool]
+  trait_methods : Map[String, Bool]
+  derived_types : Map[String, Bool]
+  field_types : Map[String, String]
+  fn_typed_fields : Map[String, Bool]
+  custom_ops : Map[String, Bool]
+  ext_custom_ops : Map[String, Bool]
+  op_impl_fns : Map[String, Array[String]]
+  fn_keys : Map[String, Bool]
+  method_names : Map[String, Bool]
+  dep_methods : Map[String, Bool]
+  method_overloads : Map[String, Array[String]]
+  fn_generics : Map[String, Map[String, Bool]]
+  fn_param_types : Map[String, Map[String, String]]
+  fn_ret_types : Map[String, String]
+}
+
+pub fn PkgMutationSummary::empty() -> PkgMutationSummary {
+  PkgMutationSummary::{
+    summaries: Map(),
+    declared_types: Map(),
+    declared_traits: Map(),
+    trait_methods: Map(),
+    derived_types: Map(),
+    field_types: Map(),
+    fn_typed_fields: Map(),
+    custom_ops: Map(),
+    ext_custom_ops: Map(),
+    op_impl_fns: Map(),
+    fn_keys: Map(),
+    method_names: Map(),
+    dep_methods: Map(),
+    method_overloads: Map(),
+    fn_generics: Map(),
+    fn_param_types: Map(),
+    fn_ret_types: Map(),
+  }
+}
+
+pub fn lookup_fn_mutation_summary(pkg : PkgMutationSummary, fn_key : String) -> Option[FnMutationSummary] {
+  pkg.summaries.get(fn_key)
+}
+
+// ---------------------------------------------------------------------------
+// Built-in mutating / read-only method & helper classification
+// ---------------------------------------------------------------------------
+
+///| Complete list of mutating `Array` / `FixedArray` / `ArrayBuf` / `ArrayView` methods
+///| checked against `compiler/src/core/types.pion` and `tools/mbt_compat/src/collections.pion`.
+pub fn ms_is_array_mutating_method(m : String) -> Bool {
+  m == "push" || m == "pop" || m == "remove" || m == "clear" || m == "truncate" ||
+  m == "resize" || m == "drain" || m == "retain" || m == "append" || m == "shrink_to_fit" ||
+  m == "set" || m == "unsafe_set" || m == "swap" || m == "insert" || m == "reverse" ||
+  m == "rev_in_place" || m == "sort" || m == "sort_by" || m == "sort_by_key" ||
+  m == "dedup" || m == "map_in_place" || m == "push_iter" || m == "blit_to" ||
+  m == "splice" || m == "fill" || m == "push_array" || m == "extend"
+}
+
+fn ms_is_shrink_method(m : String) -> Bool {
+  m == "shrink_to_fit" || m == "arr_shrink_to_fit"
+}
+
+fn ms_is_mbt_compat_arr_mutating(m : String) -> Bool {
+  is_mbt_compat_arr_mutating(m) ||
+  m == "arr_reverse" || m == "arr_fill" || m == "arr_push_array" || m == "arr_extend" ||
+  m == "fixed_array_blit_to" || m == "fixed_array_blit_to_fa" ||
+  m == "fixed_array_sort_by" || m == "fixed_array_sort_i64" || m == "fixed_array_sort_int" ||
+  m == "fixed_array_unsafe_set"
+}
+
+fn ms_is_mbt_compat_pure_ro(m : String) -> Bool {
+  m == "arr_is_empty" || m == "arr_get" || m == "arr_last" || m == "arr_copy" ||
+  m == "arr_rev" || m == "arr_concat" || m == "arr_to_array" || m == "arr_unsafe_get" ||
+  m == "arr_release_unused" || m == "arr_release_unused_with" || m == "arr_capacity_check" ||
+  m == "array_slice_clamp" || m == "fixed_array_slice_clamp" || m == "fixed_array_copy" ||
+  m == "fixed_array_unsafe_get" || m == "int_lnot" || m == "int_popcnt" ||
+  m == "int_ctz" || m == "int_clz" || m == "int_to_uint64" || m == "int64_to_byte" ||
+  m == "uint64_lnot" || m == "int_compare" || m == "int_min" || m == "int_max" ||
+  m == "uint_compare" || m == "bool_compare" || m == "double_is_nan" || m == "double_is_inf" ||
+  m == "double_compare" || m == "double_min" || m == "double_max" ||
+  m == "double_reinterpret_as_int64" || m == "float_is_nan" || m == "float_from_uint" ||
+  m == "float_reinterpret_from_uint" || m == "str_compare" || m == "str_lexical_compare" ||
+  m == "str_has_prefix" || m == "str_has_suffix" || m == "str_to_lower" || m == "str_to_upper" ||
+  m == "str_find" || m == "str_rev_find" || m == "str_contains_char" || m == "str_get_char" ||
+  m == "str_byte_len" || m == "str_cursor_step" || m == "str_view" || m == "str_exact_view" ||
+  m == "str_clamped_view" || m == "utf16_slice" || m == "utf16_code_unit_at" ||
+  m == "utf16_to_utf8_off" || m == "utf16_to_scalar_off" || m == "bytes_eq" ||
+  m == "bytes_make" || m == "bytes_slice" || m == "bytes_clamped_view" ||
+  m == "bytes_to_array" || m == "bytes_from_array" || m == "byte_to_uint" ||
+  m == "char_is_ascii_alphabetic" || m == "opt_unwrap" || m == "opt_or" ||
+  m == "opt_is_empty" || m == "ref_physical_equal" || m == "ref_new" || m == "mbt_cell" ||
+  m == "checked_div_int" || m == "checked_mod_int" || m == "checked_div_int64" ||
+  m == "checked_mod_int64" || m == "checked_div_uint" || m == "checked_mod_uint" ||
+  m == "checked_div_uint64" || m == "checked_mod_uint64"
+}
+
+fn ms_is_mbt_compat_hof_ro(m : String) -> Bool {
+  m == "arr_map" || m == "arr_mapi" || m == "arr_filter" || m == "arr_filter_map" ||
+  m == "arr_each" || m == "arr_eachi" || m == "arr_fold" || m == "arr_any" ||
+  m == "arr_all" || m == "arr_search_by" || m == "opt_map" || m == "opt_map_or" ||
+  m == "opt_bind" || m == "arr_makei" || m == "fixed_array_makei" || m == "bytes_makei"
+}
+
+fn ms_is_builtin_scalar_ty(t : String) -> Bool {
+  let s = t.trim()
+  s == "Int" || s == "Int64" || s == "Int32" || s == "Int16" || s == "Int8" ||
+  s == "UInt" || s == "UInt64" || s == "UInt32" || s == "UInt16" || s == "UInt8" ||
+  s == "Double" || s == "Float" || s == "Bool" || s == "Char" || s == "Byte" ||
+  s == "String" || s == "Unit"
+}
+
+fn ms_is_builtin_container_head(h : String) -> Bool {
+  h == "Array" || h == "FixedArray" || h == "ImmArray" || h == "Option" ||
+  h == "Result" || h == "Map" || h == "Bytes" || h == "StringBuilder" ||
+  h == "ArrayBuf" || h == "ArrayView" || h == "OrderedMap" || h == "OrderedSet" ||
+  h == "Ref" || h == "MbtCell" || h == "MbtIter"
+}
+
+fn ms_is_pure_builtin_method(m : String) -> Bool {
+  m == "length" || m == "is_empty" || m == "get" || m == "copy" || m == "to_imm" ||
+  m == "last" || m == "first" || m == "rev" || m == "unsafe_get" || m == "to_array" ||
+  m == "to_int" || m == "to_int64" || m == "to_uint" || m == "to_uint64" ||
+  m == "to_double" || m == "to_float" || m == "to_byte" || m == "to_char" ||
+  m == "unsafe_to_char" || m == "abs" || m == "min" || m == "max" || m == "neg" ||
+  m == "is_nan" || m == "is_inf" || m == "is_finite" || m == "is_some" || m == "is_none" ||
+  m == "unwrap" || m == "unwrap_or" || m == "or" || m == "code_unit_at" || m == "char_at" ||
+  m == "index_of" || m == "slice" || m == "trim" || m == "starts_with" || m == "ends_with" ||
+  m == "has_prefix" || m == "has_suffix" || m == "to_lower" || m == "to_upper" ||
+  m == "reinterpret_as_int" || m == "reinterpret_as_uint" || m == "reinterpret_as_int64" ||
+  m == "reinterpret_as_uint64" || m == "to_bits" || m == "to_bytes" || m == "keys" ||
+  m == "contains_key" || m == "slot_len" || m == "slot_live" || m == "slot_key" ||
+  m == "slot_val" || m == "join" || m == "split" || m == "iter" || m == "next" ||
+  m == "head" || m == "count" || m == "as_view" || m == "view" || m == "view_from" ||
+  m == "exact_view" || m == "to_owned"
+}
+
+fn ms_is_builtin_static_pure_prefix(q : String) -> Bool {
+  q == "Int" || q == "Int64" || q == "UInt" || q == "UInt64" || q == "Double" ||
+  q == "Float" || q == "Bool" || q == "Char" || q == "Byte" || q == "String" ||
+  q == "Bytes" || q == "Option" || q == "Result" || q == "StringBuilder" ||
+  q == "Map" || q == "FixedArray" || q == "ImmArray"
+}
+
+fn ms_is_derive_method(m : String) -> Bool {
+  m == "to_string" || m == "compare" || m == "equal" || m == "hash"
+}
+
+fn ms_strip_pkg_prefix(ty : String) -> String {
+  let t = ty.trim()
+  let cc = t.index_of("::")
+  let lb = t.index_of("[")
+  if cc > 0 && (lb < 0 || cc < lb) {
+    t.slice(cc + 2, t.length()).trim()
+  } else {
+    t
+  }
+}
+
+fn ms_type_head(ty : String) -> String {
+  let t = ms_strip_pkg_prefix(ty)
+  let lb = t.index_of("[")
+  if lb > 0 { t.slice(0, lb).trim() } else { t }
+}
+
+///| Extract element type `E` from `Array[E]` / `FixedArray[E]` / `ArrayBuf[E]` / `ArrayView[E]`, or "".
+pub fn ms_extract_array_elem_ty(ty : String) -> String {
+  let t = ms_strip_pkg_prefix(ty)
+  if !t.ends_with("]") {
+    return ""
+  }
+  if t.starts_with("Array[") {
+    return t.slice(6, t.length() - 1).trim()
+  }
+  if t.starts_with("FixedArray[") {
+    return t.slice(11, t.length() - 1).trim()
+  }
+  if t.starts_with("ArrayBuf[") {
+    return t.slice(9, t.length() - 1).trim()
+  }
+  if t.starts_with("ArrayView[") {
+    return t.slice(10, t.length() - 1).trim()
+  }
+  ""
+}
+
+///| Extract inner array element type from `Ref[Array[E]]` / `MbtCell[Array[E]]` / `Map[K, Array[E]]` / `OrderedMap[K, Array[E]]`.
+fn ms_extract_nested_array_elem_ty(ty : String) -> String {
+  let direct = ms_extract_array_elem_ty(ty)
+  if direct.length() > 0 {
+    return direct
+  }
+  let t = ms_strip_pkg_prefix(ty)
+  if !t.ends_with("]") {
+    return ""
+  }
+  if t.starts_with("Ref[") {
+    return ms_extract_nested_array_elem_ty(t.slice(4, t.length() - 1).trim())
+  }
+  if t.starts_with("MbtCell[") {
+    return ms_extract_nested_array_elem_ty(t.slice(8, t.length() - 1).trim())
+  }
+  if t.starts_with("Map[") || t.starts_with("OrderedMap[") {
+    let lb = t.index_of("[")
+    let inner = t.slice(lb + 1, t.length() - 1).trim()
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() >= 2 {
+      return ms_extract_nested_array_elem_ty(parts[1])
+    }
+  }
+  if t.starts_with("Option[") {
+    return ms_extract_nested_array_elem_ty(t.slice(7, t.length() - 1).trim())
+  }
+  ""
+}
+
+fn ms_ty_is_fn_type(ty : String) -> Bool {
+  let t = ty.trim()
+  str_has(t, "->") || t.starts_with("fn(")
+}
+
+fn ms_ty_is_dyn(ty : String) -> Bool {
+  ty.trim().starts_with("dyn ")
+}
+
+fn ms_ty_contains_generic(ty : String, active_generics : Map[String, Bool]) -> Bool {
+  if active_generics.length() == 0 {
+    return false
+  }
+  let t = ty.trim()
+  if t.length() == 0 {
+    return false
+  }
+  if active_generics.contains(t) {
+    return true
+  }
+  let toks = lex_moonbit(t)
+  let n = toks.length() - 1
+  let mut i = 0
+  while i < n {
+    if (toks[i].kind == TokenKind::UpperIdent || toks[i].kind == TokenKind::Ident) &&
+    active_generics.contains(toks[i].raw) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+fn ms_record_array_mutation(
+  sum : FnMutationSummary,
+  elem_ty : String,
+  active_generics : Map[String, Bool],
+  declared_types : Map[String, Bool],
+) -> Unit {
+  let e = elem_ty.trim()
+  if e.length() == 0 || ms_ty_contains_generic(e, active_generics) ||
+  !qt_is_ground_canon_type(e, declared_types, active_generics) {
+    sum.mutates_any_array = true
+  } else {
+    sum.mutated_elem_types[e] = true
+  }
+}
+
+fn ms_op_trait_to_symbols(trait_name : String) -> Array[String] {
+  if trait_name == "Add" { return ["+"] }
+  if trait_name == "Sub" { return ["-"] }
+  if trait_name == "Mul" { return ["*"] }
+  if trait_name == "Div" { return ["/"] }
+  if trait_name == "Mod" { return ["%"] }
+  if trait_name == "Neg" { return ["-"] }
+  if trait_name == "Eq" { return ["==", "!="] }
+  if trait_name == "Compare" { return ["<", "<=", ">", ">="] }
+  if trait_name == "Show" { return ["Show"] }
+  []
+}
+
+fn ms_op_name_to_symbol(op_name : String) -> String {
+  if op_name == "add" { return "+" }
+  if op_name == "sub" { return "-" }
+  if op_name == "mul" { return "*" }
+  if op_name == "div" { return "/" }
+  if op_name == "neg" { return "-" }
+  if op_name == "eq" { return "==" }
+  ""
+}
+
+fn ms_add_op_impl_fn(pkg : PkgMutationSummary, sym : String, fn_key : String) -> Unit {
+  pkg.custom_ops[sym] = true
+  if fn_key.length() == 0 {
+    return
+  }
+  let arr = match pkg.op_impl_fns.get(sym) {
+    Some(a) => a
+    None => []
+  }
+  let mut dup = false
+  for x in arr {
+    if x == fn_key { dup = true; break }
+  }
+  if !dup {
+    arr.push(fn_key)
+    pkg.op_impl_fns[sym] = arr
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing helpers for declarations, parameter lists, and type annotations
+// ---------------------------------------------------------------------------
+
+fn ms_join_token_slice(tokens : Array[Token], s : Int, e : Int) -> String {
+  let sb = StringBuilder()
+  let mut i = s
+  while i < e {
+    if i > s {
+      let pk = tokens[i - 1].kind
+      let ck = tokens[i].kind
+      let no_sp = pk == TokenKind::LBracket || pk == TokenKind::LParen ||
+      pk == TokenKind::ColonColon || pk == TokenKind::Dot ||
+      ck == TokenKind::RBracket || ck == TokenKind::RParen ||
+      ck == TokenKind::ColonColon || ck == TokenKind::Dot ||
+      ck == TokenKind::Comma || ck == TokenKind::LBracket
+      if !no_sp {
+        sb.write_string(" ")
+      }
+    }
+    sb.write_string(tokens[i].raw)
+    i = i + 1
+  }
+  sb.to_string().trim()
+}
+
+///| Parse `[T, U : Bound]` generic type parameter names starting at `lb`.
+fn ms_parse_generic_params(tokens : Array[Token], lb : Int, out : Map[String, Bool]) -> Int {
+  let rb = find_matching_delim(tokens, lb)
+  if rb <= lb {
+    return lb
+  }
+  let mut p = lb + 1
+  let mut bd = 0
+  let mut at_start = true
+  while p < rb {
+    let pk = tokens[p].kind
+    if pk == TokenKind::LBracket || pk == TokenKind::LParen || pk == TokenKind::LBrace {
+      bd = bd + 1
+      at_start = false
+    } else if pk == TokenKind::RBracket || pk == TokenKind::RParen || pk == TokenKind::RBrace {
+      if bd > 0 { bd = bd - 1 }
+      at_start = false
+    } else if bd == 0 && pk == TokenKind::Comma {
+      at_start = true
+    } else if bd == 0 && at_start && (pk == TokenKind::UpperIdent || pk == TokenKind::Ident) {
+      out[tokens[p].raw] = true
+      at_start = false
+    } else {
+      at_start = false
+    }
+    p = p + 1
+  }
+  rb
+}
+
+///| Parse `(a : T, b : U)` parameter types into `out`.
+fn ms_parse_fn_params(tokens : Array[Token], lp : Int, rp : Int, out : Map[String, String]) -> Unit {
+  let mut i = lp + 1
+  while i < rp {
+    if tokens[i].kind == TokenKind::Comma { i = i + 1; continue }
+    let mut pe = i
+    let mut d = 0
+    while pe < rp {
+      let pk = tokens[pe].kind
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { d = d + 1 }
+      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      else if d == 0 && pk == TokenKind::Comma { break }
+      pe = pe + 1
+    }
+    let mut nm_i = i
+    if nm_i < pe && tokens[nm_i].raw == "mut" {
+      nm_i = nm_i + 1
+    }
+    if nm_i + 2 < pe && tokens[nm_i].kind == TokenKind::Ident {
+      let pname = tokens[nm_i].raw
+      let mut ci = nm_i + 1
+      if ci < pe && (tokens[ci].kind == TokenKind::Tilde || tokens[ci].kind == TokenKind::Question) {
+        ci = ci + 1
+      }
+      if ci < pe && tokens[ci].kind == TokenKind::Colon {
+        let mut te = pe
+        let mut td = 0
+        let mut ti = ci + 1
+        while ti < pe {
+          let tk = tokens[ti].kind
+          if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+          else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { if td > 0 { td = td - 1 } }
+          else if td == 0 && tk == TokenKind::Eq { te = ti; break }
+          ti = ti + 1
+        }
+        let ty_s = ms_join_token_slice(tokens, ci + 1, te)
+        if ty_s.length() > 0 {
+          out[pname] = ty_s
+        }
+      }
+    }
+    i = pe + 1
+  }
+}
+
+struct MsFnDecl {
+  key : String
+  bare_name : String
+  recv_type : String
+  file_idx : Int
+  body_open : Int
+  body_close : Int
+}
+
+fn ms_record_field_type(pkg : PkgMutationSummary, struct_name : String, field_name : String, ty_s : String) -> Unit {
+  if struct_name.length() > 0 {
+    pkg.field_types[struct_name + "::" + field_name] = ty_s
+  }
+  if ms_ty_is_fn_type(ty_s) {
+    pkg.fn_typed_fields[field_name] = true
+  }
+  match pkg.field_types.get(field_name) {
+    Some(prev) => if prev != ty_s { pkg.field_types[field_name] = "__AMBIG__" }
+    None => pkg.field_types[field_name] = ty_s
+  }
+}
+
+///| Look up type of expression ending at `end_i` using `qfi_opt`, `local_var_types`,
+///| `pkg.field_types`, and simple literal/constructor heuristics.
+fn ms_infer_expr_ty(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  end_i : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  local_var_types : Map[String, String],
+) -> String {
+  if end_i < 0 || end_i >= tokens.length() {
+    return ""
+  }
+  let tk = tokens[end_i]
+  if tk.kind == TokenKind::IntLit { return "Int" }
+  if tk.kind == TokenKind::FloatLit { return "Double" }
+  if tk.kind == TokenKind::StringLit || tk.kind == TokenKind::RawMultiline ||
+  tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline {
+    return "String"
+  }
+  if tk.kind == TokenKind::CharLit { return "Char" }
+  if tk.kind == TokenKind::ByteCharLit { return "Byte" }
+  if tk.kind == TokenKind::ByteStringLit { return "Bytes" }
+  if tk.raw == "true" || tk.raw == "false" { return "Bool" }
+  // Try `PkgQueryTypes` on the receiver path span first.
+  match qfi_opt {
+    Some(qfi) => {
+      let rs = receiver_path_start_token(tokens, end_i)
+      if rs >= 0 && rs <= end_i {
+        match qt_lookup_expr_span_ty(qfi, content, tokens[rs].start_byte, tokens[end_i].end_byte, true) {
+          Some(ty_c) => return ty_c
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  // Bare identifier
+  if tk.kind == TokenKind::Ident && !(end_i > 0 && (tokens[end_i - 1].kind == TokenKind::Dot || tokens[end_i - 1].kind == TokenKind::ColonColon)) {
+    match local_var_types.get(tk.raw) {
+      Some(t) => return t
+      None => ()
+    }
+  }
+  // Field access `base.field`
+  if tk.kind == TokenKind::Ident && end_i >= 2 && tokens[end_i - 1].kind == TokenKind::Dot {
+    let base_ty = ms_infer_expr_ty(pkg, tokens, end_i - 2, content, qfi_opt, local_var_types)
+    let base_head = ms_type_head(base_ty)
+    if base_head.length() > 0 {
+      match pkg.field_types.get(base_head + "::" + tk.raw) {
+        Some(ft) => return ft
+        None => ()
+      }
+    }
+    match pkg.field_types.get(tk.raw) {
+      Some(ft) => if ft != "__AMBIG__" { return ft }
+      None => ()
+    }
+  }
+  // Tuple element access `base.0` / `base.1`
+  if tk.kind == TokenKind::IntLit && end_i >= 2 && tokens[end_i - 1].kind == TokenKind::Dot {
+    let base_ty = ms_infer_expr_ty(pkg, tokens, end_i - 2, content, qfi_opt, local_var_types)
+    let bt = base_ty.trim()
+    if bt.starts_with("(") && bt.ends_with(")") {
+      let parts = qt_split_top_level_type_args(bt.slice(1, bt.length() - 1))
+      let idx = ms_parse_nonneg_int(tk.raw)
+      if idx >= 0 && idx < parts.length() {
+        return parts[idx]
+      }
+    }
+  }
+  // Call result `f(...)` / `T::m(...)` / `recv.m(...)`
+  if tk.kind == TokenKind::RParen {
+    let lp = find_open_before(tokens, end_i, 0)
+    if lp >= 1 {
+      let callee = tokens[lp - 1]
+      if callee.kind == TokenKind::Ident {
+        if lp >= 2 && tokens[lp - 2].kind == TokenKind::Dot {
+          let m = callee.raw
+          if m == "length" || m == "to_int" || m == "index_of" || m == "compare" || m == "code_unit_at" { return "Int" }
+          if m == "is_empty" || m == "is_some" || m == "is_none" || m == "starts_with" || m == "ends_with" || m == "contains" { return "Bool" }
+          if m == "to_string" || m == "trim" || m == "slice" || m == "join" { return "String" }
+          let recv_ty = ms_infer_expr_ty(pkg, tokens, lp - 3, content, qfi_opt, local_var_types)
+          let rh = ms_type_head(recv_ty)
+          if rh.length() > 0 {
+            match pkg.fn_ret_types.get(rh + "::" + m) {
+              Some(rt) => return rt
+              None => ()
+            }
+          }
+        } else if lp >= 3 && tokens[lp - 2].kind == TokenKind::ColonColon {
+          let q = tokens[lp - 3].raw
+          match pkg.fn_ret_types.get(q + "::" + callee.raw) {
+            Some(rt) => return rt
+            None => ()
+          }
+        } else {
+          match pkg.fn_ret_types.get(callee.raw) {
+            Some(rt) => return rt
+            None => ()
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+fn ms_parse_nonneg_int(s : String) -> Int {
+  if s.length() == 0 { return -1 }
+  let mut v = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 { return -1 }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  v
+}
+
+///| Collect local `let [mut] x [: T] = rhs` variable types in `[s, e)` into `out`.
+fn ms_collect_local_var_types(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  out : Map[String, String],
+) -> Unit {
+  let mut i = s
+  while i + 2 < e {
+    if tokens[i].raw == "let" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
+      let mut ni = i + 1
+      if ni < e && tokens[ni].raw == "mut" {
+        ni = ni + 1
+      }
+      if ni < e && tokens[ni].kind == TokenKind::Ident {
+        let vname = tokens[ni].raw
+        if ni + 2 < e && tokens[ni + 1].kind == TokenKind::Colon {
+          let mut eq_i = ni + 2
+          let mut d = 0
+          while eq_i < e && !(d == 0 && tokens[eq_i].kind == TokenKind::Eq) {
+            let k = tokens[eq_i].kind
+            if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+            else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+            eq_i = eq_i + 1
+          }
+          if eq_i < e && eq_i > ni + 2 {
+            let ty_s = ms_join_token_slice(tokens, ni + 2, eq_i)
+            if ty_s.length() > 0 {
+              out[vname] = ty_s
+            }
+          }
+        } else if ni + 2 < e && tokens[ni + 1].kind == TokenKind::Eq {
+          let rhs_s = ni + 2
+          let rhs_e = statement_end(tokens, rhs_s, e)
+          if rhs_e > rhs_s {
+            // Check simple struct literal `Type::{ ... }` or `Type::new(...)` or `rhs` type
+            if rhs_s + 2 < rhs_e && tokens[rhs_s].kind == TokenKind::UpperIdent &&
+            tokens[rhs_s + 1].kind == TokenKind::ColonColon && tokens[rhs_s + 2].kind == TokenKind::LBrace {
+              out[vname] = tokens[rhs_s].raw
+            } else {
+              let rty = ms_infer_expr_ty(pkg, tokens, rhs_e - 1, content, qfi_opt, out)
+              if rty.length() > 0 {
+                out[vname] = rty
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+///| Split comma-separated argument ranges `(start, end_excl)` inside `tokens[lp..rp]`.
+fn ms_split_call_args(tokens : Array[Token], lp : Int, rp : Int) -> Array[(Int, Int)] {
+  let out : Array[(Int, Int)] = []
+  let mut i = lp + 1
+  while i < rp {
+    if tokens[i].kind == TokenKind::Comma { i = i + 1; continue }
+    let mut ae = i
+    let mut d = 0
+    while ae < rp {
+      let ak = tokens[ae].kind
+      if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { d = d + 1 }
+      else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      else if d == 0 && ak == TokenKind::Comma { break }
+      ae = ae + 1
+    }
+    if ae > i {
+      out.push((i, ae))
+    }
+    i = ae + 1
+  }
+  out
+}
+
+fn ms_is_token_binop(tk : Token) -> String {
+  let k = tk.kind
+  if k == TokenKind::Plus { return "+" }
+  if k == TokenKind::Minus { return "-" }
+  if k == TokenKind::Star { return "*" }
+  if k == TokenKind::Slash { return "/" }
+  if k == TokenKind::Percent { return "%" }
+  if k == TokenKind::EqEq { return "==" }
+  if k == TokenKind::BangEq { return "!=" }
+  if k == TokenKind::Lt { return "<" }
+  if k == TokenKind::LtEq { return "<=" }
+  if k == TokenKind::Gt { return ">" }
+  if k == TokenKind::GtEq { return ">=" }
+  ""
+}
+
+///| Scan `[s, e)` for direct mutation effects and call edges (into `callees_out` if `collect_edges` is true,
+///| or directly merging from `pkg.summaries` if `collect_edges` is false).
+fn ms_scan_span(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  fn_body_open : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  local_var_types : Map[String, String],
+  callables : Map[String, Bool],
+  active_generics : Map[String, Bool],
+  sum : FnMutationSummary,
+  callees_out : Array[String],
+  collect_edges : Bool,
+  depth : Int,
+) -> Unit {
+  if depth > 8 {
+    sum.unknown = true
+    return
+  }
+  let mut i = s
+  while i < e {
+    let tk = tokens[i]
+    let kk = tk.kind
+
+    // Skip uncalled inline closure literals (`fn(...) { ... }`) EXCEPT when they are
+    // handled at their call site (e.g., HOF argument or local closure call).
+    // Wait: if a closure literal is immediately invoked `(fn(...) { ... })(...)`, the
+    // indirect call check below sets `unknown = true`. If it is passed to a call, the
+    // call handler inspects it. If it is bound to `let g = fn(...) { ... }`, calling `g()`
+    // inspects `g`'s body. So skipping the literal body here avoids false taint from
+    // dead/sibling closures that are never invoked!
+    if tk.raw == "fn" && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i + 1)
+      let mut lb = cp + 1
+      while lb < e && tokens[lb].kind != TokenKind::LBrace && !tokens[lb].newline_before {
+        lb = lb + 1
+      }
+      if lb < e && tokens[lb].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(tokens, lb)
+        if rb > lb {
+          i = rb + 1
+          continue
+        }
+      }
+    }
+
+    // Class 2: String interpolation `"\{expr}"` — scan holes + check Show purity
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
+      let holes = interp_holes(tk.raw)
+      for sub in holes {
+        let sn = sub.length() - 1
+        if sn > 0 {
+          ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, local_var_types, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+          // Show dispatch: unless the hole expression is proven built-in scalar/String, mark unknown
+          let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, local_var_types)
+          if !ms_is_builtin_scalar_ty(hty) {
+            sum.unknown = true
+          }
+        }
+      }
+    }
+
+    // Class 2: Pipe operator `|>`
+    if kk == TokenKind::PipeGt {
+      // Pipe into a call or function value; fail-closed if target is not a known pure function
+      if i + 1 < e && tokens[i + 1].kind == TokenKind::Ident &&
+      !(i + 2 < e && tokens[i + 2].kind == TokenKind::LParen) {
+        let pnm = tokens[i + 1].raw
+        if callables.contains(pnm) {
+          sum.unknown = true
+        } else if pkg.fn_keys.contains(pnm) {
+          ms_add_call_effect(pkg, pnm, sum, callees_out, collect_edges)
+        } else {
+          sum.unknown = true
+        }
+      }
+    }
+
+    // Class 2: Binary operator impls (`+ - * / % == != < <= > >=`)
+    let op_sym = ms_is_token_binop(tk)
+    if op_sym.length() > 0 && pkg.custom_ops.contains(op_sym) {
+      let lhs_ty = if i > s { ms_infer_expr_ty(pkg, tokens, i - 1, content, qfi_opt, local_var_types) } else { "" }
+      let rhs_ty = if i + 1 < e { ms_infer_expr_ty(pkg, tokens, i + 1, content, qfi_opt, local_var_types) } else { "" }
+      if !(ms_is_builtin_scalar_ty(lhs_ty) && (rhs_ty.length() == 0 || ms_is_builtin_scalar_ty(rhs_ty))) {
+        if pkg.ext_custom_ops.contains(op_sym) {
+          sum.unknown = true
+        } else {
+          match pkg.op_impl_fns.get(op_sym) {
+            Some(fns) =>
+            if fns.length() == 0 {
+              sum.unknown = true
+            } else {
+              for fk in fns {
+                ms_add_call_effect(pkg, fk, sum, callees_out, collect_edges)
+              }
+            }
+            None => sum.unknown = true
+          }
+        }
+      }
+    }
+
+    // Class 2: Custom `op_get` / `op_set` indexing `x[i]`
+    if kk == TokenKind::LBracket && i > s {
+      let pk = tokens[i - 1].kind
+      let is_index = pk == TokenKind::Ident || pk == TokenKind::RParen || pk == TokenKind::RBracket
+      if is_index && (pkg.custom_ops.contains("[]") || pkg.method_overloads.contains("op_get") || pkg.method_overloads.contains("op_set")) {
+        let rty = ms_infer_expr_ty(pkg, tokens, i - 1, content, qfi_opt, local_var_types)
+        let rh = ms_type_head(rty)
+        if !(rh == "Array" || rh == "FixedArray" || rh == "ImmArray" || rh == "Bytes" || rh == "Map" || rh == "OrderedMap" || rh == "ArrayBuf" || rh == "ArrayView") {
+          sum.unknown = true
+        }
+      }
+    }
+
+    // Class 6 & 7: Assignments (`=`, `+=`, `-=`, etc.) — not `let` initializers
+    if (kk == TokenKind::Eq || kk == TokenKind::AssignOp) && i > s {
+      let is_let_init = ms_is_let_eq(tokens, i, s)
+      if !is_let_init {
+        let lhs_end = i - 1
+        let pk = tokens[lhs_end].kind
+        if pk == TokenKind::RBracket {
+          // Index assignment `arr[idx] = val` or `map[k] = val`
+          let lb = find_open_before(tokens, lhs_end, s)
+          let base_ty = if lb > s { ms_infer_expr_ty(pkg, tokens, lb - 1, content, qfi_opt, local_var_types) } else { "" }
+          let base_head = ms_type_head(base_ty)
+          if base_head == "Map" || base_head == "OrderedMap" {
+            let nested = ms_extract_nested_array_elem_ty(base_ty)
+            if nested.length() > 0 || str_has(base_ty, "Array") {
+              ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+            }
+          } else if base_head == "Bytes" {
+            ()
+          } else {
+            let elem = ms_extract_array_elem_ty(base_ty)
+            ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+          }
+        } else if pk == TokenKind::Ident && lhs_end >= s + 2 && tokens[lhs_end - 1].kind == TokenKind::Dot {
+          // Field write `obj.field = val` (including `self.items = []` and `cell.v = ...`)
+          let fname = tokens[lhs_end].raw
+          let fty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+          let base_ty = ms_infer_expr_ty(pkg, tokens, lhs_end - 2, content, qfi_opt, local_var_types)
+          let base_head = ms_type_head(base_ty)
+          if fname == "v" || fname == "val" {
+            if base_head == "Ref" || base_head == "MbtCell" || base_ty.length() == 0 {
+              let nested = ms_extract_nested_array_elem_ty(base_ty)
+              if nested.length() > 0 || str_has(base_ty, "Array") || base_ty.length() == 0 {
+                ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+              }
+            }
+          }
+          if fty.length() > 0 {
+            let elem = ms_extract_nested_array_elem_ty(fty)
+            if elem.length() > 0 || str_has(fty, "Array") {
+              ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+            }
+          } else {
+            match pkg.field_types.get(fname) {
+              Some(ft) =>
+              if ft == "__AMBIG__" || str_has(ft, "Array") {
+                let elem = ms_extract_nested_array_elem_ty(ft)
+                ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+              }
+              None => ()
+            }
+          }
+        } else if pk == TokenKind::Ident {
+          // Variable reassignment `xs = ...`
+          let vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+          if vty.length() > 0 && (str_has(vty, "Array") || ms_extract_nested_array_elem_ty(vty).length() > 0) {
+            let elem = ms_extract_nested_array_elem_ty(vty)
+            ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+          }
+        }
+      }
+    }
+
+    // Calls: `callee(...)` where `tokens[i + 1]` is `(` (same line)
+    if i + 1 < e && tokens[i + 1].kind == TokenKind::LParen && !tokens[i + 1].newline_before {
+      let lp = i + 1
+      let rp = find_matching_delim(tokens, lp)
+      // Class 3: Indirect calls `(expr)(...)`, `b.1(...)`, `arr[i](...)`, `{ ... }(...)`
+      if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace || kk == TokenKind::IntLit {
+        sum.unknown = true
+      } else if (kk == TokenKind::Ident || kk == TokenKind::UpperIdent) && !is_call_keyword(tk.raw) &&
+      !(i > s && tokens[i - 1].raw == "fn") {
+        let prev_dot = i > s && tokens[i - 1].kind == TokenKind::Dot
+        let prev_cc = i > s && tokens[i - 1].kind == TokenKind::ColonColon
+        if prev_dot {
+          // Method call `recv.m(args...)`
+          let m = tk.raw
+          let recv_end = i - 2
+          let recv_ty = ms_infer_expr_ty(pkg, tokens, recv_end, content, qfi_opt, local_var_types)
+          let recv_head = ms_type_head(recv_ty)
+          // Class 1: `dyn Trait` or generic type parameter receiver -> fail-closed!
+          if ms_ty_is_dyn(recv_ty) || (recv_ty.length() > 0 && active_generics.contains(recv_ty.trim())) {
+            sum.unknown = true
+          } else if pkg.fn_typed_fields.contains(m) && !pkg.method_overloads.contains(m) {
+            // Class 3: calling a function-typed struct field `s.cb(...)`
+            sum.unknown = true
+          } else if ms_is_array_mutating_method(m) {
+            // Class 7: mutating array method
+            if ms_is_shrink_method(m) {
+              sum.reaches_shrink = true
+            }
+            if recv_head == "Map" || recv_head == "OrderedMap" {
+              // Map::set / Map::remove / Map::clear: check if value holds Array
+              let nested = ms_extract_nested_array_elem_ty(recv_ty)
+              if nested.length() > 0 || str_has(recv_ty, "Array") {
+                ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+              }
+            } else if recv_head == "StringBuilder" {
+              ()
+            } else {
+              let elem = ms_extract_array_elem_ty(recv_ty)
+              ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+            }
+            // If this mutating method takes a callback (`retain`, `sort_by`, `sort_by_key`, `map_in_place`),
+            // also analyze its callback argument!
+            if m == "retain" || m == "sort_by" || m == "sort_by_key" || m == "map_in_place" {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              if cargs.length() >= 1 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+              }
+            }
+          } else if m == "map" || m == "mapi" || m == "filter" || m == "filter_map" ||
+          m == "each" || m == "eachi" || m == "fold" || m == "any" || m == "all" ||
+          m == "find_first" || m == "search_by" || m == "map_or" || m == "bind" {
+            // Higher-order read-only method on Array / MbtIter / Option: analyze callback!
+            let is_known_builtin_recv = recv_head == "Array" || recv_head == "FixedArray" ||
+            recv_head == "ArrayView" || recv_head == "ArrayBuf" || recv_head == "MbtIter" ||
+            recv_head == "Option" || recv_head == "Result" ||
+            (!pkg.method_overloads.contains(m) && !pkg.dep_methods.contains(m))
+            if !is_known_builtin_recv {
+              ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+            } else {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              if cargs.length() >= 1 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+              }
+            }
+          } else if m == "contains" || m == "search" {
+            // `Array::contains` / `Array::search` invokes `Eq` on elements!
+            if recv_head == "Array" || recv_head == "FixedArray" || recv_head == "String" || recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet" {
+              let elem = ms_extract_array_elem_ty(recv_ty)
+              if pkg.custom_ops.contains("==") && !ms_is_builtin_scalar_ty(elem) {
+                sum.unknown = true
+              }
+            } else {
+              ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+            }
+          } else if ms_is_derive_method(m) {
+            if ms_is_builtin_scalar_ty(recv_ty) {
+              ()
+            } else if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
+              ms_add_call_effect(pkg, recv_head + "::" + m, sum, callees_out, collect_edges)
+            } else {
+              // Class 1: derive-generated or external Show/Compare/Eq/Hash method -> fail-closed!
+              sum.unknown = true
+            }
+          } else if ms_is_pure_builtin_method(m) &&
+          (ms_is_builtin_scalar_ty(recv_ty) || ms_is_builtin_container_head(recv_head) ||
+            (recv_head.length() == 0 && !pkg.method_overloads.contains(m) && !pkg.dep_methods.contains(m) && !pkg.trait_methods.contains(m))) {
+            ()
+          } else {
+            ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+          }
+        } else if prev_cc {
+          // Qualified call `Q::name(args...)`
+          let q = if i >= s + 2 { tokens[i - 2].raw } else { "" }
+          let name = tk.raw
+          if q == "mbt_compat" {
+            if ms_is_mbt_compat_arr_mutating(name) {
+              if ms_is_shrink_method(name) {
+                sum.reaches_shrink = true
+              }
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              let elem = if cargs.length() >= 1 {
+                let a0_ty = ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types)
+                ms_extract_array_elem_ty(a0_ty)
+              } else {
+                ""
+              }
+              ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+              if name == "arr_retain" || name == "arr_sort_by" || name == "arr_sort_by_key" || name == "arr_map_in_place" {
+                if cargs.length() >= 2 {
+                  let last_a = cargs[cargs.length() - 1]
+                  ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, elem, sum, callees_out, collect_edges, depth + 1)
+                }
+              }
+            } else if ms_is_mbt_compat_pure_ro(name) {
+              ()
+            } else if name == "arr_search" || name == "arr_contains" {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              let elem = if cargs.length() >= 1 {
+                ms_extract_array_elem_ty(ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types))
+              } else {
+                ""
+              }
+              if pkg.custom_ops.contains("==") && !ms_is_builtin_scalar_ty(elem) {
+                sum.unknown = true
+              }
+            } else if name == "arr_iter" || name == "fixed_array_iter" || name == "array_view_iter" || name == "str_iter" || name == "ordered_map_iter_lazy" || name == "ordered_map_keys_iter" {
+              ()
+            } else if ms_is_mbt_compat_hof_ro(name) {
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              let elem = if cargs.length() >= 1 {
+                ms_extract_array_elem_ty(ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types))
+              } else {
+                ""
+              }
+              if cargs.length() >= 2 {
+                let last_a = cargs[cargs.length() - 1]
+                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, elem, sum, callees_out, collect_edges, depth + 1)
+              }
+            } else if name == "ordered_map_new" || name == "ordered_map_from_array" || name == "ordered_set_new" || name == "ordered_set_from_array" {
+              ()
+            } else {
+              // Unknown `mbt_compat::*` helper -> fail-closed
+              sum.unknown = true
+            }
+          } else if q == "Array" || q == "ArrayBuf" || q == "ArrayView" {
+            // Class 7: UFCS `Array::push(xs, v)` etc.
+            if ms_is_array_mutating_method(name) {
+              if ms_is_shrink_method(name) {
+                sum.reaches_shrink = true
+              }
+              let cargs = ms_split_call_args(tokens, lp, rp)
+              let elem = if cargs.length() >= 1 {
+                ms_extract_array_elem_ty(ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types))
+              } else {
+                ""
+              }
+              ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+            } else if name == "new" || name == "make" || name == "with_capacity" || name == "from_array" ||
+            ms_is_pure_builtin_method(name) {
+              ()
+            } else {
+              sum.unknown = true
+            }
+          } else if ms_is_builtin_static_pure_prefix(q) {
+            ()
+          } else if is_ctor_name(name) {
+            // Qualified enum constructor `Enum::Variant(...)`
+            ()
+          } else if pkg.fn_keys.contains(q + "::" + name) {
+            ms_add_call_effect(pkg, q + "::" + name, sum, callees_out, collect_edges)
+          } else {
+            // Class 4: Cross-package / external call -> fail-closed!
+            sum.unknown = true
+          }
+        } else {
+          // Bare call `name(args...)`
+          let name = tk.raw
+          if is_ctor_name(name) {
+            // Enum / tuple-struct constructor `Some(...)`, `Ok(...)`, `MyVariant(...)`
+            ()
+          } else if callables.contains(name) {
+            // Class 3: Calling a parameter / local function value -> fail-closed!
+            sum.unknown = true
+          } else {
+            // Check single-binding immutable local closure literal `let g = fn(...) { ... }`
+            let lb = if fn_body_open >= 0 { local_closure_body(tokens, i, name) } else { -1 }
+            if lb >= 0 {
+              let rb = find_matching_delim(tokens, lb)
+              if lb < i && i < rb {
+                // Recursive local closure -> fail-closed
+                sum.unknown = true
+              } else {
+                ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+              }
+            } else if pkg.fn_keys.contains(name) {
+              ms_add_call_effect(pkg, name, sum, callees_out, collect_edges)
+            } else if name == "panic" || name == "abort" {
+              ()
+            } else {
+              // Unknown bare function -> fail-closed!
+              sum.unknown = true
+            }
+          }
+        }
+      }
+    }
+
+    i = i + 1
+  }
+}
+
+fn ms_is_let_eq(tokens : Array[Token], eq_i : Int, lo : Int) -> Bool {
+  let mut k = eq_i - 1
+  let mut d = 0
+  while k >= lo {
+    let kk = tokens[k].kind
+    if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d + 1 }
+    else if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      if d == 0 { return false }
+      d = d - 1
+    } else if d == 0 {
+      if tokens[k].raw == "let" { return true }
+      if kk == TokenKind::Semi || tokens[k].newline_before { return false }
+    }
+    k = k - 1
+  }
+  false
+}
+
+fn ms_add_call_effect(
+  pkg : PkgMutationSummary,
+  fn_key : String,
+  sum : FnMutationSummary,
+  callees_out : Array[String],
+  collect_edges : Bool,
+) -> Unit {
+  if collect_edges {
+    callees_out.push(fn_key)
+  } else {
+    match pkg.summaries.get(fn_key) {
+      Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+      None => sum.unknown = true
+    }
+  }
+}
+
+fn ms_resolve_method_call(
+  pkg : PkgMutationSummary,
+  m : String,
+  recv_head : String,
+  sum : FnMutationSummary,
+  callees_out : Array[String],
+  collect_edges : Bool,
+) -> Unit {
+  if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
+    ms_add_call_effect(pkg, recv_head + "::" + m, sum, callees_out, collect_edges)
+    return
+  }
+  if pkg.trait_methods.contains(m) || pkg.dep_methods.contains(m) || pkg.fn_typed_fields.contains(m) {
+    sum.unknown = true
+    return
+  }
+  match pkg.method_overloads.get(m) {
+    Some(ov) =>
+    if ov.length() == 0 {
+      sum.unknown = true
+    } else if recv_head.length() > 0 && !pkg.declared_types.contains(recv_head) {
+      // Receiver is a known external type -> fail-closed!
+      sum.unknown = true
+    } else {
+      for fk in ov {
+        ms_add_call_effect(pkg, fk, sum, callees_out, collect_edges)
+      }
+    }
+    None => sum.unknown = true
+  }
+}
+
+///| Analyze a callback argument `[arg_s, arg_e)` into `sum` / `callees_out`.
+fn ms_analyze_callback_arg_into(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  arg_s : Int,
+  arg_e : Int,
+  fn_body_open : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  parent_var_types : Map[String, String],
+  callables : Map[String, Bool],
+  active_generics : Map[String, Bool],
+  elem_ty : String,
+  sum : FnMutationSummary,
+  callees_out : Array[String],
+  collect_edges : Bool,
+  depth : Int,
+) -> Unit {
+  if arg_s >= arg_e {
+    sum.unknown = true
+    return
+  }
+  // Case 1: Inline closure literal `fn(p1, p2) [-> R] { body }`
+  if tokens[arg_s].raw == "fn" && arg_s + 1 < arg_e && tokens[arg_s + 1].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, arg_s + 1)
+    let mut lb = cp + 1
+    while lb < arg_e && tokens[lb].kind != TokenKind::LBrace {
+      lb = lb + 1
+    }
+    if lb < arg_e && tokens[lb].kind == TokenKind::LBrace {
+      let rb = find_matching_delim(tokens, lb)
+      if rb < arg_e {
+        let vt : Map[String, String] = Map()
+        for k in parent_var_types.keys() {
+          match parent_var_types.get(k) {
+            Some(v) => vt[k] = v
+            None => ()
+          }
+        }
+        // Bind closure parameter types (annotated or inferred from `elem_ty`)
+        ms_parse_fn_params(tokens, arg_s + 1, cp, vt)
+        let pnames = collect_pion_fn_param_names(tokens, arg_s + 1, cp)
+        if elem_ty.length() > 0 && pnames.length() >= 1 {
+          let elem_param = pnames[pnames.length() - 1]
+          if !vt.contains(elem_param) {
+            vt[elem_param] = elem_ty
+          }
+        }
+        ms_collect_local_var_types(pkg, tokens, lb + 1, rb, content, qfi_opt, vt)
+        ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, vt, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+        return
+      }
+    }
+    sum.unknown = true
+    return
+  }
+  // Case 2: Single identifier: local immutable closure literal or top-level package fn
+  if arg_e == arg_s + 1 && tokens[arg_s].kind == TokenKind::Ident {
+    let nm = tokens[arg_s].raw
+    if callables.contains(nm) {
+      sum.unknown = true
+      return
+    }
+    let lb = if fn_body_open >= 0 { local_closure_body(tokens, arg_s, nm) } else { -1 }
+    if lb >= 0 {
+      let rb = find_matching_delim(tokens, lb)
+      ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, parent_var_types, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+      return
+    }
+    if pkg.fn_keys.contains(nm) {
+      ms_add_call_effect(pkg, nm, sum, callees_out, collect_edges)
+      return
+    }
+    sum.unknown = true
+    return
+  }
+  // Anything else (field closure `s.cb`, array element `cbs[0]`, call result `get_cb()`, etc.) -> fail-closed!
+  sum.unknown = true
+}
+
+// ---------------------------------------------------------------------------
+// Package-wide fixed-point builder
+// ---------------------------------------------------------------------------
+
+pub fn collect_pkg_mutation_summary_tokens(all_tokens : Array[Array[Token]]) -> PkgMutationSummary {
+  collect_pkg_mutation_summary(all_tokens, [], [], empty_pkg_query_types(), Map(), Map())
+}
+
+pub fn collect_pkg_mutation_summary(
+  all_tokens : Array[Array[Token]],
+  rel_paths : Array[String],
+  contents : Array[String],
+  pkg_qt : PkgQueryTypes,
+  dep_methods : Map[String, Bool],
+  op_lookup : Map[String, String],
+) -> PkgMutationSummary {
+  let pkg = PkgMutationSummary::empty()
+  for k in dep_methods.keys() {
+    pkg.dep_methods[k] = true
+    if k == " eq" {
+      pkg.custom_ops["=="] = true
+      pkg.custom_ops["!="] = true
+      pkg.ext_custom_ops["=="] = true
+      pkg.ext_custom_ops["!="] = true
+    }
+  }
+  for k in op_lookup.keys() {
+    let bar = k.index_of("|")
+    if bar > 0 {
+      let op_name = k.slice(bar + 1, k.length())
+      let sym = ms_op_name_to_symbol(op_name)
+      if sym.length() > 0 {
+        let helper = match op_lookup.get(k) { Some(v) => v, None => "" }
+        if str_has(helper, "::") {
+          pkg.custom_ops[sym] = true
+          pkg.ext_custom_ops[sym] = true
+        } else {
+          ms_add_op_impl_fn(pkg, sym, helper)
+        }
+      }
+    }
+  }
+
+  let decls : Array[MsFnDecl] = []
+
+  // Pass 1: Collect structs/enums/fields/traits/derives/impls and top-level fn declarations.
+  let mut fi = 0
+  while fi < all_tokens.length() {
+    let ts = all_tokens[fi]
+    let n = ts.length() - 1
+    let mut depth = 0
+    let mut i = 0
+    while i < n {
+      let tk = ts[i]
+      let kk = tk.kind
+      if kk == TokenKind::LBrace || kk == TokenKind::LParen || kk == TokenKind::LBracket {
+        depth = depth + 1
+        i = i + 1
+        continue
+      }
+      if kk == TokenKind::RBrace || kk == TokenKind::RParen || kk == TokenKind::RBracket {
+        if depth > 0 { depth = depth - 1 }
+        i = i + 1
+        continue
+      }
+      if depth != 0 {
+        i = i + 1
+        continue
+      }
+      // `struct Name` / `enum Name` / `type Name`
+      if (tk.raw == "struct" || tk.raw == "enum" || tk.raw == "type") && i + 1 < n &&
+      (ts[i + 1].kind == TokenKind::UpperIdent || ts[i + 1].kind == TokenKind::Ident) {
+        let tname = ts[i + 1].raw
+        pkg.declared_types[tname] = true
+        if tk.raw == "struct" {
+          let mut o = i + 2
+          while o < n && ts[o].kind != TokenKind::LBrace && ts[o].kind != TokenKind::LParen && !ts[o].newline_before {
+            o = o + 1
+          }
+          if o < n && ts[o].kind == TokenKind::LBrace {
+            let close = find_matching_delim(ts, o)
+            let mut k = o + 1
+            let mut fd = 0
+            while k < close {
+              let fk = ts[k].kind
+              if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+              else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { if fd > 0 { fd = fd - 1 } }
+              else if fd == 0 && fk == TokenKind::Ident && k + 2 < close && ts[k + 1].kind == TokenKind::Colon &&
+              (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].raw == "pub" || ts[k - 1].raw == "priv" || ts[k - 1].kind == TokenKind::Comma) {
+                let fname = ts[k].raw
+                let mut fe = k + 2
+                let mut ftd = 0
+                while fe < close {
+                  let ftk = ts[fe].kind
+                  if ftk == TokenKind::LParen || ftk == TokenKind::LBracket || ftk == TokenKind::LBrace { ftd = ftd + 1 }
+                  else if ftk == TokenKind::RParen || ftk == TokenKind::RBracket || ftk == TokenKind::RBrace { if ftd > 0 { ftd = ftd - 1 } }
+                  else if ftd == 0 && (ftk == TokenKind::Comma || ftk == TokenKind::Semi || ts[fe].newline_before) { break }
+                  fe = fe + 1
+                }
+                let ty_s = ms_join_token_slice(ts, k + 2, fe)
+                if ty_s.length() > 0 {
+                  ms_record_field_type(pkg, tname, fname, ty_s)
+                }
+              }
+              k = k + 1
+            }
+            // Check trailing `derive(...)`
+            if close + 2 < n && ts[close + 1].raw == "derive" && ts[close + 2].kind == TokenKind::LParen {
+              pkg.derived_types[tname] = true
+            }
+            i = close + 1
+            continue
+          }
+        }
+      }
+      // `trait Name { ... }`
+      if tk.raw == "trait" && i + 1 < n && (ts[i + 1].kind == TokenKind::UpperIdent || ts[i + 1].kind == TokenKind::Ident) {
+        pkg.declared_traits[ts[i + 1].raw] = true
+        let mut o = i + 2
+        while o < n && ts[o].kind != TokenKind::LBrace { o = o + 1 }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          let mut k = o + 1
+          while k + 1 < close {
+            if ts[k].kind == TokenKind::Ident && ts[k + 1].kind == TokenKind::LParen {
+              pkg.trait_methods[ts[k].raw] = true
+            }
+            k = k + 1
+          }
+          i = close + 1
+          continue
+        }
+      }
+      // `impl Trait for Type { ... }`
+      if tk.raw == "impl" && i + 1 < n {
+        let mut o = i + 1
+        let mut trait_nm = ""
+        let mut target_ty = ""
+        let mut saw_for = false
+        while o < n && ts[o].kind != TokenKind::LBrace {
+          if ts[o].raw == "for" {
+            saw_for = true
+          } else if !saw_for && (ts[o].kind == TokenKind::UpperIdent || ts[o].kind == TokenKind::Ident) && trait_nm.length() == 0 {
+            trait_nm = ts[o].raw
+          } else if saw_for && (ts[o].kind == TokenKind::UpperIdent || ts[o].kind == TokenKind::Ident) && target_ty.length() == 0 {
+            target_ty = ts[o].raw
+          }
+          o = o + 1
+        }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          let op_syms = ms_op_trait_to_symbols(trait_nm)
+          let mut k = o + 1
+          let mut id = 0
+          while k + 1 < close {
+            let kk2 = ts[k].kind
+            if kk2 == TokenKind::LBrace { id = id + 1 }
+            else if kk2 == TokenKind::RBrace { if id > 0 { id = id - 1 } }
+            else if id == 0 && ts[k].raw == "fn" && ts[k + 1].kind != TokenKind::LParen {
+              let (next_k, decl_opt) = ms_parse_fn_decl(pkg, ts, k, close, fi, target_ty)
+              match decl_opt {
+                Some(dc) => {
+                  decls.push(dc)
+                  for sym in op_syms {
+                    ms_add_op_impl_fn(pkg, sym, dc.key)
+                  }
+                  if dc.bare_name == "op_get" || dc.bare_name == "op_set" {
+                    ms_add_op_impl_fn(pkg, "[]", dc.key)
+                  }
+                }
+                None => ()
+              }
+              k = next_k
+              continue
+            }
+            k = k + 1
+          }
+          i = close + 1
+          continue
+        }
+      }
+      // Top-level `fn` / `fn[T]` / `fn Type::method`
+      if tk.raw == "fn" && i + 1 < n && ts[i + 1].kind != TokenKind::LParen {
+        let (next_i, decl_opt) = ms_parse_fn_decl(pkg, ts, i, n, fi, "")
+        match decl_opt {
+          Some(dc) => {
+            decls.push(dc)
+            // Detect Stage A operator pre-pass functions `__mbt_op_<op>_<Type>`
+            if dc.bare_name.starts_with("__mbt_op_") {
+              let rest = dc.bare_name.slice(9, dc.bare_name.length())
+              let us = rest.index_of("_")
+              if us > 0 {
+                let sym = ms_op_name_to_symbol(rest.slice(0, us))
+                if sym.length() > 0 {
+                  ms_add_op_impl_fn(pkg, sym, dc.key)
+                }
+              }
+            }
+            if dc.bare_name == "op_get" || dc.bare_name == "op_set" {
+              ms_add_op_impl_fn(pkg, "[]", dc.key)
+            }
+          }
+          None => ()
+        }
+        i = next_i
+        continue
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+
+  // Pass 2: Compute direct effects and direct call edges for every declared function.
+  let edges : Map[String, Array[String]] = Map()
+  for dc in decls {
+    let ts = all_tokens[dc.file_idx]
+    let fcontent = if dc.file_idx < contents.length() { contents[dc.file_idx] } else { "" }
+    let qfi_opt : Option[QtFileIndex] = if pkg_qt.ok && dc.file_idx < rel_paths.length() {
+      pkg_qt.files.get(rel_paths[dc.file_idx])
+    } else {
+      None
+    }
+    let sum = match pkg.summaries.get(dc.key) {
+      Some(s) => s
+      None => {
+        let s = FnMutationSummary::empty()
+        pkg.summaries[dc.key] = s
+        s
+      }
+    }
+    let callables = callable_locals(ts, dc.body_open)
+    let active_gen = match pkg.fn_generics.get(dc.key) {
+      Some(g) => g
+      None => Map()
+    }
+    let vt : Map[String, String] = Map()
+    match pkg.fn_param_types.get(dc.key) {
+      Some(pm) => {
+        for pk in pm.keys() {
+          match pm.get(pk) {
+            Some(pv) => vt[pk] = pv
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+    if dc.recv_type.length() > 0 && !vt.contains("self") {
+      vt["self"] = dc.recv_type
+    }
+    ms_collect_local_var_types(pkg, ts, dc.body_open + 1, dc.body_close, fcontent, qfi_opt, vt)
+    let fn_edges : Array[String] = match edges.get(dc.key) {
+      Some(e) => e
+      None => []
+    }
+    ms_scan_span(pkg, ts, dc.body_open + 1, dc.body_close, dc.body_open, fcontent, qfi_opt, vt, callables, active_gen, sum, fn_edges, true, 0)
+    edges[dc.key] = fn_edges
+  }
+
+  // Pass 3: Monotone fixed-point propagation over call graph.
+  let mut changed = true
+  while changed {
+    changed = false
+    for fk in edges.keys() {
+      match pkg.summaries.get(fk) {
+        Some(f_sum) =>
+        match edges.get(fk) {
+          Some(elist) => {
+            for callee in elist {
+              match pkg.summaries.get(callee) {
+                Some(c_sum) =>
+                if fn_mutation_summary_merge(f_sum, c_sum) {
+                  changed = true
+                }
+                None =>
+                if !f_sum.unknown {
+                  f_sum.unknown = true
+                  changed = true
+                }
+              }
+            }
+          }
+          None => ()
+        }
+        None => ()
+      }
+    }
+  }
+
+  pkg
+}
+
+fn ms_parse_fn_decl(
+  pkg : PkgMutationSummary,
+  ts : Array[Token],
+  fn_i : Int,
+  limit : Int,
+  file_idx : Int,
+  impl_recv_type : String,
+) -> (Int, Option[MsFnDecl]) {
+  let generics : Map[String, Bool] = Map()
+  let mut j = fn_i + 1
+  if j < limit && ts[j].kind == TokenKind::LBracket {
+    j = ms_parse_generic_params(ts, j, generics) + 1
+  }
+  let mut recv_ty = impl_recv_type
+  let mut bare_name = ""
+  if j + 2 < limit && (ts[j].kind == TokenKind::UpperIdent || ts[j].kind == TokenKind::Ident) &&
+  ts[j + 1].kind == TokenKind::ColonColon && ts[j + 2].kind == TokenKind::Ident {
+    recv_ty = ts[j].raw
+    bare_name = ts[j + 2].raw
+    j = j + 3
+  } else if j < limit && ts[j].kind == TokenKind::Ident {
+    bare_name = ts[j].raw
+    j = j + 1
+  } else {
+    return (fn_i + 1, None)
+  }
+  if j < limit && ts[j].kind == TokenKind::LBracket {
+    j = ms_parse_generic_params(ts, j, generics) + 1
+  }
+  if j >= limit || ts[j].kind != TokenKind::LParen {
+    return (j, None)
+  }
+  let lp = j
+  let rp = find_matching_delim(ts, lp)
+  if rp < lp || rp >= limit {
+    return (fn_i + 1, None)
+  }
+  let ptypes : Map[String, String] = Map()
+  ms_parse_fn_params(ts, lp, rp, ptypes)
+  let mut o = rp + 1
+  let mut ret_s = -1
+  let mut ret_e = -1
+  while o < limit && ts[o].kind != TokenKind::LBrace {
+    if ts[o].kind == TokenKind::Arrow && ret_s < 0 {
+      ret_s = o + 1
+    }
+    o = o + 1
+  }
+  if o >= limit || ts[o].kind != TokenKind::LBrace {
+    return (o, None)
+  }
+  if ret_s > 0 {
+    ret_e = o
+  }
+  let close = find_matching_delim(ts, o)
+  if close <= o {
+    return (o + 1, None)
+  }
+  let key = if recv_ty.length() > 0 { recv_ty + "::" + bare_name } else { bare_name }
+  pkg.fn_keys[key] = true
+  pkg.summaries[key] = FnMutationSummary::empty()
+  pkg.fn_generics[key] = generics
+  pkg.fn_param_types[key] = ptypes
+  if ret_s > 0 && ret_e > ret_s {
+    pkg.fn_ret_types[key] = ms_join_token_slice(ts, ret_s, ret_e)
+  }
+  if recv_ty.length() > 0 {
+    pkg.method_names[bare_name] = true
+    let ov = match pkg.method_overloads.get(bare_name) {
+      Some(a) => a
+      None => []
+    }
+    let mut dup = false
+    for x in ov {
+      if x == key { dup = true; break }
+    }
+    if !dup {
+      ov.push(key)
+      pkg.method_overloads[bare_name] = ov
+    }
+  }
+  (
+    close + 1,
+    Some(MsFnDecl::{
+      key,
+      bare_name,
+      recv_type: recv_ty,
+      file_idx,
+      body_open: o,
+      body_close: close,
+    }),
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Public span & callback summarization entry points for Gates A / B / C / D
+// ---------------------------------------------------------------------------
+
+///| Summarize any expression/block span `[s, e)` inside an enclosing function whose body opens at `fn_body_open`.
+pub fn summarize_expr_span(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  fn_body_open : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  extra_var_types : Map[String, String],
+  active_generics : Map[String, Bool],
+) -> FnMutationSummary {
+  let sum = FnMutationSummary::empty()
+  let callables = if fn_body_open >= 0 { callable_locals(tokens, fn_body_open) } else { Map() }
+  let vt : Map[String, String] = Map()
+  // Seed with enclosing function's parameter types + locals
+  if fn_body_open >= 0 {
+    let fstart = fn_start_of(tokens, fn_body_open)
+    if fstart >= 0 {
+      let mut p = fstart + 1
+      while p < fn_body_open && tokens[p].kind != TokenKind::LParen { p = p + 1 }
+      if p < fn_body_open && tokens[p].kind == TokenKind::LParen {
+        let rp = find_matching_delim(tokens, p)
+        if rp < fn_body_open {
+          ms_parse_fn_params(tokens, p, rp, vt)
+        }
+      }
+    }
+    let body_close = find_matching_delim(tokens, fn_body_open)
+    ms_collect_local_var_types(pkg, tokens, fn_body_open + 1, body_close, content, qfi_opt, vt)
+  }
+  for k in extra_var_types.keys() {
+    match extra_var_types.get(k) {
+      Some(v) => vt[k] = v
+      None => ()
+    }
+  }
+  ms_collect_local_var_types(pkg, tokens, s, e, content, qfi_opt, vt)
+  let dummy_edges : Array[String] = []
+  ms_scan_span(pkg, tokens, s, e, fn_body_open, content, qfi_opt, vt, callables, active_generics, sum, dummy_edges, false, 0)
+  sum
+}
+
+///| Summarize a callback argument `[arg_s, arg_e)` (inline closure, local closure, or top-level fn)
+///| given the target array's element type `elem_ty`.
+pub fn summarize_callback_arg(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  arg_s : Int,
+  arg_e : Int,
+  fn_body_open : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  elem_ty : String,
+  active_generics : Map[String, Bool],
+) -> FnMutationSummary {
+  let sum = FnMutationSummary::empty()
+  let callables = if fn_body_open >= 0 { callable_locals(tokens, fn_body_open) } else { Map() }
+  let vt : Map[String, String] = Map()
+  if fn_body_open >= 0 {
+    let fstart = fn_start_of(tokens, fn_body_open)
+    if fstart >= 0 {
+      let mut p = fstart + 1
+      while p < fn_body_open && tokens[p].kind != TokenKind::LParen { p = p + 1 }
+      if p < fn_body_open && tokens[p].kind == TokenKind::LParen {
+        let rp = find_matching_delim(tokens, p)
+        if rp < fn_body_open {
+          ms_parse_fn_params(tokens, p, rp, vt)
+        }
+      }
+    }
+    let body_close = find_matching_delim(tokens, fn_body_open)
+    ms_collect_local_var_types(pkg, tokens, fn_body_open + 1, body_close, content, qfi_opt, vt)
+  }
+  let dummy_edges : Array[String] = []
+  ms_analyze_callback_arg_into(pkg, tokens, arg_s, arg_e, fn_body_open, content, qfi_opt, vt, callables, active_generics, elem_ty, sum, dummy_edges, false, 0)
+  sum
+}
