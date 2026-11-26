@@ -373,6 +373,47 @@ fn pick_kw_later(
   x
 }
 
+let r15_tag : String = "seed"
+
+fn g_ok() -> Int {
+  1
+}
+
+fn __mbt_parg_1_g_ok() -> Int {
+  2
+}
+
+fn value_g(g~ : Int) -> Int {
+  g
+}
+
+fn pick_parg_clash(
+  x? : Int = g_ok(),
+  g_ok : () -> Int,
+  y? : Int = __mbt_parg_1_g_ok(),
+) -> Int {
+  let _ = g_ok
+  x * 10 + __mbt_parg_1_g_ok() + y - 2
+}
+
+#callsite(autofill(loc))
+fn pick_tag_loc(x? : String = r15_tag, loc~ : SourceLoc) -> Int {
+  let _ = loc
+  if x == "seed" { 42 } else { 9 }
+}
+
+fn pick_let_g(x? : Int = { let g = 1; g }, g~ : Int) -> Int {
+  x + g
+}
+
+fn pick_pat_g(x? : Int = match Some(1) { Some(g) => g; None => 0 }, g~ : Int) -> Int {
+  x + g
+}
+
+fn pick_named_g(x? : Int = value_g(g=1), g~ : Int) -> Int {
+  x + g
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -648,7 +689,14 @@ fn case_r5_paren_and_guard() -> String {
   let p39 = pick_later_shadow(x=10, fn() { Ok(42) }) catch { _ => 7 }
   let p40 = pick_kw_rename(fn() { 42 }, fn() { 9 })
   let p41 = pick_kw_later(fn() { 42 }, fn() { 9 }) catch { _ => 7 }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string()
+  // R15: __mbt_parg collision avoidance, non-shadowing autofill loc, and local/pattern/named-arg default exprs
+  let p42 = pick_parg_clash(x=1, fn() { 9 })
+  let p43 = pick_parg_clash(fn() { 9 })
+  let p44 = pick_tag_loc()
+  let p45 = pick_let_g(g=8)
+  let p46 = pick_pat_g(g=8)
+  let p47 = pick_named_g(g=8)
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -712,6 +760,10 @@ NEGATIVE_CASES = [
     (
         "default_param_self_shadow",
         "priv suberror E { Bad }\nfn g() -> Int raise E { raise Bad }\npub fn pick_self_shadow(g? : Int = g()) -> Int raise E { g }\n",
+    ),
+    (
+        "default_param_autofill_loc_shadow",
+        "let loc : String = \"seed\"\n#callsite(autofill(loc))\npub fn pick_loc_shadow(x? : String = loc, loc~ : SourceLoc) -> Int { let _ = loc; if x == \"seed\" { 42 } else { 9 } }\n",
     ),
     (
         "incomplete_bool_catch",
@@ -831,7 +883,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
