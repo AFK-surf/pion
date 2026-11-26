@@ -1,0 +1,371 @@
+///| Wave M2-F4 Track F4-2 unit tests:
+///| 1. Stage A.5 type-arg brackets in tuple/fn/struct contexts & strict probe disposal fail-closed gates.
+///| 2. Token-span indexing under expected `Json` (no concat) & `lower_map_literal` recursive K/V propagation.
+///| 3. Irrefutable struct pattern exhaustiveness, chained indexed field enum propagation, sibling-arm enum
+///|    inference, `(pat as x)` + nested `Some(Object(_) as v)` + or-pattern `as` (fail-closed per-branch),
+///|    16-step alias fixpoint diagnostic, and closure return `Double` literal coercion.
+///| 4. `Iter::head` / `Map::keys().head()` / `MbtJson::to_string` (`Show` format) / `Repr(x)`.
+///| 5. 4 read-only `BORROWED_ARRAY_SLICE` patterns + negative mutation/escape fail-closed gates.
+///| 6. F4-3 foreign struct update ABI wiring (in-order, out-of-order, priv-field & legacy ABI rejection before all_pure).
+
+test "F4-2-1: Stage A.5 type-arg brackets in tuple/fn/struct contexts are not mis-probed as indexing" {
+  let src =
+    "pub struct Sig[T] { val : T }\n" +
+    "pub struct Holder {\n" +
+    "  on_key : Option[(Int) -> Bool]\n" +
+    "  pairs : Array[(Sig[Bool], Bool)]\n" +
+    "  grid : Array[(Double, Int)]\n" +
+    "}\n" +
+    "pub fn check_holder(h : Holder) -> Int {\n" +
+    "  h.pairs.length() + h.grid.length()\n" +
+    "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "holder.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "type-arg brackets in tuple/fn/struct contexts must not fail")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "mbt_idx_probe"), "no mbt_idx_probe residual in struct type annotations")
+  assert_true(str_has(out, "Array[(Sig[Bool], Bool)]"), "nested generic inside tuple type preserved")
+  assert_true(str_has(out, "Option[(Int) -> Bool]"), "fn type inside Option[...] preserved")
+}
+
+test "F4-2-2: indexing under expected MbtJson never concatenates ident and MbtJson::Array; map literal propagates K/V" {
+  let src =
+    "pub fn pick_and_build(path : Array[Json], depth : Int, existing : Json) -> Json {\n" +
+    "  let m : Map[String, Json] = { \"k\": 1, \"s\": \"ok\", \"e\": existing, \"p\": path[depth] }\n" +
+    "  let d : Map[String, Double] = { \"a\": 1, \"b\": 2.5 }\n" +
+    "  let _ = d\n" +
+    "  let _ = m\n" +
+    "  path[depth]\n" +
+    "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "json_map.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "json indexing + map literal K/V should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "pathmbt_compat"), "must never concatenate receiver ident with MbtJson::Array")
+  assert_true(str_has(out, "path[depth]"), "indexing expression preserved cleanly")
+  assert_true(str_has(out, "mbt_compat::MbtJson::Number("), "Map[String, Json] wraps Int literal value")
+  assert_true(str_has(out, "(\"e\", existing)"), "Map[String, Json] does not double-wrap existing Json var")
+  assert_true(str_has(out, "(\"a\", 1.0)"), "Map[String, Double] coerces Int literal value to Double")
+}
+
+test "F4-2-3: irrefutable struct pat, chained indexed field enum, (pat as x), 16-step alias diag & closure Double" {
+  // 1. Irrefutable `Some({ radius, .. })` must not emit redundant `if true` guard
+  let s1 =
+    "pub struct Shape { radius : Int; name : String }\n" +
+    "pub fn get_r(s : Shape?) -> Int {\n" +
+    "  match s {\n" +
+    "    Some({ radius, .. }) => radius\n" +
+    "    None => 0\n" +
+    "  }\n" +
+    "}\n"
+  let r1 = transpile_package(
+    [SourceFile::{ rel_path: "irref.mbt", content: s1, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r1.blockers == 0, "irrefutable Some({ radius, .. }) succeeds")
+  assert_true(!str_has(r1.files[0].content, "if true"), "irrefutable struct pattern must not emit `if true` guard")
+
+  // 2. Match-arm `(pat as x)` + nested `Some(Object(_) as v)` + or-pattern `((A(v) | B(v)) as x)`
+  let s2 =
+    "pub enum Kind { A(Int); B(Int) }\n" +
+    "pub fn test_as(j : Json?, k : Kind) -> Int {\n" +
+    "  let a = match j {\n" +
+    "    Some(Object(_) as v) => { let _ = v; 1 }\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "  let b = match k {\n" +
+    "    ((A(v) | B(v)) as x) => { let _ = x; v }\n" +
+    "  }\n" +
+    "  a + b\n" +
+    "}\n"
+  let r2 = transpile_package(
+    [SourceFile::{ rel_path: "as_pat.mbt", content: s2, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r2.blockers == 0, "nested as-pattern and outer or-pattern as succeed")
+
+  // 3. Per-branch `as` inside or-pattern MUST fail closed
+  let s2_bad =
+    "pub enum Kind { A(Int); B(Int) }\n" +
+    "pub fn bad_or_as(k : Kind) -> Int {\n" +
+    "  match k {\n" +
+    "    A(1 as y) | B(2 as y) => y\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n"
+  let r2_bad = transpile_package(
+    [SourceFile::{ rel_path: "as_bad.mbt", content: s2_bad, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r2_bad.blockers > 0, "per-branch as inside or-pattern must fail closed")
+
+  // 4. Cyclic alias exceeds 16-step fixpoint -> MBT2PION_UNSUPPORTED_SYNTAX
+  let s3 =
+    "type A = B\n" +
+    "type B = A\n" +
+    "pub fn id(x : A) -> A { x }\n"
+  let r3 = transpile_package(
+    [SourceFile::{ rel_path: "cyc.mbt", content: s3, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_alias_diag = false
+  for d in r3.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "alias") {
+      saw_alias_diag = true
+    }
+  }
+  assert_true(saw_alias_diag, "cyclic type alias must emit MBT2PION_UNSUPPORTED_SYNTAX after 16 steps")
+
+  // 5. Closure returning IntLit under expected Double
+  let s4 =
+    "pub fn mk_fn() -> () -> Double {\n" +
+    "  fn() { 0 }\n" +
+    "}\n"
+  let r4 = transpile_package(
+    [SourceFile::{ rel_path: "clos_dbl.mbt", content: s4, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r4.blockers == 0, "closure returning IntLit under expected Double succeeds")
+  assert_true(str_has(r4.files[0].content, "0.0"), "closure body 0 coerced to 0.0 under expected Double")
+}
+
+test "F4-2-4: Map::keys().head(), MbtJson::to_string Show helper, and Repr(x) lowering" {
+  // 1. MbtJson Show helper route
+  match moonbit_show_helper("mbt_compat::MbtJson") {
+    Some(h) => assert_true(h == "mbt_compat::mbt_json_to_string", "MbtJson show helper routed")
+    None => assert_true(false, "MbtJson must have a Show helper")
+  }
+  // 2. Map::keys().head() & Map::keys().any(...) + Repr(x) lowering
+  let src =
+    "pub fn f(m : Map[String, Int], x : Int) -> (String?, Bool, String) {\n" +
+    "  let h = m.keys().head()\n" +
+    "  let has_a = m.keys().any(fn(k) { k == \"a\" })\n" +
+    "  let s = \"\\{Repr(x)}\"\n" +
+    "  (h, has_a, s)\n" +
+    "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "stdlib_f42.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::ordered_map_keys_iter(m).head()"), "m.keys().head() uses ordered_map_keys_iter")
+  assert_true(str_has(out, "mbt_compat::ordered_map_keys_iter(m).any("), "m.keys().any() uses ordered_map_keys_iter")
+  assert_true(str_has(out, "__mbt_debug_fmt(x)"), "Repr(x) lowers to __mbt_debug_fmt")
+}
+
+test "F4-2-5: 4 read-only BORROWED_ARRAY_SLICE patterns & negative mutation/escape fail-closed" {
+  let ok_src =
+    "fn consume_view(xs : Array[Int], v : ArrayView[Int]) -> Int {\n" +
+    "  xs.length() + v.length()\n" +
+    "}\n" +
+    "pub fn ok_slices(xs : Array[Int], ops : Array[Int], pairs : Array[(Int, Int)], k : Int, h : Int) -> Int {\n" +
+    "  let c = xs[k:].contains(h)\n" +
+    "  let a = pairs[:k].iter().any(fn(e) { e.0 == h })\n" +
+    "  let mut sum = 0\n" +
+    "  for v in xs[1:] {\n" +
+    "    sum = sum + v\n" +
+    "  }\n" +
+    "  let r = consume_view(xs, ops[0:k])\n" +
+    "  if c || a { sum + r } else { r }\n" +
+    "}\n"
+  let ok_res = transpile_package(
+    [SourceFile::{ rel_path: "ro_slices.mbt", content: ok_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let out = ok_res.files[0].content
+  assert_true(!str_has(out, "__mbt_slice_borrow"), "no __mbt_slice_borrow left in 4 read-only slice patterns")
+  assert_true(str_has(out, "\"__CONTAINS__\""), "contains slice marked __CONTAINS__")
+  assert_true(str_has(out, "\"__ITER__\""), "iter.any with scalar capture marked __ITER__")
+  assert_true(str_has(out, "\"__FOR_RO__\""), "for-in read-only slice marked __FOR_RO__")
+  assert_true(str_has(out, "\"__RO_VIEW__\""), "unmutated ArrayView call arg marked __RO_VIEW__")
+
+  // Negative: mutating `ops` in enclosing fn MUST keep `__mbt_slice_borrow`
+  let bad_src =
+    "fn consume_view(v : ArrayView[Int]) -> Int { v.length() }\n" +
+    "pub fn mut_slice(ops : Array[Int], k : Int) -> Int {\n" +
+    "  ops.push(9)\n" +
+    "  consume_view(ops[0:k])\n" +
+    "}\n"
+  let bad_res = transpile_package(
+    [SourceFile::{ rel_path: "mut_slice.mbt", content: bad_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(str_has(bad_res.files[0].content, "__mbt_slice_borrow"), "mutated array slice must stay borrowed")
+}
+
+test "F4-2-6: foreign struct update ABI wiring (expandable, priv-field & legacy ABI rejected before all_pure)" {
+  // Build dep ABI with: Expandable `S { mut a : Int; b : Int }`, priv-field `PrivS { x : Int; priv y : Int }`
+  let dep_src = SourceFile::{
+    rel_path: "defs.mbt",
+    content:
+      "pub(all) struct S {\n  mut a : Int\n  b : Int\n}\n" +
+      "pub(all) struct PrivS {\n  pub x : Int\n  priv y : Int\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep transpiles")
+
+  // 1. Effectful in-order update on foreign `S` expands cleanly using F4-3 schema (snapshots `s.a` before `b`!)
+  let ok_cons = SourceFile::{
+    rel_path: "cons.mbt",
+    content:
+      "pub fn upd_s(s : @dep.S) -> @dep.S {\n" +
+      "  { ..s, b: { s.a = 9; 7 } }\n" +
+      "}\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package_with_abis(
+    [ok_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("dep", dep_res.abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(ok_res.blockers == 0, "foreign expandable struct update succeeds")
+  let ok_out = ok_res.files[0].content
+  assert_true(str_has(ok_out, "let __mbt_su_b"), "effectful foreign struct update snapshots fields in declaration order")
+
+  // 2. Pure update on `PrivS` MUST fail closed with MBT2PION_DEP_ABI_ERROR BEFORE `all_pure`!
+  let priv_cons = SourceFile::{
+    rel_path: "priv_cons.mbt",
+    content:
+      "pub fn upd_priv(p : @dep.PrivS) -> @dep.PrivS {\n" +
+      "  { ..p, x: 1 }\n" +
+      "}\n",
+    is_test: false,
+  }
+  let priv_res = transpile_package_with_abis(
+    [priv_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("dep", dep_res.abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_priv_abi_err = false
+  for d in priv_res.diagnostics {
+    if d.code == "MBT2PION_DEP_ABI_ERROR" {
+      saw_priv_abi_err = true
+    }
+  }
+  assert_true(saw_priv_abi_err && priv_res.blockers > 0, "priv-field foreign struct update must fail closed before all_pure")
+
+  // 3. Pure update on legacy ABI (`structs: None`) MUST fail closed with MBT2PION_DEP_ABI_ERROR BEFORE `all_pure`!
+  let leg_abi = empty_package_abi("leg")
+  let leg_cons = SourceFile::{
+    rel_path: "leg_cons.mbt",
+    content:
+      "pub fn upd_leg(p : @leg.Point) -> @leg.Point {\n" +
+      "  { ..p, x: 1 }\n" +
+      "}\n",
+    is_test: false,
+  }
+  let leg_res = transpile_package_with_abis(
+    [leg_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("leg", leg_abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_leg_abi_err = false
+  for d in leg_res.diagnostics {
+    if d.code == "MBT2PION_DEP_ABI_ERROR" {
+      saw_leg_abi_err = true
+    }
+  }
+  assert_true(saw_leg_abi_err && leg_res.blockers > 0, "legacy ABI foreign struct update must fail closed before all_pure")
+}

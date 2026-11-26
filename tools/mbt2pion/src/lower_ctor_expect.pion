@@ -459,6 +459,29 @@ fn lookup_struct_field_ty_f3d2(ctx : StageAContext, struct_ty : String, field : 
     }
     None => ()
   }
+  // Wire F4-3 cross-package ABI `structs` metadata when `clean` is a foreign struct (`pkg::Name` or `using_types`)
+  let foreign_q = match ctx.symtab.using_types.get(clean) {
+    Some(q) => strip_type_args_sym(q)
+    None => clean
+  }
+  let fcc = foreign_q.index_of("::")
+  if fcc > 0 && fcc + 2 < foreign_q.length() {
+    let fpkg = foreign_q.slice(0, fcc)
+    let fname = foreign_q.slice(fcc + 2, foreign_q.length())
+    match symtab_lookup_struct_schema(ctx.symtab, fpkg, fname) {
+      Some(schema) => {
+        for sf in schema.fields {
+          if sf.src_name == field {
+            if sf.ty.length() > 0 {
+              return qualify_dep_field_type_f3d2(ctx, foreign_q, sf.ty)
+            }
+            break
+          }
+        }
+      }
+      None => ()
+    }
+  }
   // Resolve type aliases if present
   match ctx.symtab.type_aliases.get(clean) {
     Some(aliased) => {
@@ -2364,19 +2387,28 @@ fn try_lower_chained_field_assign_or_eq_f3d2(
   end : Int,
   file : String,
 ) -> Option[(String, Int)] {
-  // Require at least 2 hops (`x.a.b`) so 1-hop `x.field` stays on its existing path (with `.val` probe handling)
-  if next_i + 4 >= end || tokens[next_i].kind != TokenKind::Dot || tokens[next_i + 1].kind != TokenKind::Ident ||
-  tokens[next_i + 2].kind != TokenKind::Dot || tokens[next_i + 3].kind != TokenKind::Ident {
-    return None
-  }
+  // Require at least 2 postfix hops (`x.a.b` or `x.a[i].b`) so 1-hop `x.field` stays on its existing path (with `.val` probe handling)
   let mut cur = next_i
-  while cur + 1 < end && tokens[cur].kind == TokenKind::Dot && tokens[cur + 1].kind == TokenKind::Ident {
-    if tokens[cur + 1].raw == "val" {
-      return None
+  let mut hops = 0
+  while cur < end {
+    if cur + 1 < end && tokens[cur].kind == TokenKind::Dot && tokens[cur + 1].kind == TokenKind::Ident {
+      if tokens[cur + 1].raw == "val" {
+        return None
+      }
+      cur = cur + 2
+      hops = hops + 1
+    } else if tokens[cur].kind == TokenKind::LBracket && !tokens[cur].newline_before {
+      let cb = find_matching_delim(tokens, cur)
+      if cb >= end {
+        return None
+      }
+      cur = cb + 1
+      hops = hops + 1
+    } else {
+      break
     }
-    cur = cur + 2
   }
-  if cur >= end {
+  if hops < 2 || cur >= end {
     return None
   }
   let op_tok = tokens[cur]
@@ -2400,14 +2432,278 @@ fn try_lower_chained_field_assign_or_eq_f3d2(
   lhs_sb.write_string(name)
   let mut p = next_i
   while p < cur {
-    lhs_sb.write_string("." + rename_keyword_ident(tokens[p + 1].raw))
-    p = p + 2
+    if tokens[p].kind == TokenKind::Dot && p + 1 < cur {
+      lhs_sb.write_string("." + rename_keyword_ident(tokens[p + 1].raw))
+      p = p + 2
+    } else if tokens[p].kind == TokenKind::LBracket {
+      let cb = find_matching_delim(tokens, p)
+      push_expected_type(ctx, "")
+      let idx_s = lower_expr_range(ctx, tokens, p + 1, cb, file, false)
+      pop_expected_type(ctx)
+      lhs_sb.write_string("[" + idx_s + tokens[cb].leading_trivia + "]")
+      p = cb + 1
+    } else {
+      break
+    }
   }
   let saved_exp = ctx.expected_type_stack.length()
   push_expected_type(ctx, lhs_ty)
   let rhs_s = lower_expr_range(ctx, tokens, rhs_start, rhs_end, file, false)
   restore_expected_type_stack(ctx, saved_exp)
   Some((trivia + lhs_sb.to_string() + op_tok.leading_trivia + op_tok.raw + rhs_s, rhs_end))
+}
+
+///| Extract `(pos_count, labels, has_rest)` from a constructor pattern's `(...)` argument list `[open_p, close_p]`.
+fn extract_pat_ctor_shape_f42(tokens : Array[Token], open_p : Int, close_p : Int) -> (Int, Array[String], Bool) {
+  let mut pos_cnt = 0
+  let labels : Array[String] = []
+  let mut has_rest = false
+  let mut k = open_p + 1
+  while k < close_p {
+    if tokens[k].kind == TokenKind::Comma { k = k + 1; continue }
+    let mut ke = k
+    let mut kd = 0
+    while ke < close_p {
+      let kk = tokens[ke].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { kd = kd + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if kd > 0 { kd = kd - 1 } }
+      else if kd == 0 && kk == TokenKind::Comma { break }
+      ke = ke + 1
+    }
+    if ke > k {
+      if ke == k + 1 && tokens[k].kind == TokenKind::DotDot {
+        has_rest = true
+      } else if (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) &&
+      k + 1 < ke && tokens[k + 1].kind == TokenKind::Tilde {
+        // `label~` punned or `label~=pat`
+        labels.push(tokens[k].raw)
+      } else if (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) &&
+      k + 1 < ke && tokens[k + 1].kind == TokenKind::Eq {
+        // `label=pat`
+        labels.push(tokens[k].raw)
+      } else {
+        pos_cnt = pos_cnt + 1
+      }
+    }
+    k = ke + 1
+  }
+  (pos_cnt, labels, has_rest)
+}
+
+///| Infer a unique enum type at a single pattern position across sibling non-wildcard match arms
+///| (strictly same position — NEVER guards, RHS, inner matches, or bindings).
+///| Intersects `(pkg, enum, arity, labels, generics, visibility)` via `symtab_intersect_ctor_enums`
+///| and `symtab_validate_enum_variant_use`; returns `""` unless uniquely compatible.
+fn infer_pattern_list_enum_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  pat_spans : Array[(Int, Int)],
+) -> String {
+  if pat_spans.length() == 0 || !symtab_sources_complete(ctx.symtab) {
+    return ""
+  }
+  let cnames : Array[String] = []
+  let shapes : Array[(String, Int, Array[String], Bool)] = []
+  let seen_c : Map[String, Bool] = Map()
+  let mut all_option = true
+  let some_inners : Array[(Int, Int)] = []
+  let mut all_tuples = true
+  let mut tuple_arity = -1
+  let tuple_slots : Array[Array[(Int, Int)]] = []
+  let mut non_wild = 0
+  for sp in pat_spans {
+    let mut a = sp.0
+    let mut b = sp.1
+    while a < b && tokens[a].kind == TokenKind::LParen && find_matching_delim(tokens, a) == b - 1 &&
+    !paren_has_top_level_comma(tokens, a, b - 1) {
+      a = a + 1
+      b = b - 1
+    }
+    if a >= b { continue }
+    // Skip wildcards `_` and plain lowercase bindings `x`
+    if b == a + 1 && (tokens[a].kind == TokenKind::Underscore || tokens[a].kind == TokenKind::Ident) {
+      continue
+    }
+    non_wild = non_wild + 1
+    // Check Option wrapper (`Some(inner)` / `None`)
+    if all_option {
+      if b == a + 1 && tokens[a].kind == TokenKind::UpperIdent && tokens[a].raw == "None" && !has_local_ctor(ctx.symtab, "None") {
+        // ok
+      } else if a + 2 < b && tokens[a].kind == TokenKind::UpperIdent && tokens[a].raw == "Some" &&
+      !has_local_ctor(ctx.symtab, "Some") && tokens[a + 1].kind == TokenKind::LParen &&
+      find_matching_delim(tokens, a + 1) == b - 1 {
+        some_inners.push((a + 2, b - 1))
+      } else {
+        all_option = false
+      }
+    }
+    // Check tuple pattern `(p0, p1, ...)`
+    if all_tuples && tokens[a].kind == TokenKind::LParen && find_matching_delim(tokens, a) == b - 1 &&
+    paren_has_top_level_comma(tokens, a, b - 1) {
+      let elems : Array[(Int, Int)] = []
+      let mut ti = a + 1
+      while ti < b - 1 {
+        if tokens[ti].kind == TokenKind::Comma { ti = ti + 1; continue }
+        let mut te = ti
+        let mut td = 0
+        while te < b - 1 {
+          let tk = tokens[te].kind
+          if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+          else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { if td > 0 { td = td - 1 } }
+          else if td == 0 && tk == TokenKind::Comma { break }
+          te = te + 1
+        }
+        if te > ti { elems.push((ti, te)) }
+        ti = te + 1
+      }
+      if tuple_arity < 0 { tuple_arity = elems.length() }
+      else if tuple_arity != elems.length() { all_tuples = false }
+      if all_tuples { tuple_slots.push(elems) }
+    } else {
+      all_tuples = false
+    }
+    // Split depth-0 `|` segments for bare constructor extraction
+    let mut seg_s = a
+    while seg_s < b {
+      let mut seg_e = seg_s
+      let mut sd = 0
+      while seg_e < b {
+        let sk = tokens[seg_e].kind
+        if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { sd = sd + 1 }
+        else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { if sd > 0 { sd = sd - 1 } }
+        else if sd == 0 && sk == TokenKind::Pipe { break }
+        seg_e = seg_e + 1
+      }
+      if seg_s < seg_e && tokens[seg_s].kind == TokenKind::UpperIdent {
+        let is_qual = seg_s + 1 < seg_e && tokens[seg_s + 1].kind == TokenKind::ColonColon
+        let cname = tokens[seg_s].raw
+        if !is_qual && !ctx.symtab.const_defs.contains(cname) &&
+        !ctx.active_generics.contains(cname) && !ctx.symtab.local_value_names.contains(cname) &&
+        !((cname == "Some" || cname == "None" || cname == "Ok" || cname == "Err") && !has_local_ctor(ctx.symtab, cname)) {
+          if !seen_c.contains(cname) {
+            seen_c[cname] = true
+            cnames.push(cname)
+          }
+          if seg_s + 1 < seg_e && tokens[seg_s + 1].kind == TokenKind::LParen {
+            let rp = find_matching_delim(tokens, seg_s + 1)
+            if rp < seg_e {
+              let (pc, lbls, hr) = extract_pat_ctor_shape_f42(tokens, seg_s + 1, rp)
+              shapes.push((cname, pc, lbls, hr))
+            }
+          } else {
+            shapes.push((cname, 0, [], false))
+          }
+        }
+      }
+      seg_s = seg_e + 1
+    }
+  }
+  if non_wild == 0 {
+    return ""
+  }
+  if cnames.length() > 0 {
+    let (inter, any_ambig) = symtab_intersect_ctor_enums(ctx.symtab, cnames)
+    if any_ambig && inter.length() > 0 {
+      let compat : Array[String] = []
+      for cand in inter {
+        let cc = cand.index_of("::")
+        let (cpkg, cen) = if cc > 0 { (cand.slice(0, cc), cand.slice(cc + 2, cand.length())) } else { ("", cand) }
+        match symtab_lookup_enum_schema(ctx.symtab, cpkg, cen) {
+          Some(_) => {
+            let mut ok = true
+            for sh in shapes {
+              match symtab_validate_enum_variant_use(ctx.symtab, cpkg, cen, sh.0, sh.1, sh.2, sh.3, true) {
+                Ok(_) => ()
+                Err(_) => { ok = false; break }
+              }
+            }
+            if ok {
+              compat.push(cand)
+            }
+          }
+          None => {
+            // Local enum without schema: accept only if no labeled args
+            let mut has_lbl = false
+            for sh in shapes { if sh.2.length() > 0 { has_lbl = true } }
+            if !has_lbl && cpkg.length() == 0 {
+              compat.push(cand)
+            }
+          }
+        }
+      }
+      if compat.length() == 1 {
+        return compat[0]
+      }
+    }
+  }
+  if all_option && some_inners.length() > 0 {
+    let inner_e = infer_pattern_list_enum_f42(ctx, tokens, some_inners)
+    if inner_e.length() > 0 {
+      return "Option[" + inner_e + "]"
+    }
+  }
+  if all_tuples && tuple_arity >= 2 && tuple_slots.length() > 0 {
+    let slot_tys : Array[String] = []
+    let mut any_slot = false
+    let mut si = 0
+    while si < tuple_arity {
+      let col_spans : Array[(Int, Int)] = []
+      for ts in tuple_slots { col_spans.push(ts[si]) }
+      let st = infer_pattern_list_enum_f42(ctx, tokens, col_spans)
+      if st.length() > 0 { any_slot = true }
+      slot_tys.push(st)
+      si = si + 1
+    }
+    if any_slot {
+      return "(" + join_comma(slot_tys) + ")"
+    }
+  }
+  ""
+}
+
+///| Collect top-level arm pattern spans `(pat_start, pat_end)` (strictly before `if` guard / `=>`)
+///| of a `match` body `[start, end)` and infer a unique enum scrutinee type from sibling arms.
+fn infer_sibling_pattern_enum_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+) -> String {
+  let pat_spans : Array[(Int, Int)] = []
+  let mut i = start
+  while i < end {
+    let mut fa = i
+    let mut fd = 0
+    let mut if_idx = -1
+    while fa < end {
+      let fk = tokens[fa].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { if fd > 0 { fd = fd - 1 } }
+      else if fd == 0 {
+        if fk == TokenKind::FatArrow { break }
+        else if fk == TokenKind::Keyword && tokens[fa].raw == "if" && if_idx < 0 { if_idx = fa }
+      }
+      fa = fa + 1
+    }
+    if fa >= end { break }
+    let pat_end = if if_idx >= 0 { if_idx } else { fa }
+    if pat_end > i {
+      pat_spans.push((i, pat_end))
+    }
+    let bs = fa + 1
+    let mut next_i = bs
+    if bs < end && tokens[bs].kind == TokenKind::LBrace {
+      next_i = find_matching_delim(tokens, bs) + 1
+    } else if bs < end {
+      next_i = find_expr_end(tokens, bs, end)
+    }
+    if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
+      next_i = next_i + 1
+    }
+    if next_i <= i { break }
+    i = next_i
+  }
+  infer_pattern_list_enum_f42(ctx, tokens, pat_spans)
 }
 
 ///| Look up parameter types of a local closure variable (e.g. `let told = fn(kind : DragKind, ...) { ... }`).
