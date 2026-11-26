@@ -641,8 +641,8 @@ def main():
         assert e2e_out == expected_e2e, f"CLI E2E C-linked FFI mismatch: {e2e_out!r} != {expected_e2e!r}"
         print(f"[PASS] CLI E2E C-linked FFI execution: {e2e_out}")
 
-        # 3d. Negative CLI tests: invalid --ffi-shim-prefix and same-package C symbol collision
-        for bad_pfx in ("123_bad", "bad-pfx", " pion_"):
+        # 3d. Negative CLI tests: invalid --ffi-shim-prefix (including explicit empty "") and same-package C symbol collision
+        for bad_pfx in ("", "123_bad", "bad-pfx", " pion_"):
             bad_out = os.path.join(tmp, f"ffi_out_bad_{abs(hash(bad_pfx))}")
             os.makedirs(bad_out)
             bad_proc = subprocess.run(
