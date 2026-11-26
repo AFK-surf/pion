@@ -297,6 +297,18 @@ fn pipe_both(a : Bool, _b : Int) -> Bool {
   a
 }
 
+fn plain_cmp_is() -> Bool {
+  false == true is _
+}
+
+fn rb_fail() -> Bool raise LocalErr {
+  raise Empty
+}
+
+fn ov_fail() -> Int? raise LocalErr {
+  raise Empty
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -464,7 +476,51 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string()
+  // R11 P1: comparison RHS `is` precedence (`false == true is _` == `false == (true is _)` == `false`)
+  let p18 = try {
+    let v = false == true is _ && yes_helper(always_fail_g())
+    if v { 42 } else { 0 }
+  } catch {
+    _ => 7
+  }
+  let p19 = try {
+    let v = false == opt_none() is Some(always_fail_g) && yes_helper(always_fail_g())
+    if v { 42 } else { 0 }
+  } catch {
+    _ => 7
+  }
+  let p20 = if plain_cmp_is() { 1 } else { 0 }
+  // R11 P2: expression-level `<expr> catch { ... }` wraps full conjunction & exits `is` scope before handler
+  let p21 = {
+    let v = (Some(1) is Some(x)) && rb_fail() catch { _ => false }
+    if v { 42 } else { 0 }
+  }
+  let p22 = {
+    let v = Some(1) is Some(x) && rb_fail() catch { _ => false }
+    if v { 42 } else { 0 }
+  }
+  let p23 = {
+    let v = (ov_fail() is Some(x)) && rb_fail() catch { _ => false }
+    if v { 42 } else { 0 }
+  }
+  let p24 = try {
+    let v = (ov_fail() is Some(x)) && (rb_fail() catch { _ => false })
+    if v { 42 } else { 0 }
+  } catch {
+    _ => 7
+  }
+  let p25 = try {
+    let v = (Some(local_fn) is Some(always_fail_g)) && rb_fail() catch {
+      _ => {
+        let _ = always_fail_g()
+        false
+      }
+    }
+    if v { 42 } else { 0 }
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -639,7 +695,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"

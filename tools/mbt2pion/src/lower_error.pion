@@ -2834,6 +2834,102 @@ fn le_lower_range(
         }
       }
     }
+    // Expression-level `<expr> catch[!] { ... } [noraise { ... }]` shorthand:
+    // `catch` binds looser than `&&`/`||`/`|>`, so it wraps the entire preceding expression.
+    let prev_ends_stmt_c = i > start && t.newline_before && !le_is_cont_op(tokens[i - 1]) && !le_is_cont_op(t)
+    let is_expr_start_c = i == start || prev_ends_stmt_c ||
+    tokens[i - 1].kind == TokenKind::Eq ||
+    tokens[i - 1].kind == TokenKind::Colon ||
+    tokens[i - 1].kind == TokenKind::Semi ||
+    tokens[i - 1].kind == TokenKind::LParen ||
+    tokens[i - 1].kind == TokenKind::LBracket ||
+    tokens[i - 1].kind == TokenKind::LBrace ||
+    tokens[i - 1].kind == TokenKind::Comma ||
+    tokens[i - 1].kind == TokenKind::FatArrow ||
+    (tokens[i - 1].kind == TokenKind::Keyword &&
+      (tokens[i - 1].raw == "return" || tokens[i - 1].raw == "break" ||
+        tokens[i - 1].raw == "raise" || tokens[i - 1].raw == "else"))
+    let is_stmt_head_c = (t.kind == TokenKind::Keyword &&
+      (t.raw == "let" || t.raw == "const" || t.raw == "fn" || t.raw == "for" ||
+        t.raw == "while" || t.raw == "return" || t.raw == "break" || t.raw == "continue" ||
+        t.raw == "else")) ||
+    le_is_kw(t, "try") || le_is_kw(t, "guard") || le_is_kw(t, "raise") ||
+    le_is_kw(t, "catch") || le_is_kw(t, "noraise") ||
+    t.kind == TokenKind::Semi || t.kind == TokenKind::Comma ||
+    t.kind == TokenKind::RBrace || t.kind == TokenKind::RParen || t.kind == TokenKind::RBracket
+    if is_expr_start_c && !is_stmt_head_c {
+      let mut sc = i
+      let mut sd = 0
+      let mut found_catch_i = -1
+      while sc < end {
+        let st_t = tokens[sc]
+        if sd == 0 {
+          if sc > i && le_is_kw(st_t, "catch") {
+            found_catch_i = sc
+            break
+          }
+          if le_is_kw(st_t, "try") {
+            if sc + 1 < end && (tokens[sc + 1].kind == TokenKind::Question || tokens[sc + 1].kind == TokenKind::Bang) {
+              let es = sc + 2
+              sc = if es < end && tokens[es].kind == TokenKind::LBrace {
+                find_matching_delim(tokens, es) + 1
+              } else {
+                le_find_try_expr_end(tokens, es, end)
+              }
+              continue
+            }
+            let (_, _, _, _, clb0, crb0) = le_find_try_parts(tokens, sc, end)
+            if clb0 >= 0 && crb0 >= clb0 {
+              let mut nxt = crb0 + 1
+              if crb0 + 2 < end && le_is_kw(tokens[crb0 + 1], "noraise") && tokens[crb0 + 2].kind == TokenKind::LBrace {
+                nxt = find_matching_delim(tokens, crb0 + 2) + 1
+              }
+              sc = nxt
+              continue
+            }
+          }
+          if st_t.kind == TokenKind::Semi || st_t.kind == TokenKind::Comma ||
+          st_t.kind == TokenKind::RBrace || st_t.kind == TokenKind::RParen ||
+          st_t.kind == TokenKind::RBracket || st_t.kind == TokenKind::FatArrow ||
+          st_t.kind == TokenKind::Eq ||
+          (st_t.kind == TokenKind::Keyword && st_t.raw == "else") ||
+          (sc > i && st_t.newline_before && !le_is_cont_op(tokens[sc - 1]) && !le_is_cont_op(st_t)) {
+            break
+          }
+        }
+        sd = le_step_depth(st_t.kind, sd)
+        sc = sc + 1
+      }
+      if found_catch_i > i {
+        match le_match_postfix_catch(tokens, found_catch_i - 1, end) {
+          Some((is_cb, catch_lb, catch_rb)) => {
+            let mut noraise_lb = -1
+            let mut noraise_rb = -1
+            let mut after_try = catch_rb + 1
+            if catch_rb + 2 < end && le_is_kw(tokens[catch_rb + 1], "noraise") && tokens[catch_rb + 2].kind == TokenKind::LBrace {
+              noraise_lb = catch_rb + 2
+              noraise_rb = find_matching_delim(tokens, noraise_lb)
+              after_try = noraise_rb + 1
+            }
+            match le_try_lower_direct_result_call(st, src, tokens, i, found_catch_i) {
+              Some((wrap_ctor, res_call, canon_et)) => {
+                let ok_arm = le_render_ok_arm(st, src, tokens, wrap_ctor, noraise_lb, noraise_rb)
+                let err_arm = le_render_catch_err_arm(st, src, tokens, catch_lb, catch_rb, canon_et, is_cb, tokens[found_catch_i].line, tokens[found_catch_i].col)
+                sb.write_string(t.leading_trivia + "match " + res_call + " { " + ok_arm + ", " + err_arm + " }")
+              }
+              None =>
+              match le_lower_compound_try(st, src, tokens, i, found_catch_i, catch_lb, catch_rb, is_cb, noraise_lb, noraise_rb, "catch", tokens[found_catch_i].line, tokens[found_catch_i].col) {
+                Some(expr) => sb.write_string(t.leading_trivia + expr)
+                None => sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[after_try - 1].end_byte))
+              }
+            }
+            i = after_try
+            continue
+          }
+          None => ()
+        }
+      }
+    }
     // `if` / `while` push lexical scope so top-level `is <pat>` binders are visible in `then`/body only
     if t.kind == TokenKind::Keyword && (t.raw == "if" || t.raw == "while") {
       let tlb = le_find_header_body_lbrace(tokens, i, end)
@@ -2972,6 +3068,45 @@ fn le_lower_range(
         }
         i = pe
         continue
+      }
+    }
+    // Comparison/equality RHS `is <pat>`: MoonBit gives `is` higher precedence than `==`/`!=`/`<`/`<=`/`>`/`>=`,
+    // whereas Pion parses `a == b is P` as `(a == b) is P`. Parenthesize `(b is P)` explicitly!
+    if t.raw == "==" || t.raw == "!=" || t.raw == "<" || t.raw == "<=" || t.raw == ">" || t.raw == ">=" {
+      let mut is_i = -1
+      let mut j = i + 1
+      let mut jd = 0
+      while j < end {
+        let jt = tokens[j]
+        if jd == 0 {
+          if le_is_kw(jt, "is") {
+            is_i = j
+            break
+          }
+          if jt.raw == "&&" || jt.raw == "||" || jt.raw == "|>" ||
+          jt.raw == "==" || jt.raw == "!=" || jt.raw == "<" || jt.raw == "<=" || jt.raw == ">" || jt.raw == ">=" ||
+          jt.kind == TokenKind::Eq || jt.raw == "+=" || jt.raw == "-=" || jt.raw == "*=" || jt.raw == "/=" || jt.raw == "%=" ||
+          jt.kind == TokenKind::FatArrow ||
+          jt.kind == TokenKind::Semi || jt.kind == TokenKind::Comma ||
+          jt.kind == TokenKind::RParen || jt.kind == TokenKind::RBracket || jt.kind == TokenKind::RBrace ||
+          (jt.kind == TokenKind::Keyword && jt.raw == "else") ||
+          le_is_kw(jt, "catch") || le_is_kw(jt, "noraise") ||
+          (j > i + 1 && jt.newline_before && !le_is_cont_op(tokens[j - 1]) && !le_is_cont_op(jt)) {
+            break
+          }
+        }
+        jd = le_step_depth(jt.kind, jd)
+        j = j + 1
+      }
+      if is_i > i + 1 {
+        let pe = le_find_is_pat_end(tokens, is_i + 1, end)
+        if pe > is_i + 1 {
+          let lhs_is = le_lower_range(st, src, tokens, i + 1, is_i).trim()
+          let pat_txt = src.slice(tokens[is_i].start_byte, tokens[pe - 1].end_byte)
+          sb.write_string(t.leading_trivia + t.raw + " (" + lhs_is + " " + pat_txt + ")")
+          i = pe
+          continue
+        }
       }
     }
     // `for <pat> in <iter> { ... }` and C-style `for` shadowing loop binders
@@ -3513,7 +3648,7 @@ pub fn lower_checked_errors_with_env(
       if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
         used_idents[t.raw] = true
       }
-      if le_is_kw(t, "suberror") || le_is_kw(t, "raise") || le_is_kw(t, "try") || le_is_kw(t, "catch") {
+      if le_is_kw(t, "suberror") || le_is_kw(t, "raise") || le_is_kw(t, "try") || le_is_kw(t, "catch") || le_is_kw(t, "is") {
         any_err_kw = true
       } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
         if le_interp_has_err_kw(t) {
