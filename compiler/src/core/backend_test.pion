@@ -17194,3 +17194,316 @@ test "p130 wasm data spans skip edge and long interior zero runs" {
   assert_eq(edge[4095].start, 1 + 4095 * 17)
   assert_eq(edge[4095].stop, 2 + 4095 * 17)
 }
+
+///|
+test "p133 for-range body shadowing loop var separates step scope" {
+  let shadowed_src =
+    #|pub fn f(n : Int) -> Int {
+    #|  let mut sum = 0
+    #|  for i in 0..<n {
+    #|    let i = i
+    #|    sum = sum + i
+    #|  }
+    #|  sum
+    #|}
+  let pkg = parse_package("test", ["shadow.pion"], [shadowed_src])
+  let res = emit_qbe_package(pkg, false)
+  assert_true(res.ssa.contains("@forr_s"), res.ssa)
+  let plain_src =
+    #|pub fn g(n : Int) -> Int {
+    #|  let mut sum = 0
+    #|  for i in 0..<n {
+    #|    sum = sum + i
+    #|  }
+    #|  sum
+    #|}
+  let pkg2 = parse_package("test", ["plain.pion"], [plain_src])
+  let res2 = emit_qbe_package(pkg2, false)
+  assert_true(!res2.ssa.contains("@forr_s"), res2.ssa)
+}
+
+///|
+test "p134_generic_eq_arith_diamond_cycle_linear_scan" {
+  // 12-layer all-false diamond into a self-loop: 26 nodes, 49 edges.
+  // Must return false for both eq and arith AND scan each decl's AST at most once (<= 26).
+  let sb = StringBuilder()
+  sb.write_string("pub fn sink[T](x : T, n : Int) -> T {\n  if false { sink(x, n) } else { x }\n}\n")
+  sb.write_string("pub fn a12[T](x : T, n : Int) -> T {\n  if false { sink(x, n) } else { sink(x, n) }\n}\n")
+  sb.write_string("pub fn b12[T](x : T, n : Int) -> T {\n  if false { sink(x, n) } else { sink(x, n) }\n}\n")
+  let mut layer = 11
+  while layer >= 1 {
+    let cur = layer.to_string()
+    let nxt = (layer + 1).to_string()
+    sb.write_string("pub fn a" + cur + "[T](x : T, n : Int) -> T {\n  if false { a" + nxt + "(x, n) } else { b" + nxt + "(x, n) }\n}\n")
+    sb.write_string("pub fn b" + cur + "[T](x : T, n : Int) -> T {\n  if false { a" + nxt + "(x, n) } else { b" + nxt + "(x, n) }\n}\n")
+    layer = layer - 1
+  }
+  sb.write_string("pub fn top[T](x : T, n : Int) -> T {\n  if false { a1(x, n) } else { b1(x, n) }\n}\n")
+  let cr = check_source_files_full("test", ["diamond.pion"], [sb.to_string()])
+  assert_eq(cr.diagnostics.length(), 0)
+  let g = qbe_new(cr.tc, false, false)
+  match cr.tc.fns.get("top") {
+    Some(top_fi) => {
+      assert_eq(qbe_fn_body_has_eq(g, top_fi, ""), false)
+      assert_eq(qbe_fn_body_has_arith(g, top_fi, ""), false)
+      assert_true(
+        g.generic_scan_count <= 26 && g.generic_scan_count == 26,
+        "expected exactly 26 single-pass AST scans, got " + g.generic_scan_count.to_string(),
+      )
+    }
+    None => assert_true(false, "missing top fn")
+  }
+}
+
+///|
+test "p134_generic_eq_arith_cycle_with_true_order_independent" {
+  let fwd_src =
+    #|pub fn c0[T](x : T, y : T) -> Bool {
+    #|  if false { c1(x, y) } else { false }
+    #|}
+    #|pub fn c1[T](x : T, y : T) -> Bool {
+    #|  if false { c2(x, y) } else { false }
+    #|}
+    #|pub fn c2[T](x : T, y : T) -> Bool {
+    #|  if false { c0(x, y) } else { x == y }
+    #|}
+  let rev_src =
+    #|pub fn c2[T](x : T, y : T) -> Bool {
+    #|  if false { c0(x, y) } else { x == y }
+    #|}
+    #|pub fn c1[T](x : T, y : T) -> Bool {
+    #|  if false { c2(x, y) } else { false }
+    #|}
+    #|pub fn c0[T](x : T, y : T) -> Bool {
+    #|  if false { c1(x, y) } else { false }
+    #|}
+  let srcs = [fwd_src, rev_src]
+  let mut pi = 0
+  while pi < srcs.length() {
+    let cr = check_source_files_full("test", ["cyc.pion"], [srcs[pi]])
+    assert_eq(cr.diagnostics.length(), 0)
+    let g = qbe_new(cr.tc, false, false)
+    match cr.tc.fns.get("c0") {
+      Some(fi0) => assert_eq(qbe_fn_body_has_eq(g, fi0, ""), true)
+      None => assert_true(false, "missing c0")
+    }
+    match cr.tc.fns.get("c1") {
+      Some(fi1) => assert_eq(qbe_fn_body_has_eq(g, fi1, ""), true)
+      None => assert_true(false, "missing c1")
+    }
+    match cr.tc.fns.get("c2") {
+      Some(fi2) => assert_eq(qbe_fn_body_has_eq(g, fi2, ""), true)
+      None => assert_true(false, "missing c2")
+    }
+    assert_eq(g.generic_scan_count, 3)
+    pi = pi + 1
+  }
+}
+
+///|
+test "p134_generic_struct_lit_spread_eq_and_arith" {
+  let src =
+    #|pub struct S {
+    #|  pub a : Int
+    #|  pub b : Int
+    #|}
+    #|pub fn spread_eq[T](x : T, y : T, base : S) -> S {
+    #|  S::{ ..(if x == y { base } else { base }), a: 1 }
+    #|}
+    #|pub fn spread_arith[T](x : T, y : T, base : S) -> S {
+    #|  S::{ ..({ let _ = x + y; base }), a: 2 }
+    #|}
+  let cr = check_source_files_full("test", ["spread.pion"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let g = qbe_new(cr.tc, false, false)
+  match cr.tc.fns.get("spread_eq") {
+    Some(fi) => {
+      assert_eq(qbe_fn_body_has_eq(g, fi, ""), true)
+      assert_eq(qbe_fn_body_has_arith(g, fi, ""), false)
+    }
+    None => assert_true(false, "missing spread_eq")
+  }
+  match cr.tc.fns.get("spread_arith") {
+    Some(fi) => {
+      assert_eq(qbe_fn_body_has_eq(g, fi, ""), false)
+      assert_eq(qbe_fn_body_has_arith(g, fi, ""), true)
+    }
+    None => assert_true(false, "missing spread_arith")
+  }
+}
+
+///|
+test "p134_generic_xpkg_method_eq_propagation" {
+  let dep_src =
+    #|fn inner_eq[T](a : T, b : T) -> Bool {
+    #|  a == b
+    #|}
+    #|pub struct Box {
+    #|  pub id : Int
+    #|}
+    #|pub fn Box::helper[T](self : Box, a : T, b : T) -> Bool {
+    #|  let _ = self.id
+    #|  inner_eq(a, b)
+    #|}
+  let dep_cr = check_source_files_with_imports("dep", ["dep.pion"], [dep_src], [], true)
+  assert_true(dep_cr.diagnostics.length() == 0, check_result_to_json(dep_cr.diagnostics))
+  let app_src =
+    #|import "dep"
+    #|pub fn check_box[T](b : dep::Box, a : T, c : T) -> Bool {
+    #|  b.helper(a, c)
+    #|}
+  let imported = [imported_pkg_new("dep", dep_cr.tc)]
+  let app_cr = check_source_files_with_imports("app", ["app.pion"], [app_src], imported, true)
+  assert_true(app_cr.diagnostics.length() == 0, check_result_to_json(app_cr.diagnostics))
+  let g = qbe_new(app_cr.tc, false, false)
+  match app_cr.tc.fns.get("check_box") {
+    Some(fi) => assert_eq(qbe_fn_body_has_eq(g, fi, ""), true)
+    None => assert_true(false, "missing check_box")
+  }
+}
+
+///|
+test "p134_generic_xpkg_method_arith_phys_and_alias_static_propagation" {
+  // Arith and physical_equal are NOT copied into eq_tparams, so these tests
+  // directly verify cross-package (callee_pkg, callee_tc) switching for both
+  // instance methods and aliased static generic methods (`m::Box::...`).
+  let dep_src =
+    #|fn inner_arith[T](a : T, b : T) -> T {
+    #|  a + b
+    #|}
+    #|fn inner_phys[T](a : T, b : T) -> Bool {
+    #|  physical_equal(a, b)
+    #|}
+    #|pub struct Box {
+    #|  pub id : Int
+    #|}
+    #|pub fn Box::helper_arith[T](self : Box, a : T, b : T) -> T {
+    #|  let _ = self.id
+    #|  inner_arith(a, b)
+    #|}
+    #|pub fn Box::helper_phys[T](self : Box, a : T, b : T) -> Bool {
+    #|  let _ = self.id
+    #|  inner_phys(a, b)
+    #|}
+    #|pub fn Box::check_static_arith[T](a : T, b : T) -> T {
+    #|  inner_arith(a, b)
+    #|}
+    #|pub fn Box::check_static_phys[T](a : T, b : T) -> Bool {
+    #|  inner_phys(a, b)
+    #|}
+  let dep_cr = check_source_files_with_imports("dep", ["dep.pion"], [dep_src], [], true)
+  assert_true(dep_cr.diagnostics.length() == 0, check_result_to_json(dep_cr.diagnostics))
+  let app_src =
+    #|import "dep" as m
+    #|pub fn f_arith[T](b : m::Box, x : T, y : T) -> T {
+    #|  b.helper_arith(x, y)
+    #|}
+    #|pub fn f_phys[T](b : m::Box, x : T, y : T) -> Bool {
+    #|  b.helper_phys(x, y)
+    #|}
+    #|pub fn f_stat_arith[T](x : T, y : T) -> T {
+    #|  m::Box::check_static_arith(x, y)
+    #|}
+    #|pub fn f_stat_phys[T](x : T, y : T) -> Bool {
+    #|  m::Box::check_static_phys(x, y)
+    #|}
+  let imported = [imported_pkg_new("dep", dep_cr.tc)]
+  let app_cr = check_source_files_with_imports("app", ["app.pion"], [app_src], imported, true)
+  assert_true(app_cr.diagnostics.length() == 0, check_result_to_json(app_cr.diagnostics))
+  let g = qbe_new(app_cr.tc, false, false)
+  match app_cr.tc.fns.get("f_arith") {
+    Some(fi) => assert_eq(qbe_fn_body_has_arith(g, fi, ""), true)
+    None => assert_true(false, "missing f_arith")
+  }
+  match app_cr.tc.fns.get("f_phys") {
+    Some(fi) => assert_eq(qbe_fn_body_has_eq(g, fi, ""), true)
+    None => assert_true(false, "missing f_phys")
+  }
+  match app_cr.tc.fns.get("f_stat_arith") {
+    Some(fi) => assert_eq(qbe_fn_body_has_arith(g, fi, ""), true)
+    None => assert_true(false, "missing f_stat_arith")
+  }
+  match app_cr.tc.fns.get("f_stat_phys") {
+    Some(fi) => assert_eq(qbe_fn_body_has_eq(g, fi, ""), true)
+    None => assert_true(false, "missing f_stat_phys")
+  }
+}
+
+///|
+test "p134_generic_xpkg_canonical_method_key_not_hijacked_by_alias" {
+  let real_src =
+    #|pub struct Box {
+    #|  pub id : Int
+    #|}
+    #|pub fn Box::calc[T](self : Box, a : T, b : T) -> T {
+    #|  let _ = self.id
+    #|  a + b
+    #|}
+  let decoy_src =
+    #|pub struct Box {
+    #|  pub id : Int
+    #|}
+    #|pub fn Box::calc[T](self : Box, a : T, _b : T) -> T {
+    #|  let _ = self.id
+    #|  a
+    #|}
+  let real_cr = check_source_files_with_imports("real", ["real.pion"], [real_src], [], true)
+  assert_true(real_cr.diagnostics.length() == 0, check_result_to_json(real_cr.diagnostics))
+  let decoy_cr = check_source_files_with_imports("decoy", ["decoy.pion"], [decoy_src], [], true)
+  assert_true(decoy_cr.diagnostics.length() == 0, check_result_to_json(decoy_cr.diagnostics))
+  let imported = [
+    imported_pkg_new("real", real_cr.tc),
+    imported_pkg_new("decoy", decoy_cr.tc),
+  ]
+  let cases = [
+    "import \"real\" as r\nimport \"decoy\" as spare\npub fn wrap[T](b : r::Box, a : T, c : T) -> T {\n  b.calc(a, c)\n}\n",
+    "import \"real\" as r\nimport \"decoy\" as real\npub fn wrap[T](b : r::Box, a : T, c : T) -> T {\n  b.calc(a, c)\n}\n",
+  ]
+  let mut ci = 0
+  while ci < cases.length() {
+    let app_cr = check_source_files_with_imports("app", ["app.pion"], [cases[ci]], imported, true)
+    assert_true(app_cr.diagnostics.length() == 0, check_result_to_json(app_cr.diagnostics))
+    let g = qbe_new(app_cr.tc, false, false)
+    match app_cr.tc.fns.get("wrap") {
+      Some(fi) =>
+        assert_true(
+          qbe_fn_body_has_arith(g, fi, ""),
+          "case #" + ci.to_string() + " must resolve canonical real::Box::calc, not alias decoy",
+        )
+      None => assert_true(false, "missing wrap")
+    }
+    ci = ci + 1
+  }
+}
+
+///|
+test "p134_norm_mono_pkg_and_same_ssa_native_wasm" {
+  let src =
+    #|pub struct Pair[T] {
+    #|  pub a : T
+    #|  pub b : T
+    #|}
+    #|impl[T : Eq] Eq for Pair[T] {
+    #|  fn equal(self : Pair[T], other : Pair[T]) -> Bool {
+    #|    self.a == other.a && self.b == other.b
+    #|  }
+    #|}
+    #|pub fn check_pair(x : Pair[Int], y : Pair[Int]) -> Bool {
+    #|  x == y
+    #|}
+  let cr = check_source_files_full("myroot", ["pair.pion"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let g = qbe_new(cr.tc, false, false)
+  assert_eq(qbe_norm_mono_pkg(g, ""), "")
+  assert_eq(qbe_norm_mono_pkg(g, "myroot"), "")
+  assert_eq(qbe_norm_mono_pkg(g, "dep_other"), "dep_other")
+  let nat_ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "amd64_sysv")
+  let wasm_ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "wasm32")
+  assert_eq(nat_ssa.ssa, wasm_ssa.ssa)
+  // When frontend already reported errors, qbe_fail_unresolved recovers with TError (no ICE).
+  let bad_cr = check_source_files_full("myroot", ["bad.pion"], ["pub fn f() -> Int { missing_fn() }\n"])
+  assert_true(bad_cr.diagnostics.length() > 0, "expected frontend diag")
+  let bad_g = qbe_new(bad_cr.tc, false, false)
+  let rec = qbe_fail_unresolved(bad_g, "unqualified_call", "", "missing_fn", span_empty())
+  assert_eq(rec.reg, "0")
+}

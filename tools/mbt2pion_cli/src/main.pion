@@ -399,6 +399,150 @@ fn parse_manifest_deps(cwd : String, manifest_path : String, content : String, o
   }
 }
 
+///| Strip TOML `#` line comments outside double-quoted strings (aligned with `manifest.pion:toml_strip_comment`).
+fn strip_toml_comment(line : String) -> String {
+  let len = line.length()
+  let mut in_str = false
+  let mut esc = false
+  let mut i = 0
+  while i < len {
+    let c = line.code_unit_at(i)
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 35 {
+      return line.slice(0, i)
+    }
+    i = i + 1
+  }
+  line
+}
+
+///| Unquote a TOML double-quoted string (aligned with `manifest.pion:toml_unquote`).
+fn unquote_toml_string(raw : String) -> Option[String] {
+  let s = raw.trim()
+  let len = s.length()
+  if len < 2 || s.code_unit_at(0) != 34 || s.code_unit_at(len - 1) != 34 {
+    return None
+  }
+  let sb = StringBuilder()
+  let mut run = 1
+  let mut i = 1
+  while i < len - 1 {
+    let c = s.code_unit_at(i)
+    if c == 92 && i + 1 < len - 1 {
+      if i > run { sb.write_string(s.slice(run, i)) }
+      let nc = s.code_unit_at(i + 1)
+      if nc == 110 {
+        sb.write_char('\n')
+      } else if nc == 116 {
+        sb.write_char('\t')
+      } else if nc == 114 {
+        sb.write_char('\r')
+      } else if nc == 34 {
+        sb.write_char('"')
+      } else if nc == 92 {
+        sb.write_char('\\')
+      } else if nc < 0x80 {
+        sb.write_char(nc.unsafe_to_char())
+      } else {
+        i = i + 1
+        run = i
+        continue
+      }
+      i = i + 2
+      run = i
+    } else {
+      i = i + 1
+    }
+  }
+  if len - 1 > run { sb.write_string(s.slice(run, len - 1)) }
+  Some(sb.to_string())
+}
+
+///| Escape a string for a TOML double-quoted scalar.
+fn escape_toml_string(s : String) -> String {
+  let sb = StringBuilder()
+  let len = s.length()
+  let mut run = 0
+  let mut i = 0
+  while i < len {
+    let c = s.code_unit_at(i)
+    if c == 92 || c == 34 || c == 10 || c == 13 || c == 9 {
+      if i > run { sb.write_string(s.slice(run, i)) }
+      if c == 92 {
+        sb.write_string("\\\\")
+      } else if c == 34 {
+        sb.write_string("\\\"")
+      } else if c == 10 {
+        sb.write_string("\\n")
+      } else if c == 13 {
+        sb.write_string("\\r")
+      } else {
+        sb.write_string("\\t")
+      }
+      i = i + 1
+      run = i
+    } else {
+      i = i + 1
+    }
+  }
+  if len > run { sb.write_string(s.slice(run, len)) }
+  sb.to_string()
+}
+
+///| Read `[package] name = "..."` from `<dep_dir>/pion.toml` (empty if absent),
+///| matching `pionc`'s `manifest.pion` comment stripping, section trimming, and unquoting.
+fn read_dep_manifest_pkg_name(world : World, dep_dir : String) -> String {
+  let manifest_path = join_path(dep_dir, "pion.toml")
+  match fs_read(world, manifest_path) {
+    Ok(content) => {
+      let mut section = ""
+      let mut pkg_name = ""
+      for raw in content.split("\n") {
+        let clean = strip_toml_comment(raw).trim()
+        if clean.length() == 0 {
+          continue
+        }
+        if clean.starts_with("[") && clean.ends_with("]") {
+          section = clean.slice(1, clean.length() - 1).trim()
+          continue
+        }
+        if section == "package" {
+          let eq_i = clean.index_of("=")
+          if eq_i > 0 && clean.slice(0, eq_i).trim() == "name" {
+            let rhs = clean.slice(eq_i + 1, clean.length()).trim()
+            match unquote_toml_string(rhs) {
+              Some(v) => pkg_name = v
+              None => ()
+            }
+          }
+        }
+      }
+      pkg_name
+    }
+    Err(_) => ""
+  }
+}
+
+///| Format a `[dependencies]` entry for a scratch `pion.toml`, adding `package = "..."` when aliased.
+fn format_pion_dep_line(world : World, alias_name : String, dep_dir : String) -> String {
+  let actual_pkg = read_dep_manifest_pkg_name(world, dep_dir)
+  let esc_dir = escape_toml_string(dep_dir)
+  if actual_pkg.length() > 0 && actual_pkg != alias_name {
+    alias_name + " = { path = \"" + esc_dir + "\", package = \"" + escape_toml_string(actual_pkg) + "\" }\n"
+  } else {
+    alias_name + " = { path = \"" + esc_dir + "\" }\n"
+  }
+}
+
 ///| Run `pionc check --json` against a lightweight post-swap verification view of `stage_dir`
 ///| (Astra Round 6 P0-2): maps all regular files to `real_stage/<rel>` and rewrites any symlink
 ///| (relative, `../OUT/...`, or absolute `/abs/OUT/...`) whose post-swap target falls inside
@@ -431,7 +575,7 @@ fn run_pionc_check_candidate_view(
     for dep in deps {
       if !seen_dep.contains(dep.0) {
         seen_dep[dep.0] = true
-        toml_sb.write_string(dep.0 + " = { path = \"" + dep.1 + "\" }\n")
+        toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
       }
     }
   }
@@ -655,7 +799,7 @@ fn run_pionc_check_batch_status(
     for dep in deps {
       if !seen_dep.contains(dep.0) {
         seen_dep[dep.0] = true
-        toml_sb.write_string(dep.0 + " = { path = \"" + dep.1 + "\" }\n")
+        toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
         imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
       }
     }

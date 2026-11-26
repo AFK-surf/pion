@@ -624,9 +624,15 @@ pub fn f(e : E) -> Int {
 '''
 
 NEG_NESTED_AS_MBT = r'''
-pub fn f(opt : Int?) -> Int {
-  if opt is Some(x as y) && y > 0 {
-    x
+priv enum E2 {
+  A(Int)
+  B(Int)
+}
+
+pub fn f(opt : E2?) -> Int {
+  if opt is Some((A(v) | B(v)) as y) && v > 0 {
+    let _ = y
+    v
   } else {
     0
   }
