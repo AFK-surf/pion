@@ -67,6 +67,16 @@ pub(all) struct DepOpRow {
   c : Int
 }
 
+pub(all) struct PrivBoxed {
+  mut a : Int
+  priv secret : Int
+  b : Int
+}
+
+pub fn make_priv_boxed(a : Int, secret : Int, b : Int) -> PrivBoxed {
+  PrivBoxed::{ a: a, secret: secret, b: b }
+}
+
 pub(all) struct T {
   v : Int
 }
@@ -535,6 +545,27 @@ pub fn run_f3d3_7() -> String {
   j10.stringify() + "|" + Json::array(j11_arr).stringify() + "|" + j12_sh.to_string() + "|" + j13_rg + "|" + sp_user_r.to_string()
 }
 
+fn touch_str_f3d3(s : @f3d3dep.StrBoxed, v : Int) -> Int {
+  s.a = v
+  v
+}
+
+fn run_f3d3_8() -> String {
+  let s1 : @f3d3dep.Boxed = { a: 1, b: 2, c: 3 }
+  let t1 = { ..s1, c: { s1.a = 8; 6 }, b: { s1.a = 9; 5 } }
+  let s2 : @f3d3dep.Boxed = { a: 1, b: 2, c: 3 }
+  let t2 = @f3d3dep.Boxed::{ ..s2, c: { s2.a = 8; 6 }, b: { s2.a = 9; 5 } }
+  let s3 : @f3d3dep.StrBoxed = { a: 1, b: "b", c: "c" }
+  let t3 = { ..s3, c: "\{touch_str_f3d3(s3, 8)}", b: "\{touch_str_f3d3(s3, 9)}" }
+  let s4 : @f3d3dep.DepOpRow = { a: 7, b: 0, c: 0 }
+  let x = 11
+  let t4 = @f3d3dep.DepOpRow::{ ..s4, c: 1, b: x + x }
+  t1.a.to_string() + "," + t1.b.to_string() + "," + t1.c.to_string() + "|" +
+  t2.a.to_string() + "," + t2.b.to_string() + "," + t2.c.to_string() + "|" +
+  t3.a.to_string() + "," + t3.b + "," + t3.c + "|" +
+  t4.a.to_string() + "," + t4.b.to_string() + "," + t4.c.to_string()
+}
+
 pub fn run_all() -> String {
   "F3d3-1:" + run_f3d3_1() + "\n" +
   "F3d3-2:" + run_f3d3_2() + "\n" +
@@ -542,7 +573,8 @@ pub fn run_all() -> String {
   "F3d3-4:" + run_f3d3_4() + "\n" +
   "F3d3-5:" + run_f3d3_5() + "\n" +
   "F3d3-6:" + run_f3d3_6() + "\n" +
-  "F3d3-7:" + run_f3d3_7()
+  "F3d3-7:" + run_f3d3_7() + "\n" +
+  "F3d3-8:" + run_f3d3_8()
 }
 '''
 
@@ -639,32 +671,6 @@ pub fn f(opt : E2?) -> Int {
 }
 '''
 
-NEG_FOREIGN_EFFECT_SU_MBT = r'''
-pub fn f(s : @f3d3dep.Boxed) -> Int {
-  let t = { ..s, c: { s.a = 8; 6 }, b: { s.a = 9; 5 } }
-  t.a
-}
-'''
-
-NEG_FOREIGN_EXPLICIT_SU_MBT = r'''
-pub fn f(s : @f3d3dep.Boxed) -> Int {
-  let t = @f3d3dep.Boxed::{ ..s, c: { s.a = 8; 6 }, b: { s.a = 9; 5 } }
-  t.a
-}
-'''
-
-NEG_FOREIGN_INTERP_SU_MBT = r'''
-fn touch(s : @f3d3dep.StrBoxed, v : Int) -> Int {
-  s.a = v
-  v
-}
-
-pub fn f(s : @f3d3dep.StrBoxed) -> Int {
-  let t = { ..s, c: "\{touch(s, 8)}", b: "\{touch(s, 9)}" }
-  t.a
-}
-'''
-
 NEG_FOREIGN_VAL_PAT_MBT = r'''
 pub fn f(v : @f3d3dep.DepKwFields?) -> Int {
   if v is Some({ scope: a, scope_: b }) && true {
@@ -675,9 +681,9 @@ pub fn f(v : @f3d3dep.DepKwFields?) -> Int {
 }
 '''
 
-NEG_FOREIGN_OP_SU_MBT = r'''
-pub fn f(s : @f3d3dep.DepOpRow, x : Int) -> Int {
-  let t = @f3d3dep.DepOpRow::{ ..s, c: 1, b: x + x }
+NEG_FOREIGN_PRIV_SU_MBT = r'''
+pub fn f(s : @f3d3dep.PrivBoxed) -> Int {
+  let t = { ..s, b: 2 }
   t.a
 }
 '''
@@ -787,7 +793,8 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]|{"n":0}|[{"n":0},{"n":2}]|2|[{"n":0},{"n":2}]|42'
+            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]|{"n":0}|[{"n":0},{"n":2}]|2|[{"n":0},{"n":2}]|42\n'
+            'F3d3-8:9,5,6|9,5,6|9,9,8|7,22,1'
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -803,13 +810,10 @@ def main():
         assert_publish_blocked(bin_path, args.pionc, work, "pipe_as", NEG_PIPE_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_blocked(bin_path, args.pionc, work, "nested_as", NEG_NESTED_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
 
-        # Cross-package fail-closed gates (effectful/explicit/interp/op struct update & keyword-colliding foreign struct pattern)
-        for neg_name, neg_src in [
-            ("foreign_su", NEG_FOREIGN_EFFECT_SU_MBT),
-            ("foreign_explicit_su", NEG_FOREIGN_EXPLICIT_SU_MBT),
-            ("foreign_interp_su", NEG_FOREIGN_INTERP_SU_MBT),
-            ("foreign_val_pat", NEG_FOREIGN_VAL_PAT_MBT),
-            ("foreign_op_su", NEG_FOREIGN_OP_SU_MBT),
+        # Cross-package fail-closed gates (keyword-colliding foreign struct pattern & priv-field foreign struct update)
+        for neg_name, neg_src, expect_code in [
+            ("foreign_val_pat", NEG_FOREIGN_VAL_PAT_MBT, "MBT2PION_UNSUPPORTED_SYNTAX"),
+            ("foreign_priv_su", NEG_FOREIGN_PRIV_SU_MBT, "MBT2PION_DEP_ABI_ERROR"),
         ]:
             fs_sdir = os.path.join(work, f"neg_{neg_name}_src")
             fs_odir = os.path.join(work, f"neg_{neg_name}_out")
@@ -826,12 +830,12 @@ def main():
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
             )
             fsu_combined = p_fsu.stdout + "\n" + p_fsu.stderr + "\n" + (open(fs_rep).read() if os.path.exists(fs_rep) else "")
-            assert p_fsu.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in fsu_combined, (
-                f"foreign negative `{neg_name}` must fail closed:\n{fsu_combined}"
+            assert p_fsu.returncode != 0 and expect_code in fsu_combined, (
+                f"foreign negative `{neg_name}` must fail closed with `{expect_code}`:\n{fsu_combined}"
             )
             assert not os.listdir(fs_odir), f"blocked `{neg_name}` publish must leave --out empty"
 
-        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 7 positive + 13 negative cases)")
+        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 8 positive + 10 negative cases)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

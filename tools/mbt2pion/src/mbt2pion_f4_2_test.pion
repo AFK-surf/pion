@@ -1,0 +1,755 @@
+///| Wave M2-F4 Track F4-2 unit tests:
+///| 1. Stage A.5 type-arg brackets in tuple/fn/struct contexts & strict probe disposal fail-closed gates.
+///| 2. Token-span indexing under expected `Json` (no concat) & `lower_map_literal` recursive K/V propagation.
+///| 3. Irrefutable struct pattern exhaustiveness, chained indexed field enum propagation, sibling-arm enum
+///|    inference, `(pat as x)` + nested `Some(Object(_) as v)` + or-pattern `as` (fail-closed per-branch),
+///|    16-step alias fixpoint diagnostic, and closure return `Double` literal coercion.
+///| 4. `Iter::head` / `Map::keys().head()` / `MbtJson::to_string` (`Show` format) / `Repr(x)`.
+///| 5. 4 read-only `BORROWED_ARRAY_SLICE` patterns + negative mutation/escape fail-closed gates.
+///| 6. F4-3 foreign struct update ABI wiring (in-order, out-of-order, priv-field & legacy ABI rejection before all_pure).
+
+test "F4-2-1: Stage A.5 type-arg brackets in tuple/fn/struct contexts are not mis-probed as indexing" {
+  let src =
+  "pub struct Sig[T] { val : T }\n" +
+  "pub struct Holder {\n" +
+  "  on_key : Option[(Int) -> Bool]\n" +
+  "  pairs : Array[(Sig[Bool], Bool)]\n" +
+  "  grid : Array[(Double, Int)]\n" +
+  "}\n" +
+  "pub fn check_holder(h : Holder) -> Int {\n" +
+  "  h.pairs.length() + h.grid.length()\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "holder.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "type-arg brackets in tuple/fn/struct contexts must not fail")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "mbt_idx_probe"), "no mbt_idx_probe residual in struct type annotations")
+  assert_true(str_has(out, "Array[(Sig[Bool], Bool)]"), "nested generic inside tuple type preserved")
+  assert_true(str_has(out, "Option[(Int) -> Bool]"), "fn type inside Option[...] preserved")
+}
+
+test "F4-2-2: indexing under expected MbtJson never concatenates ident and MbtJson::Array; map literal propagates K/V" {
+  let src =
+  "pub fn pick_and_build(path : Array[Json], depth : Int, existing : Json) -> Json {\n" +
+  "  let m : Map[String, Json] = { \"k\": 1, \"s\": \"ok\", \"e\": existing, \"p\": path[depth] }\n" +
+  "  let d : Map[String, Double] = { \"a\": 1, \"b\": 2.5 }\n" +
+  "  let _ = d\n" +
+  "  let _ = m\n" +
+  "  path[depth]\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "json_map.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "json indexing + map literal K/V should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "pathmbt_compat"), "must never concatenate receiver ident with MbtJson::Array")
+  assert_true(str_has(out, "path[depth]"), "indexing expression preserved cleanly")
+  assert_true(str_has(out, "mbt_compat::MbtJson::Number("), "Map[String, Json] wraps Int literal value")
+  assert_true(str_has(out, "(\"e\", existing)"), "Map[String, Json] does not double-wrap existing Json var")
+  assert_true(str_has(out, "(\"a\", 1.0)"), "Map[String, Double] coerces Int literal value to Double")
+}
+
+test "F4-2-3: irrefutable struct pat, chained indexed field enum, (pat as x), 16-step alias diag & closure Double" {
+  // 1. Irrefutable `Some({ radius, .. })` must not emit redundant `if true` guard
+  let s1 =
+  "pub struct Shape { radius : Int; name : String }\n" +
+  "pub fn get_r(s : Shape?) -> Int {\n" +
+  "  match s {\n" +
+  "    Some({ radius, .. }) => radius\n" +
+  "    None => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r1 = transpile_package(
+    [SourceFile::{ rel_path: "irref.mbt", content: s1, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r1.blockers == 0, "irrefutable Some({ radius, .. }) succeeds")
+  assert_true(!str_has(r1.files[0].content, "if true"), "irrefutable struct pattern must not emit `if true` guard")
+
+  // 2. Match-arm `(pat as x)` + nested `Some(Object(_) as v)` + or-pattern `((A(v) | B(v)) as x)`
+  let s2 =
+  "pub enum Kind { A(Int); B(Int) }\n" +
+  "pub fn test_as(j : Json?, k : Kind) -> Int {\n" +
+  "  let a = match j {\n" +
+  "    Some(Object(_) as v) => { let _ = v; 1 }\n" +
+  "    _ => 0\n" +
+  "  }\n" +
+  "  let b = match k {\n" +
+  "    ((A(v) | B(v)) as x) => { let _ = x; v }\n" +
+  "  }\n" +
+  "  a + b\n" +
+  "}\n"
+  let r2 = transpile_package(
+    [SourceFile::{ rel_path: "as_pat.mbt", content: s2, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r2.blockers == 0, "nested as-pattern and outer or-pattern as succeed")
+
+  // 3. Per-branch `as` inside or-pattern MUST fail closed
+  let s2_bad =
+  "pub enum Kind { A(Int); B(Int) }\n" +
+  "pub fn bad_or_as(k : Kind) -> Int {\n" +
+  "  match k {\n" +
+  "    A(1 as y) | B(2 as y) => y\n" +
+  "    _ => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r2_bad = transpile_package(
+    [SourceFile::{ rel_path: "as_bad.mbt", content: s2_bad, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r2_bad.blockers > 0, "per-branch as inside or-pattern must fail closed")
+
+  // 4. Cyclic alias exceeds 16-step fixpoint -> MBT2PION_UNSUPPORTED_SYNTAX
+  let s3 =
+  "type A = B\n" +
+  "type B = A\n" +
+  "pub fn id(x : A) -> A { x }\n"
+  let r3 = transpile_package(
+    [SourceFile::{ rel_path: "cyc.mbt", content: s3, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_alias_diag = false
+  for d in r3.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "alias") {
+      saw_alias_diag = true
+    }
+  }
+  assert_true(saw_alias_diag, "cyclic type alias must emit MBT2PION_UNSUPPORTED_SYNTAX after 16 steps")
+
+  // 5. Closure returning IntLit under expected Double
+  let s4 =
+  "pub fn mk_fn() -> () -> Double {\n" +
+  "  fn() { 0 }\n" +
+  "}\n"
+  let r4 = transpile_package(
+    [SourceFile::{ rel_path: "clos_dbl.mbt", content: s4, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(r4.blockers == 0, "closure returning IntLit under expected Double succeeds")
+  assert_true(str_has(r4.files[0].content, "0.0"), "closure body 0 coerced to 0.0 under expected Double")
+}
+
+test "F4-2-4: Map::keys().head(), MbtJson::to_string Show helper, and Repr(x) lowering" {
+  // 1. MbtJson Show helper route
+  match moonbit_show_helper("mbt_compat::MbtJson") {
+    Some(h) => assert_true(h == "mbt_compat::mbt_json_to_string", "MbtJson show helper routed")
+    None => assert_true(false, "MbtJson must have a Show helper")
+  }
+  // 2. Map::keys().head() & Map::keys().any(...) + Repr(x) lowering
+  let src =
+  "pub fn f(m : Map[String, Int], x : Int) -> (String?, Bool, String) {\n" +
+  "  let h = m.keys().head()\n" +
+  "  let has_a = m.keys().any(fn(k) { k == \"a\" })\n" +
+  "  let s = \"\\{Repr(x)}\"\n" +
+  "  (h, has_a, s)\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "stdlib_f42.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::ordered_map_keys_iter(m).head()"), "m.keys().head() uses ordered_map_keys_iter")
+  assert_true(str_has(out, "mbt_compat::ordered_map_keys_iter(m).any("), "m.keys().any() uses ordered_map_keys_iter")
+  assert_true(str_has(out, "__mbt_debug_fmt(x)"), "Repr(x) lowers to __mbt_debug_fmt")
+}
+
+test "F4-2-5: 4 read-only BORROWED_ARRAY_SLICE patterns & negative mutation/escape fail-closed" {
+  let ok_src =
+  "fn consume_view(xs : Array[Int], v : ArrayView[Int]) -> Int {\n" +
+  "  xs.length() + v.length()\n" +
+  "}\n" +
+  "pub fn ok_slices(xs : Array[Int], ops : Array[Int], pairs : Array[(Int, Int)], k : Int, h : Int) -> Int {\n" +
+  "  let c = xs[k:].contains(h)\n" +
+  "  let a = pairs[:k].iter().any(fn(e) { e.0 == h })\n" +
+  "  let mut sum = 0\n" +
+  "  for v in xs[1:] {\n" +
+  "    sum = sum + v\n" +
+  "  }\n" +
+  "  let r = consume_view(xs, ops[0:k])\n" +
+  "  if c || a { sum + r } else { r }\n" +
+  "}\n"
+  let ok_res = transpile_package(
+    [SourceFile::{ rel_path: "ro_slices.mbt", content: ok_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let out = ok_res.files[0].content
+  assert_true(!str_has(out, "__mbt_slice_borrow"), "no __mbt_slice_borrow left in 4 read-only slice patterns")
+  assert_true(str_has(out, "\"__CONTAINS__\""), "contains slice marked __CONTAINS__")
+  assert_true(str_has(out, "\"__ITER__\""), "iter.any with scalar capture marked __ITER__")
+  assert_true(str_has(out, "\"__FOR_RO__\""), "for-in read-only slice marked __FOR_RO__")
+  assert_true(str_has(out, "\"__RO_VIEW__\""), "unmutated ArrayView call arg marked __RO_VIEW__")
+
+  // Negative: mutating `ops` in enclosing fn MUST keep `__mbt_slice_borrow`
+  let bad_src =
+  "fn consume_view(v : ArrayView[Int]) -> Int { v.length() }\n" +
+  "pub fn mut_slice(ops : Array[Int], k : Int) -> Int {\n" +
+  "  ops.push(9)\n" +
+  "  consume_view(ops[0:k])\n" +
+  "}\n"
+  let bad_res = transpile_package(
+    [SourceFile::{ rel_path: "mut_slice.mbt", content: bad_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(str_has(bad_res.files[0].content, "__mbt_slice_borrow"), "mutated array slice must stay borrowed")
+}
+
+test "F4-2-6: foreign struct update ABI wiring (expandable, priv-field & legacy ABI rejected before all_pure)" {
+  // Build dep ABI with: Expandable `S { mut a : Int; b : Int }`, priv-field `PrivS { x : Int; priv y : Int }`
+  let dep_src = SourceFile::{
+    rel_path: "defs.mbt",
+    content:
+    "pub(all) struct S {\n  mut a : Int\n  b : Int\n}\n" +
+    "pub(all) struct PrivS {\n  pub x : Int\n  priv y : Int\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep transpiles")
+
+  // 1. Effectful in-order update on foreign `S` expands cleanly using F4-3 schema (snapshots `s.a` before `b`!)
+  let ok_cons = SourceFile::{
+    rel_path: "cons.mbt",
+    content:
+    "pub fn upd_s(s : @dep.S) -> @dep.S {\n" +
+    "  { ..s, b: { s.a = 9; 7 } }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package_with_abis(
+    [ok_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("dep", dep_res.abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(ok_res.blockers == 0, "foreign expandable struct update succeeds")
+  let ok_out = ok_res.files[0].content
+  assert_true(str_has(ok_out, "let __mbt_su_b"), "effectful foreign struct update snapshots fields in declaration order")
+
+  // 2. Pure update on `PrivS` MUST fail closed with MBT2PION_DEP_ABI_ERROR BEFORE `all_pure`!
+  let priv_cons = SourceFile::{
+    rel_path: "priv_cons.mbt",
+    content:
+    "pub fn upd_priv(p : @dep.PrivS) -> @dep.PrivS {\n" +
+    "  { ..p, x: 1 }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let priv_res = transpile_package_with_abis(
+    [priv_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("dep", dep_res.abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_priv_abi_err = false
+  for d in priv_res.diagnostics {
+    if d.code == "MBT2PION_DEP_ABI_ERROR" {
+      saw_priv_abi_err = true
+    }
+  }
+  assert_true(saw_priv_abi_err && priv_res.blockers > 0, "priv-field foreign struct update must fail closed before all_pure")
+
+  // 3. Pure update on legacy ABI (`structs: None`) MUST fail closed with MBT2PION_DEP_ABI_ERROR BEFORE `all_pure`!
+  let leg_abi = empty_package_abi("leg")
+  let leg_cons = SourceFile::{
+    rel_path: "leg_cons.mbt",
+    content:
+    "pub fn upd_leg(p : @leg.Point) -> @leg.Point {\n" +
+    "  { ..p, x: 1 }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let leg_res = transpile_package_with_abis(
+    [leg_cons],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("leg", leg_abi)],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let mut saw_leg_abi_err = false
+  for d in leg_res.diagnostics {
+    if d.code == "MBT2PION_DEP_ABI_ERROR" {
+      saw_leg_abi_err = true
+    }
+  }
+  assert_true(saw_leg_abi_err && leg_res.blockers > 0, "legacy ABI foreign struct update must fail closed before all_pure")
+}
+
+test "F4-2-7: audit soundness regressions (refutable last-arm as, local Number ctor, strict RO slices, labeled/array as, keys().next(), arrow Double, cross-pkg alias)" {
+  // 1. P1-1: last-arm refutable `(Some(2) as y) => 20` MUST keep `if` guard (never drop guard on refutable inner pattern)
+  let p1_src =
+  "pub fn check_last_as(opt : Int?) -> Int {\n" +
+  "  match opt {\n" +
+  "    Some(1) => 10\n" +
+  "    (Some(2) as y) => 20\n" +
+  "  }\n" +
+  "}\n"
+  let p1_res = transpile_package(
+    [SourceFile::{ rel_path: "p1.mbt", content: p1_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(p1_res.blockers == 0, "p1 transpiles")
+  assert_true(str_has(p1_res.files[0].content, "y if (match y { Some(2) => true, _ => false })"), "refutable last-arm `as` must keep `if` guard")
+
+  // 2. P1-2: local `enum MyVal { Number(Int) }` + `Some(Number(_) as x)` must NOT hijack to `mbt_compat::MbtJson::Number`
+  let p2_src =
+  "priv enum MyVal { Number(Int); Other }\n" +
+  "pub fn check_local_num(v : MyVal?) -> Int {\n" +
+  "  match v {\n" +
+  "    Some(Number(_) as x) => match x { Number(n) => n; Other => 0 }\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let p2_res = transpile_package(
+    [SourceFile::{ rel_path: "p2.mbt", content: p2_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(p2_res.blockers == 0, "p2 transpiles")
+  assert_true(!str_has(p2_res.files[0].content, "mbt_compat::MbtJson::Number"), "local Number ctor must not be hijacked to MbtJson::Number")
+
+  // 3. P1-3: aliased array, same-call other-arg mutation, and callee view-write MUST all stay borrowed
+  let p3_cases = [
+    "fn use_v(v : ArrayView[Int]) -> Int { v.length() }\npub fn f(ops : Array[Int]) -> Int { let alias = ops; alias[0] = 99; use_v(ops[0:2]) }\n",
+    "fn mutate_and_read(a : Array[Int], v : ArrayView[Int]) -> Int { a[0] = 99; v.length() }\npub fn f(ops : Array[Int]) -> Int { mutate_and_read(ops, ops[0:2]) }\n",
+    "fn write_view(v : ArrayView[Int]) -> Int { v[0] = 99; v.length() }\npub fn f(ops : Array[Int]) -> Int { write_view(ops[0:2]) }\n",
+    "pub fn f(xs : Array[Int]) -> Int { let ys = xs; let mut s = 0; for v in xs[1:] { ys[0] = 99; s = s + v }; s }\n",
+  ]
+  for tc in p3_cases {
+    let r = transpile_package(
+      [SourceFile::{ rel_path: "p3.mbt", content: tc, is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      default_options(),
+      [],
+      false,
+      noop_check,
+    )
+    assert_true(str_has(r.files[0].content, "__mbt_slice_borrow"), "unsafe slice pattern must stay borrowed")
+  }
+
+  // 4. Unsupported-position `as` (labeled ctor arg and array pattern) MUST fail closed with MBT2PION_UNSUPPORTED_SYNTAX
+  let bad_as_cases = [
+    "priv enum E { A(Int) }\npriv enum W { Ctor(x~ : E) }\npub fn f(w : W) -> Int { match w { Ctor(x=A(n) as y) => n; _ => 0 } }\n",
+    "priv enum E { A(Int) }\npub fn f(xs : Array[E]) -> Int { match xs { [A(n) as x, ..] => n; _ => 0 } }\n",
+  ]
+  for tc in bad_as_cases {
+    let r = transpile_package(
+      [SourceFile::{ rel_path: "bad_as.mbt", content: tc, is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      default_options(),
+      [],
+      false,
+      noop_check,
+    )
+    let mut saw_unsup = false
+    for d in r.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" {
+        saw_unsup = true
+      }
+    }
+    assert_true(saw_unsup && r.blockers > 0, "unsupported `as` position must fail closed")
+  }
+
+  // 5. Map::keys().next() + Arrow closure Double coercion + cross-pkg same-name alias
+  let misc_src =
+  "fn call_d(f : () -> Double) -> Double { f() }\n" +
+  "pub fn check_misc(m : Map[String, Int]) -> (String, Double) {\n" +
+  "  let k = m.keys().next().unwrap_or(\"\")\n" +
+  "  let d = call_d(() => 0)\n" +
+  "  (k, d)\n" +
+  "}\n"
+  let misc_res = transpile_package(
+    [SourceFile::{ rel_path: "misc.mbt", content: misc_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(misc_res.blockers == 0, "misc transpiles")
+  assert_true(str_has(misc_res.files[0].content, "ordered_map_keys_iter(m).head()"), "m.keys().next() rewrites to .head()")
+  assert_true(str_has(misc_res.files[0].content, "0.0"), "arrow closure () => 0 coerces to 0.0 under Double")
+
+  let alias_src = "pub type Color = @paint.Color\n"
+  let alias_res = transpile_package(
+    [SourceFile::{ rel_path: "alias.mbt", content: alias_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(alias_res.blockers == 0, "cross-pkg same-name alias `type Color = @paint.Color` must not false-positive as cycle")
+}
+
+test "F4-2-8: R3 regressions (tuple-wrapped array as-pattern, sub-slice & pipe rejection, whole-body transitive non-fresh mutation fail-closed)" {
+  // 1. Tuple-wrapped array `as` pattern `([_, _] as fs, _)` must fall through to array-pattern lowering (no raw `[_, _]` in match)
+  let arr_as_src =
+  "pub fn check_tup_arr_as(xs : Array[Int], flag : Bool) -> Int {\n" +
+  "  match (xs, flag) {\n" +
+  "    ([_, _] as fs, true) => fs[1]\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let arr_as_res = transpile_package(
+    [SourceFile::{ rel_path: "arr_as.mbt", content: arr_as_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(arr_as_res.blockers == 0, "tuple-wrapped array as-pattern transpiles")
+  assert_true(!str_has(arr_as_res.files[0].content, "{ [_, _]"), "must not emit invalid Pion array pattern inside match")
+
+  // 2. All 8 sub-slice & transitive side-mutation cases MUST stay borrowed (`__mbt_slice_borrow`)
+  let neg_cases = [
+    // Sub-slice inside callee
+    "fn sneaky_write(v : ArrayView[Int]) -> Int { let sub = v[0:2]; sub[0] = 99; v[0] }\npub fn f(ops : Array[Int]) -> Int { sneaky_write(ops[0:2]) }\n",
+    "fn mut_v(v : ArrayView[Int]) -> Unit { v[0] = 99 }\nfn pass_sub(v : ArrayView[Int]) -> Int { mut_v(v[0:2]); v[0] }\npub fn f(ops : Array[Int]) -> Int { pass_sub(ops[0:2]) }\n",
+    // Extra sub-slice in caller
+    "fn use_v(v : ArrayView[Int]) -> Int { v[0] }\npub fn f(ops : Array[Int]) -> Int { let sub = ops[0:2]; sub[0] = 99; use_v(ops[0:2]) }\n",
+    // Helper mutating another parameter
+    "fn helper_mut(a : Array[Int]) -> Unit { a[0] = 99 }\nfn read_after_helper(a : Array[Int], v : ArrayView[Int]) -> Int { helper_mut(a); v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { read_after_helper(a, ops[0:2]) }\n",
+    // Field mutation `b.items[0] = 99`
+    "priv struct Box { items : Array[Int] }\nfn read_after_box(b : Box, v : ArrayView[Int]) -> Int { b.items[0] = 99; v[0] }\npub fn f(b : Box, ops : Array[Int]) -> Int { read_after_box(b, ops[0:2]) }\n",
+    // Alias inside callee
+    "fn alias_mut(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = a; alias_a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { alias_mut(a, ops[0:2]) }\n",
+    // Global array of same element type mutated inside callee
+    "let g_arr : Array[Int] = [1, 2, 3]\nfn global_mut(v : ArrayView[Int]) -> Int { g_arr[0] = 99; v[0] }\npub fn f(ops : Array[Int]) -> Int { global_mut(ops[0:2]) }\n",
+    // External callback parameter called inside callee
+    "fn cb_mut(cb : () -> Unit, v : ArrayView[Int]) -> Int { cb(); v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { cb_mut(cb, ops[0:2]) }\n",
+    // Block-expression alias `{ a }` must not be misclassified as a fresh Map literal
+    "fn blk_alias_mut(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = { a }; alias_a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { blk_alias_mut(a, ops[0:2]) }\n",
+    // Fresh local shadowed by non-fresh `let` rebinding must clear freshness
+    "fn shadow_fresh_mut(a : Array[Int], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let out = a; out[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { shadow_fresh_mut(a, ops[0:2]) }\n",
+    // Same callee invoked first with inline closure then with external callback must not skip via visited cache
+    "fn run_cb(cb : () -> Unit) -> Unit { cb() }\nfn two_calls(ext : () -> Unit, v : ArrayView[Int]) -> Int { run_cb(fn() { () }); run_cb(ext); v[0] }\npub fn f(ext : () -> Unit, ops : Array[Int]) -> Int { two_calls(ext, ops[0:2]) }\n",
+    // Nested map-returning argument inside array-returning call must not mark result as map_local
+    "fn get_map() -> Map[String, Int] { Map([]) }\nfn take_arr(m : Map[String, Int], a : Array[Int]) -> Array[Int] { let _ = m; a }\nfn nested_map_arg(a : Array[Int], v : ArrayView[Int]) -> Int { let x = take_arr(get_map(), a); x[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { nested_map_arg(a, ops[0:2]) }\n",
+    // Array literal immediately indexed `[a][0]` must not be treated as fresh
+    "fn arr_lit_idx_mut(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = [a][0]; alias_a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { arr_lit_idx_mut(a, ops[0:2]) }\n",
+    // Struct literal `{ a: a }` with mutating method must not be treated as fresh Map
+    "priv struct Hook { a : Array[Int] }\nfn Hook::wipe(self : Hook) -> Unit { self.a[0] = 99 }\nfn struct_lit_mut(a : Array[Int], v : ArrayView[Int]) -> Int { let h : Hook = { a: a }; h.wipe(); v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { struct_lit_mut(a, ops[0:2]) }\n",
+    // Trailing side-effecting argument after slice arg
+    "fn read_v(v : ArrayView[Int], _u : Unit) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { read_v(xs[0:3], { ys[1] = 9 }) }\n",
+    // Trailing parenthesized indirect call `(cb)(ys)` after slice arg
+    "fn read_v2(v : ArrayView[Int], _u : Unit) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int], cb : (Array[Int]) -> Unit) -> Int { read_v2(xs[0:3], (cb)(ys)) }\n",
+    // Trailing string interpolation argument after slice arg
+    "fn mut_ys(ys : Array[Int]) -> Int { ys[1] = 9; 0 }\nfn read_vs(v : ArrayView[Int], _s : String) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { read_vs(xs[0:3], \"\\{mut_ys(ys)}\") }\n",
+    // Custom impl Eq mutated via ==
+    "priv struct EqHook { xs : Array[Int] }\nimpl Eq for EqHook with equal(self, other) { let _ = other; self.xs[1] = 9; true }\nfn cmp_v(a : EqHook, b : EqHook, v : ArrayView[Int]) -> Int { if a == b { v[1] } else { 0 } }\npub fn f(a : EqHook, b : EqHook, ops : Array[Int]) -> Int { cmp_v(a, b, ops[0:2]) }\n",
+    // Shadowed to_int method
+    "priv struct IntHook { xs : Array[Int] }\nfn IntHook::to_int(self : IntHook) -> Int { self.xs[1] = 9; 0 }\nfn call_ti(h : IntHook, v : ArrayView[Int]) -> Int { let _ = h.to_int(); v[1] }\npub fn f(h : IntHook, ops : Array[Int]) -> Int { call_ti(h, ops[0:2]) }\n",
+    // Block-scoped fresh local must not leak outside block
+    "fn blk_leak(a : Array[Int], v : ArrayView[Int]) -> Int { { let a : Array[Int] = []; a.push(1) }; a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { blk_leak(a, ops[0:2]) }\n",
+    // Forward shadowing (use before fresh let)
+    "fn fwd_shadow(a : Array[Int], v : ArrayView[Int]) -> Int { let out = a; out[0] = 99; let out : Array[Int] = []; let _ = out; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { fwd_shadow(a, ops[0:2]) }\n",
+    // Callback invoked before local closure binding
+    "fn cb_before_let(cb : () -> Unit, v : ArrayView[Int]) -> Int { cb(); let cb = fn() { () }; let _ = cb; v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { cb_before_let(cb, ops[0:2]) }\n",
+    // Closure param shadowing outer fresh local
+    "fn closure_param_shadow(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let _ = out; let _ = arr.map(fn(out) { out[0] = 99; 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], ops : Array[Int]) -> Int { closure_param_shadow(arr, ops[0:2]) }\n",
+    // Single-param arrow closure shadowing outer fresh local
+    "fn arrow_param_shadow(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let _ = out; let _ = arr.map(out => { out[0] = 99; 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], ops : Array[Int]) -> Int { arrow_param_shadow(arr, ops[0:2]) }\n",
+    // Newline-chained `.unsafe_pop()` on array literal
+    "fn nl_dot_pop(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = [a]\n  .unsafe_pop()\n  alias_a[0] = 99\n  v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { nl_dot_pop(a, ops[0:2]) }\n",
+    // Indexed map call `get_arr_map()["k"]` must not be map_local
+    "fn get_arr_map(a : Array[Int]) -> Map[String, Array[Int]] { Map([(\"k\", a)]) }\nfn idx_map_call(a : Array[Int], v : ArrayView[Int]) -> Int { let arr = get_arr_map(a)[\"k\"]; arr[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { idx_map_call(a, ops[0:2]) }\n",
+    // `if` returning non-None else branch must not be map_local
+    "fn get_m2() -> Map[String, Int] { Map([]) }\nfn bad_if_map(cond : Bool, a : Array[Int], v : ArrayView[Int]) -> Int { let x = if cond { Some(get_m2()); a } else { a }; x[0] = 99; v[0] }\npub fn f(cond : Bool, a : Array[Int], ops : Array[Int]) -> Int { bad_if_map(cond, a, ops[0:2]) }\n",
+    // RO_VIEW param captured by closure literal and escaping call
+    "fn mk_esc(p : ArrayView[Int]) -> () -> Int { fn() { p[0] } }\npub fn f(xs : Array[Int]) -> () -> Int { mk_esc(xs[0:2]) }\n",
+    // RO_VIEW param captured by named local fn and escaping
+    "fn mk_named_esc(p : ArrayView[Int]) -> () -> Int { fn inner() -> Int { p[0] }; inner }\npub fn f(xs : Array[Int]) -> () -> Int { mk_named_esc(xs[0:2]) }\n",
+    // RO_VIEW param captured by arrow closure inside match arm
+    "fn mk_match_arrow(flag : Bool, p : ArrayView[Int]) -> (Int) -> Int { match flag { true => _ => p[0]; false => _ => 0 } }\npub fn f(flag : Bool, xs : Array[Int]) -> (Int) -> Int { mk_match_arrow(flag, xs[0:2]) }\n",
+    // Outer non-fresh `let a = ys` shadowed by inner fresh `let a = [0]` then mutated outside
+    "fn patch_sh(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = ys; if p.length() > 0 { let a = [0]; a[0] = 1 }; a[0] = 99; p[0] }\npub fn f(xs : Array[Int], zs : Array[Int]) -> Int { patch_sh(xs[0:2], zs) }\n",
+    // `let` RHS mutating outer same-name array before binding takes effect
+    "fn rhs_before_bind(a : Array[Int], v : ArrayView[Int]) -> Int { let a : Array[Int] = [{ a[0] = 99; 1 }]; let _ = a; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { rhs_before_bind(a, ops[0:2]) }\n",
+    // `match Some(m)` on Map? must not leak map_scope into sibling None arm shadowing outer `m`
+    "fn match_arm_leak(m : Array[Int], om : Map[String, Int]?, v : ArrayView[Int]) -> Int { match om { Some(m) => { m[\"k\"] = 1 }; None => { m[0] = 99 } }; v[0] }\npub fn f(m : Array[Int], om : Map[String, Int]?, ops : Array[Int]) -> Int { match_arm_leak(m, om, ops[0:2]) }\n",
+    // RO_VIEW param captured by pattern-matching closure `fn { ... }`
+    "fn mk_pat_closure(p : ArrayView[Int]) -> (Int) -> Int { fn { 0 => p[0]; _ => 0 } }\npub fn f(xs : Array[Int]) -> (Int) -> Int { mk_pat_closure(xs[0:2]) }\n",
+    // RO_VIEW param captured by arrow closure nested inside call inside match arm
+    "fn mk_match_call_arrow(x : Int?, arr : Array[Int], p : ArrayView[Int]) -> Array[Int] { match x { Some(_) => arr.map(y => { let _ = y; p[0] }); None => [] } }\npub fn f(x : Int?, arr : Array[Int], xs : Array[Int]) -> Array[Int] { mk_match_call_arrow(x, arr, xs[0:2]) }\n",
+    // Tuple destructuring `let (a, _) = (ys, 1)` shadowing fresh local `a`
+    "fn tuple_shadow(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let (a, _) = (ys, 1); a[0] = 99; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { tuple_shadow(xs[0:2], ys) }\n",
+    // `if ... is Some(a)` pattern binding shadowing fresh local `a`
+    "fn if_is_shadow(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let _ = a; if Some(ys) is Some(a) { a[0] = 99 }; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { if_is_shadow(xs[0:2], ys) }\n",
+    // `guard ... is Some(a)` pattern binding shadowing fresh local `a`
+    "fn guard_is_shadow(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let _ = a; guard Some(ys) is Some(a) else { return 0 }; a[0] = 99; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { guard_is_shadow(xs[0:2], ys) }\n",
+    // Multi-param arrow closure `(out, _i) => ...` shadowing fresh local `out`
+    "fn multi_arrow_shadow(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let _ = out; let _ = arr.mapi((_i, out) => { out[0] = 99; 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], ops : Array[Int]) -> Int { multi_arrow_shadow(arr, ops[0:2]) }\n",
+    // Pattern-matching closure `fn { out => ... }` shadowing fresh local `out`
+    "fn fn_pat_shadow(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let _ = out; let _ = arr.map(fn { out => { out[0] = 99; 0 } }); v[0] }\npub fn f(arr : Array[Array[Int]], ops : Array[Int]) -> Int { fn_pat_shadow(arr, ops[0:2]) }\n",
+    // Local `impl Add` operator mutation inside callee
+    "priv struct AddHook { xs : Array[Int] }\nimpl Add for AddHook with add(self, other) { let _ = other; self.xs[0] = 99; self }\nfn use_add(h : AddHook, v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\npub fn f(h : AddHook, ops : Array[Int]) -> Int { use_add(h, ops[0:2]) }\n",
+    // Parameter `mark : () -> Unit` shadowing pure top-level `fn mark()`
+    "fn mark() -> Unit { () }\nfn shadow_top_fn(mark : () -> Unit, v : ArrayView[Int]) -> Int { mark(); v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { shadow_top_fn(cb, ops[0:2]) }\n",
+    // Parameter `ys : Array[Int]` shadowing disjoint global `let ys : Array[String]`
+    "let ys : Array[String] = []\nfn shadow_global_arr(ys : Array[Int], v : ArrayView[Int]) -> Int { ys[0] = 99; v[0] }\npub fn f(xs : Array[Int]) -> Int { shadow_global_arr(xs, xs[0:2]) }\n",
+    // String interpolation side effect inside callee body (distinct args so not masked by same-arg-ref)
+    "fn mark_mut(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn interp_in_callee(v : ArrayView[Int], ys : Array[Int]) -> Int { let _ = \"\\{mark_mut(ys)}\"; v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { interp_in_callee(xs[0:2], ys) }\n",
+    // Default parameter expression `k? : Int = mark_mut(ys)` on callee (distinct args)
+    "fn mark_def(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn def_arg_callee(v : ArrayView[Int], ys : Array[Int], k? : Int = mark_def(ys)) -> Int { let _ = k; v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { def_arg_callee(xs[0:2], ys) }\n",
+    // Call-site parameter `read` shadowing top-level `fn read`
+    "fn read(v : ArrayView[Int]) -> Int { v[0] }\npub fn f(read : (ArrayView[Int]) -> Int, xs : Array[Int]) -> Int { read(xs[0:2]) }\n",
+    // Callee parameter named `ignore` shadowing built-in `ignore`
+    "fn use_ign(ignore : (Array[Int]) -> Unit, ys : Array[Int], v : ArrayView[Int]) -> Int { ignore(ys); v[0] }\npub fn f(cb : (Array[Int]) -> Unit, xs : Array[Int], ys : Array[Int]) -> Int { use_ign(cb, ys, xs[0:2]) }\n",
+    // Inline closure parameter rebound via `let cb = other`
+    "fn run_cb(cb : () -> Unit, other : () -> Unit, v : ArrayView[Int]) -> Int { let cb = other; cb(); v[0] }\npub fn f(other : () -> Unit, xs : Array[Int]) -> Int { run_cb(fn() { () }, other, xs[0:2]) }\n",
+    // Local closure `let make = fn() { ys }` shadowing top-level `fn make() -> Map[String, Int]`
+    "fn make() -> Map[String, Int] { Map([]) }\nfn shadow_map_fn(ys : Array[Int], v : ArrayView[Int]) -> Int { let make = fn() { ys }; let x = make(); x[0] = 99; v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { shadow_map_fn(ys, xs[0:2]) }\n",
+    // Higher-order method `local.each(cb)` on fresh array invoking external callback
+    "fn fresh_each(cb : (Int) -> Unit, v : ArrayView[Int]) -> Int { let local = [1]; local.each(cb); v[0] }\npub fn f(cb : (Int) -> Unit, xs : Array[Int]) -> Int { fresh_each(cb, xs[0:2]) }\n",
+    // Arrow closure parameter `ys => ...` shadowing disjoint global `let ys : Array[String]`
+    "let ys : Array[String] = []\nfn arrow_sh_global(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let _ = arr.map(ys => { ys.swap(0, 1); 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], xs : Array[Int]) -> Int { arrow_sh_global(arr, xs[0:2]) }\n",
+    // Module-level `let h : Hook` with `impl Add` used inside callee
+    "priv struct Hook { xs : Array[Int] }\nimpl Add for Hook with add(self, other) { let _ = other; self.xs[0] = 99; self }\nlet h : Hook = { xs: [1] }\nfn use_g(v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n",
+    // Multiline interpolated string `$|\{mark(ys)}` inside callee body
+    "fn mark_ml(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn ml_interp(v : ArrayView[Int], ys : Array[Int]) -> Int {\n  let _ =\n    $|\\{mark_ml(ys)}\n  v[0]\n}\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { ml_interp(xs[0:2], ys) }\n",
+    // Pipe `0 |> ignore` where `ignore` is shadowed by a parameter
+    "fn pipe_ign(ignore : (Int) -> Unit, v : ArrayView[Int]) -> Int { 0 |> ignore; v[0] }\npub fn f(cb : (Int) -> Unit, xs : Array[Int]) -> Int { pipe_ign(cb, xs[0:2]) }\n",
+    // Package-level `fn ignore(a : Array[Int])` shadowing built-in `ignore`
+    "fn ignore(a : Array[Int]) -> Unit { a.swap(0, 1) }\nfn use_pkg_ign(ys : Array[Int], v : ArrayView[Int]) -> Int { ignore(ys); v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { use_pkg_ign(ys, xs[0:2]) }\n",
+  ]
+  let mut ni = 0
+  for tc in neg_cases {
+    let r = transpile_package(
+      [SourceFile::{ rel_path: "r3_neg.mbt", content: tc, is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      default_options(),
+      [],
+      false,
+      noop_check,
+    )
+    let mut found_borrow = false
+    for f in r.files {
+      if str_has(f.content, "__mbt_slice_borrow") {
+        found_borrow = true
+      }
+    }
+    assert_true(found_borrow, "R3/R4/R5 negative slice case #" + ni.to_string() + " must stay borrowed")
+    ni = ni + 1
+  }
+}
+
+test "F4-2-9: Stage A.5 publish entry rejects duplicate probe IDs and untagged fallback" {
+  let gf = GeneratedFile::{
+    rel_path: "probe_dup.pion",
+    source_file: "probe_dup.mbt",
+    content: "pub fn f(x : String) -> Int {\n  x.length()\n}\n",
+    anchors: [],
+  }
+  // 1. Fault injection: duplicate diagnostics for the SAME unique probe_id MUST fail closed (MBT2PION_UNDISPOSED_PROBE_SITE)
+  let diags_dup : Array[Diag] = []
+  let ledger_dup : Array[DriftEntry] = []
+  let disps_dup : Array[ProbeDisposition] = []
+  let check_dup = fn(files : Array[(String, String)]) -> String {
+    let (_, src) = files[0]
+    let needle = "mbt_len_probe__"
+    let mut pos = -1
+    let mut si = 0
+    while si + needle.length() <= src.length() {
+      if src.slice(si, si + needle.length()) == needle {
+        pos = si
+        break
+      }
+      si = si + 1
+    }
+    let pname = if pos >= 0 {
+      let mut e = pos
+      while e < src.length() {
+        let ch = src.code_unit_at(e)
+        if (ch >= 48 && ch <= 57) || (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95 {
+          e = e + 1
+        } else {
+          break
+        }
+      }
+      src.slice(pos, e)
+    } else {
+      ""
+    }
+    if pname.length() == 0 {
+      return "{\"ok\":true,\"diagnostics\":[]}"
+    }
+    let d1 = "{\"file\":\"probe_dup.pion\",\"line\":2,\"col\":5,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `" + pname + "` on type `String`\"}"
+    let d2 = "{\"file\":\"probe_dup.pion\",\"line\":2,\"col\":9,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `" + pname + "` on type `String`\"}"
+    "{\"ok\":false,\"diagnostics\":[" + d1 + "," + d2 + "]}"
+  }
+  let (_, _, _, res_dup) = run_stage_a5_with_val_sites_and_origins(
+    [gf],
+    default_recipes(),
+    empty_api_map(),
+    Map(),
+    [],
+    Map(),
+    check_dup,
+    diags_dup,
+    ledger_dup,
+    disps_dup,
+    4,
+  )
+  assert_true(res_dup == 0, "duplicate probe_id must resolve 0 sites")
+  let mut has_undisposed_dup = false
+  for d in diags_dup {
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" { has_undisposed_dup = true }
+  }
+  assert_true(has_undisposed_dup, "duplicate probe_id must emit MBT2PION_UNDISPOSED_PROBE_SITE")
+
+  // 2. Fault injection: untagged diagnostic (probe_id stripped + col shifted by 15) MUST fail closed in publish entry
+  let diags_untag : Array[Diag] = []
+  let ledger_untag : Array[DriftEntry] = []
+  let disps_untag : Array[ProbeDisposition] = []
+  let check_untag = fn(files : Array[(String, String)]) -> String {
+    let _ = files
+    "{\"ok\":false,\"diagnostics\":[{\"file\":\"probe_dup.pion\",\"line\":2,\"col\":20,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `String`\"}]}"
+  }
+  let (_, _, _, res_untag) = run_stage_a5_with_val_sites_and_origins(
+    [gf],
+    default_recipes(),
+    empty_api_map(),
+    Map(),
+    [],
+    Map(),
+    check_untag,
+    diags_untag,
+    ledger_untag,
+    disps_untag,
+    4,
+  )
+  assert_true(res_untag == 0, "untagged diagnostic must resolve 0 sites in publish entry")
+  let mut has_undisposed_untag = false
+  for d in diags_untag {
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" { has_undisposed_untag = true }
+  }
+  assert_true(has_undisposed_untag, "untagged diagnostic must emit MBT2PION_UNDISPOSED_PROBE_SITE in publish entry")
+}
