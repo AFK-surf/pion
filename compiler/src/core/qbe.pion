@@ -208,6 +208,10 @@ pub struct QbeGen {
   fn_wrappers : Array[QbeFnWrapper]
   fn_wrapper_seen : Map[String, Bool]
   dyn_vtable_seen : Map[String, Bool]
+  i32_literal_tables : Array[String]
+  mut i32_literal_next_id : Int
+  mut entry_symbol : String
+  mut extern_c_syms : Option[Map[String, Bool]]
   dyn_vtables : Array[String]
   extra_fns : Array[String]
   mono_seen : Map[String, Bool]
@@ -22324,6 +22328,10 @@ fn qbe_new_for_target_name(
     fn_wrappers: [],
     fn_wrapper_seen: Map([]),
     dyn_vtable_seen: Map([]),
+    i32_literal_tables: [],
+    i32_literal_next_id: 0,
+    entry_symbol: "",
+    extern_c_syms: None,
     dyn_vtables: [],
     extra_fns: [],
     mono_seen: Map([]),
@@ -25109,6 +25117,49 @@ fn qbe_emit_flat_eval_struct_lit(
   }
   qbe_release_guards(g, guards)
   slot_vals
+}
+
+///| Direct initialization is safe for complete, checked records made only of
+/// immortal string literals. No computation or escape observes a row box.
+fn qbe_flat_string_rows(g : QbeGen, elem_ty : Ty, elems : Array[Expr]) -> Option[StructInfo] {
+  if elems.length() < 2 {
+    return None
+  }
+  let si = match qbe_flat_pod_struct_info(g, elem_ty) {
+    Some(si) => si
+    None => return None
+  }
+  if si.decl.type_params.length() != 0 {
+    return None
+  }
+  for ty in si.field_tys {
+    match ty {
+      TString => ()
+      _ => return None
+    }
+  }
+  for row in elems {
+    match row {
+      EStructLit(name, None, fields, _) => {
+        if name != si.decl.name || fields.length() != si.field_names.length() {
+          return None
+        }
+        let mut j = 0
+        while j < fields.length() {
+          if fields[j].name != si.field_names[j] {
+            return None
+          }
+          match fields[j].value {
+            EString(_, _) => ()
+            _ => return None
+          }
+          j = j + 1
+        }
+      }
+      _ => return None
+    }
+  }
+  Some(si)
 }
 
 ///|
@@ -42646,6 +42697,92 @@ fn qbe_emit_binary_chain(
 }
 
 ///|
+/// Raw C symbols that user code links under (`extern "C"` declarations and
+/// exports of this package and of every imported package, and the
+/// `--entry-symbol` entry point). Generated private data must not take one of
+/// these names.
+fn qbe_extern_c_syms(g : QbeGen) -> Map[String, Bool] {
+  match g.extern_c_syms {
+    Some(m) => return m
+    None => ()
+  }
+  let m : Map[String, Bool] = Map([])
+  let tcs : Array[TypeChecker] = [g.tc]
+  let pkgs = g.tc.all_imported_pkgs.keys()
+  for k in pkgs {
+    match g.tc.all_imported_pkgs.get(k) {
+      Some(ip) => tcs.push(ip.tc)
+      None => ()
+    }
+  }
+  for tc in tcs {
+    let names = tc.extern_fns.keys()
+    for name in names {
+      match tc.extern_fns.get(name) {
+        Some(ei) => m.set(ei.decl.c_symbol, true)
+        None => ()
+      }
+    }
+    for csym in tc.exported_c_sym_names {
+      m.set(csym, true)
+    }
+  }
+  // `--entry-symbol` renames the exported entry point.
+  if g.entry_symbol.length() > 0 {
+    m.set(g.entry_symbol, true)
+  }
+  g.extern_c_syms = Some(m)
+  m
+}
+
+///|
+/// Next free `pion_<pkg>i32_literal_<N>` name (without `$`): neither it nor
+/// its `_words` table may collide with a user C symbol.
+fn qbe_i32_literal_sym(g : QbeGen) -> String {
+  let taken = qbe_extern_c_syms(g)
+  let prefix = "pion_" + g.pkg_prefix + "i32_literal_"
+  let mut id = g.i32_literal_next_id
+  while taken.contains(prefix + id.to_string()) || taken.contains(prefix + id.to_string() + "_words") {
+    id = id + 1
+  }
+  g.i32_literal_next_id = id + 1
+  prefix + id.to_string()
+}
+
+///|
+// Materialize a fresh array via the runtime's existing stride-4 copy path.
+// The unnamed backing storage and its descriptor are never exposed to user code.
+fn qbe_i32_literal_table(g : QbeGen, elems : Array[Expr], ty : Ty) -> Option[QbeVal] {
+  let words = StringBuilder()
+  let mut i = 0
+  while i < elems.length() {
+    let word = match elems[i] {
+      EInt(raw, _) => qbe_parse_int64_lit(raw).to_int()
+      EUnary("-", EInt(raw, _), _) => (0L - qbe_parse_int64_lit(raw)).to_int()
+      _ => return None
+    }
+    if i > 0 {
+      words.write_string(", ")
+    }
+    words.write_string("w ")
+    words.write_string(word.to_string())
+    i = i + 1
+  }
+  let sym = "$" + qbe_i32_literal_sym(g)
+  let n = elems.length().to_string()
+  let data = StringBuilder()
+  data.write_string("data " + sym + "_words = align 4 { ")
+  data.write_string(words.to_string())
+  data.write_string(" }\n")
+  // Array ABI: length, capacity, ownership flag, element stride, data pointer.
+  data.write_string("data " + sym + " = align 8 { l " + n + ", l " + n + ", w 0, w 4, l " + sym + "_words }\n")
+  g.i32_literal_tables.push(data.to_string())
+  let arr = qbe_tmp(g)
+  qbe_emit(g, arr + " =l call $pion_arr_copy(l " + sym + ")")
+  Some(qval(arr, ty))
+}
+
+///|
 fn qbe_emit_expr(
   g : QbeGen,
   expr : Expr,
@@ -45274,6 +45411,20 @@ fn qbe_emit_expr_inner(
       qbe_emit_index(g, obj, idx, "", mut projected)
     }
     EArrayLit(elems, _) => {
+      if elems.length() >= 1024 {
+        match expected {
+          Some(t) =>
+            match t {
+              TArray(TInt) | TFixedArray(TInt) | TImmArray(TInt) =>
+                match qbe_i32_literal_table(g, elems, t) {
+                  Some(qv) => return qv
+                  None => ()
+                }
+              _ => ()
+            }
+          None => ()
+        }
+      }
       let is_fixed = match expected {
         Some(TFixedArray(_)) => true
         _ => false
@@ -45295,6 +45446,38 @@ fn qbe_emit_expr_inner(
       let mut elem_ty = match exp_elem {
         Some(e) => e
         None => TError
+      }
+      match qbe_flat_string_rows(g, elem_ty, elems) {
+        Some(si) => {
+          let arr = qbe_tmp(g)
+          let n = elems.length().to_string()
+          qbe_emit(g, arr + " =l call $pion_arr_new(l " + n + ", w " + qbe_arr_new_flags_w(g, elem_ty) + ")")
+          let slot = qbe_tmp(g)
+          let data = qbe_tmp(g)
+          qbe_emit(g, slot + " =l add " + arr + ", 24")
+          qbe_emit(g, data + " =l loadl " + slot)
+          let mut row_index = 0
+          for row in elems {
+            match row {
+              EStructLit(_, _, fields, _) => {
+                let addr = if row_index == 0 {
+                  data
+                } else {
+                  let row_addr = qbe_tmp(g)
+                  qbe_emit(g, row_addr + " =l add " + data + ", " + (row_index * si.field_names.length() * 8).to_string())
+                  row_addr
+                }
+                let vals = qbe_emit_flat_eval_struct_lit(g, si, elem_ty, fields)
+                qbe_emit_flat_store_vals(g, addr, vals)
+              }
+              _ => ()
+            }
+            row_index = row_index + 1
+          }
+          qbe_emit(g, "storel " + n + ", " + arr)
+          return qval(arr, if is_fixed { TFixedArray(elem_ty) } else if is_imm { TImmArray(elem_ty) } else { TArray(elem_ty) })
+        }
+        None => ()
       }
       let arr_guards = qbe_arg_guards_in_order(g, elems)
       let mut i = 0
@@ -57598,17 +57781,35 @@ fn qbe_emit_stmt(
 }
 
 ///|
-fn qbe_emit_bytes_data(sb : StringBuilder, s : String) -> Int {
-  let bytes = str_to_utf8_ints(s)
+// Keep symbols, escapes, delimiters and non-ASCII bytes in numeric form.
+// This alphabet is literal in QBE, both direct object writers and Wasm.
+fn qbe_plain_data_byte(c : Int) -> Bool {
+  c == 32 || c == 43 || (c >= 45 && c <= 57) || c == 61 ||
+  (c >= 65 && c <= 90) || c == 95 || (c >= 97 && c <= 122)
+}
+
+///|
+fn qbe_emit_bytes_data(sb : StringBuilder, bytes : Array[Int]) -> Unit {
   let mut i = 0
   while i < bytes.length() {
     sb.write_string("b ")
-    sb.write_string(bytes[i].to_string())
+    let c = bytes[i]
+    if qbe_plain_data_byte(c) && i + 1 < bytes.length() && qbe_plain_data_byte(bytes[i + 1]) {
+      sb.write_char('"')
+      sb.write_char(c.unsafe_to_char())
+      i = i + 1
+      while i < bytes.length() && qbe_plain_data_byte(bytes[i]) {
+        sb.write_char(bytes[i].unsafe_to_char())
+        i = i + 1
+      }
+      sb.write_char('"')
+    } else {
+      sb.write_string(c.to_string())
+      i = i + 1
+    }
     sb.write_string(", ")
-    i = i + 1
   }
   sb.write_string("b 0")
-  bytes.length()
 }
 
 ///|
@@ -59912,6 +60113,11 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
       "function $pion_drop_dyn(l %p) {\n@start\n    %vp =l add %p, 8\n    %vt =l loadl %vp\n    %is_obj =l loadl %vt\n    %is_obj_nz =w cnel %is_obj, 0\n    jnz %is_obj_nz, @dec, @done\n@dec\n    %data =l loadl %p\n    call $pion_rc_dec(l %data)\n@done\n    ret\n}\n\n",
     )
   }
+  let mut ti = 0
+  while ti < g.i32_literal_tables.length() {
+    out.write_string(g.i32_literal_tables[ti])
+    ti = ti + 1
+  }
   let mut dvi = 0
   while dvi < g.dyn_vtables.length() {
     out.write_string(g.dyn_vtables[dvi])
@@ -60436,6 +60642,10 @@ pub fn emit_qbe_package_multi_entry_target_opts(
   j2_disable_mask : Int,
 ) -> QbeEmitResult {
   let g = qbe_new_for_target_name(tc, release, false, target_wasm, target_name)
+  // Only the entry package exports the entry point (and keys it in the CAS).
+  if is_entry && !no_main {
+    g.entry_symbol = entry_symbol
+  }
   g.j2_disable_mask = j2_disable_mask
   let export_internals = tc.multi_pkg &&
     (pkg_has_pub_generic_fn(pkg) || pkg_has_generic_impl(pkg) || pkg_has_complex_pub_default(pkg))
@@ -60631,7 +60841,7 @@ pub fn emit_qbe_package_multi_entry_target_opts(
     out.write_string("_hdr = align 8 { w 0, w 0, w 1, h 1, h 3, l 0, l ")
     out.write_string(bytes.length().to_string())
     out.write_string(", ")
-    let _ = qbe_emit_bytes_data(out, s)
+    qbe_emit_bytes_data(out, bytes)
     out.write_string(" }\n")
     si = si + 1
   }
@@ -60641,7 +60851,7 @@ pub fn emit_qbe_package_multi_entry_target_opts(
     out.write_string("data $pion_cstr_")
     out.write_string(csi.to_string())
     out.write_string(" = { ")
-    let _ = qbe_emit_bytes_data(out, g.cstrings[csi])
+    qbe_emit_bytes_data(out, str_to_utf8_ints(g.cstrings[csi]))
     out.write_string(" }\n")
     csi = csi + 1
   }
@@ -61021,6 +61231,11 @@ pub fn emit_qbe_unit_entry_target_opts(
     }
     di = di + 1
   }
+  // Only the unit defining `main` exports the entry point; set before any
+  // function (and so any word table) is emitted.
+  if unit_has_main && !no_main {
+    g.entry_symbol = entry_symbol
+  }
 
   let mut init_consts_code = ""
   if const_decls.length() > 0 {
@@ -61151,7 +61366,7 @@ pub fn emit_qbe_unit_entry_target_opts(
     out.write_string("_hdr = align 8 { w 0, w 0, w 1, h 1, h 3, l 0, l ")
     out.write_string(bytes.length().to_string())
     out.write_string(", ")
-    let _ = qbe_emit_bytes_data(out, s)
+    qbe_emit_bytes_data(out, bytes)
     out.write_string(" }\n")
     si = si + 1
   }
@@ -61161,7 +61376,7 @@ pub fn emit_qbe_unit_entry_target_opts(
     out.write_string("data $pion_cstr_")
     out.write_string(csi.to_string())
     out.write_string(" = { ")
-    let _ = qbe_emit_bytes_data(out, g.cstrings[csi])
+    qbe_emit_bytes_data(out, str_to_utf8_ints(g.cstrings[csi]))
     out.write_string(" }\n")
     csi = csi + 1
   }
@@ -61650,7 +61865,7 @@ pub fn emit_qbe_test_package_target(
     out.write_string("_hdr = align 8 { w 0, w 0, w 1, h 1, h 3, l 0, l ")
     out.write_string(bytes.length().to_string())
     out.write_string(", ")
-    let _ = qbe_emit_bytes_data(out, s)
+    qbe_emit_bytes_data(out, bytes)
     out.write_string(" }\n")
     si = si + 1
   }
@@ -61660,7 +61875,7 @@ pub fn emit_qbe_test_package_target(
     out.write_string("data $pion_cstr_")
     out.write_string(csi.to_string())
     out.write_string(" = { ")
-    let _ = qbe_emit_bytes_data(out, g.cstrings[csi])
+    qbe_emit_bytes_data(out, str_to_utf8_ints(g.cstrings[csi]))
     out.write_string(" }\n")
     csi = csi + 1
   }
