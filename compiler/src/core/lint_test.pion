@@ -223,7 +223,8 @@ test "lint: L_IMPLICIT_IMPORT and L_UNUSED_IMPORT two-round fix and edge cases" 
   }
   lt_assert(saw_imp, check_result_to_json(dcf))
 
-  // Extra (inactive target) file implicitly using `dep` protects active unused import from deletion.
+  // Extra (inactive target) file implicitly using `dep` reports L_IMPLICIT_IMPORT on itself
+  // AND protects active unused import from deletion.
   let cr_act = check_source_files_with_imports_mapped(
     "app",
     ["a.pion"],
@@ -235,13 +236,107 @@ test "lint: L_IMPLICIT_IMPORT and L_UNUSED_IMPORT two-round fix and edge cases" 
     true,
   )
   assert_eq(cr_act.diagnostics.length(), 0)
-  let extra_pr = parse_source("wasm_only.pion", "pub fn w() -> Int { dep::add(1, 2) }\n")
+  let extra_src = "pub fn w() -> Int { dep::add(1, 2) }\n"
+  let extra_pr = parse_source("wasm_only.pion", extra_src)
   let raw_m : Map[String, String] = Map([])
   raw_m.set("a.pion", a_src)
+  raw_m.set("wasm_only.pion", extra_src)
   let d_ext = lint_package(cr_act.pkg, cr_act.tc, raw_m, [extra_pr.file])
-  assert_eq(d_ext.length(), 1)
-  assert_eq(d_ext[0].code, "L_UNUSED_IMPORT")
-  assert_eq(d_ext[0].edits.length(), 0)
+  assert_eq(d_ext.length(), 2)
+  assert_eq(lt_count_code(d_ext, "L_UNUSED_IMPORT"), 1)
+  assert_eq(lt_count_code(d_ext, "L_IMPLICIT_IMPORT"), 1)
+  i = 0
+  while i < d_ext.length() {
+    if d_ext[i].code == "L_UNUSED_IMPORT" {
+      assert_eq(d_ext[i].edits.length(), 0)
+    } else if d_ext[i].code == "L_IMPLICIT_IMPORT" {
+      assert_eq(d_ext[i].file, "wasm_only.pion")
+      assert_eq(d_ext[i].edits.length(), 1)
+    }
+    i = i + 1
+  }
+
+  // Incomplete extra file read/parse conservatively suppresses ALL import delete edits.
+  let d_inc = lint_package_opts(cr_act.pkg, cr_act.tc, raw_m, [], true)
+  assert_eq(d_inc.length(), 1)
+  assert_eq(d_inc[0].code, "L_UNUSED_IMPORT")
+  assert_eq(d_inc[0].edits.length(), 0)
+}
+
+///|
+test "lint: R1 adversarial regressions (alternating alias, multiline import, fmt blank-line, _mut, non-ASCII, field guard)" {
+  let dep_a = lt_make_dep_pkg("dep_a", "pub fn num() -> Int { 11 }\n")
+  let dep_b = lt_make_dep_pkg("dep_b", "pub fn num() -> Int { 22 }\n")
+
+  // P1-1: Alternating alias imports in same file MUST NOT emit delete edits (would flip 11 -> 22).
+  let alt_src =
+    "import \"dep_a\" as d\n" +
+    "import \"dep_b\" as d\n" +
+    "import \"dep_a\" as d\n" +
+    "pub fn main() -> Int { d::num() }\n"
+  let d_alt = lint_source_files_with_imports("app", ["alt.pion"], [alt_src], [dep_a, dep_b], true)
+  lt_assert(lt_has_code(d_alt, "L_UNUSED_IMPORT"), check_result_to_json(d_alt))
+  let mut i = 0
+  while i < d_alt.length() {
+    assert_eq(d_alt[i].edits.length(), 0)
+    i = i + 1
+  }
+
+  // P1-4: Multi-line import: unused -> no delete edit; insert after multi-line -> after `as d` line.
+  let ml_a = "import \"dep_a\"\n  as d\npub fn fa() -> Int { dep_b::num() }\n"
+  let ml_b = "import \"dep_b\"\npub fn fb() -> Int { dep_b::num() }\n"
+  let d_ml = lint_source_files_with_imports("app", ["a.pion", "b.pion"], [ml_a, ml_b], [dep_a, dep_b], true)
+  let mut saw_ml_unused = false
+  let mut saw_ml_imp = false
+  i = 0
+  while i < d_ml.length() {
+    if d_ml[i].code == "L_UNUSED_IMPORT" {
+      saw_ml_unused = true
+      assert_eq(d_ml[i].edits.length(), 0)
+    }
+    if d_ml[i].code == "L_IMPLICIT_IMPORT" {
+      saw_ml_imp = true
+      assert_eq(d_ml[i].edits.length(), 1)
+      assert_eq(d_ml[i].edits[0].line, 3)
+    }
+    i = i + 1
+  }
+  lt_assert(saw_ml_unused && saw_ml_imp, check_result_to_json(d_ml))
+  let ml_a_fixed = lt_apply_machine_edits(ml_a, "a.pion", d_ml)
+  assert_eq(ml_a_fixed, "import \"dep_a\"\n  as d\nimport \"dep_b\"\npub fn fa() -> Int { dep_b::num() }\n")
+
+  // P1-5: Deleting sole import collapses leading blank line; multi-space `let mut  w` -> `let w`.
+  let fmt_src = "import \"dep_a\"\n\npub fn f() -> Int {\n  let mut  w = 1\n  w\n}\n"
+  let d_fmt = lint_source_files_with_imports("app", ["f.pion"], [fmt_src], [dep_a], true)
+  assert_eq(d_fmt.length(), 2)
+  let fmt_fixed = lt_apply_machine_edits(fmt_src, "f.pion", d_fmt)
+  assert_eq(fmt_fixed, "pub fn f() -> Int {\n  let w = 1\n  w\n}\n")
+  assert_eq(lint_source_files_with_imports("app", ["f.pion"], [fmt_fixed], [dep_a], true).length(), 0)
+
+  // P2-3: Underscore-prefixed `let mut _x = 1` still triggers L_UNUSED_MUT (not L_UNUSED_LOCAL).
+  let um_src = "pub fn f() -> Int {\n  let mut _x = 1\n  0\n}\n"
+  let d_um = lt_lint_one(um_src)
+  assert_eq(d_um.length(), 1)
+  assert_eq(d_um[0].code, "L_UNUSED_MUT")
+  assert_eq(d_um[0].edits.length(), 1)
+  let um_fixed = lt_apply_machine_edits(um_src, "main.pion", d_um)
+  assert_eq(um_fixed, "pub fn f() -> Int {\n  let _x = 1\n  0\n}\n")
+  assert_eq(lt_lint_one(um_fixed).length(), 0)
+
+  // P2-4 & P2-8: Same-line non-ASCII before `let mut` / unused `let` computes exact byte offsets.
+  let uni_src = "pub fn f() -> Int { let _a = \"日本\"; let mut b = 1; let c = 2; b }\n"
+  let d_uni = lt_lint_one(uni_src)
+  assert_eq(d_uni.length(), 2)
+  let uni_fixed = lt_apply_machine_edits(uni_src, "main.pion", d_uni)
+  assert_eq(uni_fixed, "pub fn f() -> Int { let _a = \"日本\"; let b = 1; let _c = 2; b }\n")
+  assert_eq(lt_lint_one(uni_fixed).length(), 0)
+
+  // P2-5: Field name `s._v` in enclosing decl suppresses `v -> _v` rename edit.
+  let fld_src = "struct S { _v : Int }\npub fn f(s : S) -> Int {\n  let v = 1\n  s._v\n}\n"
+  let d_fld = lt_lint_one(fld_src)
+  assert_eq(d_fld.length(), 1)
+  assert_eq(d_fld[0].code, "L_UNUSED_LOCAL")
+  assert_eq(d_fld[0].edits.length(), 0)
 }
 
 ///|
