@@ -14380,6 +14380,43 @@ fn drv_lint_mark_allowed_in_pkg(
 }
 
 ///|
+fn drv_lint_strip_disallowed_edits(
+  diags : Array[Diagnostic],
+  allowed_files : Map[String, Bool],
+) -> Array[Diagnostic] {
+  let out : Array[Diagnostic] = []
+  let mut i = 0
+  while i < diags.length() {
+    let d = diags[i]
+    if d.edits.length() == 0 {
+      out.push(d)
+    } else {
+      let kept : Array[TextEdit] = []
+      let mut ei = 0
+      while ei < d.edits.length() {
+        if allowed_files.contains(d.edits[ei].file) {
+          kept.push(d.edits[ei])
+        }
+        ei = ei + 1
+      }
+      out.push(Diagnostic::{
+        file: d.file,
+        line: d.line,
+        col: d.col,
+        code: d.code,
+        message: d.message,
+        expected: d.expected,
+        found: d.found,
+        fixit: d.fixit,
+        edits: kept,
+      })
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
 fn drv_lint_select_pkg_dirs(world : World, root_dir : String) -> Map[String, Bool] {
   let no_deps_dirs : Map[String, Bool] = Map([])
   let root_abs = drv_canon_dir(world, root_dir)
@@ -14455,7 +14492,6 @@ fn drv_lint_collect_extra_import_files(
                 None => disk_txt
               }
               raw_map.set(fpath, mem_txt)
-              drv_lint_mark_allowed_in_pkg(world, allowed_files, fpath, node_canon_dir)
               let pr = parse_source(fpath, mem_txt)
               if pr.diagnostics.length() > 0 {
                 incomplete = true
@@ -14514,6 +14550,15 @@ fn drv_lint_eval(
         ) {
           Err(msg) => return Err(msg)
           Ok(v) => v
+        }
+        let mut mpi = 0
+        while mpi < ws.manifest_paths.length() {
+          let mp = ws.manifest_paths[mpi]
+          match fs_read(world, mp) {
+            Ok(mt) => drv_lint_record_read(read_paths, disk_snapshots, mp, mt)
+            Err(_) => ()
+          }
+          mpi = mpi + 1
         }
         let nodes = ws.nodes
         let names : Array[String] = []
@@ -14575,6 +14620,15 @@ fn drv_lint_eval(
             di = di + 1
           }
           if !is_selected {
+            let mut dpi = 0
+            while dpi < node.paths.length() {
+              let dfp = node.paths[dpi]
+              match fs_read(world, dfp) {
+                Ok(dt) => drv_lint_record_read(read_paths, disk_snapshots, dfp, dt)
+                Err(_) => ()
+              }
+              dpi = dpi + 1
+            }
             let upstream_sigs : Array[String] = []
             let t_names = trans_dep_names[k]
             let mut u = 0
@@ -14883,7 +14937,10 @@ fn drv_lint_eval(
         }
         return Ok(DrvLintEval::{
           has_errors: false,
-          diagnostics: lint_sort_and_dedup_diags(lint_diags),
+          diagnostics: drv_lint_strip_disallowed_edits(
+            lint_sort_and_dedup_diags(lint_diags),
+            allowed_files,
+          ),
           allowed_files: allowed_files,
           disk_snapshots: disk_snapshots,
           read_paths: read_paths,
@@ -14937,7 +14994,10 @@ fn drv_lint_eval(
       read_paths: read_paths,
     })
   }
-  let lds = lint_package_opts(cr.pkg, cr.tc, raw_map, [], false)
+  let lds = drv_lint_strip_disallowed_edits(
+    lint_package_opts(cr.pkg, cr.tc, raw_map, [], false),
+    allowed_files,
+  )
   Ok(DrvLintEval::{
     has_errors: false,
     diagnostics: lds,
@@ -14945,6 +15005,45 @@ fn drv_lint_eval(
     disk_snapshots: disk_snapshots,
     read_paths: read_paths,
   })
+}
+
+///|
+fn drv_lint_fix_fail(world : World, as_json : Bool, msg : String) -> Int {
+  if as_json {
+    io_println(
+      world,
+      "{\"ok\":false,\"error\":" +
+      json_quote(msg) +
+      ",\"fixed\":0,\"files\":[],\"diagnostics\":[]}",
+    )
+  } else {
+    io_eprintln(world, "error: " + msg)
+  }
+  1
+}
+
+///|
+fn drv_lint_fix_lock(world : World, targets : Array[String]) -> Int64 {
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir)
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < targets.length() {
+    if i > 0 {
+      sb.write_char('\n')
+    }
+    sb.write_string(drv_canon_dir(world, targets[i]))
+    i = i + 1
+  }
+  let lock_path = cache_dir + "/lint-fix-" + sha256_hex(sb.to_string()) + ".lock"
+  c_fs_lock(drv_cpath(lock_path))
+}
+
+///|
+fn drv_lint_fix_unlock(handle : Int64) -> Unit {
+  if handle >= 0L {
+    c_fs_unlock(handle)
+  }
 }
 
 ///|
@@ -14985,15 +15084,16 @@ fn drv_lint_print_fix_result(
 
 ///|
 /// Whole-invocation transactional `--fix` for `pionc lint`:
-/// 1. Shares a single initial disk snapshot (across the full read set) and a
-///    single accumulated in-memory `overrides` map across up to 3 fix rounds.
+/// 1. Shares a single initial disk snapshot (across the full read set: selected
+///    sources, tests, inactive targets, manifests, and loaded dependencies) and
+///    a single accumulated in-memory `overrides` map across up to 3 fix rounds.
 /// 2. Only applies `L_*` edits with `applicability == "machine"` targeting
 ///    non-symlink regular files belonging to selected packages.
-/// 3. If ANY round or the final verification produces any `E_*`, aborts with
+/// 3. If ANY round or final verification produces any `E_*`, aborts with
 ///    0 bytes written to disk (`fixed: 0, files: []`).
-/// 4. Before committing, verifies the entire read set (contents + lstat kind)
-///    is unchanged on disk; if writing file k fails, rolls back files 0..k-1
-///    to their initial snapshots.
+/// 4. Acquires a CAS-dir exclusive lock (`$PION_CACHE_DIR/lint-fix-<hash>.lock`),
+///    verifies the full read set (contents + lstat kind) is unchanged on disk,
+///    commits atomically, and checks rollback return values on partial failure.
 fn drv_run_lint_fix_cmd(
   world : World,
   targets : Array[String],
@@ -15018,7 +15118,7 @@ fn drv_run_lint_fix_cmd(
       target_override,
       acc_overrides,
     ) {
-      Err(msg) => return drv_cmd_fail(world, as_json, msg)
+      Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
       Ok(v) => v
     }
     if round == 0 {
@@ -15032,7 +15132,6 @@ fn drv_run_lint_fix_cmd(
       }
     }
     if ev.has_errors {
-      // Abort whole transaction: 0 bytes written to disk.
       return drv_lint_print_fix_result(world, false, 0, [], ev.diagnostics)
     }
     if ev.diagnostics.length() == 0 {
@@ -15156,13 +15255,14 @@ fn drv_run_lint_fix_cmd(
     target_override,
     acc_overrides,
   ) {
-    Err(msg) => return drv_cmd_fail(world, as_json, msg)
+    Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
     Ok(v) => v
   }
   if final_ev.has_errors {
     return drv_lint_print_fix_result(world, false, 0, [], final_ev.diagnostics)
   }
   if modified_files.length() > 0 {
+    let lock_h = drv_lint_fix_lock(world, targets)
     // Verify entire read set (contents + file kind) has not changed on disk.
     let mut ri = 0
     while ri < initial_read_paths.length() {
@@ -15172,7 +15272,8 @@ fn drv_run_lint_fix_cmd(
         None => -1
       }
       if drv_lstat_kind(rp) != exp_kind {
-        return drv_cmd_fail(
+        drv_lint_fix_unlock(lock_h)
+        return drv_lint_fix_fail(
           world,
           as_json,
           "file identity changed on disk during `pionc lint --fix`: " + rp,
@@ -15180,14 +15281,25 @@ fn drv_run_lint_fix_cmd(
       }
       let snap = match initial_snapshots.get(rp) {
         Some(t) => t
-        None => return drv_cmd_fail(world, as_json, "missing snapshot for " + rp)
+        None => {
+          drv_lint_fix_unlock(lock_h)
+          return drv_lint_fix_fail(world, as_json, "missing snapshot for " + rp)
+        }
       }
       let cur_disk = match fs_read(world, rp) {
         Ok(t) => t
-        Err(msg) => return drv_cmd_fail(world, as_json, "failed to re-read " + rp + ": " + msg)
+        Err(msg) => {
+          drv_lint_fix_unlock(lock_h)
+          return drv_lint_fix_fail(
+            world,
+            as_json,
+            "failed to re-read " + rp + ": " + msg,
+          )
+        }
       }
       if cur_disk != snap {
-        return drv_cmd_fail(
+        drv_lint_fix_unlock(lock_h)
+        return drv_lint_fix_fail(
           world,
           as_json,
           "file changed on disk during `pionc lint --fix`: " + rp,
@@ -15195,30 +15307,51 @@ fn drv_run_lint_fix_cmd(
       }
       ri = ri + 1
     }
-    // Commit atomically with rollback on partial write failure.
+    // Commit atomically with checked rollback on partial write failure.
     let mut fi = 0
     while fi < modified_files.length() {
       let path = modified_files[fi]
       match acc_overrides.get(path) {
         Some(new_txt) =>
           if !drv_write_text_atomic(world, path, new_txt) {
+            let failed_rb : Array[String] = []
             let mut rb = 0
             while rb < fi {
               let rbp = modified_files[rb]
               match initial_snapshots.get(rbp) {
-                Some(orig) => {
-                  let _ = drv_write_text_atomic(world, rbp, orig)
-                }
-                None => ()
+                Some(orig) =>
+                  if !drv_write_text_atomic(world, rbp, orig) {
+                    failed_rb.push(rbp)
+                  }
+                None => failed_rb.push(rbp)
               }
               rb = rb + 1
             }
-            return drv_cmd_fail(world, as_json, "failed to write " + path)
+            drv_lint_fix_unlock(lock_h)
+            let err_msg = if failed_rb.length() == 0 {
+              "failed to write " + path
+            } else {
+              let sb = StringBuilder()
+              sb.write_string("failed to write ")
+              sb.write_string(path)
+              sb.write_string("; rollback also failed for: ")
+              let mut rfi = 0
+              while rfi < failed_rb.length() {
+                if rfi > 0 {
+                  sb.write_string(", ")
+                }
+                sb.write_string(failed_rb[rfi])
+                rfi = rfi + 1
+              }
+              sb.to_string()
+            }
+            return drv_lint_fix_fail(world, as_json, err_msg)
           }
         None => ()
       }
       fi = fi + 1
     }
+    drv_lint_fix_unlock(lock_h)
   }
   let ok = !final_ev.has_errors && final_ev.diagnostics.length() == 0
   drv_lint_print_fix_result(
@@ -16238,23 +16371,25 @@ pub fn main(world : World) -> Int {
       i = i + 1
     }
     if target_override != "" && !drv_target_is_valid(target_override) {
-      return drv_cmd_fail(
-        world,
-        as_json,
-        "unknown target `" +
+      let msg = "unknown target `" +
         target_override +
-        "` (valid: arm64_apple, amd64_apple, amd64_sysv, amd64_win, arm64, rv64, ios_arm64, ios_sim_arm64, android_arm64, android_x64, wasm32)",
-      )
+        "` (valid: arm64_apple, amd64_apple, amd64_sysv, amd64_win, arm64, rv64, ios_arm64, ios_sim_arm64, android_arm64, android_x64, wasm32)"
+      return if do_fix {
+        drv_lint_fix_fail(world, as_json, msg)
+      } else {
+        drv_cmd_fail(world, as_json, msg)
+      }
     }
     if targets.length() == 0 {
       if drv_has_default_project(world) {
         targets.push(".")
       } else {
-        return drv_cmd_fail(
-          world,
-          as_json,
-          "no target specified and no pion.toml in current directory",
-        )
+        let msg = "no target specified and no pion.toml in current directory"
+        return if do_fix {
+          drv_lint_fix_fail(world, as_json, msg)
+        } else {
+          drv_cmd_fail(world, as_json, msg)
+        }
       }
     }
     if do_fix {

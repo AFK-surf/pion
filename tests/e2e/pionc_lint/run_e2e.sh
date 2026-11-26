@@ -171,8 +171,10 @@ WS_FIX2="$("$PIONC" lint --fix --json "$WS")"
 printf '%s' "$WS_FIX2" | grep -q '"ok":true' || { echo "FAIL: workspace --fix idempotent not ok: $WS_FIX2" >&2; exit 1; }
 printf '%s' "$WS_FIX2" | grep -q '"fixed":0' || { echo "FAIL: workspace --fix not idempotent: $WS_FIX2" >&2; exit 1; }
 
-# 5. [targets] inactive file implicitly using `ext_dep`:
-#    5a) Valid inactive file gets L_IMPLICIT_IMPORT + 2-round --fix + `pionc fmt --check` clean.
+# 5. [targets] inactive file isolation & fmt-clean:
+#    5a) Host-only `import "ext_dep" as Box` vs wasm-only local `struct Box`:
+#        host `pionc lint --fix` MUST NEVER inject `import` into inactive `wasm_only.pion`
+#        (must keep `wasm_only.pion` byte-identical and `pionc check --target wasm32` green!).
 TGT_PKG="$TMP_DIR/tgt_pkg"
 mkdir -p "$TGT_PKG/src"
 cat > "$TGT_PKG/pion.toml" <<'EOF'
@@ -185,8 +187,46 @@ ext_dep = { path = "../ext_dep" }
 
 [targets]
 "src/wasm_only.pion" = ["wasm32"]
+"src/host_only.pion" = ["linux", "macos", "windows"]
 EOF
-cat > "$TGT_PKG/src/lib.pion" <<'EOF'
+cat > "$TGT_PKG/src/host_only.pion" <<'EOF'
+import "ext_dep" as Box
+
+pub fn host_fn() -> Int {
+  Box::add(1, 2)
+}
+EOF
+cat > "$TGT_PKG/src/wasm_only.pion" <<'EOF'
+struct Box { v : Int }
+
+fn Box::num() -> Int {
+  42
+}
+
+pub fn wasm_fn() -> Int {
+  let b = Box::{ v: Box::num() }
+  b.v
+}
+EOF
+WASM_HASH_BEFORE="$(file_sha256 "$TGT_PKG/src/wasm_only.pion")"
+TGT_FIX="$("$PIONC" lint --fix --json "$TGT_PKG")"
+printf '%s' "$TGT_FIX" | grep -q '"ok":true' || { echo "FAIL: tgt_pkg --fix failed: $TGT_FIX" >&2; exit 1; }
+WASM_HASH_AFTER="$(file_sha256 "$TGT_PKG/src/wasm_only.pion")"
+[ "$WASM_HASH_BEFORE" = "$WASM_HASH_AFTER" ] || { echo "FAIL: host lint --fix modified inactive wasm_only.pion!" >&2; exit 1; }
+"$PIONC" check --target wasm32 --json "$TGT_PKG" | grep -q '"ok":true' || { echo "FAIL: wasm32 check broken after host lint --fix!" >&2; exit 1; }
+
+#    5b) Deleting sole unused import + multi-space `let mut  w` must pass `pionc fmt --check`.
+FMT_PKG="$TMP_DIR/fmt_pkg"
+mkdir -p "$FMT_PKG/src"
+cat > "$FMT_PKG/pion.toml" <<'EOF'
+[package]
+name = "fmt_pkg"
+version = "0.1.0"
+
+[dependencies]
+ext_dep = { path = "../ext_dep" }
+EOF
+cat > "$FMT_PKG/src/lib.pion" <<'EOF'
 import "ext_dep"
 
 pub fn host_fn() -> Int {
@@ -194,29 +234,12 @@ pub fn host_fn() -> Int {
   w
 }
 EOF
-cat > "$TGT_PKG/src/wasm_only.pion" <<'EOF'
-pub fn wasm_fn() -> Int {
-  ext_dep::add(1, 2)
-}
-EOF
-set +e
-TGT_CHK="$("$PIONC" lint --json "$TGT_PKG")"
-TGT_CHK_RC=$?
-set -e
-[ "$TGT_CHK_RC" -ne 0 ] || { echo "FAIL: expected lint issues on tgt_pkg: $TGT_CHK" >&2; exit 1; }
-printf '%s' "$TGT_CHK" | grep -q 'wasm_only.pion' || { echo "FAIL: inactive target file L_IMPLICIT_IMPORT missing: $TGT_CHK" >&2; exit 1; }
-TGT_FIX="$("$PIONC" lint --fix --json "$TGT_PKG")"
-printf '%s' "$TGT_FIX" | grep -q '"ok":true' || { echo "FAIL: tgt_pkg --fix failed: $TGT_FIX" >&2; exit 1; }
-grep -q 'import "ext_dep"' "$TGT_PKG/src/wasm_only.pion" || { echo "FAIL: wasm_only.pion missing inserted import" >&2; exit 1; }
-if grep -q 'import "ext_dep"' "$TGT_PKG/src/lib.pion"; then
-  echo "FAIL: lib.pion unused import should be deleted after wasm_only.pion gets explicit import" >&2
-  exit 1
-fi
-# P1-5: after deleting sole import & multi-space `let mut  w`, `pionc fmt --check` MUST pass!
-FMT_AFTER="$("$PIONC" fmt --check --json "$TGT_PKG/src/lib.pion")"
+FMT_FIX="$("$PIONC" lint --fix --json "$FMT_PKG")"
+printf '%s' "$FMT_FIX" | grep -q '"ok":true' || { echo "FAIL: fmt_pkg --fix failed: $FMT_FIX" >&2; exit 1; }
+FMT_AFTER="$("$PIONC" fmt --check --json "$FMT_PKG/src/lib.pion")"
 [ "$FMT_AFTER" = '{"ok":true,"unformatted":[]}' ] || { echo "FAIL: lib.pion not fmt-clean after --fix: $FMT_AFTER" >&2; exit 1; }
 
-#    5b) When an inactive target file fails to parse, conservatively forbid deleting ANY import.
+#    5c) When an inactive target file fails to parse, conservatively forbid deleting ANY import.
 TGT_BAD="$TMP_DIR/tgt_bad"
 mkdir -p "$TGT_BAD/src"
 cat > "$TGT_BAD/pion.toml" <<'EOF'
@@ -302,8 +325,14 @@ EOF
 ln -s "$OUTSIDE_DIR/leak.pion" "$SYM_PKG/src/leak.pion"
 ln -s "real.inc" "$SYM_PKG/src/inner.pion"
 set +e
+SYM_CHK="$("$PIONC" lint --json "$SYM_PKG")"
 "$PIONC" lint --fix --json "$SYM_PKG" >/dev/null
 set -e
+# R2 P2-1: public JSON must strip edits for non-committable symlink targets.
+if printf '%s' "$SYM_CHK" | grep -q '"edits"'; then
+  echo "FAIL: public lint --json exposed edits for symlink targets: $SYM_CHK" >&2
+  exit 1
+fi
 LEAK_HASH_AFTER="$(file_sha256 "$OUTSIDE_DIR/leak.pion")"
 INNER_HASH_AFTER="$(file_sha256 "$SYM_PKG/src/real.inc")"
 [ "$LEAK_HASH_BEFORE" = "$LEAK_HASH_AFTER" ] || { echo "FAIL: --fix wrote through outside symlink!" >&2; exit 1; }
@@ -421,32 +450,44 @@ set -e
 [ "$ISO_RC" -ne 0 ] || { echo "FAIL: expected L_UNREACHABLE_CODE in iso_pkg: $ISO_OUT" >&2; exit 1; }
 printf '%s' "$ISO_OUT" | grep -q '"code":"L_UNREACHABLE_CODE"' || { echo "FAIL: test fn panic masked prod L_UNREACHABLE_CODE: $ISO_OUT" >&2; exit 1; }
 
-# 11. P2-6: CLI edge guards (multi-target with manifest root; empty directory with 0 .pion files).
+# 11. P2-6 & R2 P2-2: CLI edge guards + unified --fix --json failure schema.
 EMPTY_DIR="$TMP_DIR/empty_dir"
 mkdir -p "$EMPTY_DIR"
 set +e
 EMPTY_OUT="$("$PIONC" lint --json "$EMPTY_DIR")"
 EMPTY_RC=$?
+EMPTY_FIX_OUT="$("$PIONC" lint --fix --json "$EMPTY_DIR")"
+EMPTY_FIX_RC=$?
 MIX_OUT="$("$PIONC" lint --json "$ISO_PKG" "$SINGLE")"
 MIX_RC=$?
 set -e
 [ "$EMPTY_RC" -ne 0 ] || { echo "FAIL: empty directory must not return ok:true: $EMPTY_OUT" >&2; exit 1; }
+[ "$EMPTY_FIX_RC" -ne 0 ] || { echo "FAIL: --fix on empty directory must fail: $EMPTY_FIX_OUT" >&2; exit 1; }
+printf '%s' "$EMPTY_FIX_OUT" | grep -q '"fixed":0' || { echo "FAIL: --fix --json error missing fixed:0: $EMPTY_FIX_OUT" >&2; exit 1; }
+printf '%s' "$EMPTY_FIX_OUT" | grep -q '"files":\[\]' || { echo "FAIL: --fix --json error missing files:[]: $EMPTY_FIX_OUT" >&2; exit 1; }
+printf '%s' "$EMPTY_FIX_OUT" | grep -q '"diagnostics":\[\]' || { echo "FAIL: --fix --json error missing diagnostics:[]: $EMPTY_FIX_OUT" >&2; exit 1; }
 [ "$MIX_RC" -ne 0 ] || { echo "FAIL: mixing manifest root with multiple targets must fail: $MIX_OUT" >&2; exit 1; }
 
-# 12. Real examples/ packages lint clean, and dynamic dogfood check on all compiler/src/core/lint*.pion.
+# 12. Real examples/ packages lint clean, and dynamic dogfood check explicitly
+#     including all `compiler/src/core/*.pion` (including `lint*_test.pion`).
 for EX in examples/text_stats examples/http_loopback; do
   EX_OUT="$("$PIONC" lint --json "$ROOT_DIR/$EX")"
   [ "$EX_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: pionc lint $EX -> $EX_OUT" >&2; exit 1; }
 done
 set +e
-CORE_LINT_OUT="$("$PIONC" lint --json "$ROOT_DIR/compiler/src/core")"
+CORE_LINT_OUT="$("$PIONC" lint --json "$ROOT_DIR/compiler/src/core"/*.pion)"
 set -e
 python3 - "$CORE_LINT_OUT" "$ROOT_DIR/compiler/src/core" <<'PYEOF'
 import glob, json, os, sys
 d = json.loads(sys.argv[1])
+diags = d.get("diagnostics", [])
+e_diags = [x for x in diags if str(x.get("code", "")).startswith("E_")]
+if e_diags:
+    print("FAIL: unexpected E_* diagnostics in core/*.pion dogfood:", e_diags, file=sys.stderr)
+    sys.exit(1)
 lint_files = {os.path.basename(p) for p in glob.glob(os.path.join(sys.argv[2], "lint*.pion"))}
-assert len(lint_files) >= 2, f"expected lint*.pion files, got {lint_files}"
-bad = [x for x in d.get("diagnostics", []) if os.path.basename(x.get("file", "")) in lint_files]
+assert len(lint_files) >= 2 and "lint.pion" in lint_files and "lint_test.pion" in lint_files, f"expected lint*.pion files, got {lint_files}"
+bad = [x for x in diags if os.path.basename(x.get("file", "")) in lint_files]
 if bad:
     print("FAIL: dogfood diagnostics on lint*.pion:", bad, file=sys.stderr)
     sys.exit(1)

@@ -814,6 +814,7 @@ struct LintImportTokSpan {
   start_line : Int
   end_line : Int
   clean_single_line : Bool
+  end_line_clean : Bool
 }
 
 ///|
@@ -823,10 +824,103 @@ struct LintFileImportTokens {
 }
 
 ///|
+fn lint_tok_is_hash(k : TokenKind) -> Bool {
+  match k {
+    Hash => true
+    _ => false
+  }
+}
+
+///|
+fn lint_tok_is_ident(k : TokenKind) -> Bool {
+  match k {
+    Ident(_) => true
+    _ => false
+  }
+}
+
+///|
+fn lint_tok_is_bang(k : TokenKind) -> Bool {
+  match k {
+    Bang => true
+    _ => false
+  }
+}
+
+///|
+/// True when `toks[ti]` is immediately preceded by a declaration attribute
+/// (`#attr`, `#attr(...)`, `#[...]`, or `#![...]`). Deleting that `import` line
+/// would silently re-attach the attribute to the following declaration.
+fn lint_tok_preceded_by_attr(toks : Array[Token], ti : Int) -> Bool {
+  if ti <= 0 {
+    return false
+  }
+  let prev = toks[ti - 1].kind
+  // Case 1: `#ident`
+  if lint_tok_is_ident(prev) && ti >= 2 && lint_tok_is_hash(toks[ti - 2].kind) {
+    return true
+  }
+  // Case 2: `#[...]` or `#![...]`
+  let is_rb = match prev {
+    RBracket => true
+    _ => false
+  }
+  if is_rb {
+    let mut depth = 1
+    let mut k = ti - 2
+    while k >= 0 && depth > 0 {
+      match toks[k].kind {
+        RBracket => depth = depth + 1
+        LBracket => depth = depth - 1
+        _ => ()
+      }
+      if depth == 0 {
+        break
+      }
+      k = k - 1
+    }
+    if depth == 0 {
+      if k >= 1 && lint_tok_is_hash(toks[k - 1].kind) {
+        return true
+      }
+      if k >= 2 && lint_tok_is_bang(toks[k - 1].kind) && lint_tok_is_hash(toks[k - 2].kind) {
+        return true
+      }
+    }
+  }
+  // Case 3: `#ident(...)`
+  let is_rp = match prev {
+    RParen => true
+    _ => false
+  }
+  if is_rp {
+    let mut depth = 1
+    let mut k = ti - 2
+    while k >= 0 && depth > 0 {
+      match toks[k].kind {
+        RParen => depth = depth + 1
+        LParen => depth = depth - 1
+        _ => ()
+      }
+      if depth == 0 {
+        break
+      }
+      k = k - 1
+    }
+    if depth == 0 && k >= 2 && lint_tok_is_ident(toks[k - 1].kind) && lint_tok_is_hash(toks[k - 2].kind) {
+      return true
+    }
+  }
+  false
+}
+
+///|
 /// Lexes `src` and extracts exact `[start_line, end_line]` token spans for every
 /// top-level `import "..." [as ident]` declaration. Marks `clean_single_line`
 /// only when all tokens of that declaration live on one physical line, no other
-/// token shares that line, and the raw line contains no comments or trailing junk.
+/// token shares that line, the raw line contains no comments or trailing junk,
+/// and no declaration attribute (`#verify`, `#[...]`, ...) precedes it.
+/// Marks `end_line_clean` only when no token follows this import on `end_line`.
 fn lint_scan_import_tokens(
   file : String,
   src : String,
@@ -909,13 +1003,26 @@ fn lint_scan_import_tokens(
         Some(n) => n
         None => 0
       }
+      let next_on_end_line = if j < toks.length() {
+        let next_is_eof = match toks[j].kind {
+          Eof => true
+          _ => false
+        }
+        !next_is_eof && toks[j].span.line == end_line
+      } else {
+        false
+      }
+      let end_line_clean = !next_on_end_line
+      let preceded_by_attr = lint_tok_preceded_by_attr(toks, ti)
       let clean_single = start_line == end_line &&
         line_total == tok_cnt &&
+        !preceded_by_attr &&
         lint_is_clean_single_import_line(src, starts, start_line)
       spans.push(LintImportTokSpan::{
         start_line: start_line,
         end_line: end_line,
         clean_single_line: clean_single,
+        end_line_clean: end_line_clean,
       })
       ti = j
     } else {
@@ -1064,7 +1171,11 @@ fn lint_make_insert_import_edit(
   if !imp_toks.ok || imp_toks.spans.length() != f.imports.length() {
     return None
   }
-  let last_end_line = imp_toks.spans[imp_toks.spans.length() - 1].end_line
+  let last_span = imp_toks.spans[imp_toks.spans.length() - 1]
+  if !last_span.end_line_clean {
+    return None
+  }
+  let last_end_line = last_span.end_line
   if last_end_line >= 1 && last_end_line < starts.length() {
     Some(text_edit_replace(f.path, last_end_line + 1, 1, last_end_line + 1, 1, stmt + eol, "machine"))
   } else if last_end_line >= 1 && last_end_line == starts.length() {
@@ -1099,9 +1210,6 @@ fn lint_check_imports(
   }
 
   // 1. Build package-wide alias -> path map, valid alias set, and conflict flags.
-  //    Any alias bound to >1 distinct path anywhere in the package (including
-  //    alternating imports within one file) is marked conflicted: never auto-insert
-  //    or auto-delete edits for it.
   let alias_path : Map[String, String] = Map([])
   let alias_conflict : Map[String, Bool] = Map([])
   let known_aliases : Map[String, String] = Map([])
@@ -1126,12 +1234,15 @@ fn lint_check_imports(
     fi = fi + 1
   }
 
-  // 2. Scan every file in the package (active + test + inactive targets) for
-  //    external alias usage and detect aliases implicitly relied on by any file.
+  // 2. Scan every file in the package (active + extra/inactive `[targets]`) for
+  //    external alias usage. Inactive files ONLY protect active unused imports
+  //    from deletion — they NEVER receive cross-target L_IMPLICIT_IMPORT edits.
   let usages : Array[LintImportUsage] = []
   let pkg_has_implicit_user : Map[String, Bool] = Map([])
+  let inactive_implicit_user : Map[String, String] = Map([])
   fi = 0
   while fi < all_files.length() {
+    let is_active_file = fi < pkg.files.length()
     let f = all_files[fi]
     let u = lint_scan_imports_file(tc.import_aliases, f)
     usages.push(u)
@@ -1146,18 +1257,19 @@ fn lint_check_imports(
       let al = u.used_order[ui]
       if !declared.contains(al) {
         pkg_has_implicit_user.set(al, true)
+        if !is_active_file && !inactive_implicit_user.contains(al) {
+          inactive_implicit_user.set(al, f.path)
+        }
       }
       ui = ui + 1
     }
     fi = fi + 1
   }
 
-  // 3. Emit L_UNUSED_IMPORT & L_IMPLICIT_IMPORT for `pkg.files`, and
-  //    L_IMPLICIT_IMPORT for `extra_import_files` (inactive `[targets]` files).
+  // 3. Emit L_UNUSED_IMPORT & L_IMPLICIT_IMPORT ONLY for active `pkg.files`.
   fi = 0
-  while fi < all_files.length() {
-    let is_active_file = fi < pkg.files.length()
-    let f = all_files[fi]
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
     let u = usages[fi]
     let fidx_opt = lint_get_file_index(raw_sources, idx_cache, f.path)
     let has_src = match fidx_opt {
@@ -1180,46 +1292,73 @@ fn lint_check_imports(
     let toks_aligned = imp_toks.ok && imp_toks.spans.length() == f.imports.length()
 
     let declared : Map[String, String] = Map([])
-    if is_active_file {
-      // Pre-compute which import lines in this file will safely be deleted so
-      // blank-line collapsing accounts for adjacent deleted imports.
-      let del_lines : Map[Int, Bool] = Map([])
-      let seen_pre : Map[String, String] = Map([])
-      let mut ii = 0
-      while ii < f.imports.length() {
-        let imp = f.imports[ii]
-        let is_conflicted = alias_conflict.contains(imp.alias_name)
-        let can_del_line = has_src &&
-          toks_aligned &&
-          imp_toks.spans[ii].clean_single_line &&
-          !is_conflicted &&
-          !extra_files_incomplete
-        match seen_pre.get(imp.alias_name) {
-          Some(prev_path) =>
-            if can_del_line && prev_path == imp.path {
-              del_lines.set(imp_toks.spans[ii].start_line, true)
-            }
-          None => {
-            seen_pre.set(imp.alias_name, imp.path)
-            if !u.first_span.contains(imp.alias_name) &&
-              can_del_line &&
-              !pkg_has_implicit_user.contains(imp.alias_name) {
-              del_lines.set(imp_toks.spans[ii].start_line, true)
-            }
+    // Pre-compute which import lines in this file will safely be deleted so
+    // blank-line collapsing accounts for adjacent deleted imports.
+    let del_lines : Map[Int, Bool] = Map([])
+    let seen_pre : Map[String, String] = Map([])
+    let mut ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      let is_conflicted = alias_conflict.contains(imp.alias_name)
+      let can_del_line = has_src &&
+        toks_aligned &&
+        imp_toks.spans[ii].clean_single_line &&
+        !is_conflicted &&
+        !extra_files_incomplete
+      match seen_pre.get(imp.alias_name) {
+        Some(prev_path) =>
+          if can_del_line && prev_path == imp.path {
+            del_lines.set(imp_toks.spans[ii].start_line, true)
+          }
+        None => {
+          seen_pre.set(imp.alias_name, imp.path)
+          if !u.first_span.contains(imp.alias_name) &&
+            can_del_line &&
+            !pkg_has_implicit_user.contains(imp.alias_name) {
+            del_lines.set(imp_toks.spans[ii].start_line, true)
           }
         }
-        ii = ii + 1
       }
+      ii = ii + 1
+    }
 
-      ii = 0
-      while ii < f.imports.length() {
-        let imp = f.imports[ii]
-        let is_conflicted = alias_conflict.contains(imp.alias_name)
-        let line_clean = has_src && toks_aligned && imp_toks.spans[ii].clean_single_line
-        match declared.get(imp.alias_name) {
-          Some(prev_path) => {
-            // Duplicate import alias in the same file.
-            let edit_opt = if prev_path == imp.path &&
+    ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      let is_conflicted = alias_conflict.contains(imp.alias_name)
+      let line_clean = has_src && toks_aligned && imp_toks.spans[ii].clean_single_line
+      match declared.get(imp.alias_name) {
+        Some(prev_path) => {
+          let edit_opt = if prev_path == imp.path &&
+            !is_conflicted &&
+            !extra_files_incomplete &&
+            line_clean {
+            lint_make_delete_import_edit(
+              f.path,
+              raw_src,
+              starts,
+              imp_toks.spans[ii].start_line,
+              del_lines,
+            )
+          } else {
+            None
+          }
+          out.push(
+            lint_diag_with_edit(
+              imp.span,
+              "L_UNUSED_IMPORT",
+              "duplicate import `" + imp.alias_name + "` in `" + f.path + "`",
+              "at most one import per alias in a file",
+              "duplicate `import " + json_quote(imp.path) + "`",
+              "remove the duplicate `import` declaration",
+              edit_opt,
+            ),
+          )
+        }
+        None => {
+          declared.set(imp.alias_name, imp.path)
+          if !u.first_span.contains(imp.alias_name) {
+            let edit_opt = if !pkg_has_implicit_user.contains(imp.alias_name) &&
               !is_conflicted &&
               !extra_files_incomplete &&
               line_clean {
@@ -1233,57 +1372,30 @@ fn lint_check_imports(
             } else {
               None
             }
+            let fix_msg = match inactive_implicit_user.get(imp.alias_name) {
+              Some(inact_file) =>
+                "not auto-removed because inactive target file `" +
+                inact_file +
+                "` references `" +
+                imp.alias_name +
+                "::`; run `pionc lint --target <target>` to fix that target first"
+              None => "remove the unused `import` declaration"
+            }
             out.push(
               lint_diag_with_edit(
                 imp.span,
                 "L_UNUSED_IMPORT",
-                "duplicate import `" + imp.alias_name + "` in `" + f.path + "`",
-                "at most one import per alias in a file",
-                "duplicate `import " + json_quote(imp.path) + "`",
-                "remove the duplicate `import` declaration",
+                "unused import `" + imp.alias_name + "`",
+                "imported package alias referenced in this file",
+                "unused `import " + json_quote(imp.path) + "`",
+                fix_msg,
                 edit_opt,
               ),
             )
           }
-          None => {
-            declared.set(imp.alias_name, imp.path)
-            if !u.first_span.contains(imp.alias_name) {
-              let edit_opt = if !pkg_has_implicit_user.contains(imp.alias_name) &&
-                !is_conflicted &&
-                !extra_files_incomplete &&
-                line_clean {
-                lint_make_delete_import_edit(
-                  f.path,
-                  raw_src,
-                  starts,
-                  imp_toks.spans[ii].start_line,
-                  del_lines,
-                )
-              } else {
-                None
-              }
-              out.push(
-                lint_diag_with_edit(
-                  imp.span,
-                  "L_UNUSED_IMPORT",
-                  "unused import `" + imp.alias_name + "`",
-                  "imported package alias referenced in this file",
-                  "unused `import " + json_quote(imp.path) + "`",
-                  "remove the unused `import` declaration",
-                  edit_opt,
-                ),
-              )
-            }
-          }
         }
-        ii = ii + 1
       }
-    } else {
-      let mut ii = 0
-      while ii < f.imports.length() {
-        declared.set(f.imports[ii].alias_name, f.imports[ii].path)
-        ii = ii + 1
-      }
+      ii = ii + 1
     }
 
     let mut ui = 0
@@ -1294,7 +1406,9 @@ fn lint_check_imports(
           Some(s) => s
           None => span_new(f.path, 1, 1)
         }
-        let edit_opt = if !alias_conflict.contains(al) && has_src {
+        let edit_opt = if !alias_conflict.contains(al) &&
+          !extra_files_incomplete &&
+          has_src {
           match alias_path.get(al) {
             Some(p) => lint_make_insert_import_edit(f, raw_src, starts, imp_toks, p, al)
             None => None
@@ -1393,10 +1507,69 @@ fn lint_collect_idents_pat(idents : Map[String, Bool], p : Pattern) -> Unit {
 }
 
 ///|
+fn lint_collect_idents_name(idents : Map[String, Bool], name : String) -> Unit {
+  if name.length() == 0 {
+    return
+  }
+  idents.set(name, true)
+  if has_qual_sep(name) {
+    let qp = split_qual_name(name)
+    idents.set(qp.prefix, true)
+    idents.set(qp.name, true)
+  }
+}
+
+///|
+fn lint_collect_idents_type(idents : Map[String, Bool], t : TypeExpr) -> Unit {
+  match t {
+    TyName(name, args, _) => {
+      lint_collect_idents_name(idents, name)
+      let mut i = 0
+      while i < args.length() {
+        lint_collect_idents_type(idents, args[i])
+        i = i + 1
+      }
+    }
+    TyFn(ps, ret, _) => {
+      let mut i = 0
+      while i < ps.length() {
+        lint_collect_idents_type(idents, ps[i])
+        i = i + 1
+      }
+      lint_collect_idents_type(idents, ret)
+    }
+    TyTuple(ts, _) => {
+      let mut i = 0
+      while i < ts.length() {
+        lint_collect_idents_type(idents, ts[i])
+        i = i + 1
+      }
+    }
+    TyDynTrait(name, _) => lint_collect_idents_name(idents, name)
+    TyMissing(_) => ()
+  }
+}
+
+///|
+fn lint_collect_idents_bounds(idents : Map[String, Bool], bounds : Array[TypeBound]) -> Unit {
+  let mut i = 0
+  while i < bounds.length() {
+    idents.set(bounds[i].param, true)
+    let mut j = 0
+    while j < bounds[i].traits.length() {
+      lint_collect_idents_name(idents, bounds[i].traits[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
 fn lint_collect_idents_params(idents : Map[String, Bool], params : Array[Param]) -> Unit {
   let mut i = 0
   while i < params.length() {
     idents.set(params[i].name, true)
+    lint_collect_idents_type(idents, params[i].ty)
     match params[i].default_expr {
       Some(de) => lint_collect_idents_expr(idents, de)
       None => ()
@@ -1417,16 +1590,18 @@ fn lint_collect_idents_stmts(idents : Map[String, Bool], stmts : Array[Stmt]) ->
 ///|
 fn lint_collect_idents_stmt(idents : Map[String, Bool], s : Stmt) -> Unit {
   match s {
-    SLet(name, _, _, init, _) => {
+    SLet(name, _, ty, init, _) => {
       idents.set(name, true)
+      lint_collect_idents_type(idents, ty)
       lint_collect_idents_expr(idents, init)
     }
-    SLetTuple(names, _, init, _) => {
+    SLetTuple(names, ty, init, _) => {
       let mut i = 0
       while i < names.length() {
         idents.set(names[i], true)
         i = i + 1
       }
+      lint_collect_idents_type(idents, ty)
       lint_collect_idents_expr(idents, init)
     }
     SAssign(lhs, rhs, _) => {
@@ -1586,8 +1761,9 @@ fn lint_collect_idents_expr(idents : Map[String, Bool], e : Expr) -> Unit {
       lint_collect_idents_expr(idents, scrut)
       lint_collect_idents_pat(idents, pat)
     }
-    EClosure(params, _, body, _) => {
+    EClosure(params, ret_ty, body, _) => {
       lint_collect_idents_params(idents, params)
+      lint_collect_idents_type(idents, ret_ty)
       lint_collect_idents_stmts(idents, body)
     }
     EScope(w, f, _) => {
@@ -1599,7 +1775,10 @@ fn lint_collect_idents_expr(idents : Map[String, Bool], e : Expr) -> Unit {
       lint_collect_idents_expr(idents, f)
     }
     EMove(inner, _) => lint_collect_idents_expr(idents, inner)
-    EAs(inner, _, _) => lint_collect_idents_expr(idents, inner)
+    EAs(inner, ty, _) => {
+      lint_collect_idents_expr(idents, inner)
+      lint_collect_idents_type(idents, ty)
+    }
     ETry(inner, _) => lint_collect_idents_expr(idents, inner)
     EInterp(parts, _) => lint_collect_idents_exprs(idents, parts)
     ENamedArg(aname, _, arg_e, _) => {
@@ -2469,7 +2648,15 @@ fn lint_check_fn_decl(
   out : Array[Diagnostic],
 ) -> Unit {
   let idents : Map[String, Bool] = Map([])
+  let mut tpi = 0
+  while tpi < fd.type_params.length() {
+    idents.set(fd.type_params[tpi], true)
+    tpi = tpi + 1
+  }
+  lint_collect_idents_name(idents, fd.receiver_type)
+  lint_collect_idents_bounds(idents, fd.type_bounds)
   lint_collect_idents_params(idents, fd.params)
+  lint_collect_idents_type(idents, fd.ret_ty)
   lint_collect_idents_stmts(idents, fd.body)
   let ctx = LintDeclCtx::{
     tc: tc,
@@ -2507,6 +2694,7 @@ fn lint_check_extern_fn_decl(
   }
   let idents : Map[String, Bool] = Map([])
   lint_collect_idents_params(idents, ef.params)
+  lint_collect_idents_type(idents, ef.ret_ty)
   lint_collect_idents_stmts(idents, ef.body)
   let ctx = LintDeclCtx::{
     tc: tc,
@@ -2540,6 +2728,7 @@ fn lint_check_const_decl(
   out : Array[Diagnostic],
 ) -> Unit {
   let idents : Map[String, Bool] = Map([])
+  lint_collect_idents_type(idents, cd.ty)
   lint_collect_idents_expr(idents, cd.value)
   let ctx = LintDeclCtx::{
     tc: tc,
