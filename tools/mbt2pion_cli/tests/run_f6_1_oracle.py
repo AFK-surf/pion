@@ -289,6 +289,10 @@ fn opt_none() -> Int? {
   Option::None
 }
 
+priv struct R9Box {
+  v : Bool
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -405,7 +409,18 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string()
+  // R9 P1-1: struct field initializer `R9Box::{ v: (Some(local_fn) is Some(always_fail_g)) && ... }` MUST propagate!
+  let p13 = try {
+    let obj = R9Box::{ v: (Some(local_fn) is Some(always_fail_g)) && yes_helper(always_fail_g()) }
+    if obj.v {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -580,7 +595,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -847,6 +862,77 @@ def main():
                 f"R8 P1-3 different impls ({ord_name}) MUST fail closed with MBT2PION_DEP_ABI_ERROR:\n{combined}"
             )
         print("[f6-1-oracle] PASS R8 P1-3 different impls with same canonical name & ABI fail closed (both orders)")
+
+        # 3a-7. R9 P1-2: identical source/ABI/files_sha256 in DIFFERENT directories with DIFFERENT transitive deps
+        # (`L/x -> L/leaf(1)` vs `R/x -> R/leaf(2)`) MUST fail closed, while same canonical dir (`R/x` vs `R/./x`) succeeds!
+        r9_base = os.path.join(work, "r9_trans")
+        r9_dirs = {}
+        for side, leaf_val in [("L", "1"), ("R", "2")]:
+            l_src = os.path.join(r9_base, side, "mbt", "leaf")
+            l_out = os.path.join(r9_base, side, "leaf")
+            x_src = os.path.join(r9_base, side, "mbt", "x")
+            x_out = os.path.join(r9_base, side, "x")
+            for d in (l_src, x_src):
+                os.makedirs(d)
+            for d in (l_out, x_out):
+                os.makedirs(os.path.join(d, "src"))
+            with open(os.path.join(l_src, "moon.pkg"), "w") as f:
+                f.write("\n")
+            with open(os.path.join(l_src, "leaf.mbt"), "w") as f:
+                f.write(f"pub fn get() -> Int {{ {leaf_val} }}\n")
+            with open(os.path.join(l_out, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "leaf"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+            run_cmd([bin_path, "--src", l_src, "--out", os.path.join(l_out, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+            with open(os.path.join(x_src, "moon.pkg"), "w") as f:
+                f.write('import { "f6/r9/leaf" }\n')
+            with open(os.path.join(x_src, "x.mbt"), "w") as f:
+                f.write("pub fn get() -> Int { @leaf.get() }\n")
+            with open(os.path.join(x_out, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "x"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nleaf = {{ path = "{l_out}" }}\n')
+            run_cmd([bin_path, "--src", x_src, "--out", os.path.join(x_out, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"leaf={l_out}", "--pionc", args.pionc])
+            r9_dirs[side] = (l_out, x_out)
+
+        assert open(os.path.join(r9_dirs["L"][1], "src", "mbt2pion_abi.json")).read() == open(os.path.join(r9_dirs["R"][1], "src", "mbt2pion_abi.json")).read(), \
+            "L/x and R/x must have identical mbt2pion_abi.json (same ABI & files_sha256)"
+
+        r9_dn_src = os.path.join(r9_base, "dn_src")
+        os.makedirs(r9_dn_src)
+        with open(os.path.join(r9_dn_src, "moon.pkg"), "w") as f:
+            f.write('import { "f6/r9/x" @other }\n')
+        with open(os.path.join(r9_dn_src, "dn.mbt"), "w") as f:
+            f.write("pub fn run_r9() -> Int { @other.get() }\n")
+
+        for ord_name, dep_flags in [
+            ("lr", ["--dep", f"x={r9_dirs['L'][1]}", "--dep", f"other={r9_dirs['R'][1]}"]),
+            ("rl", ["--dep", f"other={r9_dirs['R'][1]}", "--dep", f"x={r9_dirs['L'][1]}"]),
+        ]:
+            r9_dn_out = os.path.join(r9_base, f"dn_fail_{ord_name}")
+            os.makedirs(r9_dn_out)
+            res = run_cmd(
+                [bin_path, "--src", r9_dn_src, "--out", r9_dn_out, "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc],
+                check=False,
+            )
+            combined = res.stdout + "\n" + res.stderr
+            rep_p = os.path.join(r9_dn_out, "migration_report.json")
+            if os.path.isfile(rep_p):
+                combined += "\n" + open(rep_p).read()
+            assert res.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in combined, (
+                f"R9 P1-2 different dirs with identical files_sha256 ({ord_name}) MUST fail closed:\n{combined}"
+            )
+
+        # Same canonical dir via `/./` MUST succeed and produce 2 on Pion native & wasm32 (matching Moon)
+        r9_same_out = os.path.join(r9_base, "dn_same")
+        os.makedirs(os.path.join(r9_same_out, "src"))
+        r_x_dot = os.path.join(r9_base, "R", ".", "x")
+        with open(os.path.join(r9_same_out, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "r9_same"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\nx = {{ path = "{r9_dirs["R"][1]}" }}\n')
+        run_cmd([bin_path, "--src", r9_dn_src, "--out", os.path.join(r9_same_out, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--dep", f"x={r9_dirs['R'][1]}", "--dep", f"other={r_x_dot}", "--pionc", args.pionc])
+        with open(os.path.join(r9_same_out, "src", "main.pion"), "w") as f:
+            f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_r9().to_string())\n  0\n}\n")
+        r9_pn = run_cmd([args.pionc, "run", r9_same_out]).stdout.strip()
+        r9_pw = run_cmd([args.pionc, "run", "--target", "wasm32", r9_same_out]).stdout.strip()
+        assert r9_pn == "2" and r9_pw == "2", f"R9 same canonical dir (/./) mismatch: nat={r9_pn!r} wasm={r9_pw!r}"
+        print("[f6-1-oracle] PASS R9 P1-2 identical files_sha256 different dirs fail closed; same canonical dir (/./) == 2")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
