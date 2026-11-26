@@ -263,9 +263,9 @@ RT_LOG_DIR=$(mktemp -d)
 TSAN_PID=""
 ASAN_PID=""
 SMOKE_PID=""
-CORE_PID=""
+SAN_BG_PID=""
 cleanup_verify() {
-  bg_kill "$TSAN_PID" "$ASAN_PID" "$SMOKE_PID" "$CORE_PID"
+  bg_kill "$TSAN_PID" "$ASAN_PID" "$SMOKE_PID" "$SAN_BG_PID"
   rm -rf "$RT_LOG_DIR"
 }
 trap cleanup_verify EXIT
@@ -306,6 +306,13 @@ if [ "$RT_FAIL" -ne 0 ]; then
   exit 1
 fi
 
+if [ "$MODE" = "bootstrap" ]; then
+  # Overlap sanitizer runtime + ASan+UBSan QBE build with Stage 1 & Stage 2 bootstrap.
+  bg_start "$RT_LOG_DIR/san_rt.log" env ROOT_DIR="$ROOT_DIR" OUT_DIR="$OUT_DIR" PION_REQUIRE_SANITIZERS="${PION_REQUIRE_SANITIZERS:-0}" \
+    sh -euc '. "$ROOT_DIR/scripts/san-rt-env.sh"'
+  SAN_BG_PID="$BG_PID"
+fi
+
 PION_STAGE0_ONLY=0 PION_STAGE0_BIN="$OUT_DIR/pionc0" PION_SKIP_RT_TEST=1 PION_SKIP_QBE_BUILD=1 PION_DEFER_CORE_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
 
 PIONC2="$OUT_DIR/pionc2"
@@ -343,17 +350,14 @@ rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
 if [ "$MODE" = "bootstrap" ]; then
-  bg_start "$RT_LOG_DIR/core_test.log" env PION_CACHE_DIR="$OUT_DIR/cas_core_test" \
-    sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"
-  CORE_PID="$BG_PID"
-  . "$ROOT_DIR/scripts/san-rt-env.sh"
-  if ! bg_join "$CORE_PID" "$RT_LOG_DIR/core_test.log"; then
-    CORE_PID=""
-    rm -rf "$OUT_DIR/cas_core_test"
-    exit 1
+  if [ -n "$SAN_BG_PID" ]; then
+    if ! bg_join "$SAN_BG_PID" "$RT_LOG_DIR/san_rt.log"; then
+      SAN_BG_PID=""
+      echo "FAIL: sanitizer runtime / QBE prebuild" >&2
+      exit 1
+    fi
+    SAN_BG_PID=""
   fi
-  CORE_PID=""
-  rm -rf "$OUT_DIR/cas_core_test"
   echo "=== VERIFY-ALL BOOTSTRAP GATES PASSED ==="
   GATE_ELAPSED_S=$(( $(python3 -c 'import time; print(int(time.time()))') - T_GATE_START ))
   echo "verify-all.sh --bootstrap-only duration: ${GATE_ELAPSED_S}s"
@@ -395,10 +399,8 @@ if [ "$MODE" = "full" ]; then
 fi
 E2E_CMDS="$RT_LOG_DIR/e2e_cmds.txt"
 : > "$E2E_CMDS"
-if [ "$MODE" = "full" ]; then
-  # Gate [2/6] step [6/9], deferred by PION_DEFER_CORE_TEST=1: one long single-threaded build.
-  printf '%s\n' 'PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC' >> "$E2E_CMDS"
-fi
+# Gate [2/6] step [6/9], deferred by PION_DEFER_CORE_TEST=1: one long single-threaded build.
+printf '%s\n' 'PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC' >> "$E2E_CMDS"
 cat >> "$E2E_CMDS" <<'E2E'
 # Slowest suites first so the pool packs well.
 # Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.

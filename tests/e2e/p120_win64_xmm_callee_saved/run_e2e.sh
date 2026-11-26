@@ -577,25 +577,51 @@ fi
 if [ -n "$SAN_QBE" ]; then
   export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
   export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
-  N=0
-  replay() { # $1 input, then qbe options
-    in=$1
-    shift
-    "$QBE" "$@" -o "$TMP_DIR/ref.out" "$in"
-    "$SAN_QBE" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
-    [ ! -s "$TMP_DIR/san.err" ] || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in wrote diagnostics"; }
-    cmp "$TMP_DIR/ref.out" "$TMP_DIR/san.out" || fail "sanitized QBE $* $in: output differs from out/qbe"
-    N=$((N + 1))
-  }
-  for IN in "$F/fixture.ssa" "$TMP_DIR/nbody.ssa" "$TMP_DIR/spectralnorm.ssa" "$TMP_DIR/mandelbrot_mt.ssa"; do
-    replay "$IN" -t amd64_win
-    replay "$IN" --seh -t amd64_win
-    replay "$IN" -t amd64_sysv
-    replay "$IN" -t amd64_sysv --obj
-    replay "$IN" -t arm64
-    replay "$IN" -t arm64_apple
-  done
-  [ "$N" -eq 24 ] || fail "replayed $N outputs, want 24"
+  python3 -E - "$QBE" "$SAN_QBE" "$TMP_DIR" \
+    "$F/fixture.ssa" "$TMP_DIR/nbody.ssa" "$TMP_DIR/spectralnorm.ssa" "$TMP_DIR/mandelbrot_mt.ssa" <<'PYEOF'
+import os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+qbe, san_qbe, tmp_dir = sys.argv[1:4]
+inputs = sys.argv[4:]
+routes = [
+    ["-t", "amd64_win"],
+    ["--seh", "-t", "amd64_win"],
+    ["-t", "amd64_sysv"],
+    ["-t", "amd64_sysv", "--obj"],
+    ["-t", "arm64"],
+    ["-t", "arm64_apple"],
+]
+tasks = []
+idx = 0
+for inp in inputs:
+    for opts in routes:
+        tasks.append((idx, inp, opts))
+        idx += 1
+assert len(tasks) == 24, f"expected 24 replay tasks, got {len(tasks)}"
+jobs = min(os.cpu_count() or 1, 4)
+
+def run_one(item):
+    i, inp, opts = item
+    ref_out = os.path.join(tmp_dir, f"ref_{i}.out")
+    san_out = os.path.join(tmp_dir, f"san_{i}.out")
+    r1 = subprocess.run([qbe, *opts, "-o", ref_out, inp])
+    if r1.returncode != 0:
+        raise SystemExit(f"FAIL: p120 out/qbe {' '.join(opts)} {inp}")
+    r2 = subprocess.run([san_qbe, *opts, "-o", san_out, inp], capture_output=True, text=True)
+    if r2.returncode != 0:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p120 sanitized QBE {' '.join(opts)} {inp}")
+    if r2.stderr:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p120 sanitized QBE {' '.join(opts)} {inp} wrote diagnostics")
+    with open(ref_out, "rb") as f1, open(san_out, "rb") as f2:
+        if f1.read() != f2.read():
+            raise SystemExit(f"FAIL: p120 sanitized QBE {' '.join(opts)} {inp}: output differs from out/qbe")
+
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(run_one, tasks))
+PYEOF
   echo "p120 ASan+UBSan QBE: 24 outputs (4 inputs x amd64_win default / --seh / amd64_sysv text + --obj / arm64 / arm64_apple) clean and equal to out/qbe"
 elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
