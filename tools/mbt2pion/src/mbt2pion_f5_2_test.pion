@@ -141,6 +141,12 @@ test "lower_ffi: fail-closed on invalid attributes, unannotated or owned params,
 
   let bad_pfx = try_lower_extern_c_fn_with_prefix("", "f10", "s : String", " -> Int", "\"c_f10\"", ["#borrow(s)"], used, "")
   assert_true(!bad_pfx.ok, "empty shim_prefix on bridged FFI must fail closed")
+
+  let bad_pfx_digit = try_lower_extern_c_fn_with_prefix("", "f11", "s : String", " -> Int", "\"c_f11\"", ["#borrow(s)"], used, "9pion_")
+  assert_true(!bad_pfx_digit.ok, "digit-leading shim_prefix must fail closed")
+
+  let bad_pfx_dash = try_lower_extern_c_fn_with_prefix("", "f12", "s : String", " -> Int", "\"c_f12\"", ["#borrow(s)"], used, "pion-bad_")
+  assert_true(!bad_pfx_dash.ok, "hyphenated shim_prefix must fail closed")
 }
 
 test "lower_ffi: C-ABI param collision avoidance and verbatim oracle alignment" {
@@ -297,4 +303,148 @@ test "abi: builtin_mbt_compat_enum_schemas exposes canonical MbtJson::Number ari
     }
   }
   assert_eq(num_arity, 2)
+}
+
+test "stage_a_ffi: default empty prefix stays fail-closed, opt-in prefix lowers bridged extern C and preserves direct scalars" {
+  let src = "pub extern \"C\" fn raw_add(a : Int, b : Int) -> Int = \"c_raw_add\"\n\n#borrow(msg, data)\npub extern \"C\" fn send_msg(msg : String, data : Bytes, tag : Int) -> Int = \"c_send_msg\"\n\npub extern \"C\" fn get_name() -> String = \"c_get_name\"\n"
+  let sf = SourceFile::{ rel_path: "ffi_mod.mbt", content: src, is_test: false }
+
+  // 1. Default (ffi_shim_prefix == "") must fail closed on bridged extern C
+  let res_def = transpile_package([sf], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(res_def.blockers > 0, "default empty ffi_shim_prefix must block bridged extern C")
+  let mut has_ffi_err = false
+  for d in res_def.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" {
+      has_ffi_err = true
+    }
+  }
+  assert_true(has_ffi_err, "must emit MBT2PION_UNSUPPORTED_FFI_SIGNATURE by default")
+
+  // 2. Opt-in ffi_shim_prefix == "pion_" must lower cleanly with 0 blockers
+  let opts_pfx = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "pion_",
+    header: default_header_meta("native"),
+  }
+  let res_ok = transpile_package([sf], empty_api_map(), default_recipes(), [], [], opts_pfx, [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_eq(res_ok.blockers, 0)
+  assert_eq(res_ok.files.length(), 1)
+  let out = res_ok.files[0].content
+  assert_true(
+    str_has(out, "pub extern \"C\" fn raw_add(a : Int, b : Int) -> Int = \"c_raw_add\""),
+    "direct scalar extern C must keep original C symbol without prefix",
+  )
+  assert_true(
+    str_has(out, "extern \"C\" fn __mbt_c_ffi_send_msg(msg_ptr : Ptr, msg_len : Int, data_ptr : Ptr, data_len : Int, tag : Int) -> Int = \"pion_c_send_msg\""),
+    "bridged extern C must use prefixed C symbol",
+  )
+  assert_true(
+    str_has(out, "extern \"C\" fn __mbt_c_ffi_get_name() -> Ptr = \"pion_c_get_name\""),
+    "String return extern C must use prefixed C symbol",
+  )
+  assert_eq(res_ok.ffi_symbols.length(), 3)
+  assert_true(res_ok.ffi_symbols[0].fn_name == "raw_add" && res_ok.ffi_symbols[0].raw_c_symbol == "c_raw_add" && res_ok.ffi_symbols[0].emitted_c_symbol == "c_raw_add" && !res_ok.ffi_symbols[0].bridged, "scalar symbol mapping mismatch")
+  assert_true(res_ok.ffi_symbols[1].fn_name == "send_msg" && res_ok.ffi_symbols[1].raw_c_symbol == "c_send_msg" && res_ok.ffi_symbols[1].emitted_c_symbol == "pion_c_send_msg" && res_ok.ffi_symbols[1].bridged, "bridged send_msg mapping mismatch")
+  assert_true(res_ok.ffi_symbols[2].fn_name == "get_name" && res_ok.ffi_symbols[2].raw_c_symbol == "c_get_name" && res_ok.ffi_symbols[2].emitted_c_symbol == "pion_c_get_name" && res_ok.ffi_symbols[2].bridged, "bridged get_name mapping mismatch")
+
+  let rep = render_migration_report_json(res_ok, opts_pfx)
+  assert_true(str_has(rep, "\"ffi_shim_prefix\":\"pion_\""), "migration report must include ffi_shim_prefix")
+  assert_true(str_has(rep, "\"emitted_c_symbol\":\"pion_c_send_msg\""), "migration report must include ffi_symbols table")
+}
+
+test "stage_a_ffi: package-wide C symbol collision fails closed in both declaration orders" {
+  let opts_pfx = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "pion_",
+    header: default_header_meta("native"),
+  }
+  // Order 1: direct scalar `"pion_foo"` before bridged `"foo"`
+  let src1 = "extern \"C\" fn raw_foo(x : Int) -> Int = \"pion_foo\"\n#borrow(s)\nextern \"C\" fn bridged_foo(s : String) -> Int = \"foo\"\n"
+  let r1 = transpile_package([SourceFile::{ rel_path: "c1.mbt", content: src1, is_test: false }], empty_api_map(), default_recipes(), [], [], opts_pfx, [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(r1.blockers > 0, "direct then bridged symbol collision must fail closed")
+
+  // Order 2: bridged `"foo"` before direct scalar `"pion_foo"`
+  let src2 = "#borrow(s)\nextern \"C\" fn bridged_foo(s : String) -> Int = \"foo\"\nextern \"C\" fn raw_foo(x : Int) -> Int = \"pion_foo\"\n"
+  let r2 = transpile_package([SourceFile::{ rel_path: "c2.mbt", content: src2, is_test: false }], empty_api_map(), default_recipes(), [], [], opts_pfx, [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(r2.blockers > 0, "bridged then direct symbol collision must fail closed")
+
+  // Order 3: two bridged functions emitting same prefixed C symbol
+  let src3 = "#borrow(s)\nextern \"C\" fn f_a(s : String) -> Int = \"dup\"\n#borrow(s)\nextern \"C\" fn f_b(s : String) -> Int = \"dup\"\n"
+  let r3 = transpile_package([SourceFile::{ rel_path: "c3.mbt", content: src3, is_test: false }], empty_api_map(), default_recipes(), [], [], opts_pfx, [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(r3.blockers > 0, "duplicate bridged C symbol must fail closed")
+}
+
+test "abi: ffi_shim_prefix enters abi_sha256 when non-empty and stays backward-compatible when empty" {
+  let base_abi = empty_package_abi("demo")
+  let base_payload = render_canonical_abi_payload(base_abi)
+  assert_true(!str_has(base_payload, "ffi_shim_prefix"), "empty ffi_shim_prefix must be omitted for backward-compatible abi_sha256")
+  let sha_empty = compute_abi_payload_sha256(base_abi)
+
+  let pfx_abi = PackageAbi::{
+    package_name: "demo",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    ffi_shim_prefix: "pion_",
+    publishable: true,
+  }
+  let pfx_payload = render_canonical_abi_payload(pfx_abi)
+  assert_true(str_has(pfx_payload, "\"ffi_shim_prefix\":\"pion_\""), "non-empty ffi_shim_prefix must appear in canonical ABI payload")
+  let sha_pion = compute_abi_payload_sha256(pfx_abi)
+  assert_true(sha_pion != sha_empty, "non-empty ffi_shim_prefix must change abi_sha256")
+
+  let alt_abi = PackageAbi::{
+    package_name: "demo",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    ffi_shim_prefix: "alt_",
+    publishable: true,
+  }
+  assert_true(compute_abi_payload_sha256(alt_abi) != sha_pion, "different ffi_shim_prefix must produce distinct abi_sha256")
+
+  // Round-trip through render_abi_json + verify_and_parse_dep_abi
+  let hdr = "// abi-sha256: " + sha_pion + "\npub fn f() -> Int { 1 }\n"
+  let pfiles = [("a.pion", hdr)]
+  let raw_json = render_abi_json(pfx_abi, pfiles)
+  let diags : Array[Diag] = []
+  match verify_and_parse_dep_abi("demo", "/tmp/demo", pfiles, Some(raw_json), diags) {
+    Some(parsed) => {
+      assert_eq(diags.length(), 0)
+      assert_true(parsed.ffi_shim_prefix == "pion_", "parsed ABI must preserve ffi_shim_prefix")
+    }
+    None => assert_true(false, "valid ABI with ffi_shim_prefix must verify cleanly")
+  }
+
+  // Tampered invalid ffi_shim_prefix in mbt2pion_abi.json must fail closed
+  let bad_json = str_replace_all(raw_json, "\"pion_\"", "\"123-bad\"")
+  let bad_diags : Array[Diag] = []
+  let bad_res = verify_and_parse_dep_abi("demo", "/tmp/demo", pfiles, Some(bad_json), bad_diags)
+  assert_true(bad_res is None && bad_diags.length() > 0, "tampered invalid ffi_shim_prefix in ABI must fail closed")
 }

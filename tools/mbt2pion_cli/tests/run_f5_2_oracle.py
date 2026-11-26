@@ -3,7 +3,7 @@ r"""4-Target Differential Oracle for map-pattern `if`/`guard ... is` chains and 
 MoonBit native == MoonBit wasm-gc == Pion native == Pion wasm32,
 plus real C-compiled FFI bridge verification on Pion native.
 """
-import argparse, os, shutil, subprocess, sys, tempfile
+import argparse, json, os, shutil, subprocess, sys, tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
@@ -151,6 +151,137 @@ pub fn run_nested_map_dfs() -> String {
 
 pub fn run_all() -> String {
   run_map_is_1() + " :: " + run_map_is_guard() + " :: " + run_map_is_shadow() + " :: " + run_map_short_circuit() + " :: " + run_nested_map_dfs()
+}
+'''
+
+FFI_E2E_MBT = r'''
+pub extern "C" fn scalar_add(a : Int, b : Int) -> Int = "raw_scalar_add"
+
+#borrow(data_dir, cloud)
+pub extern "C" fn ffi_start(data_dir : String, cloud : String, beta : Int) -> Int = "demo_start"
+
+#borrow(msg, data)
+pub extern "C" fn ffi_send_bytes(msg : String, data : Bytes) -> Int = "demo_send_bytes"
+
+#borrow(data)
+pub extern "C" fn ffi_pick(data : Bytes, tag : Int) -> Int = "demo_pick"
+
+pub extern "C" fn ffi_scheme() -> String = "demo_scheme"
+
+pub extern "C" fn ffi_null_str() -> String = "demo_null_str"
+
+pub extern "C" fn ffi_nul_trunc() -> String = "demo_nul_trunc"
+
+#borrow(tag)
+pub extern "C" fn ffi_read_buf(tag : String) -> Bytes = "demo_read_buf"
+
+#borrow(a, b)
+pub extern "C" fn ffi_mutate_and_alias(a : Bytes, b : Bytes) -> Int = "demo_mutate_and_alias"
+'''
+
+FFI_COLLIDE_MBT = r'''
+pub extern "C" fn raw_collide(x : Int) -> Int = "pion_dup_sym"
+
+#borrow(s)
+pub extern "C" fn bridged_collide(s : String) -> Int = "dup_sym"
+'''
+
+FFI_E2E_C = r'''
+#include <stdint.h>
+#include <string.h>
+
+static uint8_t g_buf[64];
+static int32_t g_buf_len = 0;
+
+int32_t raw_scalar_add(int32_t a, int32_t b) {
+  return a + b;
+}
+
+int32_t pion_demo_start(const char *dir_ptr, int32_t dir_len, const char *url_ptr, int32_t url_len, int32_t beta) {
+  int32_t sum = dir_len * 100 + url_len * 10 + beta;
+  if (dir_len > 0 && dir_ptr[0] == '/') sum += 1;
+  if (url_len > 0 && url_ptr[0] == 'h') sum += 2;
+  return sum;
+}
+
+int32_t pion_demo_send_bytes(const char *msg_ptr, int32_t msg_len, const uint8_t *data_ptr, int32_t data_len) {
+  (void)msg_ptr;
+  int32_t n = data_len < 64 ? data_len : 64;
+  for (int32_t i = 0; i < n; i++) {
+    g_buf[i] = (uint8_t)(data_ptr[i] ^ (uint8_t)(msg_len & 0xff));
+  }
+  g_buf_len = n;
+  return msg_len * 100 + data_len;
+}
+
+int32_t pion_demo_pick(const uint8_t *data_ptr, int32_t data_len, int32_t tag) {
+  int32_t first = (data_len > 0 && data_ptr != NULL) ? (int32_t)data_ptr[0] : -1;
+  return tag * 1000 + data_len * 10 + (first >= 0 ? first : 0);
+}
+
+const char *pion_demo_scheme(void) {
+  return "pion-scheme";
+}
+
+const char *pion_demo_null_str(void) {
+  return NULL;
+}
+
+const char *pion_demo_nul_trunc(void) {
+  static const char buf[6] = { 'a', 'b', '\0', 'c', 'd', '\0' };
+  return buf;
+}
+
+const uint8_t *pion_demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_len) {
+  (void)tag_ptr;
+  if (tag_len <= 0) {
+    *out_len = 0;
+    return NULL;
+  }
+  *out_len = g_buf_len;
+  return g_buf;
+}
+
+int32_t pion_demo_mutate_and_alias(uint8_t *a_ptr, int32_t a_len, const uint8_t *b_ptr, int32_t b_len) {
+  int32_t same_ptr = (a_ptr == b_ptr) ? 1 : 0;
+  if (a_len > 0 && a_ptr != NULL) {
+    a_ptr[0] = 0xFF;
+  }
+  return same_ptr * 100 + a_len * 10 + b_len;
+}
+'''
+
+FFI_E2E_MAIN_PION = r'''
+pub fn main(w : World) -> Int {
+  let sc = scalar_add(19, 23)
+  let s = ffi_start("/tmp", "https://ex", 1)
+  let u = ffi_start("/你好🚀", "h", 0)
+  let e_str = ffi_start("", "", 5)
+  let payload = "\x10\x00\x30".to_bytes()
+  let send_rc = ffi_send_bytes("abcd", payload)
+  let out = ffi_read_buf("ok")
+  let empty_b = ffi_read_buf("")
+  let empty_send = ffi_send_bytes("", "".to_bytes())
+  let null_s = ffi_null_str()
+  let nul_trunc = ffi_nul_trunc()
+  let picked = ffi_pick("\x05\x06".to_bytes(), 7)
+  let picked_empty = ffi_pick("".to_bytes(), 3)
+  let orig = "\x2a\x2b".to_bytes()
+  let alias_rc = ffi_mutate_and_alias(orig, orig)
+  let orig0 = orig[0].to_int()
+  let b0 = out[0].to_int()
+  let b1 = out[1].to_int()
+  let b2 = out[2].to_int()
+  io_println(
+    w,
+    sc.to_string() + "|" + s.to_string() + "|" + u.to_string() + "|" + e_str.to_string() + "|" +
+    send_rc.to_string() + "|" + empty_send.to_string() + "|" + ffi_scheme() + "|" +
+    null_s.length().to_string() + "|" + nul_trunc + ":" + nul_trunc.length().to_string() + "|" +
+    empty_b.length().to_string() + "|" + picked.to_string() + "|" + picked_empty.to_string() + "|" +
+    alias_rc.to_string() + ":" + orig0.to_string() + "|" +
+    out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string(),
+  )
+  0
 }
 '''
 
@@ -314,13 +445,29 @@ def main():
         with open(os.path.join(pion_out, "pion.toml"), "w") as f:
             f.write(f'[package]\nname = "map_is_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
         with open(os.path.join(pion_out, "main.pion"), "w") as f:
-            f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_all())\n  0\n}\n")
+            f.write(
+                'fn run_split_next() -> String {\n'
+                '  let e = match ({ let __sp = ("").split(","); if __sp.length() > 0 { Some(__sp[0]) } else { None } }) {\n'
+                '    Some(s) => "Some(" + s.length().to_string() + ":" + s + ")"\n'
+                '    None => "None"\n'
+                '  }\n'
+                '  let ne = match ({ let __sp = ("ab,cd").split(","); if __sp.length() > 0 { Some(__sp[0]) } else { None } }) {\n'
+                '    Some(s) => "Some(" + s.length().to_string() + ":" + s + ")"\n'
+                '    None => "None"\n'
+                '  }\n'
+                '  e + "|" + ne\n'
+                '}\n\n'
+                'pub fn main(w : World) -> Int {\n'
+                '  io_println(w, run_all() + " :: " + run_split_next())\n'
+                '  0\n'
+                '}\n'
+            )
 
         # Pion native
         nat_bin = os.path.join(tmp, "map_is_nat")
         run_cmd([args.pionc, "build", "-o", nat_bin, pion_out])
         pion_nat_out = run_cmd([nat_bin])
-        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999 :: 0:1|0:1|0:1|12:2:a,b|4 :: 1:axb|0:ax"
+        expected = "1025|-2|-3 :: 73|70|-9 :: 5|999|999 :: 0:1|0:1|0:1|12:2:a,b|4 :: 1:axb|0:ax :: Some(0:)|Some(2:ab)"
         assert pion_nat_out == expected, f"Pion native mismatch: {pion_nat_out!r} != {expected!r}"
         print(f"[PASS] Pion native map-is: {pion_nat_out}")
 
@@ -341,7 +488,21 @@ def main():
             with open(os.path.join(mbt_mod, "src", "moon.pkg"), "w") as f:
                 f.write('options("is-main": true)\n')
             with open(os.path.join(mbt_mod, "src", "main.mbt"), "w") as f:
-                f.write(MAP_IS_MBT + "\nfn main {\n  println(run_all())\n}\n")
+                f.write(
+                    MAP_IS_MBT
+                    + '\nfn run_split_next() -> String {\n'
+                    + '  let e = match "".split(",").next() {\n'
+                    + '    Some(s) => "Some(" + s.length().to_string() + ":" + s.to_string() + ")"\n'
+                    + '    None => "None"\n'
+                    + '  }\n'
+                    + '  let ne = match "ab,cd".split(",").next() {\n'
+                    + '    Some(s) => "Some(" + s.length().to_string() + ":" + s.to_string() + ")"\n'
+                    + '    None => "None"\n'
+                    + '  }\n'
+                    + '  e + "|" + ne\n'
+                    + '}\n'
+                    + '\nfn main {\n  println(run_all() + " :: " + run_split_next())\n}\n'
+                )
             for target in ("native", "wasm-gc"):
                 m_out = run_cmd([args.moon, "run", "--target", target, "src"], cwd=mbt_mod)
                 assert m_out == pion_nat_out, f"MoonBit {target} mismatch: {m_out!r} != {pion_nat_out!r}"
@@ -365,6 +526,172 @@ def main():
         expected_ffi = "504|1113|pion-scheme|0|0|77|3:20,36,52"
         assert ffi_out == expected_ffi, f"FFI bridge native mismatch: {ffi_out!r} != {expected_ffi!r}"
         print(f"[PASS] Pion native C-ABI FFI bridge: {ffi_out}")
+
+        # 3. End-to-end CLI `--ffi-shim-prefix` + real C object link & execution
+        ffi_src_dir = os.path.join(tmp, "ffi_mbt_pkg")
+        os.makedirs(ffi_src_dir)
+        with open(os.path.join(ffi_src_dir, "ffi_e2e.mbt"), "w") as f:
+            f.write(FFI_E2E_MBT)
+        with open(os.path.join(ffi_src_dir, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+
+        # 3a. Default (no --ffi-shim-prefix) in --mode publish MUST fail closed and leave --out empty
+        ffi_out_def = os.path.join(tmp, "ffi_out_default")
+        os.makedirs(ffi_out_def)
+        rep_def_path = os.path.join(tmp, "ffi_report_default.json")
+        def_proc = subprocess.run(
+            [
+                mbt2pion_bin,
+                "--src", ffi_src_dir,
+                "--out", ffi_out_def,
+                "--mode", "publish",
+                "--no-fmt",
+                "--report", rep_def_path,
+                "--mbt-compat", COMPAT_DIR,
+                "--pionc", args.pionc,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert def_proc.returncode != 0, "default (no --ffi-shim-prefix) must fail closed in --mode publish"
+        assert os.listdir(ffi_out_def) == [], f"default failed publish must leave --out empty, got: {os.listdir(ffi_out_def)}"
+        with open(rep_def_path) as f:
+            rep_def = json.load(f)
+        def_codes = {d["code"] for d in rep_def.get("diagnostics", [])}
+        assert "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" in def_codes, f"expected MBT2PION_UNSUPPORTED_FFI_SIGNATURE, got {def_codes}"
+        print("[PASS] CLI default fail-closed on bridged extern \"C\" (--out empty)")
+
+        # 3b. Opt-in `--ffi-shim-prefix pion_` in --mode publish MUST succeed with accurate report & ABI
+        ffi_out_pfx = os.path.join(tmp, "ffi_out_pion")
+        os.makedirs(ffi_out_pfx)
+        rep_pfx_path = os.path.join(tmp, "ffi_report_pion.json")
+        run_cmd([
+            mbt2pion_bin,
+            "--src", ffi_src_dir,
+            "--out", ffi_out_pfx,
+            "--mode", "publish",
+            "--no-fmt",
+            "--ffi-shim-prefix", "pion_",
+            "--report", rep_pfx_path,
+            "--mbt-compat", COMPAT_DIR,
+            "--pionc", args.pionc,
+        ])
+        with open(rep_pfx_path) as f:
+            rep_pfx = json.load(f)
+        assert rep_pfx.get("ffi_shim_prefix") == "pion_", f"report ffi_shim_prefix mismatch: {rep_pfx.get('ffi_shim_prefix')!r}"
+        sym_by_fn = {item["fn_name"]: item for item in rep_pfx.get("ffi_symbols", [])}
+        assert sym_by_fn["scalar_add"] == {
+            "file": "ffi_e2e.mbt",
+            "fn_name": "scalar_add",
+            "raw_c_symbol": "raw_scalar_add",
+            "emitted_c_symbol": "raw_scalar_add",
+            "bridged": False,
+        }, f"scalar_add mapping mismatch: {sym_by_fn.get('scalar_add')}"
+        assert sym_by_fn["ffi_start"]["emitted_c_symbol"] == "pion_demo_start" and sym_by_fn["ffi_start"]["bridged"] is True
+        assert sym_by_fn["ffi_mutate_and_alias"]["emitted_c_symbol"] == "pion_demo_mutate_and_alias" and sym_by_fn["ffi_mutate_and_alias"]["bridged"] is True
+        with open(os.path.join(ffi_out_pfx, "mbt2pion_abi.json")) as f:
+            abi_pion = json.load(f)
+        assert abi_pion["payload"].get("ffi_shim_prefix") == "pion_", "mbt2pion_abi.json must record ffi_shim_prefix"
+
+        # Different prefix must produce a different abi_sha256 (cache/ABI separation)
+        ffi_out_alt = os.path.join(tmp, "ffi_out_alt")
+        os.makedirs(ffi_out_alt)
+        run_cmd([
+            mbt2pion_bin,
+            "--src", ffi_src_dir,
+            "--out", ffi_out_alt,
+            "--mode", "publish",
+            "--no-fmt",
+            "--ffi-shim-prefix", "alt_",
+            "--mbt-compat", COMPAT_DIR,
+            "--pionc", args.pionc,
+        ])
+        with open(os.path.join(ffi_out_alt, "mbt2pion_abi.json")) as f:
+            abi_alt = json.load(f)
+        assert abi_alt["abi_sha256"] != abi_pion["abi_sha256"], "distinct --ffi-shim-prefix must yield distinct abi_sha256"
+        print("[PASS] CLI --ffi-shim-prefix publish, report symbol table, and ABI separation")
+
+        # 3c. Compile real C shim with `cc -c` to `.o` + link transpiled `.pion` via `pionc build` and run
+        csrc_dir = os.path.join(ffi_out_pfx, "csrc")
+        os.makedirs(csrc_dir)
+        c_file = os.path.join(csrc_dir, "e2e_shim.c")
+        o_file = os.path.join(csrc_dir, "e2e_shim.o")
+        with open(c_file, "w") as f:
+            f.write(FFI_E2E_C)
+        cc_bin = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        assert cc_bin, "C compiler (cc/gcc/clang) required for real C-link FFI verification"
+        run_cmd([cc_bin, "-O2", "-c", c_file, "-o", o_file])
+        with open(os.path.join(ffi_out_pfx, "pion.toml"), "w") as f:
+            f.write(
+                f'[package]\nname = "ffi_e2e_pkg"\nversion = "0.1.0"\n\n'
+                f'[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n\n'
+                f'[link.macos]\nflags = ["{o_file}"]\n\n'
+                f'[link.linux]\nflags = ["{o_file}"]\n'
+            )
+        with open(os.path.join(ffi_out_pfx, "main.pion"), "w") as f:
+            f.write(FFI_E2E_MAIN_PION)
+        e2e_bin = os.path.join(tmp, "ffi_e2e_nat")
+        run_cmd([args.pionc, "build", "-o", e2e_bin, ffi_out_pfx])
+        e2e_out = run_cmd([e2e_bin])
+        # sc=42, s=504, u=1113, e_str=5, send_rc=403, empty_send=0, scheme=pion-scheme, null_s_len=0,
+        # nul_trunc="ab":2, empty_b_len=0, picked=7025 (7*1000+2*10+5), picked_empty=3000 (3*1000+0+0),
+        # alias_rc=22 (same_ptr=0, a_len=2, b_len=2) & orig0=42 (0x2a unchanged!),
+        # out="3:20,4,52" (0x10^4=20, 0x00^4=4, 0x30^4=52)
+        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|3:20,4,52"
+        assert e2e_out == expected_e2e, f"CLI E2E C-linked FFI mismatch: {e2e_out!r} != {expected_e2e!r}"
+        print(f"[PASS] CLI E2E C-linked FFI execution: {e2e_out}")
+
+        # 3d. Negative CLI tests: invalid --ffi-shim-prefix and same-package C symbol collision
+        for bad_pfx in ("123_bad", "bad-pfx", " pion_"):
+            bad_out = os.path.join(tmp, f"ffi_out_bad_{abs(hash(bad_pfx))}")
+            os.makedirs(bad_out)
+            bad_proc = subprocess.run(
+                [
+                    mbt2pion_bin,
+                    "--src", ffi_src_dir,
+                    "--out", bad_out,
+                    "--mode", "publish",
+                    "--ffi-shim-prefix", bad_pfx,
+                    "--mbt-compat", COMPAT_DIR,
+                    "--pionc", args.pionc,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert bad_proc.returncode != 0, f"invalid --ffi-shim-prefix {bad_pfx!r} must fail"
+            assert os.listdir(bad_out) == [], f"invalid --ffi-shim-prefix {bad_pfx!r} must leave --out empty"
+
+        col_src = os.path.join(tmp, "ffi_col_pkg")
+        os.makedirs(col_src)
+        with open(os.path.join(col_src, "collide.mbt"), "w") as f:
+            f.write(FFI_COLLIDE_MBT)
+        with open(os.path.join(col_src, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        col_out = os.path.join(tmp, "ffi_col_out")
+        os.makedirs(col_out)
+        col_rep = os.path.join(tmp, "ffi_col_report.json")
+        col_proc = subprocess.run(
+            [
+                mbt2pion_bin,
+                "--src", col_src,
+                "--out", col_out,
+                "--mode", "publish",
+                "--no-fmt",
+                "--ffi-shim-prefix", "pion_",
+                "--report", col_rep,
+                "--mbt-compat", COMPAT_DIR,
+                "--pionc", args.pionc,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert col_proc.returncode != 0, "same-package C symbol collision must fail closed"
+        assert os.listdir(col_out) == [], f"symbol collision must leave --out empty, got: {os.listdir(col_out)}"
+        with open(col_rep) as f:
+            col_rep_json = json.load(f)
+        col_codes = {d["code"] for d in col_rep_json.get("diagnostics", [])}
+        assert "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" in col_codes, f"expected MBT2PION_UNSUPPORTED_FFI_SIGNATURE on collision, got {col_codes}"
+        print("[PASS] CLI negative tests: invalid --ffi-shim-prefix & C symbol collision fail-closed")
 
         print("[SUMMARY] map-is & ffi-bridge oracle: ALL PASS")
     finally:
