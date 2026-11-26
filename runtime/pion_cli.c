@@ -7,9 +7,11 @@
 #endif
 #include "pion_rt.h"
 #include <windows.h>
+#include <winioctl.h>
 #include <direct.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +21,15 @@
 #endif
 #ifndef ERROR_CANT_RESOLVE_FILENAME
 #define ERROR_CANT_RESOLVE_FILENAME 1921
+#endif
+#ifndef IO_REPARSE_TAG_SYMLINK
+#define IO_REPARSE_TAG_SYMLINK 0xA000000CL
+#endif
+#ifndef IO_REPARSE_TAG_MOUNT_POINT
+#define IO_REPARSE_TAG_MOUNT_POINT 0xA0000003L
+#endif
+#ifndef MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+#define MAXIMUM_REPARSE_DATA_BUFFER_SIZE (16 * 1024)
 #endif
 
 static wchar_t *pion_cli_utf8_to_wide(const char *data, size_t len) {
@@ -602,9 +613,147 @@ int64_t pion_cli_lpath_change_ms(const char *path) {
     return pion_cli_win_change_ms(path, FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
+typedef struct {
+    ULONG  ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    union {
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            ULONG  Flags;
+            WCHAR  PathBuffer[1];
+        } SymbolicLinkReparseBuffer;
+        struct {
+            USHORT SubstituteNameOffset;
+            USHORT SubstituteNameLength;
+            USHORT PrintNameOffset;
+            USHORT PrintNameLength;
+            WCHAR  PathBuffer[1];
+        } MountPointReparseBuffer;
+    } u;
+} PionReparseDataBuffer;
+
 char *pion_fs_readlink(const char *path) {
-    (void)path;
-    return NULL;
+    if (!path || path[0] == '\0') return NULL;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return NULL;
+    HANDLE h = CreateFileW(
+        wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    unsigned char *buf = (unsigned char *)malloc(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+    if (!buf) {
+        CloseHandle(h);
+        return NULL;
+    }
+    DWORD bytes_ret = 0;
+    BOOL ok = DeviceIoControl(
+        h,
+        FSCTL_GET_REPARSE_POINT,
+        NULL,
+        0,
+        buf,
+        MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+        &bytes_ret,
+        NULL
+    );
+    CloseHandle(h);
+    if (!ok || bytes_ret < 8) {
+        free(buf);
+        return NULL;
+    }
+    const PionReparseDataBuffer *rdb = (const PionReparseDataBuffer *)buf;
+    const unsigned char *pbuf = NULL;
+    size_t avail = 0;
+    USHORT off = 0;
+    USHORT len_bytes = 0;
+    if (rdb->ReparseTag == IO_REPARSE_TAG_SYMLINK) {
+        size_t hdr = offsetof(PionReparseDataBuffer, u.SymbolicLinkReparseBuffer.PathBuffer);
+        if ((size_t)bytes_ret < hdr) { free(buf); return NULL; }
+        pbuf = buf + hdr;
+        avail = (size_t)bytes_ret - hdr;
+        if (rdb->u.SymbolicLinkReparseBuffer.PrintNameLength > 0) {
+            off = rdb->u.SymbolicLinkReparseBuffer.PrintNameOffset;
+            len_bytes = rdb->u.SymbolicLinkReparseBuffer.PrintNameLength;
+        } else {
+            off = rdb->u.SymbolicLinkReparseBuffer.SubstituteNameOffset;
+            len_bytes = rdb->u.SymbolicLinkReparseBuffer.SubstituteNameLength;
+        }
+    } else if (rdb->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+        size_t hdr = offsetof(PionReparseDataBuffer, u.MountPointReparseBuffer.PathBuffer);
+        if ((size_t)bytes_ret < hdr) { free(buf); return NULL; }
+        pbuf = buf + hdr;
+        avail = (size_t)bytes_ret - hdr;
+        if (rdb->u.MountPointReparseBuffer.PrintNameLength > 0) {
+            off = rdb->u.MountPointReparseBuffer.PrintNameOffset;
+            len_bytes = rdb->u.MountPointReparseBuffer.PrintNameLength;
+        } else {
+            off = rdb->u.MountPointReparseBuffer.SubstituteNameOffset;
+            len_bytes = rdb->u.MountPointReparseBuffer.SubstituteNameLength;
+        }
+    } else {
+        free(buf);
+        return NULL;
+    }
+    if (len_bytes == 0 || (off & 1u) != 0 || (len_bytes & 1u) != 0 ||
+        (size_t)off + (size_t)len_bytes > avail) {
+        free(buf);
+        return NULL;
+    }
+    size_t wlen = (size_t)len_bytes / sizeof(wchar_t);
+    wchar_t *wtmp = (wchar_t *)malloc((wlen + 1) * sizeof(wchar_t));
+    if (!wtmp) {
+        free(buf);
+        return NULL;
+    }
+    memcpy(wtmp, pbuf + off, len_bytes);
+    wtmp[wlen] = L'\0';
+    free(buf);
+    wchar_t *wsrc = wtmp;
+    if (wlen >= 8 && memcmp(wsrc, L"\\??\\UNC\\", 8 * sizeof(wchar_t)) == 0) {
+        wsrc += 6;
+        wlen -= 6;
+        wsrc[0] = L'\\';
+    } else if (wlen >= 4 && memcmp(wsrc, L"\\??\\", 4 * sizeof(wchar_t)) == 0) {
+        wsrc += 4;
+        wlen -= 4;
+    }
+    if (wlen == 0 || wlen > (size_t)INT_MAX) {
+        free(wtmp);
+        return NULL;
+    }
+    int u8len = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, wsrc, (int)wlen, NULL, 0, NULL, NULL
+    );
+    if (u8len <= 0) {
+        free(wtmp);
+        return NULL;
+    }
+    char *out = (char *)malloc((size_t)u8len + 1);
+    if (!out) {
+        free(wtmp);
+        return NULL;
+    }
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wsrc, (int)wlen, out, u8len, NULL, NULL
+        ) != u8len) {
+        free(out);
+        free(wtmp);
+        return NULL;
+    }
+    out[u8len] = '\0';
+    free(wtmp);
+    return out;
 }
 
 #else /* POSIX */

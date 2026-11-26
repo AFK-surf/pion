@@ -158,6 +158,7 @@ pub struct QbeFnWrapper {
   /// type param: `"0"` / `"1"`, or `"env"` for a flag loaded from the next
   /// closure env word (still live in the generic that took the value).
   tp_flags : Array[String]
+  is_extern_c : Bool
 }
 
 ///|
@@ -23248,6 +23249,7 @@ fn qbe_register_fn_wrapper(
   param_tys : Array[Ty],
   ret_ty : Ty,
   tp_flags : Array[String],
+  is_extern_c : Bool,
 ) -> String {
   if !g.fn_wrapper_seen.contains(wrap_sym) {
     g.fn_wrapper_seen.set(wrap_sym, true)
@@ -23257,9 +23259,30 @@ fn qbe_register_fn_wrapper(
       param_tys: param_tys,
       ret_ty: ret_ty,
       tp_flags: tp_flags,
+      is_extern_c: is_extern_c,
     })
   }
   wrap_sym
+}
+
+///|
+fn qbe_emit_extern_fn_value(
+  g : QbeGen,
+  einfo : ExternFnInfo,
+  wrap_kind : String,
+  wrap_name : String,
+) -> QbeVal {
+  let wrap_sym = "$pion_" + g.pkg_prefix + "wrap_" + wrap_kind + "_" + wrap_name
+  let wrap = qbe_register_fn_wrapper(
+    g,
+    wrap_sym,
+    "$" + einfo.decl.c_symbol,
+    einfo.param_tys,
+    einfo.ret_ty,
+    [],
+    true,
+  )
+  qbe_alloc_fn_value(g, wrap, [], TFn(einfo.param_tys, einfo.ret_ty))
 }
 
 ///|
@@ -23333,6 +23356,7 @@ fn qbe_emit_fn_value(
       mptys,
       mret,
       [],
+      false,
     )
     return qbe_alloc_fn_value(g, wrap, env_regs, TFn(mptys, mret))
   }
@@ -23370,6 +23394,7 @@ fn qbe_emit_fn_value(
     finfo.param_tys,
     finfo.ret_ty,
     flags,
+    false,
   )
   let vptys : Array[Ty] = []
   let mut i = 0
@@ -43685,6 +43710,18 @@ fn qbe_emit_expr_inner(
               }
               None => ()
             }
+            match ipkg.tc.extern_fns.get(name) {
+              Some(ei) => {
+                let qei = qualify_extern_fn_info(ipkg, ei)
+                return qbe_emit_extern_fn_value(
+                  g,
+                  qei,
+                  "ex",
+                  qbe_mangle_qual_sym(ipkg.name + "::" + name),
+                )
+              }
+              None => ()
+            }
             if name != "None" && name != "Some" && name != "Ok" && name != "Err" {
               match ipkg.tc.variant_to_enum.get(name) {
                 Some(en) =>
@@ -43739,6 +43776,17 @@ fn qbe_emit_expr_inner(
             "",
             expected,
             id_sp,
+          )
+        }
+        None => ()
+      }
+      match g.tc.extern_fns.get(name) {
+        Some(einfo) => {
+          return qbe_emit_extern_fn_value(
+            g,
+            einfo,
+            "lx",
+            qbe_mangle_pkg_sym(name),
           )
         }
         None => ()
@@ -43830,6 +43878,18 @@ fn qbe_emit_expr_inner(
                       sub_pkg.name,
                       expected,
                       id_sp,
+                    )
+                  }
+                  None => ()
+                }
+                match sub_pkg.tc.extern_fns.get(mem) {
+                  Some(ei) => {
+                    let qei = qualify_extern_fn_info(sub_pkg, ei)
+                    return qbe_emit_extern_fn_value(
+                      g,
+                      qei,
+                      "ex",
+                      qbe_mangle_qual_sym(sub_pkg.name + "::" + mem),
                     )
                   }
                   None => ()
@@ -43939,6 +43999,18 @@ fn qbe_emit_expr_inner(
                 ipkg.name,
                 expected,
                 id_sp,
+              )
+            }
+            None => ()
+          }
+          match ipkg.tc.extern_fns.get(mem) {
+            Some(ei) => {
+              let qei = qualify_extern_fn_info(ipkg, ei)
+              return qbe_emit_extern_fn_value(
+                g,
+                qei,
+                "ex",
+                qbe_mangle_qual_sym(ipkg.name + "::" + mem),
               )
             }
             None => ()
@@ -60933,7 +61005,12 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
     pi = 0
     while pi < w.param_tys.length() {
       let ps = pi.to_string()
-      match qbe_abi_ty(w.param_tys[pi]) {
+      let pabi = if w.is_extern_c {
+        qbe_c_abi_ty(w.param_tys[pi])
+      } else {
+        qbe_abi_ty(w.param_tys[pi])
+      }
+      match pabi {
         "d" => out.write_string("    %ap" + ps + " =d cast %p" + ps + "\n")
         "s" => {
           out.write_string("    %wp" + ps + " =w copy %p" + ps + "\n")
@@ -60955,8 +61032,18 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
       }
       fi = fi + 1
     }
-    let ret_abi = qbe_abi_ty(w.ret_ty)
-    if ret_abi == "l" {
+    let is_unit_extern = w.is_extern_c && (match w.ret_ty {
+      TUnit => true
+      _ => false
+    })
+    let ret_abi = if w.is_extern_c {
+      qbe_c_abi_ty(w.ret_ty)
+    } else {
+      qbe_abi_ty(w.ret_ty)
+    }
+    if is_unit_extern {
+      out.write_string("    call ")
+    } else if ret_abi == "l" {
       out.write_string("    %r =l call ")
     } else {
       out.write_string("    %rv =" + ret_abi + " call ")
@@ -60968,7 +61055,11 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
       if pi > 0 {
         out.write_string(", ")
       }
-      let pabi = qbe_abi_ty(w.param_tys[pi])
+      let pabi = if w.is_extern_c {
+        qbe_c_abi_ty(w.param_tys[pi])
+      } else {
+        qbe_abi_ty(w.param_tys[pi])
+      }
       out.write_string(pabi)
       if pabi == "l" {
         out.write_string(" %p")
@@ -60993,6 +61084,11 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
       fi = fi + 1
     }
     out.write_string(")\n")
+    if is_unit_extern {
+      out.write_string("    ret 0\n}\n\n")
+      i = i + 1
+      continue
+    }
     match ret_abi {
       "d" => out.write_string("    %r =l cast %rv\n")
       "s" => {
@@ -61000,7 +61096,14 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
         out.write_string("    %r =l extuw %rw\n")
       }
       "w" =>
-        if qbe_is_uint32_ty(w.ret_ty) {
+        if w.is_extern_c {
+          match w.ret_ty {
+            TBool | TChar | TUInt => out.write_string("    %r =l extuw %rv\n")
+            TByte => out.write_string("    %r =l extub %rv\n")
+            TInt8 => out.write_string("    %r =l extsb %rv\n")
+            _ => out.write_string("    %r =l extsw %rv\n")
+          }
+        } else if qbe_is_uint32_ty(w.ret_ty) {
           out.write_string("    %r =l extuw %rv\n")
         } else {
           out.write_string("    %r =l extsw %rv\n")

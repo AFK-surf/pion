@@ -2930,6 +2930,11 @@ static void test_p22a_systems_io(int argc, char **argv) {
     assert(ok == 1 && pion_str_len(rl_j) > 0);
     assert(strstr(((PionString *)rl_j)->data, "sub") != NULL);
     pion_rc_dec(rl_j);
+    char *cli_rl_j = pion_fs_readlink(jbuf);
+    assert(cli_rl_j != NULL && strstr(cli_rl_j, "sub") != NULL);
+    free(cli_rl_j);
+    char *cli_rl_dir = pion_fs_readlink(sub_win);
+    assert(cli_rl_dir == NULL);
     void *rl_dir = pion_world_fs_readlink(w, sub_s, &ok);
     assert(ok == 0 && pion_str_len(rl_dir) > 0);
     pion_rc_dec(rl_dir);
