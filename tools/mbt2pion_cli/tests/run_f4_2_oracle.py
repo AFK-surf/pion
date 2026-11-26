@@ -503,11 +503,14 @@ def main():
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
 
-        # 3l-split. Same-package split-file global `let h : Hook` & `let hs : Array[Hook]` with `impl Add` in sibling file MUST fail closed
+        # 3l-split. Same-package split-file global `let h : Hook`, `let hs : Array[Hook]`, and nested `struct Holder { inner : Hook }` MUST fail closed
         for sp_name, f_body in [
             ("split_hook", "fn use_g(v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
             ("split_hook_arr_idx", "fn use_g(v : ArrayView[Int]) -> Int { let _ = hs[0] + hs[0]; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
             ("split_hook_arr_for", "fn use_g(v : ArrayView[Int]) -> Int { for x in hs { let _ = x + x }; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_holder_for", "struct Holder { inner : Hook }\nlet holders : Array[Holder] = [{ inner: h }]\nfn use_g(v : ArrayView[Int]) -> Int { for e in holders { let _ = e.inner + e.inner }; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_holder_pop", "struct Holder { inner : Hook }\nlet holders : Array[Holder] = [{ inner: h }]\nfn use_g(v : ArrayView[Int]) -> Int { match holders.pop() { Some(e) => { let _ = e.inner + e.inner }; None => () }; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_holder_remove", "struct Holder { inner : Hook }\nlet holders : Array[Holder] = [{ inner: h }]\nfn use_g(v : ArrayView[Int]) -> Int { let e = holders.remove(0); let _ = e.inner + e.inner; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
         ]:
             sp_src = os.path.join(work, f"neg_{sp_name}_src")
             sp_out = os.path.join(work, f"neg_{sp_name}_out")
