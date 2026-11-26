@@ -176,6 +176,15 @@ pub struct QbeProbeHints {
 }
 
 ///|
+struct QbeCleanupNode {
+  lbl : String
+  depth : Int
+  slot : String
+  next_lbl : String
+  order : Int
+}
+
+///|
 pub struct QbeGen {
   tc : TypeChecker
   release : Bool
@@ -300,6 +309,11 @@ pub struct QbeGen {
   mut fn_start_tmp : Int
   mut fn_start_lbl : Int
   mut fn_inlined_cost : Int
+  mut fn_cleanup_enabled : Bool
+  mut fn_ret_slot : String
+  mut fn_ret_epi_lbl : String
+  mut fn_cleanup_pads : Map[String, String]
+  mut fn_cleanup_nodes : Array[QbeCleanupNode]
   mut fn_allocs : StringBuilder
   mut fn_body : StringBuilder
   mut scopes : Array[QbeScope]
@@ -15931,7 +15945,7 @@ fn qbe_collect_pkg_inline_fns(
             }
             if !collected && !fd.is_pub && fd.body.length() <= 12 {
               let loop_max_depth = if g.target_wasm { 1 } else { 2 }
-              let loop_max_cost = if g.target_wasm { 96 } else { 220 }
+              let loop_max_cost = qbe_loop_inline_max_cost(g)
               let lcost = qbe_stmts_loop_inline_cost(
                 fd.body,
                 key,
@@ -16805,22 +16819,74 @@ fn qbe_emit_inline_closure_flat_struct_lit(
 }
 
 ///|
+fn qbe_loop_inline_max_cost(g : QbeGen) -> Int {
+  if g.target_wasm {
+    96
+  } else {
+    220
+  }
+}
+
+///|
+fn qbe_inline_max_cost(
+  g : QbeGen,
+  same_file : Bool,
+  is_pub : Bool,
+  consumes_variant : Bool,
+  unbox_destructure : Bool = false,
+) -> Int {
+  let use_legacy = (g.j2_disable_mask & 32) != 0
+  let in_loop = g.loop_breaks.length() > 0
+  if same_file && !is_pub && g.inline_depth == 0 && in_loop {
+    return qbe_loop_inline_max_cost(g)
+  }
+  if use_legacy {
+    if same_file || consumes_variant {
+      42
+    } else {
+      22
+    }
+  } else if in_loop {
+    if same_file || consumes_variant || unbox_destructure {
+      42
+    } else {
+      22
+    }
+  } else if consumes_variant || unbox_destructure {
+    42
+  } else if same_file {
+    18
+  } else {
+    10
+  }
+}
+
+///|
 fn qbe_caller_over_inline_budget(g : QbeGen, callee_cost : Int) -> Bool {
-  if callee_cost <= 12 {
+  let use_legacy = (g.j2_disable_mask & 32) != 0
+  let in_loop = g.loop_breaks.length() > 0
+  if use_legacy || in_loop {
+    if callee_cost <= 12 {
+      return false
+    }
+    if g.target_wasm {
+      return g.fn_inlined_cost + callee_cost > 1600 ||
+        g.fn_body.length() > 24576
+    } else {
+      let dt = g.next_tmp - g.fn_start_tmp
+      let dl = g.next_lbl - g.fn_start_lbl
+      return g.fn_inlined_cost + callee_cost > 1600 || dt > 3000 || dl > 500
+    }
+  }
+  if callee_cost <= 4 {
     return false
   }
   if g.target_wasm {
-    g.fn_body.length() > 65536 ||
-    g.fn_inlined_cost + callee_cost > 1600 ||
-    g.fn_body.length() > 24576
+    g.fn_inlined_cost + callee_cost > 480 || g.fn_body.length() > 16384
   } else {
     let dt = g.next_tmp - g.fn_start_tmp
     let dl = g.next_lbl - g.fn_start_lbl
-    g.fn_inlined_cost + callee_cost > 1600 ||
-    dt > 6000 ||
-    dl > 1000 ||
-    dt > 3000 ||
-    dl > 500
+    g.fn_inlined_cost + callee_cost > 480 || dt > 1500 || dl > 250
   }
 }
 
@@ -16906,16 +16972,13 @@ fn qbe_try_inline_fn_call(
         Some(fidx) => g.cur_file_idx < 0 || fidx == g.cur_file_idx
         None => true
       }
-      let base_max_cost = if same_file { 42 } else { 22 }
-      let loop_max_cost = if g.target_wasm { 96 } else { 220 }
-      let max_cost = if same_file &&
-        !inl_fd.is_pub &&
-        g.inline_depth == 0 &&
-        g.loop_breaks.length() > 0 {
-        loop_max_cost
-      } else {
-        base_max_cost
-      }
+      let max_cost = qbe_inline_max_cost(
+        g,
+        same_file,
+        inl_fd.is_pub,
+        false,
+        unbox_destructure=destructure,
+      )
       let fn_cost = match g.inline_fn_costs.get(key) {
         Some(c) => c
         None => 0
@@ -17196,7 +17259,13 @@ fn qbe_try_inline_xpkg_fn_call(
     false,
     if is_opt_res { 1 } else { 0 },
   )
-  if fn_cost < 0 || qbe_caller_over_inline_budget(g, fn_cost) {
+  let xpkg_max_cost = qbe_inline_max_cost(g, false, true, is_opt_res)
+  if fn_cost < 0 ||
+    ((g.j2_disable_mask & 32) == 0 &&
+      g.loop_breaks.length() == 0 &&
+      !is_opt_res &&
+      fn_cost > xpkg_max_cost) ||
+    qbe_caller_over_inline_budget(g, fn_cost) {
     return None
   }
   g.fn_inlined_cost = g.fn_inlined_cost + (if fn_cost > 0 { fn_cost } else { 1 })
@@ -20720,16 +20789,12 @@ fn qbe_local_fn_can_scalar_inline(g : QbeGen, key : String, finfo : FnInfo) -> O
         TOption(_) | TResult(_, _) => true
         _ => false
       }
-      let base_max_cost = if same_file || consumes_variant { 42 } else { 22 }
-      let loop_max_cost = if g.target_wasm { 96 } else { 220 }
-      let max_cost = if same_file &&
-        !inl_fd.is_pub &&
-        g.inline_depth == 0 &&
-        g.loop_breaks.length() > 0 {
-        loop_max_cost
-      } else {
-        base_max_cost
-      }
+      let max_cost = qbe_inline_max_cost(
+        g,
+        same_file,
+        inl_fd.is_pub,
+        consumes_variant,
+      )
       let fn_cost = match g.inline_fn_costs.get(key) {
         Some(c) => c
         None => 0
@@ -20784,7 +20849,13 @@ fn qbe_xpkg_fn_can_scalar_inline(
           false,
           if is_opt_res { 1 } else { 0 },
         )
-        if fn_cost < 0 || qbe_caller_over_inline_budget(g, fn_cost) {
+        let xpkg_max_cost = qbe_inline_max_cost(g, false, true, is_opt_res)
+        if fn_cost < 0 ||
+          ((g.j2_disable_mask & 32) == 0 &&
+            g.loop_breaks.length() == 0 &&
+            !is_opt_res &&
+            fn_cost > xpkg_max_cost) ||
+          qbe_caller_over_inline_budget(g, fn_cost) {
           return None
         }
         Some(finfo.decl)
@@ -22646,6 +22717,11 @@ fn qbe_new_for_target_name(
     fn_start_tmp: 0,
     fn_start_lbl: 0,
     fn_inlined_cost: 0,
+    fn_cleanup_enabled: false,
+    fn_ret_slot: "",
+    fn_ret_epi_lbl: "",
+    fn_cleanup_pads: Map([]),
+    fn_cleanup_nodes: [],
     fn_allocs: StringBuilder(),
     fn_body: StringBuilder(),
     scopes: [],
@@ -23373,6 +23449,194 @@ fn qbe_release_scopes_down_to(g : QbeGen, target_depth : Int) -> Unit {
     qbe_release_scope_locals(g, g.scopes[i])
     i = i - 1
   }
+}
+
+///|
+fn qbe_scope_pop_meta_only(g : QbeGen) -> Unit {
+  if g.scopes.length() > 0 {
+    let sc = g.scopes[g.scopes.length() - 1]
+    let mut zi = 0
+    while zi < sc.locals.length() {
+      g.zeroed_slots.remove(sc.locals[zi].slot)
+      g.stack_view_slots.remove(sc.locals[zi].slot)
+      g.borrow_owner_slot.remove(sc.locals[zi].slot)
+      g.borrow_owner_name.remove(sc.locals[zi].slot)
+      g.mut_local_slots.remove(sc.locals[zi].slot)
+      qbe_clear_shadowed_local_meta(g, sc.locals[zi].name)
+      zi = zi + 1
+    }
+    let _ = g.scopes.pop()
+  }
+  g.block_immut_fields = Map([])
+  g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
+}
+
+///|
+fn qbe_fn_cleanup_begin(g : QbeGen, enabled : Bool) -> Unit {
+  g.fn_cleanup_enabled = enabled && (g.j2_disable_mask & 16) == 0
+  g.fn_ret_slot = ""
+  g.fn_ret_epi_lbl = ""
+  g.fn_cleanup_pads = Map([])
+  g.fn_cleanup_nodes = []
+}
+
+///|
+fn qbe_collect_shared_cleanup_steps(g : QbeGen) -> Option[Array[(String, Int)]] {
+  let steps : Array[(String, Int)] = []
+  let mut si = g.scopes.length() - 1
+  while si >= 0 {
+    let sc = g.scopes[si]
+    let mut li = sc.locals.length() - 1
+    while li >= 0 {
+      let loc = sc.locals[li]
+      if loc.ref_slot != "" {
+        if !g.zeroed_slots.contains(loc.slot) && !g.moved_slots.contains(loc.slot) {
+          return None
+        }
+      } else if loc.owned &&
+        !g.zeroed_slots.contains(loc.slot) &&
+        !g.moved_slots.contains(loc.slot) {
+        if loc.is_cell {
+          steps.push((loc.slot, 1))
+        } else {
+          match loc.ty {
+            TParam(_) => return None
+            _ =>
+              if qbe_is_obj_ty(g, loc.ty) {
+                steps.push((loc.slot, 0))
+              }
+          }
+        }
+      }
+      li = li - 1
+    }
+    si = si - 1
+  }
+  if steps.length() < 2 {
+    None
+  } else {
+    Some(steps)
+  }
+}
+
+///|
+fn qbe_try_emit_shared_cleanup_exit(g : QbeGen, ret_reg : String) -> Bool {
+  if !g.fn_cleanup_enabled ||
+    g.block_term ||
+    g.inline_ret_lbl != "" ||
+    g.tco_mode != 0 {
+    return false
+  }
+  let steps = match qbe_collect_shared_cleanup_steps(g) {
+    Some(s) => s
+    None => return false
+  }
+  if g.fn_ret_epi_lbl == "" {
+    g.fn_ret_epi_lbl = qbe_lbl(g, "ret_epi")
+  }
+  if !g.cur_fn_void {
+    if g.fn_ret_slot == "" {
+      let s = qbe_tmp(g)
+      g.fn_allocs.write_string(" ")
+      g.fn_allocs.write_string(s)
+      g.fn_allocs.write_string(" =l alloc8 8\n")
+      g.fn_ret_slot = s
+    }
+    let abi = qbe_abi_ty(g.cur_ret_abi_ty)
+    qbe_emit(g, "store" + abi + " " + ret_reg + ", " + g.fn_ret_slot)
+  }
+  let mut next_lbl = g.fn_ret_epi_lbl
+  let mut depth = 1
+  let mut i = steps.length() - 1
+  while i >= 0 {
+    let (slot, kind) = steps[i]
+    let sig = (if kind == 1 { "c:" } else { "o:" }) + slot + "->" + next_lbl
+    match g.fn_cleanup_pads.get(sig) {
+      Some(existing_lbl) => next_lbl = existing_lbl
+      None => {
+        let lbl = qbe_lbl(g, "cln")
+        let ord = g.fn_cleanup_nodes.length()
+        g.fn_cleanup_pads.set(sig, lbl)
+        g.fn_cleanup_nodes.push(
+          QbeCleanupNode::{
+            lbl: lbl,
+            depth: depth,
+            slot: slot,
+            next_lbl: next_lbl,
+            order: ord,
+          },
+        )
+        next_lbl = lbl
+      }
+    }
+    depth = depth + 1
+    i = i - 1
+  }
+  qbe_emit_term(g, "jmp " + next_lbl)
+  true
+}
+
+///|
+fn qbe_fn_cleanup_flush(g : QbeGen) -> Unit {
+  if g.fn_ret_epi_lbl == "" && g.fn_cleanup_nodes.length() == 0 {
+    return
+  }
+  if !g.block_term {
+    qbe_emit_term(g, "hlt")
+  }
+  let nodes = g.fn_cleanup_nodes
+  let n = nodes.length()
+  let mut max_depth = 0
+  let mut i = 0
+  while i < n {
+    if nodes[i].depth > max_depth {
+      max_depth = nodes[i].depth
+    }
+    i = i + 1
+  }
+  let buckets : Array[Array[QbeCleanupNode]] = []
+  let mut d = 0
+  while d <= max_depth {
+    buckets.push([])
+    d = d + 1
+  }
+  i = 0
+  while i < n {
+    let node = nodes[i]
+    buckets[node.depth].push(node)
+    i = i + 1
+  }
+  d = max_depth
+  while d >= 0 {
+    let bucket = buckets[d]
+    let mut bi = 0
+    while bi < bucket.length() {
+      let node = bucket[bi]
+      qbe_emit_lbl(g, node.lbl)
+      let v = qbe_tmp(g)
+      qbe_emit(g, v + " =l loadl " + node.slot)
+      qbe_emit(g, "call $pion_rc_dec(l " + v + ")")
+      qbe_emit_term(g, "jmp " + node.next_lbl)
+      bi = bi + 1
+    }
+    d = d - 1
+  }
+  if g.fn_ret_epi_lbl != "" {
+    qbe_emit_lbl(g, g.fn_ret_epi_lbl)
+    if g.cur_fn_void {
+      qbe_emit_term(g, "ret")
+    } else {
+      let abi = qbe_abi_ty(g.cur_ret_abi_ty)
+      let rv = qbe_tmp(g)
+      qbe_emit(g, rv + " =" + abi + " load" + abi + " " + g.fn_ret_slot)
+      qbe_emit_term(g, "ret " + rv)
+    }
+  }
+  g.fn_ret_slot = ""
+  g.fn_ret_epi_lbl = ""
+  g.fn_cleanup_pads = Map([])
+  g.fn_cleanup_nodes = []
 }
 
 ///|
@@ -31971,6 +32235,11 @@ fn qbe_emit_closure_obj(
   let saved_fn_start_tmp = g.fn_start_tmp
   let saved_fn_start_lbl = g.fn_start_lbl
   let saved_fn_inlined_cost = g.fn_inlined_cost
+  let saved_fn_cleanup_enabled = g.fn_cleanup_enabled
+  let saved_fn_ret_slot = g.fn_ret_slot
+  let saved_fn_ret_epi_lbl = g.fn_ret_epi_lbl
+  let saved_fn_cleanup_pads = g.fn_cleanup_pads
+  let saved_fn_cleanup_nodes = g.fn_cleanup_nodes
   let clo_before_tmp = g.next_tmp
   let clo_before_lbl = g.next_lbl
   let saved_scopes = g.scopes
@@ -32042,6 +32311,7 @@ fn qbe_emit_closure_obj(
   g.fn_start_tmp = g.next_tmp
   g.fn_start_lbl = g.next_lbl
   g.fn_inlined_cost = 0
+  qbe_fn_cleanup_begin(g, true)
   g.scopes = []
   g.lookup_scope_floor = 0
   g.loop_breaks = []
@@ -32159,8 +32429,13 @@ fn qbe_emit_closure_obj(
   if !g.block_term {
     if is_spawn {
       qbe_rc_dec(g, bres.reg, bres.ty)
-      qbe_scope_pop(g)
-      qbe_emit_term(g, "ret")
+      if g.fn_cleanup_pads.length() > 0 &&
+        qbe_try_emit_shared_cleanup_exit(g, "") {
+        qbe_scope_pop_meta_only(g)
+      } else {
+        qbe_scope_pop(g)
+        qbe_emit_term(g, "ret")
+      }
     } else {
       let ret_v = if qbe_ty_has_untyped_option(bres.ty) && qbe_ty_has_niche_option(g, actual_ret) {
         qval(qbe_normalize_untyped_none_in_val(g, bres.reg, actual_ret), actual_ret)
@@ -32168,12 +32443,18 @@ fn qbe_emit_closure_obj(
         bres
       }
       let ret_l = qbe_as_l(g, ret_v)
-      qbe_scope_pop(g)
-      qbe_emit_term(g, "ret " + ret_l)
+      if g.fn_cleanup_pads.length() > 0 &&
+        qbe_try_emit_shared_cleanup_exit(g, ret_l) {
+        qbe_scope_pop_meta_only(g)
+      } else {
+        qbe_scope_pop(g)
+        qbe_emit_term(g, "ret " + ret_l)
+      }
     }
   } else {
     let _ = g.scopes.pop()
   }
+  qbe_fn_cleanup_flush(g)
 
   let hdr = StringBuilder()
   if is_spawn {
@@ -32202,6 +32483,11 @@ fn qbe_emit_closure_obj(
   g.fn_start_tmp = saved_fn_start_tmp + (g.next_tmp - clo_before_tmp)
   g.fn_start_lbl = saved_fn_start_lbl + (g.next_lbl - clo_before_lbl)
   g.fn_inlined_cost = saved_fn_inlined_cost
+  g.fn_cleanup_enabled = saved_fn_cleanup_enabled
+  g.fn_ret_slot = saved_fn_ret_slot
+  g.fn_ret_epi_lbl = saved_fn_ret_epi_lbl
+  g.fn_cleanup_pads = saved_fn_cleanup_pads
+  g.fn_cleanup_nodes = saved_fn_cleanup_nodes
   g.scopes = saved_scopes
   g.lookup_scope_floor = saved_floor
   g.loop_breaks = saved_breaks
@@ -48446,6 +48732,10 @@ fn qbe_emit_try_err_exit(
     qbe_emit_term(g, "jmp " + g.inline_ret_lbl)
     return
   }
+  if from_boxed_reg != "" &&
+    qbe_try_emit_shared_cleanup_exit(g, from_boxed_reg) {
+    return
+  }
   qbe_release_scopes_down_to(g, 0)
   if from_boxed_reg != "" {
     qbe_emit_term(g, "ret " + from_boxed_reg)
@@ -48485,8 +48775,11 @@ fn qbe_emit_try_none_exit(g : QbeGen) -> Unit {
     TOption(ri) => ri
     _ => TError
   }
-  qbe_release_scopes_down_to(g, 0)
   let none_obj = qbe_emit_none(g, ret_inner)
+  if qbe_try_emit_shared_cleanup_exit(g, none_obj) {
+    return
+  }
+  qbe_release_scopes_down_to(g, 0)
   qbe_emit_term(g, "ret " + none_obj)
 }
 
@@ -50820,6 +51113,11 @@ fn qbe_try_emit_while_bce_versioned(
     } else {
       qbe_emit_term(g, "jnz " + u4_ok + ", " + l_u4 + ", " + l_fast)
       qbe_emit_lbl(g, l_u4)
+      let u4_loop_depth = g.scopes.length()
+      g.loop_breaks.push(l_end)
+      g.loop_conts.push(l_u4_tail)
+      g.loop_depths.push(u4_loop_depth)
+      g.hot_loop_depth = g.hot_loop_depth + 1
       let mut ui = 0
       while ui < 4 {
         g.block_immut_fields = Map([])
@@ -50831,6 +51129,10 @@ fn qbe_try_emit_while_bce_versioned(
         qbe_scope_pop(g)
         ui = ui + 1
       }
+      let _ = g.loop_breaks.pop()
+      let _ = g.loop_conts.pop()
+      let _ = g.loop_depths.pop()
+      g.hot_loop_depth = g.hot_loop_depth - 1
       let iv_u4_w = qbe_tmp(g)
       let iv_u4_l = qbe_tmp(g)
       let c_u4 = qbe_tmp(g)
@@ -53905,11 +54207,13 @@ fn qbe_try_emit_let_match_opt_res(
     Some(qval("0", TUnit))
   } else {
     let cv = qbe_coerce_val(g, mv, g.cur_ret_abi_ty)
-    qbe_release_scopes_down_to(g, 0)
-    if g.cur_fn_void {
-      qbe_emit_term(g, "ret")
-    } else {
-      qbe_emit_term(g, "ret " + cv)
+    if !qbe_try_emit_shared_cleanup_exit(g, cv) {
+      qbe_release_scopes_down_to(g, 0)
+      if g.cur_fn_void {
+        qbe_emit_term(g, "ret")
+      } else {
+        qbe_emit_term(g, "ret " + cv)
+      }
     }
     Some(qval("0", TNever))
   }
@@ -58026,15 +58330,22 @@ fn qbe_emit_stmt(
         }
         None => qbe_zero_reg(target_abi_ty)
       }
-      qbe_release_scopes_down_to(g, 0)
-      if did_ret_mov {
-        g.movable_locals = old_mov
-        g.moved_slots = old_moved
-      }
-      if g.cur_fn_void {
-        qbe_emit_term(g, "ret")
+      if qbe_try_emit_shared_cleanup_exit(g, rv) {
+        if did_ret_mov {
+          g.movable_locals = old_mov
+          g.moved_slots = old_moved
+        }
       } else {
-        qbe_emit_term(g, "ret " + rv)
+        qbe_release_scopes_down_to(g, 0)
+        if did_ret_mov {
+          g.movable_locals = old_mov
+          g.moved_slots = old_moved
+        }
+        if g.cur_fn_void {
+          qbe_emit_term(g, "ret")
+        } else {
+          qbe_emit_term(g, "ret " + rv)
+        }
       }
       qval("0", TNever)
     }
@@ -59699,6 +60010,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.fn_start_tmp = g.next_tmp
       g.fn_start_lbl = g.next_lbl
       g.fn_inlined_cost = 0
+      qbe_fn_cleanup_begin(g, true)
       g.scopes = []
       g.loop_breaks = []
       g.loop_conts = []
@@ -59807,12 +60119,18 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
         let bres = qbe_emit_stmts(g, body, Some(finfo.ret_ty))
         if !g.block_term {
           let ret_reg = qbe_coerce_val(g, bres, finfo.ret_ty)
-          qbe_scope_pop(g)
-          qbe_emit_term(g, "ret " + ret_reg)
+          if g.fn_cleanup_pads.length() > 0 &&
+            qbe_try_emit_shared_cleanup_exit(g, ret_reg) {
+            qbe_scope_pop_meta_only(g)
+          } else {
+            qbe_scope_pop(g)
+            qbe_emit_term(g, "ret " + ret_reg)
+          }
         } else {
           let _ = g.scopes.pop()
         }
       }
+      qbe_fn_cleanup_flush(g)
       g.in_verify = false
       g.cur_tparams = []
       g.live_tparams = []
@@ -59890,6 +60208,7 @@ fn qbe_emit_extern_fn_decl(
       g.fn_start_tmp = g.next_tmp
       g.fn_start_lbl = g.next_lbl
       g.fn_inlined_cost = 0
+      qbe_fn_cleanup_begin(g, true)
       g.scopes = []
       g.loop_breaks = []
       g.loop_conts = []
@@ -60018,16 +60337,27 @@ fn qbe_emit_extern_fn_decl(
       if !g.block_term {
         if is_unit {
           qbe_rc_dec(g, bres.reg, bres.ty)
-          qbe_scope_pop(g)
-          qbe_emit_term(g, "ret")
+          if g.fn_cleanup_pads.length() > 0 &&
+            qbe_try_emit_shared_cleanup_exit(g, "") {
+            qbe_scope_pop_meta_only(g)
+          } else {
+            qbe_scope_pop(g)
+            qbe_emit_term(g, "ret")
+          }
         } else {
           let ret_reg = qbe_coerce_val(g, bres, ret_abi_ty)
-          qbe_scope_pop(g)
-          qbe_emit_term(g, "ret " + ret_reg)
+          if g.fn_cleanup_pads.length() > 0 &&
+            qbe_try_emit_shared_cleanup_exit(g, ret_reg) {
+            qbe_scope_pop_meta_only(g)
+          } else {
+            qbe_scope_pop(g)
+            qbe_emit_term(g, "ret " + ret_reg)
+          }
         }
       } else {
         let _ = g.scopes.pop()
       }
+      qbe_fn_cleanup_flush(g)
 
       let out = StringBuilder()
       out.write_string("export function ")
@@ -60081,6 +60411,7 @@ fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
           g.fn_start_tmp = g.next_tmp
           g.fn_start_lbl = g.next_lbl
           g.fn_inlined_cost = 0
+          qbe_fn_cleanup_begin(g, true)
           g.scopes = []
           g.loop_breaks = []
           g.loop_conts = []
@@ -60146,11 +60477,17 @@ fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
           let bres = qbe_emit_stmts(g, body, Some(finfo.ret_ty))
           if !g.block_term {
             let ret_reg = qbe_coerce_val(g, bres, finfo.ret_ty)
-            qbe_scope_pop(g)
-            qbe_emit_term(g, "ret " + ret_reg)
+            if g.fn_cleanup_pads.length() > 0 &&
+              qbe_try_emit_shared_cleanup_exit(g, ret_reg) {
+              qbe_scope_pop_meta_only(g)
+            } else {
+              qbe_scope_pop(g)
+              qbe_emit_term(g, "ret " + ret_reg)
+            }
           } else {
             let _ = g.scopes.pop()
           }
+          qbe_fn_cleanup_flush(g)
           g.in_verify = false
 
           let out = StringBuilder()
@@ -60208,6 +60545,7 @@ fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   g.fn_start_tmp = g.next_tmp
   g.fn_start_lbl = g.next_lbl
   g.fn_inlined_cost = 0
+  qbe_fn_cleanup_begin(g, true)
   g.scopes = []
   g.lookup_scope_floor = 0
   g.loop_breaks = []
@@ -60274,11 +60612,17 @@ fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   let bres = qbe_emit_stmts(g, body, Some(concrete_ret))
   if !g.block_term {
     let ret_reg = qbe_coerce_val(g, bres, concrete_ret)
-    qbe_scope_pop(g)
-    qbe_emit_term(g, "ret " + ret_reg)
+    if g.fn_cleanup_pads.length() > 0 &&
+      qbe_try_emit_shared_cleanup_exit(g, ret_reg) {
+      qbe_scope_pop_meta_only(g)
+    } else {
+      qbe_scope_pop(g)
+      qbe_emit_term(g, "ret " + ret_reg)
+    }
   } else {
     let _ = g.scopes.pop()
   }
+  qbe_fn_cleanup_flush(g)
   g.in_verify = false
   g.cur_type_subst = Map([])
   g.lexical_type_subst = Map([])
@@ -60676,6 +61020,18 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
     in_default_arg_expansion: false,
     in_imported_default_arg: false,
     priv_imported_types: Map([]),
+    record_types: false,
+    qt_filter_mode: 0,
+    qt_filter_files: Map([]),
+    qt_log_depth: 0,
+    qt_write_log: [],
+    qt_last_call_key: "",
+    qt_last_call_cand: None,
+    qt_pending_refs: Map([]),
+    qt_last_expr_ty: Map([]),
+    qt_expr_tys: Map([]),
+    qt_call_infos: Map([]),
+    qt_bindings: Map([]),
   }
   let mut fi = 0
   while fi < pkg.files.length() {
@@ -61016,6 +61372,7 @@ pub fn emit_qbe_package_multi_entry_target_opts(
     g.fn_start_tmp = g.next_tmp
     g.fn_start_lbl = g.next_lbl
     g.fn_inlined_cost = 0
+    qbe_fn_cleanup_begin(g, false)
     g.scopes = []
     g.loop_breaks = []
     g.loop_conts = []
@@ -61578,6 +61935,7 @@ pub fn emit_qbe_unit_entry_target_opts(
       g.fn_start_tmp = g.next_tmp
       g.fn_start_lbl = g.next_lbl
       g.fn_inlined_cost = 0
+      qbe_fn_cleanup_begin(g, false)
       g.scopes = []
       g.loop_breaks = []
       g.loop_conts = []
@@ -61966,6 +62324,7 @@ pub fn emit_qbe_test_package_target(
     g.fn_start_tmp = g.next_tmp
     g.fn_start_lbl = g.next_lbl
     g.fn_inlined_cost = 0
+    qbe_fn_cleanup_begin(g, false)
     g.scopes = []
     g.loop_breaks = []
     g.loop_conts = []
@@ -62087,6 +62446,7 @@ pub fn emit_qbe_test_package_target(
     g.fn_start_tmp = g.next_tmp
     g.fn_start_lbl = g.next_lbl
     g.fn_inlined_cost = 0
+    qbe_fn_cleanup_begin(g, false)
     g.scopes = []
     g.loop_breaks = []
     g.loop_conts = []

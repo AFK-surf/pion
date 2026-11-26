@@ -4240,6 +4240,113 @@ static void test_w1_string_span_map_entry(void) {
     printf("  string spans, scalar map entries and managed String reads: OK\n");
 }
 
+extern int32_t pion_cli_read_line_bounded_fp(FILE *fp, int64_t max_bytes,
+                                             void *out_buf_slot, void *out_len_slot);
+extern void pion_cli_free_buf(void *buf);
+extern int32_t pion_cli_write_line_fp(FILE *fp, const char *data, int64_t len);
+
+static void test_cli_bounded_line_io(void) {
+    /* 1. Normal LF, CRLF, empty lines, and final line without trailing LF */
+    FILE *fp = tmpfile();
+    assert(fp != NULL);
+    const char *sample = "hello\nworld\r\n\n\r\nlast_no_lf";
+    assert(fwrite(sample, 1, strlen(sample), fp) == strlen(sample));
+    rewind(fp);
+
+    char *buf = NULL;
+    int64_t len = -1;
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 5 && buf != NULL && strcmp(buf, "hello") == 0);
+    pion_cli_free_buf(buf);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 5 && buf != NULL && strcmp(buf, "world") == 0);
+    pion_cli_free_buf(buf);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 0 && buf == NULL);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 0 && buf == NULL);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 10 && buf != NULL && strcmp(buf, "last_no_lf") == 0);
+    pion_cli_free_buf(buf);
+
+    /* Clean EOF */
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 1);
+    assert(len == 0 && buf == NULL);
+    fclose(fp);
+
+    /* 2. Exact limit (LF, CRLF, EOF) and over-limit draining + recovery */
+    fp = tmpfile();
+    assert(fp != NULL);
+    const char *exact = "12345\n12345\r\n123456\nok\n12345\r";
+    assert(fwrite(exact, 1, strlen(exact), fp) == strlen(exact));
+    rewind(fp);
+
+    /* Exact 5 bytes + LF */
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 0);
+    assert(len == 5 && buf != NULL && strcmp(buf, "12345") == 0);
+    pion_cli_free_buf(buf);
+
+    /* Exact 5 bytes + CRLF */
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 0);
+    assert(len == 5 && buf != NULL && strcmp(buf, "12345") == 0);
+    pion_cli_free_buf(buf);
+
+    /* 6 bytes (> 5) -> status 2, drains cleanly so next frame "ok" is intact */
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 2);
+    assert(len == 0 && buf == NULL);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 0);
+    assert(len == 2 && buf != NULL && strcmp(buf, "ok") == 0);
+    pion_cli_free_buf(buf);
+
+    /* 5 bytes + trailing CR at EOF (6 payload bytes > 5) -> status 2 */
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 2);
+    assert(len == 0 && buf == NULL);
+
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 1);
+    fclose(fp);
+
+    /* 3. Exact limit at EOF without LF */
+    fp = tmpfile();
+    assert(fp != NULL);
+    assert(fwrite("abcde", 1, 5, fp) == 5);
+    rewind(fp);
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 0);
+    assert(len == 5 && buf != NULL && strcmp(buf, "abcde") == 0);
+    pion_cli_free_buf(buf);
+    assert(pion_cli_read_line_bounded_fp(fp, 5, &buf, &len) == 1);
+    fclose(fp);
+
+    /* 4. I/O read error (status 3) on write-only stream */
+#ifndef _WIN32
+    {
+        FILE *wfp = fopen("/dev/null", "w");
+        assert(wfp != NULL);
+        assert(pion_cli_read_line_bounded_fp(wfp, 64, &buf, &len) == 3);
+        assert(len == 0 && buf == NULL);
+        fclose(wfp);
+    }
+#endif
+    fp = tmpfile();
+    assert(fp != NULL);
+    /* Write-only fd via /dev/null or ferror simulation: use freopen? Simpler:
+     * invalid negative max_bytes returns 3, and write_line_fp round-trip. */
+    assert(pion_cli_read_line_bounded_fp(fp, -1, &buf, &len) == 3);
+    assert(pion_cli_write_line_fp(fp, "{\"ok\":true}", 11) == 0);
+    assert(pion_cli_write_line_fp(fp, "", 0) == 0);
+    rewind(fp);
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 11 && buf != NULL && strcmp(buf, "{\"ok\":true}") == 0);
+    pion_cli_free_buf(buf);
+    assert(pion_cli_read_line_bounded_fp(fp, 64, &buf, &len) == 0);
+    assert(len == 0 && buf == NULL);
+    fclose(fp);
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -4274,6 +4381,7 @@ int main(int argc, char **argv) {
     test_p61b_map_hint_hit_miss_aba();
     test_p71c_hashdos_bit63_noncollision();
     test_w1_string_span_map_entry();
+    test_cli_bounded_line_io();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();

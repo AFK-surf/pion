@@ -1243,10 +1243,10 @@ start of the iteration there is one at its end, whose target completion gives th
 theorem body_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
     (CS : SrcCtx G src si cert.svid.val cert.facts.val cert.savail)
     (CT : TgtCtx G tgt ti cert.tvid.val cert.tavail cert.bm_t.val cert.bm_s.val)
-    {steps : Pion.Array Step} {i : Std.I32} {g : ValGraph} {sc sx tc tx : Std.I32}
+    {nst : Std.I32} {steps : Pion.Array Step} {i : Std.I32} {g : ValGraph} {sc sx tc tx : Std.I32}
     {tchain schain : Pion.Array Std.I32} {i' : Std.I32} {g' : ValGraph} {sc' sx' tc' tx' : Std.I32}
     {tchain' schain' : Pion.Array Std.I32}
-    (hb : replay_pair_loop0.body steps src cert tgt ti si i g sc sx tc tx tchain schain =
+    (hb : replay_pair_loop0.body nst steps src cert tgt ti si i g sc sx tc tx tchain schain =
       ok (.cont (i', g', sc', sx', tc', tx', tchain', schain')))
     (hpre : GPre cert g) (hpos : 0 ≤ sc.val ∧ 0 ≤ sx.val ∧ 0 ≤ tc.val ∧ 0 ≤ tx.val) :
     vg_extends g g' ∧ GPre cert g' ∧ (0 ≤ sc'.val ∧ 0 ≤ sx'.val ∧ 0 ≤ tc'.val ∧ 0 ≤ tx'.val) ∧
@@ -1256,12 +1256,11 @@ theorem body_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
         ∃ env' n' s0' s' ts', RState G src tgt cert si ti o args res N sc' sx' tc' tx' schain' env' n' s0' s' ts' ∧
           (TGoal tgt o args res tc' tx' ts' → TGoal tgt o args res tc tx ts)) := by
   unfold replay_pair_loop0.body at hb
-  obtain ⟨nst, hnst, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
   swap
-  · rw [ite_eq_right hilt] at hb1; cases ok_inj' hb1
-  rw [ite_eq_left hilt] at hb1
-  obtain ⟨st, hst, hb2⟩ := bind_eq_ok hb1
+  · rw [ite_eq_right hilt] at hb; cases ok_inj' hb
+  rw [ite_eq_left hilt] at hb
+  obtain ⟨st, hst, hb2⟩ := bind_eq_ok hb
   obtain ⟨sx1, hsx1, hb3⟩ := bind_eq_ok hb2
   obtain ⟨q4, hq4, hb4⟩ := bind_eq_ok hb3
   obtain ⟨tx1, vg1⟩ := q4
@@ -1340,16 +1339,15 @@ theorem body_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
   obtain ⟨m', hm'⟩ := hback1 ⟨m, hm⟩
   exact ⟨Bt, m', hBtb, hm'⟩
 
-theorem body_done {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {i : Std.I32}
+theorem body_done {nst : Std.I32} {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {i : Std.I32}
     {g : ValGraph} {sc sx tc tx : Std.I32} {tchain schain : Pion.Array Std.I32}
     {y : Std.I32 × ValGraph × Std.I32 × Std.I32 × Std.I32 × Std.I32 × Pion.Array Std.I32 × Pion.Array Std.I32}
-    (hb : replay_pair_loop0.body steps src cert tgt ti si i g sc sx tc tx tchain schain = ok (.done (.inr y))) :
+    (hb : replay_pair_loop0.body nst steps src cert tgt ti si i g sc sx tc tx tchain schain = ok (.done (.inr y))) :
     y = (i, g, sc, sx, tc, tx, tchain, schain) := by
   unfold replay_pair_loop0.body at hb
-  obtain ⟨nst, hnst, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
-  · rw [ite_eq_left hilt] at hb1
-    obtain ⟨st, -, hb2⟩ := bind_eq_ok hb1
+  · rw [ite_eq_left hilt] at hb
+    obtain ⟨st, -, hb2⟩ := bind_eq_ok hb
     obtain ⟨sx1, -, hb3⟩ := bind_eq_ok hb2
     obtain ⟨q4, -, hb4⟩ := bind_eq_ok hb3
     obtain ⟨tx1, vg1⟩ := q4
@@ -1378,8 +1376,8 @@ theorem body_done {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si t
     obtain ⟨schain2, sc2, sx6⟩ := q
     simp only at hb12
     cases ok_inj' hb12
-  · rw [ite_eq_right hilt] at hb1
-    have e := ok_inj' hb1
+  · rw [ite_eq_right hilt] at hb
+    have e := ok_inj' hb
     simp only [ControlFlow.done.injEq, Sum.inr.injEq] at e
     exact e.symm
 
@@ -1402,14 +1400,14 @@ def LoopRel (G : ValGraph) (src tgt : Func) (cert : Cert) (si ti : FnInfo)
             TGoal tgt o args res tc' tx' ts') →
           TGoal tgt o args res tc tx ts)
 
-theorem loop_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
+theorem loop_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {nst : Std.I32}
     (CS : SrcCtx G src si cert.svid.val cert.facts.val cert.savail)
     (CT : TgtCtx G tgt ti cert.tvid.val cert.tavail cert.bm_t.val cert.bm_s.val) (steps : Pion.Array Step) :
     ∀ x r, loop (fun (x : Std.I32 × ValGraph × Std.I32 × Std.I32 × Std.I32 × Std.I32 × Pion.Array Std.I32 ×
         Pion.Array Std.I32) =>
       match x with
       | (i, vg, sc, sx, tc, tx, tchain, schain) =>
-        replay_pair_loop0.body steps src cert tgt ti si i vg sc sx tc tx tchain schain) x = ok r →
+        replay_pair_loop0.body nst steps src cert tgt ti si i vg sc sx tc tx tchain schain) x = ok r →
     LoopRel G src tgt cert si ti x r := by
   apply loop_ok_rel
   rintro ⟨i, g, sc, sx, tc, tx, tchain, schain⟩ c r hb hc
@@ -1428,7 +1426,7 @@ theorem loop_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
     simp only at hc
     subst hc
     subst hy
-    have hb' : replay_pair_loop0.body steps src cert tgt ti si i g sc sx tc tx tchain schain =
+    have hb' : replay_pair_loop0.body nst steps src cert tgt ti si i g sc sx tc tx tchain schain =
         ok (.done (.inr y)) := hb
     have hd := body_done hb'
     subst hd
@@ -1559,15 +1557,14 @@ theorem step_inl {src tgt : Func} {cert : Cert} {vg1 : ValGraph} {sc tc sx1 tx1 
       · exact lit _ _ (by decide) (ok_inj' h4)
       · cases ok_inj' h4
 
-theorem body_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {i : Std.I32}
+theorem body_inl {nst : Std.I32} {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {i : Std.I32}
     {g : ValGraph} {sc sx tc tx : Std.I32} {tchain schain : Pion.Array Std.I32} {e : Std.I32 × ValGraph}
-    (hb : replay_pair_loop0.body steps src cert tgt ti si i g sc sx tc tx tchain schain = ok (.done (.inl e))) :
+    (hb : replay_pair_loop0.body nst steps src cert tgt ti si i g sc sx tc tx tchain schain = ok (.done (.inl e))) :
     Code e.1 := by
   unfold replay_pair_loop0.body at hb
-  obtain ⟨nst, -, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
-  · rw [ite_eq_left hilt] at hb1
-    obtain ⟨st, -, hb2⟩ := bind_eq_ok hb1
+  · rw [ite_eq_left hilt] at hb
+    obtain ⟨st, -, hb2⟩ := bind_eq_ok hb
     obtain ⟨sx1, -, hb3⟩ := bind_eq_ok hb2
     obtain ⟨q4, -, hb4⟩ := bind_eq_ok hb3
     obtain ⟨tx1, vg1⟩ := q4
@@ -1629,15 +1626,15 @@ theorem body_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti
     obtain ⟨schain2, sc2, sx6⟩ := q
     simp only at hb12
     cases ok_inj' hb12
-  · rw [ite_eq_right hilt] at hb1
-    cases ok_inj' hb1
+  · rw [ite_eq_right hilt] at hb
+    cases ok_inj' hb
 
-theorem loop_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} :
+theorem loop_inl {nst : Std.I32} {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} :
     ∀ x e, loop (fun (x : Std.I32 × ValGraph × Std.I32 × Std.I32 × Std.I32 × Std.I32 × Pion.Array Std.I32 ×
         Pion.Array Std.I32) =>
       match x with
       | (i, vg, sc, sx, tc, tx, tchain, schain) =>
-        replay_pair_loop0.body steps src cert tgt ti si i vg sc sx tc tx tchain schain) x = ok (.inl e) →
+        replay_pair_loop0.body nst steps src cert tgt ti si i vg sc sx tc tx tchain schain) x = ok (.inl e) →
     Code e.1 := by
   intro x e h
   have key := loop_ok_inv _ (fun _ => True)
@@ -1715,8 +1712,8 @@ theorem replay_pair_dec {g : ValGraph} {src : Func} {si : FnInfo} {tgt : Func} {
     {p : PairCert} {g' : ValGraph} (h : replay_pair g src si tgt ti cert p = ok (0#i32, g')) :
     0 ≤ p.sb.val ∧ p.sb.val < si.nb.val ∧ 0 ≤ p.tb.val ∧ p.tb.val < ti.nb.val ∧
       (∃ g1, head_ok g src cert.svid tgt cert.tvid p.sb p.tb = ok (true, g1)) ∧ bm_has cert p.tb p.sb = ok true ∧
-      ∃ i1 vg2 sc1 sx1 tc1 tx1 tchain1 schain1,
-        replay_pair_loop0 p.steps src cert tgt ti si 0#i32 g p.sb 0#i32 p.tb 0#i32 (Pion.Array.ofList [p.tb])
+      ∃ nst i1 vg2 sc1 sx1 tc1 tx1 tchain1 schain1,
+        replay_pair_loop0 nst p.steps src cert tgt ti si 0#i32 g p.sb 0#i32 p.tb 0#i32 (Pion.Array.ofList [p.tb])
           (Pion.Array.ofList [p.sb]) = ok (.inr (i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1)) ∧
         ∃ sx2 tx2 vg3 Bs Bt nsi nti fs, skip_src_pure vg2 src cert.svid sc1 sx1 = ok sx2 ∧
           skip_tgt_pure vg2 tgt cert.tvid tc1 tx1 = ok (tx2, vg3) ∧ Pion.Array.get src.blocks sc1 = ok Bs ∧
@@ -1752,6 +1749,7 @@ theorem replay_pair_dec {g : ValGraph} {src : Func} {si : FnInfo} {tgt : Func} {
       | true => exact ht2
       | false => exact absurd rfl h3f
   obtain ⟨rfl, hbm⟩ := ht1
+  obtain ⟨nst, -, h6⟩ := bind_eq_ok h6
   obtain ⟨s, hs, h7⟩ := bind_eq_ok h6
   cases s with
   | inl e =>
@@ -1791,7 +1789,7 @@ theorem replay_pair_dec {g : ValGraph} {src : Func} {si : FnInfo} {tgt : Func} {
     obtain ⟨et62, eg4⟩ := e14
     have ht62 : t62 = true := by revert et62; cases t62 <;> simp
     subst ht62 eg4
-    exact ⟨h1, not_le.mp h2, h3, not_le.mp h4, ⟨_, hq1⟩, hbm, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hs,
+    exact ⟨h1, not_le.mp h2, h3, not_le.mp h4, ⟨_, hq1⟩, hbm, nst, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hs,
       sx2, tx2, vg3, Bs, Bt, nsi, nti, fs, hsx2, hq9, hBs, hnsi, hsxn, hBt, hnti, htxn, hfs, hq14⟩
 
 theorem ofList_val {α : Type} (l : List α) : (Pion.Array.ofList l : Pion.Array α).val = l := rfl
@@ -1820,7 +1818,7 @@ theorem pair_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
   | _ N ih =>
   intro i p env s0 ts Bs Bt hp hsb0 htb0 hin hhist hrun htin hw henv
   obtain ⟨g, g', hg, hgG, hg'G, hrp⟩ := hpairs i p hp
-  obtain ⟨-, -, -, -, -, -, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hloop, sx2, tx2, vg3, Bs1, Bt1, nsi,
+  obtain ⟨-, -, -, -, -, -, nst, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hloop, sx2, tx2, vg3, Bs1, Bt1, nsi,
     nti, fs, hsx2, hq9, hBs1, hnsi, hsxn, hBt1, hnti, htxn, hfs, hce⟩ := replay_pair_dec hrp
   have hrel := loop_sim CS CT p.steps _ _ hloop hg ⟨hsb0, by simp, htb0, by simp⟩ _ rfl
   obtain ⟨e2, hg2, ⟨hsc1, hsx1, htc1, htx1⟩, hsem⟩ := hrel
@@ -1943,6 +1941,7 @@ theorem replay_code {g : ValGraph} {src : Func} {si : FnInfo} {tgt : Func} {ti :
   obtain ⟨t3, -, h6⟩ := bind_eq_ok h5
   split at h6
   · rw [← ok_inj' h6]; right; dsimp only; decide
+  obtain ⟨nst, -, h6⟩ := bind_eq_ok h6
   obtain ⟨s, hs, h7⟩ := bind_eq_ok h6
   cases s with
   | inl e => simp only at h7; rw [← ok_inj' h7]; right; exact loop_inl _ e hs
@@ -1973,7 +1972,7 @@ theorem replay_ext {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
     (CT : TgtCtx G tgt ti cert.tvid.val cert.tavail cert.bm_t.val cert.bm_s.val) {g g' : ValGraph}
     {p : PairCert} (h : replay_pair g src si tgt ti cert p = ok (0#i32, g')) (hg : GPre cert g) :
     vg_extends g g' ∧ GPre cert g' := by
-  obtain ⟨hsb0, -, htb0, -, -, -, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hloop, sx2, tx2, vg3, Bs1, Bt1,
+  obtain ⟨hsb0, -, htb0, -, -, -, nst, i1, vg2, sc1, sx1, tc1, tx1, tchain1, schain1, hloop, sx2, tx2, vg3, Bs1, Bt1,
     nsi, nti, fs, hsx2, hq9, hBs1, hnsi, hsxn, hBt1, hnti, htxn, hfs, hce⟩ := replay_pair_dec h
   obtain ⟨e2, hg2, ⟨hsc1, hsx1, htc1, htx1⟩, -⟩ :=
     loop_sim CS CT p.steps _ _ hloop hg ⟨hsb0, by simp, htb0, by simp⟩ _ rfl
@@ -1985,11 +1984,12 @@ theorem replay_ext {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
   exact ⟨vg_extends_trans e2 (vg_extends_trans e3 e4), gPre_ext e4 d4 hg3⟩
 
 /-- The loop over the pairs of `cert_fail_code`. -/
-theorem pairs_loop {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
+theorem pairs_loop {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo} {n : Std.I32}
     (CS : SrcCtx G src si cert.svid.val cert.facts.val cert.savail)
-    (CT : TgtCtx G tgt ti cert.tvid.val cert.tavail cert.bm_t.val cert.bm_s.val) :
+    (CT : TgtCtx G tgt ti cert.tvid.val cert.tavail cert.bm_t.val cert.bm_s.val)
+    (hn1 : n.val = cert.pairs.val.length) (hn2 : cert.pairs.val.length ≤ 2147483647) :
     ∀ x r, loop (fun (x : Std.I32 × ValGraph) => match x with
-      | (i, vg) => cert_fail_code_loop0.body cert.pairs src si tgt ti cert i vg) x = ok r →
+      | (i, vg) => cert_fail_code_loop0.body n cert.pairs src si tgt ti cert i vg) x = ok r →
     match x with
     | (i, g) => 0 ≤ i.val → GPre cert g → (∀ c, r = .inl c → c ≠ 0#i32) ∧
       ∀ j g4, r = .inr (j, g4) → vg_extends g g4 ∧ GPre cert g4 ∧
@@ -1999,10 +1999,8 @@ theorem pairs_loop {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
   apply loop_ok_rel
   rintro ⟨i, g⟩ c r hb hc
   intro hi0 hg
-  change cert_fail_code_loop0.body cert.pairs src si tgt ti cert i g = ok c at hb
+  change cert_fail_code_loop0.body n cert.pairs src si tgt ti cert i g = ok c at hb
   unfold cert_fail_code_loop0.body at hb
-  obtain ⟨n, hn, hb⟩ := bind_eq_ok hb
-  obtain ⟨hn1, hn2⟩ := arr_length_ok hn
   split at hb
   · rename_i hlt
     simp only [i32_lt_iff] at hlt
@@ -2237,18 +2235,20 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
     · intro b hr hbl j sb h1 h2 x hx hav v hv hv0
       exact stable_transport E2 hv2t hv hv0 (AT.scope b hr hbl j sb h1 h2 x hx hav v hv hv0)
   -- the pairs
+  obtain ⟨np, hnp, h⟩ := bind_eq_ok h
+  obtain ⟨hnp1, hnp2⟩ := arr_length_ok hnp
   obtain ⟨s, hs, h⟩ := bind_eq_ok h
   have hg3 : GPre cert vg3 :=
     ⟨d3, vidsOK_extends e3 hv2s, vidsOK_extends e3 hv2t, fun fb hm => (hfa fb hm).2.2.2.1⟩
   obtain ⟨CS3, CT3⟩ := mkCtx vg3 (vg_extends_refl _) d3
-  have hL3 := pairs_loop CS3 CT3 _ _ hs (by simp) hg3
+  have hL3 := pairs_loop CS3 CT3 hnp1 hnp2 _ _ hs (by simp) hg3
   cases s with
   | inl c => simp only at h; exact absurd (ok_inj' h) (hL3.1 c rfl)
   | inr y =>
     obtain ⟨j, vg4⟩ := y
     obtain ⟨e4, hg4, -⟩ := hL3.2 j vg4 rfl
     obtain ⟨CS, CT⟩ := mkCtx vg4 e4 hg4.1
-    obtain ⟨-, -, hk⟩ := (pairs_loop CS CT _ _ hs (by simp) hg3).2 j vg4 rfl
+    obtain ⟨-, -, hk⟩ := (pairs_loop CS CT hnp1 hnp2 _ _ hs (by simp) hg3).2 j vg4 rfl
     exact ⟨si, ti, vg4, CS, CT, fun k p hp => hk k p (by simp) hp, hp0⟩
 
 theorem src_start {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I32} {facts : List Fact}

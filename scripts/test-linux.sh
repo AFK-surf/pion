@@ -721,6 +721,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p133_for_range_shadow/run_e2e.sh" "$PI
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p135_sforrange_scanners/run_e2e.sh" "$PIONC"
 # P134: QBE generic eq/arith single-scan O(V+E) reverse propagation, canonical mono_pkg normalization & fail-closed ICE on unresolved bindings (4-mode native/wasm32 dev/release + frontend diag + backend ICE).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p134_qbe_soundness/run_e2e.sh" "$PIONC"
+
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_check_server/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

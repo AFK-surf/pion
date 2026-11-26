@@ -1,0 +1,211 @@
+///| Unit tests: Stage B content-versioned cache equivalence & explicit dep_methods isolation.
+
+test "stage_b_cache: stage_b cache ON vs OFF produces byte-identical output and reduces lex/build counts" {
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{
+      rel_path: "a.pion",
+      content: "fn helper(xs : Array[Int]) -> Unit {\n  xs.shrink_to_fit()\n  xs.shrink_to_fit()\n}\n",
+      source_file: "a.mbt",
+      anchors: [],
+    },
+    GeneratedFile::{
+      rel_path: "b.pion",
+      content: "fn keep_sorted(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x })\n  xs.sort_by_key(fn(x) { x })\n}\n",
+      source_file: "b.mbt",
+      anchors: [],
+    },
+    GeneratedFile::{
+      rel_path: "c.pion",
+      content: "fn untouched(x : Int) -> Int {\n  x + 1\n}\n",
+      source_file: "c.mbt",
+      anchors: [],
+    },
+  ]
+  let make_mock_check = fn() -> (Array[(String, String)]) -> String {
+    let round = [0]
+    fn(batch : Array[(String, String)]) -> String {
+      round[0] = round[0] + 1
+      let sb = StringBuilder()
+      sb.write_string("{\"ok\":false,\"diagnostics\":[")
+      let mut first = true
+      for item in batch {
+        let lines = item.1.split("\n")
+        let mut li = 0
+        while li < lines.length() {
+          let ln = lines[li]
+          if str_has(ln, ".shrink_to_fit()") {
+            if !first { sb.write_string(",") }
+            first = false
+            sb.write_string("{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"")
+            sb.write_string(item.0)
+            sb.write_string("\",\"line\":")
+            sb.write_string((li + 1).to_string())
+            sb.write_string(",\"col\":6,\"message\":\"unknown method `shrink_to_fit` on type `Array[Int]`\"}")
+          } else if str_has(ln, ".sort_by_key(") {
+            if !first { sb.write_string(",") }
+            first = false
+            sb.write_string("{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"")
+            sb.write_string(item.0)
+            sb.write_string("\",\"line\":")
+            sb.write_string((li + 1).to_string())
+            sb.write_string(",\"col\":6,\"message\":\"unknown method `sort_by_key` on type `Array[Int]`\"}")
+          }
+          li = li + 1
+        }
+      }
+      sb.write_string("]}")
+      if first { "{\"ok\":true,\"diagnostics\":[]}" } else { sb.to_string() }
+    }
+  }
+
+  let empty_api = ApiMap::{ symbols: [], pkg_aliases: Map() }
+  let diags_on : Array[Diag] = []
+  let drift_on : Array[DriftEntry] = []
+  stage_b_set_cache_enabled(true)
+  stage_b_reset_perf_counters()
+  let (out_on, it_on, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_on,
+    drift_on,
+  )
+  let stats_on = stage_b_get_perf_counters()
+
+  let diags_off : Array[Diag] = []
+  let drift_off : Array[DriftEntry] = []
+  stage_b_set_cache_enabled(false)
+  stage_b_reset_perf_counters()
+  let (out_off, it_off, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_off,
+    drift_off,
+  )
+  let stats_off = stage_b_get_perf_counters()
+  stage_b_set_cache_enabled(true)
+
+  assert_eq(it_on, it_off)
+  assert_eq(out_on.length(), out_off.length())
+  assert_eq(diags_on.length(), diags_off.length())
+  let mut idx = 0
+  while idx < out_on.length() {
+    assert_true(out_on[idx].rel_path == out_off[idx].rel_path, "rel_path mismatch")
+    assert_true(out_on[idx].content == out_off[idx].content, "content mismatch")
+    idx = idx + 1
+  }
+  // Cache ON must lex fewer times and build ShrinkPkg/SortKeyEnv once per round instead of once per site.
+  assert_true(stats_on.0 < stats_off.0, "expected fewer lex calls with cache ON")
+  assert_true(stats_on.1 < stats_off.1, "expected fewer ShrinkPkg builds with cache ON")
+  assert_true(stats_on.2 < stats_off.2, "expected fewer SortKeyEnv builds with cache ON")
+}
+
+test "stage_b_cache: explicit dep_methods does not leak across consecutive runs" {
+  let src = "fn run(xs : Array[String]) -> Unit {\n  xs.sort_by_key(fn(x) { x.length() })\n}\n"
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{ rel_path: "k.pion", content: src, source_file: "k.mbt", anchors: [] },
+  ]
+  let mock_check = fn(batch : Array[(String, String)]) -> String {
+    if str_has(batch[0].1, ".sort_by_key(") {
+      "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"k.pion\",\"line\":2,\"col\":6,\"message\":\"unknown method `sort_by_key` on type `Array[String]`\"}]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let empty_api = ApiMap::{ symbols: [], pkg_aliases: Map() }
+  // Run 1: `length` is shadowed in `dep_methods` -> blocked with MBT2PION_ARRAY_ITER_MUTATION
+  let deps1 : Map[String, Bool] = Map()
+  deps1["length"] = true
+  let d1 : Array[Diag] = []
+  let (_, _, _) = run_stage_b_with_ops_and_deps(files, empty_api, Map(), deps1, mock_check, d1, [])
+  assert_true(d1.length() > 0, "expected dep_methods to block shadowed length in run 1")
+
+  // Run 2: empty `dep_methods` -> must NOT inherit `length` from Run 1
+  let d2 : Array[Diag] = []
+  let (out2, _, _) = run_stage_b_with_ops_and_deps(files, empty_api, Map(), Map(), mock_check, d2, [])
+  assert_eq(d2.length(), 0)
+  assert_true(str_has(out2[0].content, "mbt_compat::arr_sort_by_key"), "expected run 2 to lower sort_by_key")
+}
+
+test "stage_b_cache: same-round rewrite before sibling lex never poisons token_cache" {
+  // pass 1: `a.pion` is rewritten (`Float::is_nan`) without lexing `a.pion`, then in the SAME
+  // round `b.pion` triggers `shrink_to_fit` -> `get_all_round_tokens()`, which lexes `a.pion`'s
+  // pass-1 content. `file_vers["a.pion"]` must only bump when `cur_files = next_files` flips,
+  // so pass 2 MUST re-lex `a.pion`'s updated content instead of serving stale pass-1 tokens.
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{
+      rel_path: "a.pion",
+      content: "fn check_nan(x : Float, xs : Array[Int]) -> Bool {\n  let b = Float::is_nan(x)\n  xs.shrink_to_fit()\n  b\n}\n",
+      source_file: "a.mbt",
+      anchors: [],
+    },
+    GeneratedFile::{
+      rel_path: "b.pion",
+      content: "fn other_shrink(ys : Array[Int]) -> Unit {\n  ys.shrink_to_fit()\n}\n",
+      source_file: "b.mbt",
+      anchors: [],
+    },
+  ]
+  let make_mock_check = fn() -> (Array[(String, String)]) -> String {
+    let round = [0]
+    fn(batch : Array[(String, String)]) -> String {
+      round[0] = round[0] + 1
+      if round[0] == 1 {
+        return "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"a.pion\",\"line\":2,\"col\":11,\"message\":\"unknown static function `Float::is_nan`\"},{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"b.pion\",\"line\":2,\"col\":6,\"message\":\"unknown method `shrink_to_fit` on type `Array[Int]`\"}]}"
+      }
+      for item in batch {
+        if item.0 == "a.pion" && str_has(item.1, ".shrink_to_fit()") {
+          return "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"a.pion\",\"line\":3,\"col\":6,\"message\":\"unknown method `shrink_to_fit` on type `Array[Int]`\"}]}"
+        }
+      }
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+
+  let empty_api = ApiMap::{ symbols: [], pkg_aliases: Map() }
+  let diags_on : Array[Diag] = []
+  stage_b_set_cache_enabled(true)
+  stage_b_reset_perf_counters()
+  let (out_on, it_on, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_on,
+    [],
+  )
+  let stats_on = stage_b_get_perf_counters()
+
+  let diags_off : Array[Diag] = []
+  stage_b_set_cache_enabled(false)
+  stage_b_reset_perf_counters()
+  let (out_off, it_off, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_off,
+    [],
+  )
+  stage_b_set_cache_enabled(true)
+
+  assert_eq(it_on, it_off)
+  assert_eq(diags_on.length(), diags_off.length())
+  assert_eq(out_on.length(), out_off.length())
+  let mut idx = 0
+  while idx < out_on.length() {
+    assert_true(out_on[idx].content == out_off[idx].content, "cache ON/OFF content mismatch after same-round rewrite")
+    idx = idx + 1
+  }
+  assert_true(str_has(out_on[0].content, "mbt_compat::float_is_nan"), "expected Float::is_nan lowered")
+  assert_true(str_has(out_on[0].content, "mbt_compat::arr_shrink_to_fit"), "expected a.pion shrink_to_fit lowered")
+  // pass 1 lexes a@v0 and b@v0 (2 lex calls); pass 2 MUST re-lex modified a@v1 and b@v1 (4 lex calls total, never 2).
+  assert_true(stats_on.0 >= 3, "expected a.pion to be re-lexed in pass 2 after pass 1 rewrite")
+}

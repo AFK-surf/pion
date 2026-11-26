@@ -8069,9 +8069,11 @@ fn lower_one_token_or_form(
       }
     }
     // Unqualified `Number(...)` when expected type is `mbt_compat::MbtJson`, or in pattern position
-    // with `..` / `repr=` / `repr~` when unshadowed by any local constructor `Number`
+    // with `..` / `repr=` / `repr~` when unshadowed by any local or imported constructor `Number`
     if !prev_colon2 && !prev_dot && t.raw == "Number" &&
     !has_local_ctor(ctx.symtab, "Number") &&
+    !ctx.symtab.ctors.contains("Number") &&
+    !ctx.symtab.enum_schemas_by_ctor.contains("Number") &&
     i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 1)
       let is_json_num_pat = current_expected_type(ctx).trim() == "mbt_compat::MbtJson" || (in_pattern && {
@@ -8097,6 +8099,7 @@ fn lower_one_token_or_form(
       if is_json_num_pat {
         let mut pat_v = ""
         let mut repr_arg = ""
+        let mut pos_count = 0
         let mut pi = i + 2
         while pi < close_p {
           if tokens[pi].kind == TokenKind::Comma || tokens[pi].kind == TokenKind::DotDot {
@@ -8118,14 +8121,20 @@ fn lower_one_token_or_form(
           } else if tokens[pi].kind == TokenKind::Ident && tokens[pi].raw == "repr" &&
           pi + 1 < pe && tokens[pi + 1].kind == TokenKind::Tilde {
             repr_arg = "repr"
-          } else if pe > pi && pat_v.length() == 0 {
+          } else if pe > pi {
+            pos_count = pos_count + 1
+            if pos_count > 1 {
+              break
+            }
             pat_v = lower_expr_range(ctx, tokens, pi, pe, file, in_pattern).trim()
           }
           pi = pe + 1
         }
-        let inner_v = if pat_v.length() > 0 { pat_v } else if in_pattern { "_" } else { "0.0" }
-        let inner_r = if repr_arg.length() > 0 { repr_arg } else if in_pattern { "_" } else { "Option::None" }
-        return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ", " + inner_r + ")", close_p + 1)
+        if pos_count <= 1 {
+          let inner_v = if pat_v.length() > 0 { pat_v } else if in_pattern { "_" } else { "0.0" }
+          let inner_r = if repr_arg.length() > 0 { repr_arg } else if in_pattern { "_" } else { "Option::None" }
+          return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ", " + inner_r + ")", close_p + 1)
+        }
       }
     }
     // `Show::to_string(x)` (the trait method called by its trait's name) -> placeholder `mbt_compat::__mbt_show_trait(x)`,
@@ -8378,7 +8387,14 @@ fn lower_one_token_or_form(
         push_expected_type(ctx, "")
         let inner = lower_expr_range(ctx, tokens, i + 2, close_p, file, false).trim()
         pop_expected_type(ctx)
-        let dbg_fn = if inner.starts_with("mbt_compat::__mbt_show_trait(") {
+        let is_exact_show_call = i + 6 < close_p &&
+        tokens[i + 2].kind == TokenKind::UpperIdent && tokens[i + 2].raw == "Show" &&
+        tokens[i + 3].kind == TokenKind::ColonColon &&
+        tokens[i + 4].kind == TokenKind::Ident && tokens[i + 4].raw == "to_string" &&
+        tokens[i + 5].kind == TokenKind::LParen &&
+        find_matching_delim(tokens, i + 5) == close_p - 1 &&
+        inner.starts_with("mbt_compat::__mbt_show_trait(")
+        let dbg_fn = if is_exact_show_call {
           "mbt_compat::debug_string"
         } else {
           "mbt_compat::__mbt_debug_fmt"
@@ -11376,6 +11392,48 @@ fn merge_inferred_arm_types(a : String, b : String) -> (String, Bool) {
   ("", false)
 }
 
+fn is_diverging_match_arm(tokens : Array[Token], bs : Int, be : Int) -> Bool {
+  if bs >= be { return false }
+  let is_div_start = fn(idx : Int, limit : Int) -> Bool {
+    if idx >= limit { return false }
+    let tk = tokens[idx]
+    if tk.kind == TokenKind::Keyword &&
+    (tk.raw == "return" || tk.raw == "break" || tk.raw == "continue" || tk.raw == "raise") {
+      return true
+    }
+    if tk.kind == TokenKind::Ident && (tk.raw == "panic" || tk.raw == "abort") &&
+    idx + 1 < limit && tokens[idx + 1].kind == TokenKind::LParen {
+      return true
+    }
+    false
+  }
+  if is_div_start(bs, be) {
+    return true
+  }
+  if tokens[bs].kind == TokenKind::LBrace && find_matching_delim(tokens, bs) + 1 == be {
+    let inner_s = bs + 1
+    let inner_e = be - 1
+    let mut last_s = inner_s
+    let mut k = inner_s
+    let mut d = 0
+    while k < inner_e {
+      let tk = tokens[k]
+      if d == 0 && (tk.kind == TokenKind::Semi || (k > inner_s && tk.newline_before)) {
+        if tk.kind == TokenKind::Semi {
+          if k + 1 < inner_e { last_s = k + 1 }
+        } else {
+          last_s = k
+        }
+      }
+      if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { d = d + 1 }
+      else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      k = k + 1
+    }
+    return is_div_start(last_s, inner_e)
+  }
+  false
+}
+
 fn infer_match_arms_common_type(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
   let mut acc = ""
   let mut i = start
@@ -11397,7 +11455,7 @@ fn infer_match_arms_common_type(ctx : StageAContext, tokens : Array[Token], star
     } else if bs < end {
       be = find_expr_end(tokens, bs, end)
     }
-    if be > bs {
+    if be > bs && !is_diverging_match_arm(tokens, bs, be) {
       let aty = if tokens[bs].kind == TokenKind::LBrace && be == find_matching_delim(tokens, bs) + 1 {
         infer_block_ret_type_f3d2(ctx, tokens, bs, be - 1)
       } else {
@@ -11425,7 +11483,7 @@ fn is_range_pat_atom_bound(tokens : Array[Token], s : Int, e : Int) -> Bool {
   if s >= e { return false }
   if s + 1 == e {
     let k = tokens[s].kind
-    return k == TokenKind::IntLit || k == TokenKind::CharLit || k == TokenKind::ByteCharLit || k == TokenKind::Ident
+    return k == TokenKind::IntLit || k == TokenKind::CharLit || k == TokenKind::ByteCharLit
   }
   if s + 2 == e && tokens[s].kind == TokenKind::Minus && tokens[s + 1].kind == TokenKind::IntLit {
     return true
@@ -12006,14 +12064,19 @@ fn lower_match_arms_with_ty(
         rscan = rscan + 1
       }
       if has_top_range_op {
-        // Split top-level `|` alternatives and verify each is a simple range or scalar literal
+        // Split top-level `|` alternatives and verify each is a non-empty simple range or scalar literal
         let alts : Array[(Int, Int)] = []
+        let mut all_valid = true
         let mut as_i = i
         let mut adep = 0
         let mut ak = i
         while ak <= pat_end {
           if ak == pat_end || (adep == 0 && tokens[ak].kind == TokenKind::Pipe) {
-            if ak > as_i { alts.push((as_i, ak)) }
+            if ak <= as_i {
+              all_valid = false
+              break
+            }
+            alts.push((as_i, ak))
             as_i = ak + 1
           } else {
             let kk = tokens[ak].kind
@@ -12022,34 +12085,38 @@ fn lower_match_arms_with_ty(
           }
           ak = ak + 1
         }
-        let mut all_valid = alts.length() > 0
+        if alts.length() == 0 {
+          all_valid = false
+        }
         let conds : Array[String] = []
         let rv = fresh_temp(ctx, "rp")
-        for alt in alts {
-          let (al_s, al_e) = alt
-          let mut rop = -1
-          let mut j = al_s
-          while j < al_e {
-            let jk = tokens[j].kind
-            if jk == TokenKind::DotDotEq || jk == TokenKind::DotDotLt || jk == TokenKind::DotDotLtEq {
-              rop = j
+        if all_valid {
+          for alt in alts {
+            let (al_s, al_e) = alt
+            let mut rop = -1
+            let mut j = al_s
+            while j < al_e {
+              let jk = tokens[j].kind
+              if jk == TokenKind::DotDotEq || jk == TokenKind::DotDotLt || jk == TokenKind::DotDotLtEq {
+                rop = j
+                break
+              }
+              j = j + 1
+            }
+            if rop > al_s && rop + 1 < al_e &&
+            is_range_pat_atom_bound(tokens, al_s, rop) &&
+            is_range_pat_atom_bound(tokens, rop + 1, al_e) {
+              let lo_s = lower_expr_range(ctx, tokens, al_s, rop, file, false).trim()
+              let hi_s = lower_expr_range(ctx, tokens, rop + 1, al_e, file, false).trim()
+              let hi_op = if tokens[rop].kind == TokenKind::DotDotLt { " < " } else { " <= " }
+              conds.push("(" + rv + " >= " + lo_s + " && " + rv + hi_op + hi_s + ")")
+            } else if rop < 0 && is_range_pat_atom_bound(tokens, al_s, al_e) {
+              let v_s = lower_expr_range(ctx, tokens, al_s, al_e, file, false).trim()
+              conds.push("(" + rv + " == " + v_s + ")")
+            } else {
+              all_valid = false
               break
             }
-            j = j + 1
-          }
-          if rop > al_s && rop + 1 < al_e &&
-          is_range_pat_atom_bound(tokens, al_s, rop) &&
-          is_range_pat_atom_bound(tokens, rop + 1, al_e) {
-            let lo_s = lower_expr_range(ctx, tokens, al_s, rop, file, false).trim()
-            let hi_s = lower_expr_range(ctx, tokens, rop + 1, al_e, file, false).trim()
-            let hi_op = if tokens[rop].kind == TokenKind::DotDotLt { " < " } else { " <= " }
-            conds.push("(" + rv + " >= " + lo_s + " && " + rv + hi_op + hi_s + ")")
-          } else if rop < 0 && is_range_pat_atom_bound(tokens, al_s, al_e) {
-            let v_s = lower_expr_range(ctx, tokens, al_s, al_e, file, false).trim()
-            conds.push("(" + rv + " == " + v_s + ")")
-          } else {
-            all_valid = false
-            break
           }
         }
         if all_valid && conds.length() > 0 {
@@ -12067,6 +12134,7 @@ fn lower_match_arms_with_ty(
           }
           let fa_triv = guard_arrow_trivia(tokens[fa].leading_trivia)
           sb.write_string(lead_triv + rv + " if " + full_guard + fa_triv + "=>" + body_raw + trail_sep)
+          had_guarded_struct_arm = true
           handled_special = true
         }
       }
@@ -16021,7 +16089,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 let pty = lower_type_tokens_checked(ctx, tokens, col_i + 1, pe, sf.rel_path).trim()
                 tp_sb.write_string(raw_pn + " : " + pty)
                 impl_param_scope.push((raw_pn, pty))
-              } else if pidx == 0 && (raw_pn == "self" || raw_pn == "_self") {
+              } else if pidx == 0 && (raw_pn == "self" || raw_pn == "_self" || (trait_name == "Debug" && mname == "to_repr")) {
                 tp_sb.write_string(raw_pn + " : " + self_ty)
                 impl_param_scope.push((raw_pn, self_ty))
               } else {
@@ -16136,8 +16204,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
           "pub fn " + self_ty + "::to_string(self : " + self_ty + ") -> String {\n  let " + logger_param + " = StringBuilder()\n  let " + run_var + " : () -> Unit = fn() -> Unit " + body + "\n  " + run_var + "()\n  " + logger_param + ".to_string()\n}"
         } else if trait_name == "Debug" && mname == "to_repr" {
-          // MoonBit `impl Debug for T with to_repr(self) { ... }` -> Pion `pub fn T::to_repr(self : T) -> String`
-          "pub fn " + self_ty + "::to_repr(self : " + self_ty + ") -> String " + body
+          // MoonBit `impl Debug for T with to_repr(x) { ... }` -> Pion `pub fn T::to_repr(x : T) -> String`
+          let comma_p = p_str.index_of(",")
+          let first_p = if comma_p > 0 { p_str.slice(0, comma_p).trim() } else { p_str.trim() }
+          let col_p = first_p.index_of(":")
+          let raw_sp = if col_p > 0 { first_p.slice(0, col_p).trim() } else { first_p }
+          let self_param = if raw_sp.length() > 0 && raw_sp != "_" { raw_sp } else { "self" }
+          "pub fn " + self_ty + "::to_repr(" + self_param + " : " + self_ty + ") -> String " + body
         } else {
           "impl " + trait_name + " for " + self_ty + " {\n  fn " + mname + "(" + typed_params + ")" + ret_str + " " + body + "\n}"
         }
