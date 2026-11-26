@@ -469,6 +469,8 @@ sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p128_binary_size_opts/run_e2e.sh" "$PIONC2"
 # P129: Opt-Track Z1 compile speed (single frame stack for check_binary_chain / qbe_emit_binary_chain, lazy left-operand guards, inline_rc substring scans + ASCII batch line split, target reuse in build/run; 4,000-deep left / right binary trees, 1,500 mixed &&/||, 1,200-part String +, 300 `?` operands, owned String/Array left operands with `?` / `return` right operands, inline_rc RC / call-only / `call`-prefixed identifier / UTF-8 bodies; dev + --release native, ASan/LSan and Wasm32 output, host / explicit / PION_TARGET / wasm32 build and run, --emit-web-rt accept / reject, bounded host probes).
 sh "$ROOT_DIR/tests/e2e/p129_compile_speed_z1/run_e2e.sh" "$PIONC2"
+# P131: owned left operands of `if` / `while` condition comparisons held across an early-exiting right operand (qbe_emit_cond_branch_leaf; String == / != / < / >=, loop break / continue, `?`, Array[Int], #derive(Eq) struct / enum with String fields, StrView, a left operand that leaves itself; dev + --release native, ASan/LSan and Wasm32 exact output).
+sh "$ROOT_DIR/tests/e2e/p131_cond_branch_rc_guard/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
