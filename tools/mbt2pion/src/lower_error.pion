@@ -431,6 +431,18 @@ fn le_analyze_try_body(st : LeState, tokens : Array[Token], s : Int, e : Int) ->
   let mut i = s
   while i < e {
     let t = tokens[i]
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) {
+        if p.is_expr {
+          let ht = lex_moonbit(p.text)
+          let (hk, hu) = le_analyze_try_body(st, ht, 0, ht.length() - 1)
+          if hk { has_known = true }
+          if hu { has_unknown_ext = true }
+        }
+      }
+      i = i + 1
+      continue
+    }
     if le_is_kw(t, "raise") {
       has_known = true
     } else if t.kind == TokenKind::PkgRef && i + 3 < e &&
@@ -948,6 +960,35 @@ fn le_lower_range(
         continue
       }
     }
+    // Arrow closures: `x => { ... }` and `(a, b) => { ... }` isolate `return` and shadow params
+    if t.kind == TokenKind::Ident && i + 2 < end &&
+    tokens[i + 1].kind == TokenKind::FatArrow && tokens[i + 2].kind == TokenKind::LBrace {
+      let crb = find_matching_delim(tokens, i + 2)
+      let pm : Map[String, String] = Map()
+      pm[t.raw] = ""
+      st.lex_var_types.push(pm)
+      st.frames.push(LeFrame::PlainFn(""))
+      sb.write_string(t.leading_trivia + t.raw + tokens[i + 1].leading_trivia + "=>" + tokens[i + 2].leading_trivia + "{" + le_lower_range(st, src, tokens, i + 3, crb) + tokens[crb].leading_trivia + "}")
+      let _ = st.frames.pop()
+      let _ = st.lex_var_types.pop()
+      i = crb + 1
+      continue
+    }
+    if t.kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i)
+      if cp + 2 < end && tokens[cp + 1].kind == TokenKind::FatArrow && tokens[cp + 2].kind == TokenKind::LBrace {
+        let crb = find_matching_delim(tokens, cp + 2)
+        let pm : Map[String, String] = Map()
+        le_seed_params(tokens, i, cp, "", pm)
+        st.lex_var_types.push(pm)
+        st.frames.push(LeFrame::PlainFn(""))
+        sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[cp + 2].end_byte) + le_lower_range(st, src, tokens, cp + 3, crb) + tokens[crb].leading_trivia + "}")
+        let _ = st.frames.pop()
+        let _ = st.lex_var_types.pop()
+        i = crb + 1
+        continue
+      }
+    }
     // Inline `fn` closure: reject raising closures fail-closed, isolate non-raising closures
     if t.kind == TokenKind::Keyword && t.raw == "fn" {
       match le_parse_fn_header(src, tokens, i, end) {
@@ -1283,6 +1324,10 @@ pub fn lower_checked_errors(
       }
       if le_is_kw(t, "suberror") || le_is_kw(t, "raise") || le_is_kw(t, "try") || le_is_kw(t, "catch") {
         any_err_kw = true
+      } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+        if le_interp_has_err_kw(t) {
+          any_err_kw = true
+        }
       }
       i = i + 1
     }
@@ -1554,6 +1599,8 @@ pub fn lower_checked_errors(
       // 4. Fail-closed on residual `raise` / `try` / `catch` outside top-level `fn` / `test` (e.g. top-level `let`/`const`/`impl`)
       if le_is_kw(t, "raise") || le_is_kw(t, "try") || le_is_kw(t, "catch") {
         le_unsup(st, t.line, t.col, "unsupported `" + t.raw + "` outside top-level `fn`/`test`")
+      } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+        le_scan_residual_err_in_interp(st, t)
       }
 
       i = i + 1
@@ -1566,6 +1613,52 @@ pub fn lower_checked_errors(
     fi = fi + 1
   }
   out_sources
+}
+
+///| Return true iff a string interpolation token contains `suberror`/`raise`/`try`/`catch` in any `\{...}` hole.
+fn le_interp_has_err_kw(t : Token) -> Bool {
+  if t.kind != TokenKind::InterpString && t.kind != TokenKind::InterpMultiline {
+    return false
+  }
+  for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) {
+    if p.is_expr {
+      let ht = lex_moonbit(p.text)
+      let mut k = 0
+      while k < ht.length() - 1 {
+        let h = ht[k]
+        if le_is_kw(h, "suberror") || le_is_kw(h, "raise") || le_is_kw(h, "try") || le_is_kw(h, "catch") {
+          return true
+        }
+        if (h.kind == TokenKind::InterpString || h.kind == TokenKind::InterpMultiline) && le_interp_has_err_kw(h) {
+          return true
+        }
+        k = k + 1
+      }
+    }
+  }
+  false
+}
+
+///| Scan string interpolation holes at top-level (outside `fn`/`test`) for residual error keywords.
+fn le_scan_residual_err_in_interp(st : LeState, t : Token) -> Unit {
+  if t.kind != TokenKind::InterpString && t.kind != TokenKind::InterpMultiline {
+    return
+  }
+  for p in split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline) {
+    if p.is_expr {
+      let ht = lex_moonbit(p.text)
+      let mut k = 0
+      while k < ht.length() - 1 {
+        let h = ht[k]
+        if le_is_kw(h, "raise") || le_is_kw(h, "try") || le_is_kw(h, "catch") {
+          le_unsup(st, t.line, t.col, "unsupported `" + h.raw + "` inside top-level string interpolation")
+        } else if h.kind == TokenKind::InterpString || h.kind == TokenKind::InterpMultiline {
+          le_scan_residual_err_in_interp(st, h)
+        }
+        k = k + 1
+      }
+    }
+  }
 }
 
 ///| Convenience helper for lowering checked-error syntax in a single source string.

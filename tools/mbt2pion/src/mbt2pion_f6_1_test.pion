@@ -289,3 +289,122 @@ test "F6-1: R2 regressions (nested raising arg in try/catch, bare try boundary, 
   for d in d8 { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit8 = true } }
   assert_true(hit8, "P2-2 residual catch outside top-level fn/test fails closed")
 }
+
+test "F6-1: R3 regressions (unannotated cross-pkg struct update, interp in try/top-level, order-invariant canon_val_types, arrow closures)" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  // P1-1: unannotated `let b = { ..@up.preset, x: 10 }; b.x + b.y` (direct, aliased `@u.preset`, and `pub using` re-export)
+  let up_src = SourceFile::{
+    rel_path: "cfg.mbt",
+    content: "pub(all) struct Cfg {\n  x : Int\n  y : Int\n}\npub let preset : Cfg = { x: 1, y: 3 }\n",
+    is_test: false,
+  }
+  let up_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "up",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let up_res = transpile_package([up_src], empty_api_map(), default_recipes(), [], [], up_opts, [], false, noop_check)
+  assert_true(up_res.blockers == 0, "R3 P1-1 upstream compiles cleanly")
+
+  // Direct `@up.preset` with NO outer type annotation on `let b` or return type
+  let down_direct = SourceFile::{
+    rel_path: "direct.mbt",
+    content: "pub fn run() -> Int {\n  let b = { ..@up.preset, x: 10 }\n  b.x + b.y\n}\n",
+    is_test: false,
+  }
+  let down_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "down",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let res_direct = transpile_package_with_abis([down_direct], empty_api_map(), default_recipes(), [], [], [], [("up", up_res.abi)], [], down_opts, [], false, noop_check)
+  assert_true(res_direct.blockers == 0 && str_has(res_direct.files[0].content, "up::Cfg::{"), "R3 P1-1 unannotated @up.preset struct update resolves to up::Cfg")
+
+  // Aliased `@u.preset` with NO outer type annotation
+  let down_alias = SourceFile::{
+    rel_path: "alias.mbt",
+    content: "pub fn run() -> Int {\n  let b = { ..@u.preset, x: 10 }\n  b.x + b.y\n}\n",
+    is_test: false,
+  }
+  let res_alias = transpile_package_with_abis([down_alias], empty_api_map(), default_recipes(), [], [], [], [("u", up_res.abi)], [], down_opts, [], false, noop_check)
+  assert_true(res_alias.blockers == 0 && str_has(res_alias.files[0].content, "u::Cfg::{"), "R3 P1-1 unannotated @u.preset struct update resolves to u::Cfg")
+
+  // Re-exported `pub using @up { type Cfg, preset }`: remaps `up::Cfg` -> `mid::Cfg` (and alias `m::Cfg`) in `symtab_finalize_dep_reexports`
+  let mid_abi = PackageAbi::{
+    package_name: "mid",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "Cfg", kind: "type", target_pkg: "up", target_name: "Cfg" },
+      AbiReexport::{ name: "preset", kind: "value", target_pkg: "up", target_name: "preset" },
+    ],
+    values: [],
+    publishable: true,
+  }
+  let st_re = empty_symbol_table()
+  symtab_load_dep_abi(st_re, "up", up_res.abi)
+  symtab_load_dep_abi(st_re, "mid", mid_abi)
+  let d_re : Array[Diag] = []
+  symtab_finalize_dep_reexports(st_re, d_re)
+  assert_true(d_re.length() == 0 && st_re.val_types.get("mid::preset") == Some("mid::Cfg"), "R3 P1-1 re-exported value type remaps to mid::Cfg")
+  let st_re_alias = empty_symbol_table()
+  symtab_load_dep_abi(st_re_alias, "up", up_res.abi)
+  symtab_load_dep_abi(st_re_alias, "m", mid_abi)
+  let d_re_a : Array[Diag] = []
+  symtab_finalize_dep_reexports(st_re_alias, d_re_a)
+  assert_true(d_re_a.length() == 0 && st_re_alias.val_types.get("m::preset") == Some("m::Cfg"), "R3 P1-1 aliased re-exported value type remaps to m::Cfg")
+
+  // P1-2: raising call inside string interpolation in `try ... catch` / postfix `catch` + top-level interp residual
+  let cfg = default_error_lower_config()
+  let d_interp : Array[Diag] = []
+  let src_interp = "priv suberror E String\nfn bad() -> Int raise E { raise E(\"boom\") }\nfn take(s : String) -> Int raise E { s.length() }\nfn outer_try() -> Int raise E {\n  try take(\"\\{bad()}\") catch { _ => 7 }\n}\nfn outer_postfix() -> Int raise E {\n  take(\"\\{bad()}\") catch { _ => 7 }\n}\n"
+  let out_interp = lower_checked_errors_single(src_interp, "p1_2_interp.mbt", cfg, d_interp)
+  assert_true(d_interp.length() == 0, "R3 P1-2 interp inside try/catch lowers cleanly")
+  assert_true(!str_has(out_interp, "bad()?"), "R3 P1-2 bad() inside interp must NOT use `?` and escape try/catch")
+  assert_true(str_has(out_interp, "(fn() { Ok({ (match take(\"\\{(match bad()"), "R3 P1-2 interp raising call lowered inside TryClosure IIFE")
+
+  let d_top_interp : Array[Diag] = []
+  let _ = lower_checked_errors_single("let n : String = \"\\{@json.parse(\"1\") catch { _ => 7 }}\"\n", "p1_2_top.mbt", cfg, d_top_interp)
+  let mut hit_top_interp = false
+  for d in d_top_interp { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit_top_interp = true } }
+  assert_true(hit_top_interp, "R3 P1-2 top-level string interpolation with catch fails closed")
+
+  // P2-1: load-order invariance between `(shared, b)` and `(b, shared)` when sharing `package_name = "shared"`
+  let abi_s1 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "Int" }], publishable: true }
+  let abi_s2 = PackageAbi::{ package_name: "shared", enums: [], struct_val_fields: [], structs: None, companion_files: [], op_impls: [], reexports: [], values: [AbiValueSchema::{ name: "v", ty: "String" }], publishable: true }
+  let st_ab = empty_symbol_table()
+  symtab_load_dep_abi(st_ab, "shared", abi_s1)
+  symtab_load_dep_abi(st_ab, "b", abi_s2)
+  let st_ba = empty_symbol_table()
+  symtab_load_dep_abi(st_ba, "b", abi_s2)
+  symtab_load_dep_abi(st_ba, "shared", abi_s1)
+  assert_true(st_ab.val_types.get("shared::v") == Some("Int") && st_ba.val_types.get("shared::v") == Some("Int"), "R3 P2-1 direct shared::v order-invariant")
+  assert_true(st_ab.val_types.get("b::v") == Some("String") && st_ba.val_types.get("b::v") == Some("String"), "R3 P2-1 direct b::v order-invariant")
+  assert_true(st_ab.canon_val_types.get("shared::v") == None && st_ba.canon_val_types.get("shared::v") == None, "R3 P2-1 conflicting canon_val_types removed in both orders")
+  assert_true(st_ab.canon_val_types_ambig.contains("shared::v") && st_ba.canon_val_types_ambig.contains("shared::v"), "R3 P2-1 canon_val_types_ambig true in both orders")
+
+  // P2-2: arrow closures isolate `return` from enclosing raising fn and reject `raise` inside arrow closure
+  let d_arr : Array[Diag] = []
+  let src_arr = "priv suberror E String\nfn with_arrows() -> Int raise E {\n  let f = n => { if n > 0 { return 3 }; 2 }\n  let g = (a, b) => { if a > b { return a }; b }\n  f(1) + g(4, 2)\n}\n"
+  let out_arr = lower_checked_errors_single(src_arr, "p2_2_arrow.mbt", cfg, d_arr)
+  assert_true(d_arr.length() == 0, "R3 P2-2 arrow closures inside raising fn lower cleanly")
+  assert_true(str_has(out_arr, "return 3") && str_has(out_arr, "return a"), "R3 P2-2 return inside arrow closure NOT wrapped in Ok")
+  assert_true(!str_has(out_arr, "return Ok(3)") && !str_has(out_arr, "return Ok(a)"), "R3 P2-2 no Ok-wrapping of arrow closure returns")
+
+  let d_arr_bad : Array[Diag] = []
+  let _ = lower_checked_errors_single("priv suberror E String\nfn f() -> Int raise E {\n  let g = n => { if n < 0 { raise E(\"neg\") }; n }\n  g(1)\n}\n", "p2_2_arrow_bad.mbt", cfg, d_arr_bad)
+  let mut hit_arr_bad = false
+  for d in d_arr_bad { if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { hit_arr_bad = true } }
+  assert_true(hit_arr_bad, "R3 P2-2 raise inside arrow closure fails closed")
+}
