@@ -17,7 +17,7 @@ Verifies:
      - Full-capacity `push` realloc + write in `search_by` & `iter()`: Moon visits `[1,2,3]` -> `None`; Pion blocks!
      - `pop`, `remove(0)`, `remove(1)`, `clear`, `splice`, `resize` in `search_by` & `iter()`: Pion blocks!
      - Spare-cap `shrink_to_fit` + write vs full-cap `shrink_to_fit` + write: Pion blocks!
-     - Opus P1-3 `for x in f2 { if x == 1 { f2.clear() }; s += x }`: Moon native & wasm-gc output `6`; Pion blocks!
+     - `for x in f2 { if x == 1 { f2.clear() }; s += x }`: Moon native & wasm-gc output `6`; Pion blocks!
      - Lazy `map`/`filter` escape: Pion blocks!
      - `combobox`-style external callback alias capture: Pion blocks!
 """
@@ -174,7 +174,7 @@ pub fn run_counterexamples() -> String {
     }
     x == 9
   })
-  // 3. Opus P1-3: `for x in f2 { if x == 1 { f2.clear() }; s += x }` -> 6!
+  // 3. `for x in f2 { if x == 1 { f2.clear() }; s += x }` -> 6!
   let f2 = [1, 2, 3]
   let mut s2 = 0
   for x in f2 {
@@ -260,7 +260,7 @@ pub fn f(xs : Array[Int]) -> Int {
   it.count()
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
-    "for_in_clear_opus_f2": (r'''
+    "for_in_clear_snapshot": (r'''
 pub fn f() -> Int {
   let f2 = [1, 2, 3]
   let mut s = 0
@@ -492,6 +492,93 @@ pub fn f(xs : Array[Int]) -> Int {
         "MBT2PION_ARRAY_ITER_MUTATION",
         ".clear(..)",
     ),
+    "hook_push_local_kept_iter": (r'''
+struct Hook { a : Array[Int] }
+fn Hook::push(self : Hook, v : Int) -> Unit {
+  let _ = v
+  self.a.clear()
+}
+pub fn f() -> Int {
+  let xs = [1, 2, 3]
+  let h : Hook = { a: xs }
+  let it = xs.iter()
+  h.push(4)
+  it.to_array()[1]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".push(..)"),
+    "for_in_self_field_alias_grow_write": (r'''
+struct Box { items : Array[Int] }
+pub fn Box::run(self : Box, xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    self.items.push(4)
+    self.items[1] = 9
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written"),
+    "for_in_field_iter_param_clear": (r'''
+struct Box { items : Array[Int] }
+pub fn danger(b : Box, xs : Array[Int]) -> Int {
+  let mut s = 0
+  for x in b.items {
+    xs.clear()
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_tuple_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+pub fn f(xs : Array[Int], bad : BadEq, pair : (Int, BadEq)) -> Int {
+  let mut s = 0
+  for x in xs {
+    if (1, bad) == pair { s = s + x }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_option_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+pub fn f(xs : Array[Int], a : BadEq, b : BadEq) -> Int {
+  let mut s = 0
+  for x in xs {
+    if Some(a) == Some(b) { s = s + x }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_dead_block_shadow_bad_eq": (r'''
+struct BadEq { same : (BadEq) -> Bool }
+impl Eq for BadEq with equal(self, other) { (self.same)(other) }
+pub fn f(xs : Array[Int], bad : BadEq, target : BadEq) -> Int {
+  if false { let target : Int = 0; let _ = target }
+  let mut s = 0
+  for x in xs {
+    if bad == target { s = s + x }
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
+    "for_in_sneaky_eq_split_grow_write": (r'''
+struct SneakyEq { xs : Array[Int] }
+impl Eq for SneakyEq with equal(self, other) {
+  let _ = other
+  self.xs.push(4)
+  true
+}
+pub fn f(xs : Array[Int], a : SneakyEq, b : SneakyEq) -> Int {
+  let mut s = 0
+  for x in xs {
+    if a == b { xs[1] = 99 }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "impl Eq"),
 }
 
 

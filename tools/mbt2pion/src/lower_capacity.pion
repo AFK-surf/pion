@@ -1266,7 +1266,12 @@ fn kept_iter_mutations(
       if p + 3 < e && tokens[p + 1].kind == TokenKind::Dot && tokens[p + 2].kind == TokenKind::Ident &&
       tokens[p + 3].kind == TokenKind::LParen {
         let m = tokens[p + 2].raw
-        if is_cap_arr_growth_method(m) {
+        let recv_is_builtin = (p == t && ((head.length() > 0 && nm == head) || fresh_local_binding(tokens, nm, body_open, t, false))) ||
+        receiver_is_builtin(tokens, p, body_open, t, sort_env_local)
+        if !recv_is_builtin && user_methods.contains(m) &&
+        (is_cap_arr_growth_method(m) || is_cap_arr_write_method(m)) {
+          return "`" + nm + "." + m + "(..)` may invoke a user/dependency method while it is kept"
+        } else if is_cap_arr_growth_method(m) {
           flags[0] = true
         } else if is_cap_arr_write_method(m) {
           flags[1] = true
@@ -3050,10 +3055,16 @@ pub struct CapPkgSummary {
   has_custom_eq : Bool
   // True iff a type declared IN THIS PACKAGE defines `impl Eq`.
   local_has_custom_eq : Bool
+  // True iff a dependency defines `op_equal` / `eq` / `equal`.
+  dep_has_custom_eq : Bool
   // Local types whose `impl Eq` is NOT proven free of array/opaque hazards (or "*" if unattributed).
   impure_eq_types : Map[String, Bool]
-  // Local types whose `impl Eq` IS proven free of array/opaque hazards.
+  // Local types whose `Eq` (manual or derived non-generic struct/enum) IS proven free of array/opaque hazards.
   pure_eq_types : Map[String, Bool]
+  // Unambiguous variant constructor names uniquely owned by a local enum in `pure_eq_types`.
+  pure_enum_ctors : Map[String, Bool]
+  // All struct type names declared in this package.
+  local_struct_names : Map[String, Bool]
   // Struct field name -> unambiguous type string ("Int", "Array:Int", "Node", or "" if ambiguous).
   field_types : Map[String, String]
   // Struct field name -> true iff EVERY struct declaration of this field has a built-in scalar or Option[built-in] type.
@@ -3079,8 +3090,11 @@ pub fn CapPkgSummary::empty() -> CapPkgSummary {
     dep_methods: Map(),
     has_custom_eq: false,
     local_has_custom_eq: false,
+    dep_has_custom_eq: false,
     impure_eq_types: Map(),
     pure_eq_types: Map(),
+    pure_enum_ctors: Map(),
+    local_struct_names: Map(),
     field_types: Map(),
     field_all_builtin: Map(),
     array_elem_types: Map(),
@@ -3102,6 +3116,203 @@ fn is_builtin_eq_type_name(t : String) -> Bool {
 
 fn is_pure_eq_type_name(t : String, summary : CapPkgSummary) -> Bool {
   is_builtin_eq_type_name(t) || summary.pure_eq_types.contains(t)
+}
+
+///| Extract local type dependencies from a type expression slice `ts[s..e)`.
+///| Returns `true` iff every leaf is a built-in scalar or a plain local type name (no generics, no `pkg::Ty`, no `->`).
+fn extract_pure_type_deps(ts : Array[Token], s_in : Int, e_in : Int, deps : Array[String]) -> Bool {
+  let mut s = s_in
+  let mut e = e_in
+  // Skip trailing `?` (Option sugar)
+  while e > s && ts[e - 1].raw == "?" {
+    e = e - 1
+  }
+  if s >= e {
+    return false
+  }
+  if e == s + 1 {
+    if !is_type_ident_tok(ts[s].kind) {
+      return false
+    }
+    if !is_builtin_eq_type_name(ts[s].raw) {
+      deps.push(ts[s].raw)
+    }
+    return true
+  }
+  // `Option[T]` / `Array[T]` / `FixedArray[T]`
+  if (ts[s].raw == "Option" || ts[s].raw == "Array" || ts[s].raw == "FixedArray") &&
+  s + 2 < e && ts[s + 1].kind == TokenKind::LBracket && find_matching_delim(ts, s + 1) == e - 1 {
+    return extract_pure_type_deps(ts, s + 2, e - 1, deps)
+  }
+  // Tuple `(T1, T2, ...)` — note: `(A) -> B` will NOT have `find_matching_delim(ts, s) == e - 1`.
+  if ts[s].kind == TokenKind::LParen && find_matching_delim(ts, s) == e - 1 {
+    let mut cur = s + 1
+    let mut k = s + 1
+    let mut d = 0
+    while k < e - 1 {
+      let kk = ts[k].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && kk == TokenKind::Comma {
+        if !extract_pure_type_deps(ts, cur, k, deps) {
+          return false
+        }
+        cur = k + 1
+      }
+      k = k + 1
+    }
+    if cur < e - 1 {
+      return extract_pure_type_deps(ts, cur, e - 1, deps)
+    }
+    return true
+  }
+  false
+}
+
+///| Collect local non-generic `struct` / `enum` type dependencies for monotone `pure_eq_types` fixpoint,
+///| all local struct names (`local_struct_names`), and all local enum variant constructor owners (`ctor_owner`).
+fn collect_local_pure_type_candidates(
+  all_tokens : Array[Array[Token]],
+) -> (Map[String, Bool], Map[String, Array[String]], Map[String, String]) {
+  let local_structs : Map[String, Bool] = Map()
+  let candidates : Map[String, Array[String]] = Map()
+  let invalid_candidates : Map[String, Bool] = Map()
+  let ctor_owner : Map[String, String] = Map()
+  for ts in all_tokens {
+    let n = ts.length()
+    let mut i = 0
+    while i < n {
+      let is_struct = ts[i].raw == "struct" && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident)
+      let is_enum = ts[i].raw == "enum" && (ts[i].kind == TokenKind::Keyword || ts[i].kind == TokenKind::Ident)
+      if (is_struct || is_enum) && i + 1 < n && is_type_ident_tok(ts[i + 1].kind) {
+        let tname = ts[i + 1].raw
+        if is_struct {
+          local_structs[tname] = true
+        }
+        let mut o = i + 2
+        let mut is_generic = false
+        while o < n && ts[o].kind != TokenKind::LBrace && ts[o].kind != TokenKind::LParen && ts[o].kind != TokenKind::Eof {
+          if ts[o].kind == TokenKind::LBracket {
+            is_generic = true
+          }
+          o = o + 1
+        }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          if is_generic {
+            invalid_candidates[tname] = true
+          }
+          let deps : Array[String] = []
+          let mut all_ok = !is_generic
+          if is_struct {
+            let mut k = o + 1
+            let mut d = 0
+            while k > 0 && k < close {
+              let kk = ts[k].kind
+              if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+              else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+              else if d == 0 && kk == TokenKind::Ident && k + 2 < close && ts[k + 1].kind == TokenKind::Colon &&
+              (k == o + 1 || ts[k].newline_before || ts[k - 1].raw == "mut" || ts[k - 1].raw == "priv" || ts[k - 1].kind == TokenKind::Comma || ts[k - 1].kind == TokenKind::Semi) {
+                let ty_s = k + 2
+                let mut ty_e = ty_s
+                let mut td = 0
+                while ty_e < close {
+                  let tk = ts[ty_e].kind
+                  if td == 0 && (tk == TokenKind::Comma || tk == TokenKind::Semi || (ty_e > ty_s && ts[ty_e].newline_before)) {
+                    break
+                  }
+                  if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+                  else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+                  ty_e = ty_e + 1
+                }
+                if all_ok && !extract_pure_type_deps(ts, ty_s, ty_e, deps) {
+                  all_ok = false
+                }
+                k = ty_e
+                continue
+              }
+              k = k + 1
+            }
+          } else {
+            // `enum E { Variant1; Variant2(T1, label~ : T2); ... }`
+            let mut k = o + 1
+            let mut d = 0
+            while k > 0 && k < close {
+              let kk = ts[k].kind
+              if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+              else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+              else if d == 0 && kk == TokenKind::UpperIdent &&
+              (k == o + 1 || ts[k].newline_before || ts[k - 1].kind == TokenKind::Semi || ts[k - 1].kind == TokenKind::Comma) {
+                let vname = ts[k].raw
+                if vname != "Some" && vname != "None" && vname != "Ok" && vname != "Err" {
+                  match ctor_owner.get(vname) {
+                    Some(prev) => if prev != tname { ctor_owner[vname] = "" }
+                    None => ctor_owner[vname] = tname
+                  }
+                }
+                if k + 1 < close && ts[k + 1].kind == TokenKind::LParen && !ts[k + 1].newline_before {
+                  let rp = find_matching_delim(ts, k + 1)
+                  if rp > k + 1 && rp < close {
+                    if all_ok {
+                      let mut cur = k + 2
+                      let mut pk = k + 2
+                      let mut pd = 0
+                      while pk <= rp {
+                        let at_end = pk == rp
+                        let pkk = ts[pk].kind
+                        if !at_end && (pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace) { pd = pd + 1 }
+                        else if !at_end && (pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace) { pd = pd - 1 }
+                        else if at_end || (pd == 0 && pkk == TokenKind::Comma) {
+                          if cur < pk {
+                            // Handle optional `[mut] label~ : Type`
+                            let mut ts_ = cur
+                            if ts_ < pk && ts[ts_].raw == "mut" { ts_ = ts_ + 1 }
+                            let mut colon_i = -1
+                            let mut scan = ts_
+                            let mut sd = 0
+                            while scan < pk {
+                              let sk = ts[scan].kind
+                              if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { sd = sd + 1 }
+                              else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { sd = sd - 1 }
+                              else if sd == 0 && sk == TokenKind::Colon { colon_i = scan; break }
+                              scan = scan + 1
+                            }
+                            if colon_i >= 0 {
+                              ts_ = colon_i + 1
+                            }
+                            if !extract_pure_type_deps(ts, ts_, pk, deps) {
+                              all_ok = false
+                            }
+                          }
+                          cur = pk + 1
+                        }
+                        pk = pk + 1
+                      }
+                    }
+                    k = rp + 1
+                    continue
+                  } else {
+                    all_ok = false
+                  }
+                }
+              }
+              k = k + 1
+            }
+          }
+          if all_ok && !invalid_candidates.contains(tname) {
+            candidates[tname] = deps
+          } else {
+            invalid_candidates[tname] = true
+            candidates.remove(tname)
+          }
+          i = if close > i { close } else { i + 1 }
+          continue
+        }
+      }
+      i = i + 1
+    }
+  }
+  (local_structs, candidates, ctor_owner)
 }
 
 ///| Collect unambiguous struct field types across the package:
@@ -3388,7 +3599,7 @@ pub fn collect_cap_pkg_summary(
         } else if !is_pure_key_method(m) || sort_env.methods.contains(m) {
           edges.push("M:" + m)
         }
-        // Astra P1-1: If a user/dep defines a same-name method (e.g. `Hook::push`), also propagate its effects
+        // If a user/dep defines a same-name method (e.g. `Hook::push`), also propagate its effects
         // whenever the receiver is not proven to be a built-in/fresh `Array`!
         if is_arr_op && !is_own_fresh && sort_env.methods.contains(m) &&
         !receiver_is_builtin(ts, k - 1, body_open, k, sort_env) {
@@ -3849,6 +4060,7 @@ pub fn collect_cap_pkg_summary(
   }
 
   let (field_types, field_all_builtin, array_elem_types, array_elem_all_builtin) = collect_struct_field_types_from_tokens(all_tokens)
+  let (local_struct_names, pure_type_candidates, ctor_owner) = collect_local_pure_type_candidates(all_tokens)
   let impure_eq_types : Map[String, Bool] = Map()
   let pure_eq_types : Map[String, Bool] = Map()
   let mut found_local_eq = false
@@ -3862,7 +4074,7 @@ pub fn collect_cap_pkg_summary(
             let ty = dk.slice(0, sep)
             match effects.get(dk) {
               Some(ef) =>
-              if ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || (ef.may_grow && ef.may_write) {
+              if ef.may_grow || ef.may_write || ef.may_shrink_or_shift || ef.may_shrink_to_fit || ef.may_call_opaque || ef.may_call_unknown || ef.may_pass_param_to_dep {
                 impure_eq_types[ty] = true
               } else if !impure_eq_types.contains(ty) {
                 pure_eq_types[ty] = true
@@ -3881,6 +4093,44 @@ pub fn collect_cap_pkg_summary(
   if local_has_custom_eq && !found_local_eq {
     impure_eq_types["*"] = true
   }
+  // Monotone fixpoint: local non-generic `struct` / `enum` whose fields/payloads are transitively built-in or pure_eq_types.
+  if !impure_eq_types.contains("*") {
+    let mut changed = true
+    while changed {
+      changed = false
+      for tname in pure_type_candidates.keys() {
+        if pure_eq_types.contains(tname) || impure_eq_types.contains(tname) {
+          continue
+        }
+        match pure_type_candidates.get(tname) {
+          Some(deps) => {
+            let mut ok = true
+            for d in deps {
+              if !is_builtin_eq_type_name(d) && !pure_eq_types.contains(d) {
+                ok = false
+                break
+              }
+            }
+            if ok {
+              pure_eq_types[tname] = true
+              changed = true
+            }
+          }
+          None => ()
+        }
+      }
+    }
+  }
+  let pure_enum_ctors : Map[String, Bool] = Map()
+  for vname in ctor_owner.keys() {
+    match ctor_owner.get(vname) {
+      Some(owner) =>
+      if owner.length() > 0 && pure_eq_types.contains(owner) {
+        pure_enum_ctors[vname] = true
+      }
+      None => ()
+    }
+  }
 
   let dep_methods_copy : Map[String, Bool] = Map()
   for dm in dep_methods.keys() {
@@ -3889,6 +4139,7 @@ pub fn collect_cap_pkg_summary(
       _ => ()
     }
   }
+  let dep_has_custom_eq = dep_methods_copy.contains("op_equal") || dep_methods_copy.contains("eq") || dep_methods_copy.contains("equal")
   CapPkgSummary::{
     effects: effects,
     by_name: by_name,
@@ -3896,8 +4147,11 @@ pub fn collect_cap_pkg_summary(
     dep_methods: dep_methods_copy,
     has_custom_eq: has_custom_eq,
     local_has_custom_eq: local_has_custom_eq,
+    dep_has_custom_eq: dep_has_custom_eq,
     impure_eq_types: impure_eq_types,
     pure_eq_types: pure_eq_types,
+    pure_enum_ctors: pure_enum_ctors,
+    local_struct_names: local_struct_names,
     field_types: field_types,
     field_all_builtin: field_all_builtin,
     array_elem_types: array_elem_types,
@@ -4037,6 +4291,14 @@ fn resolve_local_type_name(
   // 2. Local `let [mut] nm : Ty = ...` or `let [mut] nm = <lit / ident / field>` before `site_i`
   let mut li = site_i - 1
   while li > fn_bo {
+    if tokens[li].kind == TokenKind::RBrace {
+      let lb = find_open_before(tokens, li, fn_bo)
+      if lb < 0 {
+        break
+      }
+      li = lb - 1
+      continue
+    }
     if tokens[li].raw == "let" {
       let mut ni = li + 1
       if ni < site_i && tokens[ni].raw == "mut" { ni = ni + 1 }
@@ -4050,22 +4312,32 @@ fn resolve_local_type_name(
         } else if tokens[ni + 1].kind == TokenKind::Eq {
           let rhs = ni + 2
           let rk = tokens[rhs].kind
-          if rk == TokenKind::IntLit || (tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::IntLit) {
+          let is_stmt_boundary = fn(end_pos : Int) -> Bool {
+            let nxt = end_pos + 1
+            nxt >= site_i || tokens[nxt].newline_before || tokens[nxt].kind == TokenKind::Semi || tokens[nxt].kind == TokenKind::RBrace
+          }
+          if rk == TokenKind::IntLit && is_stmt_boundary(rhs) {
             return "Int"
           }
-          if rk == TokenKind::FloatLit || (tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::FloatLit) {
+          if tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::IntLit && is_stmt_boundary(rhs + 1) {
+            return "Int"
+          }
+          if rk == TokenKind::FloatLit && is_stmt_boundary(rhs) {
             return "Double"
           }
-          if rk == TokenKind::StringLit { return "String" }
-          if rk == TokenKind::CharLit { return "Char" }
-          if tokens[rhs].raw == "true" || tokens[rhs].raw == "false" { return "Bool" }
+          if tokens[rhs].raw == "-" && rhs + 1 < site_i && tokens[rhs + 1].kind == TokenKind::FloatLit && is_stmt_boundary(rhs + 1) {
+            return "Double"
+          }
+          if rk == TokenKind::StringLit && is_stmt_boundary(rhs) { return "String" }
+          if rk == TokenKind::CharLit && is_stmt_boundary(rhs) { return "Char" }
+          if (tokens[rhs].raw == "true" || tokens[rhs].raw == "false") && is_stmt_boundary(rhs) { return "Bool" }
           if rk == TokenKind::Ident && tokens[rhs].raw != nm {
             // `Array::make(n, <lit>)` or `mbt_compat::arr_make(n, <lit>)`
             if (tokens[rhs].raw == "Array" || tokens[rhs].raw == "mbt_compat") && rhs + 4 < site_i &&
             tokens[rhs + 1].kind == TokenKind::ColonColon && (tokens[rhs + 2].raw == "make" || tokens[rhs + 2].raw == "arr_make") &&
             tokens[rhs + 3].kind == TokenKind::LParen {
               let cp = find_matching_delim(tokens, rhs + 3)
-              if cp > rhs + 3 && cp < site_i {
+              if cp > rhs + 3 && cp < site_i && is_stmt_boundary(cp) {
                 let last_arg = cp - 1
                 if tokens[last_arg].kind == TokenKind::IntLit { return "Array:Int" }
                 if tokens[last_arg].kind == TokenKind::FloatLit { return "Array:Double" }
@@ -4087,13 +4359,13 @@ fn resolve_local_type_name(
                   }
                 }
               }
-              if !(cur + 1 < site_i && tokens[cur + 1].kind == TokenKind::LParen) {
+              if is_stmt_boundary(cur) && eq_field_recv_is_local(tokens, cur - 1, fn_bo, li, summary) {
                 match summary.field_types.get(tokens[cur].raw) {
                   Some(ft) => if ft.length() > 0 { return ft }
                   None => ()
                 }
               }
-            } else if !(rhs + 1 < site_i && (tokens[rhs + 1].kind == TokenKind::LParen || tokens[rhs + 1].kind == TokenKind::ColonColon || tokens[rhs + 1].kind == TokenKind::LBracket)) {
+            } else if is_stmt_boundary(rhs) {
               let inner_ty = resolve_local_type_name(tokens, tokens[rhs].raw, fn_bo, li, summary)
               if inner_ty.length() > 0 { return inner_ty }
             }
@@ -4137,8 +4409,84 @@ fn resolve_local_type_name(
   ""
 }
 
+///| True iff `(tokens[lp+1 .. rp])` contains no top-level tuple comma, semicolon, block, `if`, or `match`.
+fn paren_is_single_expr(tokens : Array[Token], lp : Int, rp : Int) -> Bool {
+  if lp < 0 || rp <= lp + 1 {
+    return false
+  }
+  let mut k = lp + 1
+  let mut d = 0
+  while k < rp {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      if d == 0 && kk == TokenKind::LBrace {
+        return false
+      }
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      d = d - 1
+    } else if d == 0 {
+      if kk == TokenKind::Comma || kk == TokenKind::Semi || tokens[k].raw == "if" || tokens[k].raw == "match" {
+        return false
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| True iff the struct field receiver immediately before `dot_pos` is proven to be a local struct
+///| whenever dependencies define custom `Eq` (prevents cross-package same-name field pollution).
+fn eq_field_recv_is_local(
+  tokens : Array[Token],
+  dot_pos : Int,
+  body_open : Int,
+  site_i : Int,
+  summary : CapPkgSummary,
+) -> Bool {
+  if !summary.dep_has_custom_eq {
+    return true
+  }
+  if dot_pos <= 0 {
+    return false
+  }
+  let prev = tokens[dot_pos - 1]
+  // Direct `r.f`
+  if (prev.kind == TokenKind::Ident || prev.raw == "self") &&
+  !(dot_pos >= 2 && (tokens[dot_pos - 2].kind == TokenKind::Dot || tokens[dot_pos - 2].kind == TokenKind::ColonColon)) {
+    if prev.raw == "self" {
+      return true
+    }
+    if body_open < 0 {
+      return false
+    }
+    let rty = resolve_local_type_name(tokens, prev.raw, body_open, site_i, summary)
+    return rty.length() > 0 && summary.local_struct_names.contains(rty)
+  }
+  // Chained `e.mid.f`
+  if prev.kind == TokenKind::Ident && dot_pos >= 2 && tokens[dot_pos - 2].kind == TokenKind::Dot {
+    if !eq_field_recv_is_local(tokens, dot_pos - 2, body_open, site_i, summary) {
+      return false
+    }
+    match summary.field_types.get(prev.raw) {
+      Some(ft) => return summary.local_struct_names.contains(ft)
+      None => return false
+    }
+  }
+  false
+}
+
+///| Strict whitelist of built-in methods guaranteed to return a built-in scalar (never `Option[T]` or user type).
+fn is_pure_scalar_eq_method(m : String) -> Bool {
+  m == "length" || m == "is_empty" || m == "to_int" || m == "to_double" || m == "to_float" ||
+  m == "to_string" || m == "to_int64" || m == "to_uint" || m == "to_uint64" || m == "code_unit_at" ||
+  m == "contains" || m == "starts_with" || m == "ends_with" || m == "index_of" || m == "last_index_of" ||
+  m == "is_some" || m == "is_none" || m == "is_ok" || m == "is_err" || m == "abs" || m == "floor" ||
+  m == "ceil" || m == "round" || m == "trunc" || m == "sqrt" || m == "compare"
+}
+
 ///| True iff the operand ending at `idx` (`is_lhs == true`) or starting at `idx` (`is_lhs == false`)
-///| of `==`/`!=` is proven to have a built-in or pure-`Eq` type (Opus P1 Scheme A).
+///| of `==`/`!=` is proven to have a built-in scalar or pure-`Eq` type (fail-closed on containers of unverified types).
 fn eq_operand_is_pure(
   tokens : Array[Token],
   idx : Int,
@@ -4152,53 +4500,149 @@ fn eq_operand_is_pure(
     return false
   }
   let mut p = idx
-  // Strip outer parens on the operand side, or handle `()` Unit literal
+  let mut bound_lo = -1
+  let mut bound_hi = -1
+  // Strip outer parens on the operand side, or handle `()` Unit literal / scalar-result calls / enum ctors.
   if is_lhs {
-    if tokens[p].kind == TokenKind::RParen && p > 0 && tokens[p - 1].kind == TokenKind::LParen {
-      // Either `()` unit literal or `expr.m()` call
-      if p >= 2 && tokens[p - 2].kind == TokenKind::Ident && p >= 3 && tokens[p - 3].kind == TokenKind::Dot {
-        if is_builtin_result_method(tokens[p - 2].raw) {
+    while tokens[p].kind == TokenKind::RParen && p > 0 {
+      let lp = find_open_before(tokens, p, if body_open >= 0 { body_open } else { 0 })
+      if lp < 0 {
+        return false
+      }
+      if lp == p - 1 {
+        // Either `()` unit literal or `expr.m()` call
+        if lp >= 2 && tokens[lp - 1].kind == TokenKind::Ident && tokens[lp - 2].kind == TokenKind::Dot {
+          if is_pure_scalar_eq_method(tokens[lp - 1].raw) && !summary.sort_env.methods.contains(tokens[lp - 1].raw) {
+            return true
+          }
+          return false
+        }
+        if !(lp >= 1 && is_type_ident_tok(tokens[lp - 1].kind)) {
           return true
         }
-      } else if !(p >= 2 && tokens[p - 2].kind == TokenKind::Ident) {
-        return true
+        return false
       }
-    }
-    if tokens[p].kind == TokenKind::RParen && p > 0 {
-      let lp = find_open_before(tokens, p, if body_open >= 0 { body_open } else { 0 })
-      if lp > 0 && tokens[lp - 1].kind == TokenKind::Ident && lp >= 2 && tokens[lp - 2].kind == TokenKind::Dot &&
-      is_builtin_result_method(tokens[lp - 1].raw) {
-        return true
+      // `expr.m(...)` scalar-result method call
+      if lp >= 2 && tokens[lp - 1].kind == TokenKind::Ident && tokens[lp - 2].kind == TokenKind::Dot {
+        if is_pure_scalar_eq_method(tokens[lp - 1].raw) && !summary.sort_env.methods.contains(tokens[lp - 1].raw) {
+          return true
+        }
+        return false
       }
-      if lp >= 0 && !(lp > 0 && tokens[lp - 1].kind == TokenKind::Ident) && p - 1 > lp {
-        p = p - 1
+      // Qualified pure enum payload constructor `E::V(...)`
+      if lp >= 3 && tokens[lp - 1].kind == TokenKind::UpperIdent && tokens[lp - 2].kind == TokenKind::ColonColon &&
+      is_type_ident_tok(tokens[lp - 3].kind) && !(lp >= 4 && tokens[lp - 4].kind == TokenKind::ColonColon) {
+        return summary.pure_eq_types.contains(tokens[lp - 3].raw)
       }
+      // Unambiguous bare pure enum payload constructor `V(...)`
+      if lp >= 1 && tokens[lp - 1].kind == TokenKind::UpperIdent &&
+      !(lp >= 2 && (tokens[lp - 2].kind == TokenKind::Dot || tokens[lp - 2].kind == TokenKind::ColonColon)) {
+        return summary.pure_enum_ctors.get(tokens[lp - 1].raw) == Some(true)
+      }
+      // Other call `f(...)` — cannot strip parens
+      if lp >= 1 && is_type_ident_tok(tokens[lp - 1].kind) {
+        return false
+      }
+      // Grouping parens `(expr)`: reject tuples, blocks, `if`, `match`
+      if !paren_is_single_expr(tokens, lp, p) {
+        return false
+      }
+      bound_lo = lp + 1
+      bound_hi = p - 1
+      p = p - 1
     }
   } else {
-    if tokens[p].kind == TokenKind::LParen && p + 1 < n && tokens[p + 1].kind == TokenKind::RParen {
-      return true
-    }
-    while p + 1 < n && tokens[p].kind == TokenKind::LParen {
+    while p < n && tokens[p].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, p)
+      if rp < 0 {
+        return false
+      }
+      if rp == p + 1 {
+        let after_u = rp + 1
+        if after_u < n && (tokens[after_u].kind == TokenKind::Dot || tokens[after_u].raw == "|>" || tokens[after_u].kind == TokenKind::ColonColon) {
+          return false
+        }
+        return true
+      }
+      if !paren_is_single_expr(tokens, p, rp) {
+        return false
+      }
+      bound_lo = p + 1
+      bound_hi = rp - 1
       p = p + 1
     }
     if tokens[p].raw == "-" && p + 1 < n &&
     (tokens[p + 1].kind == TokenKind::IntLit || tokens[p + 1].kind == TokenKind::FloatLit) {
+      if bound_hi >= 0 && p + 1 != bound_hi {
+        return false
+      }
+      let after_n = p + 2
+      if after_n < n && (tokens[after_n].kind == TokenKind::Dot || tokens[after_n].raw == "|>" || tokens[after_n].kind == TokenKind::ColonColon) {
+        return false
+      }
       return true
     }
   }
   let tk = tokens[p]
   let kk = tk.kind
+  // When inside stripped parens `(expr)`, literals must occupy the entire parenthesized span.
+  let lit_fits_bounds = if bound_lo >= 0 && bound_hi >= 0 {
+    if is_lhs {
+      p == bound_lo || (p == bound_lo + 1 && tokens[bound_lo].raw == "-")
+    } else {
+      p == bound_hi
+    }
+  } else {
+    true
+  }
   if kk == TokenKind::IntLit || kk == TokenKind::FloatLit || kk == TokenKind::StringLit ||
   kk == TokenKind::CharLit || tk.raw == "true" || tk.raw == "false" || tk.raw == "None" {
-    return true
-  }
-  // Builtin receiver / call / expression
-  if body_open >= 0 && receiver_is_builtin(tokens, p, body_open, site_i, summary.sort_env) {
+    if !lit_fits_bounds {
+      return false
+    }
+    if is_lhs {
+      // Reject tuple field projection like `pair.0` or qualified `pkg::None`
+      if p > 0 && (tokens[p - 1].kind == TokenKind::Dot || tokens[p - 1].kind == TokenKind::ColonColon) {
+        return false
+      }
+    } else {
+      // Reject method call / pipe on literal like `0.to_bad()` or `0 |> to_bad()`
+      if p + 1 < n && (tokens[p + 1].kind == TokenKind::Dot || tokens[p + 1].raw == "|>" || tokens[p + 1].kind == TokenKind::ColonColon) {
+        return false
+      }
+    }
     return true
   }
   if is_lhs {
+    // Qualified pure enum unit variant `E::V`
+    if kk == TokenKind::UpperIdent && p >= 2 && tokens[p - 1].kind == TokenKind::ColonColon &&
+    is_type_ident_tok(tokens[p - 2].kind) && !(p >= 3 && tokens[p - 3].kind == TokenKind::ColonColon) {
+      if bound_lo >= 0 && p - 2 != bound_lo {
+        return false
+      }
+      return summary.pure_eq_types.contains(tokens[p - 2].raw)
+    }
+    // Unambiguous bare pure enum unit variant `V`
+    if kk == TokenKind::UpperIdent && !(p >= 1 && (tokens[p - 1].kind == TokenKind::Dot || tokens[p - 1].kind == TokenKind::ColonColon)) {
+      if bound_lo >= 0 && p != bound_lo {
+        return false
+      }
+      return summary.pure_enum_ctors.get(tk.raw) == Some(true)
+    }
     // Field access `e.f`
     if kk == TokenKind::Ident && p >= 1 && tokens[p - 1].kind == TokenKind::Dot {
+      if bound_lo >= 0 {
+        let mut s_walk = p - 2
+        while s_walk > bound_lo && (tokens[s_walk].kind == TokenKind::Ident || tokens[s_walk].kind == TokenKind::Dot || tokens[s_walk].raw == "self") {
+          s_walk = s_walk - 1
+        }
+        if s_walk != bound_lo || !(tokens[s_walk].kind == TokenKind::Ident || tokens[s_walk].raw == "self") {
+          return false
+        }
+      }
+      if !eq_field_recv_is_local(tokens, p - 1, body_open, site_i, summary) {
+        return false
+      }
       if summary.field_all_builtin.get(tk.raw) == Some(true) {
         return true
       }
@@ -4213,6 +4657,9 @@ fn eq_operand_is_pure(
       let lb = find_open_before(tokens, p, if body_open >= 0 { body_open } else { 0 })
       if lb > 0 && tokens[lb - 1].kind == TokenKind::Ident {
         if lb >= 2 && tokens[lb - 2].kind == TokenKind::Dot {
+          if !eq_field_recv_is_local(tokens, lb - 2, body_open, site_i, summary) {
+            return false
+          }
           if summary.array_elem_all_builtin.get(tokens[lb - 1].raw) == Some(true) {
             return true
           }
@@ -4225,6 +4672,9 @@ fn eq_operand_is_pure(
             None => ()
           }
         } else {
+          if bound_lo >= 0 && lb - 1 != bound_lo {
+            return false
+          }
           let arr_ty = resolve_local_type_name(tokens, tokens[lb - 1].raw, body_open, site_i, summary)
           if arr_ty.starts_with("Array:") && is_pure_eq_type_name(arr_ty.slice(6, arr_ty.length()), summary) {
             return true
@@ -4235,28 +4685,60 @@ fn eq_operand_is_pure(
     }
     // Bare identifier `x`
     if kk == TokenKind::Ident && !(p >= 1 && tokens[p - 1].kind == TokenKind::ColonColon) {
+      if bound_lo >= 0 && p != bound_lo {
+        return false
+      }
       let ty = resolve_local_type_name(tokens, tk.raw, body_open, site_i, summary)
       if ty.length() > 0 && is_pure_eq_type_name(ty, summary) {
         return true
       }
     }
   } else {
+    // Qualified pure enum variant `E::V` or `E::V(...)`
+    if is_type_ident_tok(kk) && p + 2 < n && tokens[p + 1].kind == TokenKind::ColonColon &&
+    tokens[p + 2].kind == TokenKind::UpperIdent && !(p >= 1 && tokens[p - 1].kind == TokenKind::ColonColon) {
+      let end_pos = if p + 3 < n && tokens[p + 3].kind == TokenKind::LParen && !tokens[p + 3].newline_before {
+        find_matching_delim(tokens, p + 3)
+      } else {
+        p + 2
+      }
+      if bound_hi >= 0 && end_pos != bound_hi {
+        return false
+      }
+      return summary.pure_eq_types.contains(tk.raw)
+    }
+    // Unambiguous bare pure enum variant `V` or `V(...)`
+    if kk == TokenKind::UpperIdent && !(p + 1 < n && tokens[p + 1].kind == TokenKind::ColonColon) {
+      let end_pos = if p + 1 < n && tokens[p + 1].kind == TokenKind::LParen && !tokens[p + 1].newline_before {
+        find_matching_delim(tokens, p + 1)
+      } else {
+        p
+      }
+      if bound_hi >= 0 && end_pos != bound_hi {
+        return false
+      }
+      return summary.pure_enum_ctors.get(tk.raw) == Some(true)
+    }
     // Walk forward through `a.b[i].c` on RHS to find the terminal segment
-    if kk == TokenKind::Ident {
+    if kk == TokenKind::Ident || tk.raw == "self" {
       let mut cur = p
+      let mut end_tok = p
       let mut is_call = false
       let mut is_idx = false
       while cur + 1 < n {
         if tokens[cur + 1].kind == TokenKind::Dot && cur + 2 < n && tokens[cur + 2].kind == TokenKind::Ident {
           cur = cur + 2
+          end_tok = cur
           is_idx = false
         } else if tokens[cur + 1].kind == TokenKind::LBracket {
           let rb = find_matching_delim(tokens, cur + 1)
           if rb > cur + 1 {
             if rb + 2 < n && tokens[rb + 1].kind == TokenKind::Dot && tokens[rb + 2].kind == TokenKind::Ident {
               cur = rb + 2
+              end_tok = cur
               is_idx = false
             } else {
+              end_tok = rb
               is_idx = true
               break
             }
@@ -4264,20 +4746,29 @@ fn eq_operand_is_pure(
             break
           }
         } else if tokens[cur + 1].kind == TokenKind::LParen && !tokens[cur + 1].newline_before {
+          let rp = find_matching_delim(tokens, cur + 1)
+          end_tok = if rp > cur + 1 { rp } else { cur + 1 }
           is_call = true
           break
         } else {
           break
         }
       }
+      if bound_hi >= 0 && end_tok != bound_hi {
+        return false
+      }
       if is_call {
-        if cur >= 1 && tokens[cur - 1].kind == TokenKind::Dot && is_builtin_result_method(tokens[cur].raw) {
+        if cur >= 1 && tokens[cur - 1].kind == TokenKind::Dot &&
+        is_pure_scalar_eq_method(tokens[cur].raw) && !summary.sort_env.methods.contains(tokens[cur].raw) {
           return true
         }
         return false
       }
       if is_idx {
         if cur >= 1 && tokens[cur - 1].kind == TokenKind::Dot {
+          if !eq_field_recv_is_local(tokens, cur - 1, body_open, site_i, summary) {
+            return false
+          }
           if summary.array_elem_all_builtin.get(tokens[cur].raw) == Some(true) {
             return true
           }
@@ -4298,6 +4789,9 @@ fn eq_operand_is_pure(
         return false
       }
       if cur > p && tokens[cur - 1].kind == TokenKind::Dot {
+        if !eq_field_recv_is_local(tokens, cur - 1, body_open, site_i, summary) {
+          return false
+        }
         if summary.field_all_builtin.get(tokens[cur].raw) == Some(true) {
           return true
         }
@@ -4706,7 +5200,7 @@ fn summary_custom_eq_is_pure(summary : CapPkgSummary) -> Bool {
   found
 }
 
-///| Sound `for x in xs { ... }` / `for i, x in xs { ... }` hazard checker (Opus P1-3 + Wave F4-1 R1/R2).
+///| Sound `for x in xs { ... }` / `for i, x in xs { ... }` hazard checker enforcing `(buf, init_len)` slot-stability.
 ///| Catches any shrink (`clear`/`pop`/`remove`/`truncate`/`drain`/`retain`), compound shift
 ///| (`insert`/`splice`/`resize`/etc.), `shrink_to_fit`, grow+write (including cross-function),
 ///| opaque/indirect/cross-package calls, or custom `impl Eq` on `xs` or its aliases when another
@@ -4868,7 +5362,21 @@ fn for_in_body_hazard(
   let is_local_fresh_recv = fn(r : String, r_is_field : Bool, pos : Int) -> Bool {
     !r_is_field && r.length() > 0 && body_open >= 0 && fresh_local_binding(tokens, r, body_open, pos, true)
   }
-  let iter_elem_ty = if !is_field_iter && root.length() > 0 && body_open >= 0 {
+  let iter_elem_ty = if is_field_iter && tail.length() > 0 {
+    match summary.array_elem_types.get(tail) {
+      Some(fe) => if fe.length() > 0 { fe } else {
+        match summary.field_types.get(tail) {
+          Some(ft) => if ft.starts_with("Array:") { ft.slice(6, ft.length()) } else { "" }
+          None => ""
+        }
+      }
+      None =>
+      match summary.field_types.get(tail) {
+        Some(ft) => if ft.starts_with("Array:") { ft.slice(6, ft.length()) } else { "" }
+        None => ""
+      }
+    }
+  } else if !is_field_iter && root.length() > 0 && body_open >= 0 {
     let rty = resolve_local_type_name(tokens, root, body_open, loop_open, summary)
     if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
   } else {
@@ -4880,16 +5388,30 @@ fn for_in_body_hazard(
     } else if is_local_fresh_recv(r, r_is_field, pos) {
       false
     } else if is_field_iter {
-      (r_is_field && r_tail == tail) || (!r_is_field && names.contains(r))
+      let param_can_alias = if !r_is_field && arr_params.contains(r) && !fresh_before.contains(r) {
+        let rty = if body_open >= 0 { resolve_local_type_name(tokens, r, body_open, pos, summary) } else { "" }
+        let re = if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
+        !(iter_elem_ty.length() > 0 && re.length() > 0 && re != iter_elem_ty)
+      } else {
+        false
+      }
+      (r_is_field && r_tail == tail) || (!r_is_field && names.contains(r)) || param_can_alias
     } else {
       let field_can_alias = if r_is_field {
         if r_tail == tail {
           true
-        } else if arr_params.contains(root) && r != "self" && summary.array_fields.get(r_tail) == Some(true) {
-          // Statically distinct element types (e.g. `Array[(Int, Int)]` vs `Array[Int]`) cannot alias.
-          match summary.array_elem_types.get(r_tail) {
-            Some(fe) => !(iter_elem_ty.length() > 0 && fe.length() > 0 && fe != iter_elem_ty)
-            None => true
+        } else if arr_params.contains(root) {
+          if summary.array_fields.get(r_tail) == Some(true) {
+            // Statically distinct element types (e.g. `Array[(Int, Int)]` vs `Array[Int]`) cannot alias.
+            match summary.array_elem_types.get(r_tail) {
+              Some(fe) => !(iter_elem_ty.length() > 0 && fe.length() > 0 && fe != iter_elem_ty)
+              None => true
+            }
+          } else if !summary.field_types.contains(r_tail) {
+            // Field not declared in this package (e.g. foreign `dep::Box.items`) -> conservatively may alias.
+            true
+          } else {
+            false
           }
         } else {
           false
@@ -4982,7 +5504,7 @@ fn for_in_body_hazard(
         }
       }
     }
-    // Custom `impl Eq` on `==` / `!=` for non-local/escaped arrays (Opus P1 Scheme A: per-type impure Eq tracking)
+    // Custom `impl Eq` on `==` / `!=` for non-local/escaped arrays (per-type impure Eq tracking)
     if !fresh_root && summary.local_has_custom_eq && summary.impure_eq_types.length() > 0 &&
     (kk == TokenKind::EqEq || tk.raw == "!=") {
       let lhs_pure = k > s && eq_operand_is_pure(tokens, k - 1, body_open, k, summary, true)
@@ -5040,6 +5562,9 @@ fn for_in_body_hazard(
         0
       }
       let recv_is_builtin_arr_or_val = (recv_is_field && summary.array_fields.get(recv_tail) == Some(true)) ||
+      (!recv_is_field && recv_r.length() > 0 && body_open >= 0 &&
+        (fresh_local_binding(tokens, recv_r, body_open, k, false) ||
+          resolve_local_type_name(tokens, recv_r, body_open, k, summary).starts_with("Array:"))) ||
       (body_open >= 0 && receiver_is_builtin(tokens, k - 1, body_open, k, summary.sort_env))
       let recv_proven_disjoint_builtin = !may_alias && is_builtin_first_order_method(m) && apk == 0 &&
       (!summary.by_name.contains(m) || recv_is_builtin_arr_or_val)
@@ -5062,7 +5587,7 @@ fn for_in_body_hazard(
             cp_m > k + 3 && tokens[k + 3].raw == "fn"
             let handled_arr_builtin = is_read_only_array_method(m) || is_cap_arr_growth_method(m) ||
             is_cap_arr_write_method(m) || is_cap_arr_shrink_or_shift_method(m) || m == "shrink_to_fit"
-            if pass_kind > 0 && !inline_iter_pred && !handled_arr_builtin && !can_exit(k) {
+            if pass_kind > 0 && !inline_iter_pred && !(handled_arr_builtin && recv_is_builtin_arr_or_val) && !can_exit(k) {
               return "dependency method `." + m + "(..)` may mutate the array during `for .. in`"
             }
           }
