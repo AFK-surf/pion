@@ -8,7 +8,8 @@
 #   4. negative: an orphan package (member of no workspace) writing `{ workspace = true }`
 #      fails even though the consumer's [workspace.dependencies] defines the same name
 #      (both outside and nested inside the consumer directory)
-#   5. git dependency whose checkout is its own [workspace]
+#   5. git dependency whose checkout is its own [workspace] (consumer decoy `b` again)
+#   6. external workspace member reached through an outward symlink
 # Each positive case runs `pionc check` and `pionc build`; case 1 also drives
 # `pionc check --server` `reload` after editing the external workspace manifest.
 set -eu
@@ -232,12 +233,19 @@ git -C "$S5/ext_repo" config user.email "pion-test@example.com"
 git -C "$S5/ext_repo" add .
 git -C "$S5/ext_repo" commit -q -m "init ext workspace"
 EXT_REV="$(git -C "$S5/ext_repo" rev-parse HEAD)"
-mkdir -p "$S5/consumer"
-cat > "$S5/consumer/pion.toml" <<'EOF'
-[workspace]
-members = ["app"]
-EOF
+# The consumer declares a decoy `b`: the git package's inherited `b` must neither
+# resolve against it nor be redirected onto it as a root pin.
+write_consumer_ws "$S5/consumer"
 write_app "$S5/consumer/app" "a = { git = \"file://$S5/ext_repo\", rev = \"$EXT_REV\", subdir = \"packages/a\" }"
 expect_ok git "$S5/consumer/app" "$S5/consumer"
 
-echo "p32d_external_ws_dep: ALL PASSED (nested, sibling, single, orphan x2, git, check --server reload)"
+# 6. External workspace whose member is an outward symlink (`ext/packages/a -> ../../real_a`):
+#    the enclosing workspace is found through the literal (non-canonical) ancestors.
+S6="$TMP_DIR/s6"
+write_ext_ws "$S6/ext"
+mv "$S6/ext/packages/a" "$S6/real_a"
+ln -s ../../real_a "$S6/ext/packages/a"
+write_app "$S6/app" 'a = { path = "../ext/packages/a" }'
+expect_ok symlink "$S6/app" "$S6/app"
+
+echo "p32d_external_ws_dep: ALL PASSED (nested, sibling, single, orphan x2, git, symlinked member, check --server reload)"
