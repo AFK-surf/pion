@@ -22,7 +22,10 @@
 #      `pion_i32_literal_1_words` next to two word-table literals (the tables
 #      take other names); edges: out-of-range decimal / hex / underscore /
 #      negative literals give the same words through 1,023 element stores and
-#      a 1,024 element word table.
+#      a 1,024 element word table;
+#   6. ints as a static library whose `--entry-symbol` is
+#      `pion_i32_literal_0` / `pion_i32_literal_0_words` (dev, --release),
+#      linked into a C host: same output.
 # Each program: check.py on the dev and --release SSA, exact stdout natively
 # (dev, --release) and on Wasm32 (Node, dev and --release); ints and records
 # (and collide, edges) also under ASan/LSan; sparse and sparsecap also
@@ -126,5 +129,24 @@ for PROG in strings ints records sparse sparsecap collide edges; do
   N=$((N + 1))
 done
 [ "$N" -eq 7 ]
+
+# --entry-symbol renames the entry point to the names the first word table
+# would take: the tables avoid it, the static library links and runs.
+RT_LIB="${PION_RT_LIB:-$ROOT_DIR/out/libpionrt.a}"
+for SYM in pion_i32_literal_0 pion_i32_literal_0_words; do
+  for MODE in dev release; do
+    FLAG=""
+    [ "$MODE" = "release" ] && FLAG="--release"
+    BASE="$TMP_DIR/entry_${SYM}_$MODE"
+    build $FLAG --entry-symbol "$SYM" --emit-staticlib "$BASE.a" "$GEN/ints.pion"
+    printf 'int %s(int argc, char **argv);\nint main(int argc, char **argv) { return %s(argc, argv); }\n' \
+      "$SYM" "$SYM" > "$BASE.c"
+    "$CC_BIN" -O1 "$BASE.c" "$BASE.a" "$RT_LIB" -lm -lpthread -o "$BASE"
+    "$BASE" > "$BASE.out" 2> "$BASE.err"
+    same_output "ints --entry-symbol $SYM $MODE" "$GEN/ints.expected" "$BASE.out"
+    no_stderr "ints --entry-symbol $SYM $MODE" "$BASE.err"
+  done
+  echo "p130 --entry-symbol $SYM: static library links, output equals the reference"
+done
 
 echo "PASS: p130_real_workload_data_opts"
