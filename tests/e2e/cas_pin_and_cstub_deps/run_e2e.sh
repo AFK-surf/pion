@@ -571,12 +571,17 @@ fi
 echo "(E) Wasm32 build/run without -o under PION_CACHE_MAX_KB=1 (keep_keys + HIT) -> OK"
 
 # ============================================================================
-# Scenario F (Round 2 #3 + Round 3): Same-size + same-mtime external .a edit
+# Scenario F (Round 2 #3 + Round 3/4): Same-size + same-mtime_ns external .a edit
 # ============================================================================
 cp -p "$WS_C/app/libext_mtime.a" "$TMP_DIR/libext_mtime.ref"
 # Ensure hot default build & hot testbin exist in CAS_C before rewriting .a
 PION_CACHE_DIR="$CAS_C" "$PIONC" build "$WS_C/app"
-PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > /dev/null
+PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > "$TMP_DIR/f_test_before.json"
+python3 - "$TMP_DIR/f_test_before.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["ok"] is True and d["passed"] == 2 and d["failed"] == 0, d
+PYEOF
 cat > "$WS_C/ext_obj.c" <<'EOF'
 #include <stdint.h>
 int64_t mtime_ext_lib_val(void) { return 99; }
@@ -584,28 +589,30 @@ EOF
 "${CC:-cc}" -c "$WS_C/ext_obj.c" -o "$WS_C/ext_obj.o"
 rm -f "$WS_C/app/libext_mtime.a"
 ar rcs "$WS_C/app/libext_mtime.a" "$WS_C/ext_obj.o"
-touch -r "$TMP_DIR/libext_mtime.ref" "$WS_C/app/libext_mtime.a"
-# Explicitly verify BOTH byte size and mtime are strictly identical!
+# Restore nanosecond-exact atime/mtime and verify BOTH st_size & st_mtime_ns match!
 python3 - "$TMP_DIR/libext_mtime.ref" "$WS_C/app/libext_mtime.a" <<'PYEOF'
 import os, sys
-s1, s2 = os.stat(sys.argv[1]), os.stat(sys.argv[2])
+ref_p, cur_p = sys.argv[1], sys.argv[2]
+s1 = os.stat(ref_p)
+os.utime(cur_p, ns=(s1.st_atime_ns, s1.st_mtime_ns))
+s2 = os.stat(cur_p)
 assert s1.st_size == s2.st_size, f"expected identical .a size: {s1.st_size} vs {s2.st_size}"
-assert int(s1.st_mtime) == int(s2.st_mtime), f"expected identical .a mtime: {s1.st_mtime} vs {s2.st_mtime}"
+assert s1.st_mtime_ns == s2.st_mtime_ns, f"expected identical .a mtime_ns: {s1.st_mtime_ns} vs {s2.st_mtime_ns}"
 PYEOF
-# Hot `pionc run` (uses default CAS bin key, not `-o`) MUST relink and print 114
-OUT_F="$(PION_CACHE_DIR="$CAS_C" "$PIONC" run "$WS_C/app")"
-[ "$OUT_F" = "mtime_sum=114" ] || fail "Scenario F expected mtime_sum=114 from default CAS bin after same-size/same-mtime .a edit, got $OUT_F"
-# Hot `pionc test` MUST also relink testbin (app_mtime_ok expects 57, so it must FAIL now with 114!)
-cat > "$WS_C/app/src/app_test.pion" <<'EOF'
-test "app_mtime_ok" { debug_assert(combined() == 114L, "app_mtime_ok_114") }
-EOF
-PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > "$TMP_DIR/f_test.json"
-python3 - "$TMP_DIR/f_test.json" <<'PYEOF'
+# Without touching ANY .pion test source, hot `pionc test` MUST relink testbin and
+# fail `app_mtime_ok` (which asserts combined() == 57, now 114)!
+if PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > "$TMP_DIR/f_test_after.json"; then
+  fail "Scenario F expected hot pionc test to relink and fail stale 57 expectation"
+fi
+python3 - "$TMP_DIR/f_test_after.json" <<'PYEOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
-assert d["ok"] is True and d["passed"] == 2 and d["failed"] == 0, d
+assert d["ok"] is False and d["passed"] == 1 and d["failed"] == 1, d
 PYEOF
-echo "(F) external .a content edit with verified identical size & mtime -> default run & testbin relink OK"
+# Hot `pionc run` (default CAS bin key, not `-o`) MUST also relink and print 114
+OUT_F="$(PION_CACHE_DIR="$CAS_C" "$PIONC" run "$WS_C/app")"
+[ "$OUT_F" = "mtime_sum=114" ] || fail "Scenario F expected mtime_sum=114 from default CAS bin after same-size/same-mtime_ns .a edit, got $OUT_F"
+echo "(F) external .a content edit with identical size & st_mtime_ns (untouched test) -> relink OK"
 
 # ============================================================================
 # Scenario G (Round 2 #5): -I shadowing, UTF-8 Chinese path, racy compile edit
@@ -881,5 +888,101 @@ REAL_CC_BIN="$REAL_CC_ABS" INJECT_RENAME=0 RENAME_HDR="$WS_J/pkg/hdr.h" CC="$RAC
 grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/j2.trace" || fail "Scenario J expected MISS after preserved-mtime atomic rename"
 [ "$("$TMP_DIR/j_bin2")" = "200" ] || fail "Scenario J expected 200 after preserved-mtime atomic rename"
 echo "(J) preserved-mtime atomic header rename during compile -> ctime/dir guard self-heal OK"
+
+# ============================================================================
+# Scenario K (Round 4): Transitive header parent shadowing, truncated .deps,
+#                       and symlinked directory + `..` retargeting
+# ============================================================================
+# K1: Transitive header `a/a.h` includes `"b.h"` hitting `inc/b.h`; adding `a/b.h` shadows it
+WS_K1="$TMP_DIR/ws_k1"
+mkdir -p "$WS_K1/pkg/src" "$WS_K1/a" "$WS_K1/inc"
+cat > "$WS_K1/inc/b.h" <<'EOF'
+#define K1_VAL 17
+EOF
+cat > "$WS_K1/a/a.h" <<'EOF'
+#include "b.h"
+EOF
+cat > "$WS_K1/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "../a/a.h"
+int64_t k1_val(void) { return K1_VAL; }
+EOF
+cat > "$WS_K1/pkg/pion.toml" <<'EOF'
+[package]
+name = "k1_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../inc"]
+EOF
+cat > "$WS_K1/pkg/src/main.pion" <<'EOF'
+extern "C" fn k1_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, k1_val().to_string()) }
+EOF
+CAS_K1="$TMP_DIR/cas_k1"
+mkdir -p "$CAS_K1"
+PION_CACHE_DIR="$CAS_K1" "$PIONC" build -o "$TMP_DIR/k1_bin1" "$WS_K1/pkg"
+[ "$("$TMP_DIR/k1_bin1")" = "17" ] || fail "Scenario K1 cold expected 17"
+# K2: Truncate the .deps manifest -> MUST MISS and self-heal!
+DEPS_FILE="$(ls "$CAS_K1/obj/"cstub_dep_*.deps | head -n 1)"
+[ -n "$DEPS_FILE" ] || fail "Scenario K2 expected .deps file in $CAS_K1/obj"
+python3 - "$DEPS_FILE" <<'PYEOF'
+import sys
+p = sys.argv[1]
+txt = open(p).read()
+# Drop the trailing sha256 line
+lines = txt.splitlines()
+assert lines[0] == "v2" and lines[-1].startswith("sha256:"), lines
+open(p, "w").write("\n".join(lines[:-1]) + "\n")
+PYEOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_K1" "$PIONC" build -o "$TMP_DIR/k2_bin" "$WS_K1/pkg" 2>"$TMP_DIR/k2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/k2.trace" || fail "Scenario K2 expected MISS on truncated .deps manifest"
+[ "$("$TMP_DIR/k2_bin")" = "17" ] || fail "Scenario K2 expected 17 after self-heal"
+# Now introduce sibling `a/b.h` shadowing `inc/b.h` for `a/a.h`
+cat > "$WS_K1/a/b.h" <<'EOF'
+#define K1_VAL 71
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_K1" "$PIONC" build -o "$TMP_DIR/k1_bin2" "$WS_K1/pkg" 2>"$TMP_DIR/k1.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/k1.trace" || fail "Scenario K1 expected MISS on transitive parent-dir shadowing"
+[ "$("$TMP_DIR/k1_bin2")" = "71" ] || fail "Scenario K1 expected 71 after transitive parent-dir shadowing"
+
+# K3: Header reached via symlinked directory + `..` (`sym_dir -> d1/sub`, `sym_dir/../target.h`)
+WS_K3="$TMP_DIR/ws_k3"
+mkdir -p "$WS_K3/pkg/src" "$WS_K3/d1/sub" "$WS_K3/d2/sub"
+cat > "$WS_K3/d1/target.h" <<'EOF'
+#define K3_VAL 101
+EOF
+cat > "$WS_K3/d2/target.h" <<'EOF'
+#define K3_VAL 202
+EOF
+ln -s "$WS_K3/d1/sub" "$WS_K3/pkg/sym_dir"
+cat > "$WS_K3/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "sym_dir/../target.h"
+int64_t k3_val(void) { return K3_VAL; }
+EOF
+cat > "$WS_K3/pkg/pion.toml" <<'EOF'
+[package]
+name = "k3_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_K3/pkg/src/main.pion" <<'EOF'
+extern "C" fn k3_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, k3_val().to_string()) }
+EOF
+CAS_K3="$TMP_DIR/cas_k3"
+mkdir -p "$CAS_K3"
+PION_CACHE_DIR="$CAS_K3" "$PIONC" build -o "$TMP_DIR/k3_bin1" "$WS_K3/pkg"
+[ "$("$TMP_DIR/k3_bin1")" = "101" ] || fail "Scenario K3 cold expected 101"
+# Retarget sym_dir -> d2/sub while d1/target.h remains untouched
+ln -sfn "$WS_K3/d2/sub" "$WS_K3/pkg/sym_dir"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_K3" "$PIONC" build -o "$TMP_DIR/k3_bin2" "$WS_K3/pkg" 2>"$TMP_DIR/k3.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/k3.trace" || fail "Scenario K3 expected MISS after symlink-dir + .. retarget"
+[ "$("$TMP_DIR/k3_bin2")" = "202" ] || fail "Scenario K3 expected 202 after symlink-dir + .. retarget"
+echo "(K) transitive parent shadowing + truncated v2 .deps + symlink-dir/.. retarget -> OK"
 
 echo "PASS: cas_pin_and_cstub_deps"

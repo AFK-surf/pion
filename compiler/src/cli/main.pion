@@ -754,11 +754,14 @@ fn drv_ensure_msvc_rt_obj(
     let _ = fs_remove(world, obj_tmp)
     return Ok(None)
   }
+  drv_cas_pin_add(pin, cas_key)
+  if pin.lock_handle >= 0L {
+    let _ = drv_cas_pin_flush(world, pin)
+  }
   if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
     return Err("failed to publish CAS runtime: " + obj_path)
   }
   let sz = fs_size(world, obj_path)
-  drv_cas_pin_add(pin, cas_key)
   drv_cas_record_and_evict_pinned(
     world,
     cache_dir,
@@ -868,11 +871,14 @@ fn drv_ensure_cross_rt_lib(
     }
     Ok(_) => ()
   }
+  drv_cas_pin_add(pin, cas_key)
+  if pin.lock_handle >= 0L {
+    let _ = drv_cas_pin_flush(world, pin)
+  }
   if !drv_publish_tmp(world, ar_tmp, ar_path, true) {
     return Err("failed to publish CAS runtime: " + ar_path)
   }
   let sz = fs_size(world, ar_path)
-  drv_cas_pin_add(pin, cas_key)
   drv_cas_record_and_evict_pinned(
     world,
     cache_dir,
@@ -1250,12 +1256,13 @@ fn drv_sha256_file(path : String, memo : Map[String, String]) -> Option[String] 
 }
 
 ///|
-/// Pure lexical absolute path normalization (prepends cwd for relative paths,
-/// normalizes `\` -> `/` on Windows, folds `/./` and `/a/../`) WITHOUT calling
-/// `realpath`, so symlinks remain intact in `.deps` manifests and `-I` dirs.
+/// Pure lexical absolute path normalization: prepends cwd for relative paths,
+/// normalizes `\` -> `/` on Windows, and collapses redundant `//` and `/./`,
+/// while PRESERVING `..` segments and symlinks verbatim so OS filesystem
+/// resolution is never altered when a symlinked directory precedes `..`.
 fn drv_cstub_abs_lexical_path(world : World, raw_path : String) -> String {
   let mut p = raw_path
-  if c_cli_is_windows() != 0 {
+  if c_cli_is_windows() != 0 || drv_is_drive_abs(p) {
     let sb = StringBuilder()
     let n = p.length()
     let mut run = 0
@@ -1275,7 +1282,66 @@ fn drv_cstub_abs_lexical_path(world : World, raw_path : String) -> String {
     }
     p = sb.to_string()
   }
-  drv_abs_path(world, p)
+  if p.length() == 0 || (str_code_at(p, 0) != 47 && !drv_is_drive_abs(p)) {
+    let cwd = drv_cwd(world)
+    if cwd.length() > 0 && (str_code_at(cwd, 0) == 47 || drv_is_drive_abs(cwd)) {
+      p = drv_join_path(cwd, p)
+      if c_cli_is_windows() != 0 || drv_is_drive_abs(p) {
+        let sb2 = StringBuilder()
+        let n2 = p.length()
+        let mut run2 = 0
+        let mut i2 = 0
+        while i2 < n2 {
+          if str_code_at(p, i2) == 92 {
+            if i2 > run2 {
+              sb2.write_string(slice_str(p, run2, i2))
+            }
+            sb2.write_char('/')
+            run2 = i2 + 1
+          }
+          i2 = i2 + 1
+        }
+        if n2 > run2 {
+          sb2.write_string(slice_str(p, run2, n2))
+        }
+        p = sb2.to_string()
+      }
+    }
+  }
+  let mut root = ""
+  let mut body = p
+  if drv_is_drive_abs(p) {
+    root = slice_str(p, 0, 2) + "/"
+    body = slice_str(p, 2, p.length())
+  } else if p.length() > 0 && str_code_at(p, 0) == 47 {
+    root = "/"
+    body = slice_str(p, 1, p.length())
+  }
+  let parts : Array[String] = []
+  let mut seg_start = 0
+  let mut i = 0
+  let bn = body.length()
+  while i <= bn {
+    if i == bn || str_code_at(body, i) == 47 {
+      let seg = slice_str(body, seg_start, i)
+      seg_start = i + 1
+      if seg.length() > 0 && seg != "." {
+        parts.push(seg)
+      }
+    }
+    i = i + 1
+  }
+  let out = StringBuilder()
+  out.write_string(root)
+  let mut j = 0
+  while j < parts.length() {
+    if j > 0 {
+      out.write_char('/')
+    }
+    out.write_string(parts[j])
+    j = j + 1
+  }
+  out.to_string()
 }
 
 ///|
@@ -2570,6 +2636,20 @@ fn drv_cas_pin_and_verify(
   while ki < keys.length() {
     drv_cas_pin_add(pin, keys[ki])
     ki = ki + 1
+  }
+  // When no active pin session exists (`drv_cas_pin_none()` or read-only/unflockable
+  // cache), degrade to direct regular-file verification rather than invalidating
+  // every hot CAS HIT.
+  if pin.lock_handle < 0L {
+    let mut vi = 0
+    while vi < verify_paths.length() {
+      match drv_lstat_regular_size(world, verify_paths[vi]) {
+        Some(_) => ()
+        None => return false
+      }
+      vi = vi + 1
+    }
+    return true
   }
   if !drv_cas_pin_flush(world, pin) {
     return false
@@ -5336,13 +5416,21 @@ fn drv_cstub_after_include_seg(p : String) -> Int {
   last
 }
 
+fn drv_cstub_is_system_header(h : String) -> Bool {
+  drv_starts_with(h, "/usr/") ||
+  drv_starts_with(h, "/Library/") ||
+  drv_starts_with(h, "/System/") ||
+  drv_starts_with(h, "/Applications/")
+}
+
 ///|
-/// Checks whether any earlier include search directory in `search_dirs` now
-/// contains a header shadowing one of the manifest's recorded headers `hdrs`.
-/// Iterates ALL matching `search_dirs[di]` (no early `break`) so nested
-/// `-I /repo -I /repo/sub` prefixes are checked accurately, and uses the
-/// `/include/<rel>` suffix for system headers outside `search_dirs` to avoid
-/// false positives on bare basenames like `types.h` or `time.h`.
+/// Checks whether any earlier include search directory in `search_dirs` OR any
+/// non-system recorded header's parent directory (`hdr_dirs`, for transitive
+/// `#include "..."` siblings) now contains a header shadowing one of the
+/// manifest's recorded headers `hdrs`. Iterates ALL matching `search_dirs[di]`
+/// (no early `break`) so nested `-I /repo -I /repo/sub` prefixes are checked
+/// accurately, and uses the `/include/<rel>` suffix for system headers outside
+/// `search_dirs` to avoid false positives on bare basenames like `types.h`.
 fn drv_cstub_has_shadowing_header(
   world : World,
   src_path : String,
@@ -5350,21 +5438,56 @@ fn drv_cstub_has_shadowing_header(
   search_dirs : Array[String],
   trace_cas : Bool,
 ) -> Bool {
+  // Collect deduplicated parent directories of all non-system recorded headers
+  // so transitive `#include "foo.h"` sibling shadowing is detected.
+  let hdr_dirs : Array[String] = []
+  let seen_hdir : Map[String, Bool] = Map([])
   let mut hi = 0
   while hi < hdrs.length() {
     let h = hdrs[hi]
+    let mut in_search = false
+    let mut di = 0
+    while di < search_dirs.length() {
+      if drv_starts_with(h, search_dirs[di] + "/") {
+        in_search = true
+        break
+      }
+      di = di + 1
+    }
+    if in_search || !drv_cstub_is_system_header(h) {
+      let pd = drv_parent_dir(h)
+      if pd.length() > 0 && !seen_hdir.contains(pd) {
+        seen_hdir.set(pd, true)
+        hdr_dirs.push(pd)
+      }
+    }
+    hi = hi + 1
+  }
+  hi = 0
+  while hi < hdrs.length() {
+    let h = hdrs[hi]
+    let h_canon = drv_cstub_canon_path(world, h)
     let mut matched_any = false
+    let cand_rels : Array[String] = []
+    let seen_rel : Map[String, Bool] = Map([])
     let mut di = 0
     while di < search_dirs.length() {
       let pref = search_dirs[di] + "/"
       if drv_starts_with(h, pref) {
         matched_any = true
+        let rel = slice_str(h, search_dirs[di].length() + 1, h.length())
+        if rel.length() > 0 && !seen_rel.contains(rel) {
+          seen_rel.set(rel, true)
+          cand_rels.push(rel)
+        }
         if di > 0 {
-          let rel = slice_str(h, search_dirs[di].length() + 1, h.length())
           let mut j = 0
           while j < di {
             let cand = search_dirs[j] + "/" + rel
-            if cand != h && fs_exists(world, cand) && !fs_is_dir(world, cand) {
+            if cand != h &&
+              fs_exists(world, cand) &&
+              !fs_is_dir(world, cand) &&
+              drv_cstub_canon_path(world, cand) != h_canon {
               if trace_cas {
                 io_eprintln(
                   world,
@@ -5392,10 +5515,17 @@ fn drv_cstub_has_shadowing_header(
         drv_path_basename(h)
       }
       if rel.length() > 0 {
+        if !seen_rel.contains(rel) {
+          seen_rel.set(rel, true)
+          cand_rels.push(rel)
+        }
         let mut j = 0
         while j < search_dirs.length() {
           let cand = search_dirs[j] + "/" + rel
-          if cand != h && fs_exists(world, cand) && !fs_is_dir(world, cand) {
+          if cand != h &&
+            fs_exists(world, cand) &&
+            !fs_is_dir(world, cand) &&
+            drv_cstub_canon_path(world, cand) != h_canon {
             if trace_cas {
               io_eprintln(
                 world,
@@ -5411,6 +5541,36 @@ fn drv_cstub_has_shadowing_header(
           }
           j = j + 1
         }
+      }
+    }
+    // Check transitive header parent directories for newly introduced sibling headers
+    if matched_any || !drv_cstub_is_system_header(h) {
+      let mut ri = 0
+      while ri < cand_rels.length() {
+        let rel = cand_rels[ri]
+        let mut hdi = 0
+        while hdi < hdr_dirs.length() {
+          let cand = hdr_dirs[hdi] + "/" + rel
+          if cand != h &&
+            fs_exists(world, cand) &&
+            !fs_is_dir(world, cand) &&
+            drv_cstub_canon_path(world, cand) != h_canon {
+            if trace_cas {
+              io_eprintln(
+                world,
+                "[cas] cstub=" +
+                src_path +
+                " SHADOW hdr=" +
+                h +
+                " by=" +
+                cand,
+              )
+            }
+            return true
+          }
+          hdi = hdi + 1
+        }
+        ri = ri + 1
       }
     }
     hi = hi + 1
@@ -5479,6 +5639,25 @@ fn drv_cstub_racy_file(
 }
 
 ///|
+fn drv_cstub_parse_nonneg_int(s : String) -> Int {
+  let n = s.length()
+  if n == 0 || n > 9 {
+    return -1
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return -1
+    }
+    acc = acc * 10 + (c - 48)
+    i = i + 1
+  }
+  acc
+}
+
+///|
 fn drv_cstub_read_dep_manifest(
   world : World,
   dep_manifest_path : String,
@@ -5491,18 +5670,36 @@ fn drv_cstub_read_dep_manifest(
     Ok(t) => t
     Err(_) => return None
   }
-  let lines = drv_split_lines(txt)
-  if lines.length() == 0 || lines[0] != "v2" {
+  if txt.length() == 0 || str_code_at(txt, txt.length() - 1) != 10 {
     return None
   }
+  let lines = drv_split_lines(txt)
+  if lines.length() < 3 || lines[0] != "v2" {
+    return None
+  }
+  let count = drv_cstub_parse_nonneg_int(lines[1])
+  if count < 0 || lines.length() != count + 3 {
+    return None
+  }
+  let body_sb = StringBuilder()
+  body_sb.write_string("v2\n")
+  body_sb.write_string(lines[1])
+  body_sb.write_string("\n")
   let hdrs : Array[String] = []
-  let mut i = 1
-  while i < lines.length() {
-    let l = lines[i]
-    if l.length() > 0 {
-      hdrs.push(l)
+  let mut i = 0
+  while i < count {
+    let l = lines[i + 2]
+    if l.length() == 0 {
+      return None
     }
+    hdrs.push(l)
+    body_sb.write_string(l)
+    body_sb.write_string("\n")
     i = i + 1
+  }
+  let expected_tail = "sha256:" + sha256_hex(body_sb.to_string())
+  if lines[count + 2] != expected_tail {
+    return None
   }
   Some(hdrs)
 }
@@ -5511,13 +5708,16 @@ fn drv_cstub_read_dep_manifest(
 fn drv_cstub_format_dep_manifest(hdrs : Array[String]) -> String {
   let sb = StringBuilder()
   sb.write_string("v2\n")
+  sb.write_string(hdrs.length().to_string())
+  sb.write_string("\n")
   let mut i = 0
   while i < hdrs.length() {
     sb.write_string(hdrs[i])
     sb.write_string("\n")
     i = i + 1
   }
-  sb.to_string()
+  let body = sb.to_string()
+  body + "sha256:" + sha256_hex(body) + "\n"
 }
 
 ///|
@@ -5647,6 +5847,14 @@ fn drv_cstub_parse_and_hash_deps(
   if !saw_src {
     return None
   }
+  // Hash all headers uncached FIRST, then run racy-change checks AFTER hashing
+  // so any concurrent file/symlink/rename mutation in the window between check
+  // and open/read is guaranteed to be caught.
+  drv_sort_strings(hdrs)
+  let hdrs_fp = match drv_cstub_hash_dep_headers_uncached(world, hdrs) {
+    Some(v) => v
+    None => return None
+  }
   let checked_dirs : Map[String, Bool] = Map([])
   if drv_cstub_racy_file(world, src_path, pre_hash_ms, checked_dirs) {
     return None
@@ -5658,17 +5866,15 @@ fn drv_cstub_parse_and_hash_deps(
     }
     i = i + 1
   }
-  drv_sort_strings(hdrs)
-  match drv_cstub_hash_dep_headers_uncached(world, hdrs) {
-    Some(hdrs_fp) => Some((hdrs, hdrs_fp))
-    None => None
-  }
+  Some((hdrs, hdrs_fp))
 }
 
 ///|
 /// Publishes a freshly compiled `c_source` object to CAS (or keeps the local
 /// staged `obj_tmp` and defers `stage_dir` cleanup to `pin.temp_dirs` when
-/// `post_src_hash != src_hash` or the pin session is inactive).
+/// `post_src_hash != src_hash` or pinning fails). Pins & flushes keys BEFORE
+/// renaming into shared CAS so no concurrent evictor can remove the entry
+/// between rename and pin write.
 /// Returns `Ok((final_key, obj_path, kept_local_stage))`.
 fn drv_cstub_publish_one(
   world : World,
@@ -5738,6 +5944,15 @@ fn drv_cstub_publish_one(
       "[cas] cstub=" + src_path + " MISS key=" + drv_prefix16(final_key),
     )
   }
+  let obj_cas_key = "cstub_" + final_key
+  drv_cas_pin_add(pin, obj_cas_key)
+  match hdrs_opt {
+    Some(_) => drv_cas_pin_add(pin, "cstub_dep_" + base_key)
+    None => ()
+  }
+  if !drv_cas_pin_flush(world, pin) {
+    return Ok((final_key, obj_tmp, true))
+  }
   let dst_p = cache_dir + "/obj/cstub_" + final_key + ".o"
   let pub_sz : Int64 = if !fs_rename(world, obj_tmp, dst_p) {
     match drv_lstat_regular_size(world, dst_p) {
@@ -5753,10 +5968,8 @@ fn drv_cstub_publish_one(
       None => return Err("empty or invalid c_source object " + dst_p)
     }
   }
-  let obj_cas_key = "cstub_" + final_key
   out_new_keys.push(obj_cas_key)
   out_new_sizes.push(pub_sz)
-  drv_cas_pin_add(pin, obj_cas_key)
   match hdrs_opt {
     Some(hdrs) => {
       let dep_cas_key = "cstub_dep_" + base_key
@@ -5771,7 +5984,6 @@ fn drv_cstub_publish_one(
             Some(dsz) => {
               out_new_keys.push(dep_cas_key)
               out_new_sizes.push(dsz)
-              drv_cas_pin_add(pin, dep_cas_key)
             }
             None => ()
           }
@@ -6346,13 +6558,16 @@ fn drv_compile_pkg_rc_sources(
           ")",
         )
       }
+      drv_cas_pin_add(pin, "rc_" + key)
+      if pin.lock_handle >= 0L {
+        let _ = drv_cas_pin_flush(world, pin)
+      }
       if !drv_publish_tmp(world, res_tmp, res_path, true) {
         return Err("failed to publish CAS resource: " + res_path)
       }
       let sz = fs_size(world, res_path)
       out_new_keys.push("rc_" + key)
       out_new_sizes.push(if sz > 0L { sz } else { 0L })
-      drv_cas_pin_add(pin, "rc_" + key)
     }
     out_res.push(res_path)
     out_keys.push(key)
@@ -9120,36 +9335,6 @@ fn drv_ws_run_dag(
 }
 
 ///|
-fn drv_build_workspace_objects(
-  world : World,
-  root_dir : String,
-  release : Bool,
-  include_entry : Bool,
-  jobs : Int,
-  target_override : String,
-  sysroot : String,
-  need_pic : Bool,
-  root_tests : Bool,
-) -> Result[DrvWsBuilt, String] {
-  drv_build_workspace_objects_entry(
-    world,
-    root_dir,
-    release,
-    include_entry,
-    jobs,
-    target_override,
-    sysroot,
-    need_pic,
-    root_tests,
-    "main",
-    false,
-    false,
-    false,
-    drv_cas_pin_none(),
-  )
-}
-
-///|
 fn drv_build_workspace_objects_entry(
   world : World,
   root_dir : String,
@@ -9516,36 +9701,6 @@ fn drv_stub_hash(stub_text : String, sources : Array[String]) -> String {
     }
     sha256_hex(sb.to_string())
   }
-}
-
-///|
-/// Builds already-loaded workspace `nodes` (dependencies first, entry package
-/// last): CAS-cached objects for every package, plus the checked entry package.
-fn drv_build_nodes_objects(
-  world : World,
-  nodes : Array[PkgNodeInput],
-  release : Bool,
-  include_entry : Bool,
-  jobs : Int,
-  target_override : String,
-  sysroot : String,
-  need_pic : Bool,
-  root_tests : Bool,
-) -> Result[DrvWsBuilt, String] {
-  drv_build_nodes_objects_entry(
-    world,
-    nodes,
-    release,
-    include_entry,
-    jobs,
-    target_override,
-    sysroot,
-    need_pic,
-    root_tests,
-    "main",
-    false,
-    drv_cas_pin_none(),
-  )
 }
 
 ///|
@@ -10092,6 +10247,10 @@ fn drv_build_wasm_targets(
             }
             Ok(_) => ()
           }
+        }
+        drv_cas_pin_add(pin, wasm_cas_key)
+        if pin.lock_handle >= 0L {
+          let _ = drv_cas_pin_flush(world, pin)
         }
         match drv_publish_tool_output(world, tmp_bin, cached_wasm, true, "wasm emit") {
           Err(e) => {
@@ -11102,17 +11261,21 @@ fn drv_build_targets(
     }
 
     if !has_main && out_bin_arg == "" {
+      drv_cas_pin_close(world, pin)
       return Ok(obj_paths[0])
     }
 
     if out_bin_arg != "" {
       drv_ensure_parent_dir(world, out_bin_arg)
     }
-    let rt_lib = match drv_resolve_rt_lib_for(world, qbe_target, sysroot) {
-      Err(e) => return Err(e)
+    let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
+      Err(e) => {
+        drv_cas_pin_close(world, pin)
+        return Err(e)
+      }
       Ok(p) => p
     }
-    return drv_link_objects(
+    let link_res = drv_link_objects(
       world,
       qbe_target,
       apple_tools,
@@ -11125,6 +11288,8 @@ fn drv_build_targets(
       out_bin_arg == "",
       false,
     )
+    drv_cas_post_run_evict(world, cache_dir, pin, [])
+    return link_res
   }
   let single_upstream : Array[String] = []
   if no_main {
@@ -11312,6 +11477,10 @@ fn drv_build_targets(
           "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
         )
       }
+      drv_cas_pin_add(pin, key)
+      if pin.lock_handle >= 0L {
+        let _ = drv_cas_pin_flush(world, pin)
+      }
       if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
         return Err("failed to publish CAS object: " + obj_path)
       }
@@ -11355,6 +11524,10 @@ fn drv_build_targets(
       if rc_as != 0 {
         let _ = fs_remove(world, obj_tmp)
         return Err("as failed with exit code " + rc_as.to_string())
+      }
+      drv_cas_pin_add(pin, key)
+      if pin.lock_handle >= 0L {
+        let _ = drv_cas_pin_flush(world, pin)
       }
       if !drv_publish_tmp(world, obj_tmp, obj_path, true) {
         return Err("failed to publish CAS object: " + obj_path)
@@ -11809,6 +11982,9 @@ fn drv_exec_test_jobs(
   // first-exec code-signing assessment of a new) binary overlaps other builds.
   let nb = build_lines.length()
   if nb > 0 {
+    if pin.lock_handle >= 0L {
+      let _ = drv_cas_pin_flush(world, pin)
+    }
     let spec = drv_join_char(build_lines, "\n")
     let nw = if nb < nw_max { nb } else { nw_max }
     let cursor = AtomicInt::new(0)
@@ -12986,6 +13162,9 @@ fn drv_exec_wasm_test_units(
     drv_cas_pin_and_verify(world, cache_dir, pin, [wasm_tkey], [wasm_path])
   if !wasm_hit {
     drv_cas_pin_add(pin, wasm_tkey)
+    if pin.lock_handle >= 0L {
+      let _ = drv_cas_pin_flush(world, pin)
+    }
     let wasm_bytes = emit_wasm_from_ssa_units_opts(
       ssa_units,
       false,

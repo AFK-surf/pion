@@ -13,7 +13,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 #ifndef WC_ERR_INVALID_CHARS
 #define WC_ERR_INVALID_CHARS 0x80
@@ -571,21 +570,36 @@ int32_t pion_fs_lstat_kind(const char *path) {
     return 1;
 }
 
-int64_t pion_cli_path_change_ms(const char *path) {
+static int64_t pion_cli_win_change_ms(const char *path, DWORD extra_flags) {
     if (!path || !*path) return -1;
     wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
     if (!wp) return -1;
-    struct _stat64 st;
-    int rc = _wstat64(wp, &st);
+    HANDLE h = CreateFileW(
+        wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | extra_flags,
+        NULL
+    );
     free(wp);
-    if (rc != 0) return -1;
-    int64_t m = (int64_t)st.st_mtime * 1000LL;
-    int64_t c = (int64_t)st.st_ctime * 1000LL;
-    return m >= c ? m : c;
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    FILE_BASIC_INFO bi;
+    BOOL ok = GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi));
+    CloseHandle(h);
+    if (!ok) return -1;
+    int64_t w = (bi.LastWriteTime.QuadPart - 116444736000000000LL) / 10000LL;
+    int64_t c = (bi.ChangeTime.QuadPart - 116444736000000000LL) / 10000LL;
+    return w >= c ? w : c;
+}
+
+int64_t pion_cli_path_change_ms(const char *path) {
+    return pion_cli_win_change_ms(path, 0);
 }
 
 int64_t pion_cli_lpath_change_ms(const char *path) {
-    return pion_cli_path_change_ms(path);
+    return pion_cli_win_change_ms(path, FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
 #else /* POSIX */
