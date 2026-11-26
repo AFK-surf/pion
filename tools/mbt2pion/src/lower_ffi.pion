@@ -3,14 +3,14 @@
 ///| Handles:
 ///| - Direct scalar/pointer C-ABI declarations (`Int`, `Int64`, `UInt`, `UInt64`,
 ///|   `Byte`, `Bool`, `Double`, `Float`, `Ptr`, `Unit`) with zero wrapper overhead.
-///| - Bridged C-ABI declarations using `#borrow(...)` / `#owned(...)` attributes
+///| - Bridged C-ABI declarations using explicit `#borrow(...)` attributes
 ///|   and `String` / `Bytes` parameters or return types:
-///|   - `String` param -> `(ptr : Ptr, len : Int)` via `s.as_cstr(), s.length()` (zero-copy)
-///|   - `Bytes` param -> `(ptr : Ptr, len : Int)` via `ptr_alloc` + `bytes_copy_to_ptr` + `ptr_free`
-///|   - `String` return -> `Ptr` converted via `cstr_to_str(ptr)`
-///|   - `Bytes` return -> trailing out-length `Ptr` + `Ptr` return converted via `bytes_from_ptr(ptr, len)`
-///| - Fail-closed rejection (`ok: false`) for unknown FFI attributes, invalid `#borrow`/`#owned`
-///|   parameter references, conflicting attributes, or unsupported non-C-ABI types.
+///|   - `String` param (must be in `#borrow`) -> `(ptr : Ptr, len : Int)` via `s.as_cstr(), s.to_bytes().length()`
+///|   - `Bytes` param (must be in `#borrow`) -> `(ptr : Ptr, len : Int)` via `ptr_alloc` + `bytes_copy_to_ptr` + `ptr_free`
+///|   - `String` return -> `Ptr` converted via `if ptr_is_null(p) { "" } else { cstr_to_str(p) }`
+///|   - `Bytes` return -> trailing out-length `Ptr` + `Ptr` return converted via `if ptr_is_null(p) || n <= 0 { "".to_bytes() } else { bytes_from_ptr(p, n) }`
+///| - Fail-closed rejection (`ok: false`) for `#owned(...)`, unannotated `String`/`Bytes` params,
+///|   unknown FFI attributes, invalid `#borrow` parameter references, or unsupported non-C-ABI types.
 
 pub enum FfiParamKind {
   Direct
@@ -76,20 +76,21 @@ pub fn classify_ffi_ret_type(ty : String) -> Option[FfiRetKind] {
   }
 }
 
-///| Parse `#borrow(a, b)` and `#owned(c)` FFI attributes into validated parameter sets.
-///| Rejects unknown attributes, malformed syntax, empty lists, or conflicting borrow/owned markers.
+///| Parse `#borrow(a, b)` FFI attributes into validated parameter sets.
+///| Rejects `#owned(...)`, unknown attributes, malformed syntax, or empty lists fail-closed.
 pub fn parse_ffi_attr_params(attrs : Array[String]) -> Result[FfiAttrInfo, String] {
   let borrowed : Map[String, Bool] = Map()
   let owned : Map[String, Bool] = Map()
   for raw in attrs {
     let s = raw.trim()
+    if s.starts_with("#owned(") && s.ends_with(")") {
+      return Err("unsupported MoonBit FFI `#owned` attribute (only `#borrow` is supported for C-ABI bridging)")
+    }
     let is_borrow = s.starts_with("#borrow(") && s.ends_with(")")
-    let is_owned = s.starts_with("#owned(") && s.ends_with(")")
-    if !is_borrow && !is_owned {
+    if !is_borrow {
       return Err("unsupported MoonBit FFI attribute `" + s + "`")
     }
-    let prefix_len = if is_borrow { 8 } else { 7 }
-    let inner = s.slice(prefix_len, s.length() - 1).trim()
+    let inner = s.slice(8, s.length() - 1).trim()
     if inner.length() == 0 {
       return Err("empty parameter list in FFI attribute `" + s + "`")
     }
@@ -99,17 +100,7 @@ pub fn parse_ffi_attr_params(attrs : Array[String]) -> Result[FfiAttrInfo, Strin
       if pname.length() == 0 {
         return Err("malformed parameter list in FFI attribute `" + s + "`")
       }
-      if is_borrow {
-        if owned.contains(pname) {
-          return Err("parameter `" + pname + "` cannot be both `#borrow` and `#owned`")
-        }
-        borrowed[pname] = true
-      } else {
-        if borrowed.contains(pname) {
-          return Err("parameter `" + pname + "` cannot be both `#borrow` and `#owned`")
-        }
-        owned[pname] = true
-      }
+      borrowed[pname] = true
     }
   }
   Ok(FfiAttrInfo::{ borrowed, owned })
@@ -216,14 +207,26 @@ pub fn try_lower_extern_c_fn(
       error_msg: "unsupported FFI return type `" + ret_ty + "` on `" + fn_name + "`",
     }
   }
-  // Validate that every `#borrow` / `#owned` name refers to an existing `String`/`Bytes` param.
+  // Validate that every `String`/`Bytes` parameter is explicitly listed in `#borrow(...)`
+  // (unannotated MoonBit FFI params default to owned and must fail closed).
   let param_kinds : Map[String, FfiParamKind] = Map()
   let mut needs_bridge = false
   for p in params {
     param_kinds[p.name] = p.kind
     match p.kind {
       FfiParamKind::Direct => ()
-      FfiParamKind::Str | FfiParamKind::Bytes => needs_bridge = true
+      FfiParamKind::Str | FfiParamKind::Bytes => {
+        needs_bridge = true
+        if !attr_info.borrowed.contains(p.name) {
+          return FfiLowerResult::{
+            ok: false,
+            needs_bridge: false,
+            code: "",
+            c_symbol: c_sym_lit,
+            error_msg: "FFI parameter `" + p.name + "` of type `" + p.ty + "` must be explicitly listed in `#borrow(...)`",
+          }
+        }
+      }
     }
   }
   match ret_kind {
@@ -296,7 +299,7 @@ pub fn try_lower_extern_c_fn(
         c_params.push(p.name + "_ptr : Ptr")
         c_params.push(p.name + "_len : Int")
         call_args.push(p.name + ".as_cstr()")
-        call_args.push(p.name + ".length()")
+        call_args.push(p.name + ".to_bytes().length()")
       }
       FfiParamKind::Bytes => {
         let len_var = ffi_fresh_ident(used_idents, "__ffi_" + p.name + "_len")
@@ -355,7 +358,7 @@ pub fn try_lower_extern_c_fn(
       let ptr_var = ffi_fresh_ident(used_idents, "__ffi_ret_ptr")
       let str_var = ffi_fresh_ident(used_idents, "__ffi_ret_str")
       sb.write_string("  let " + ptr_var + " = " + call_expr + "\n")
-      sb.write_string("  let " + str_var + " = cstr_to_str(" + ptr_var + ")\n")
+      sb.write_string("  let " + str_var + " = if ptr_is_null(" + ptr_var + ") { \"\" } else { cstr_to_str(" + ptr_var + ") }\n")
       for pf in post_frees {
         sb.write_string(pf + "\n")
       }
@@ -368,7 +371,7 @@ pub fn try_lower_extern_c_fn(
       sb.write_string("  let " + ptr_var + " = " + call_expr + "\n")
       sb.write_string("  let " + rlen_var + " = ptr_read_i32(" + out_len_box + ", 0L)\n")
       sb.write_string("  ptr_free(" + out_len_box + ")\n")
-      sb.write_string("  let " + bytes_var + " = bytes_from_ptr(" + ptr_var + ", " + rlen_var + ")\n")
+      sb.write_string("  let " + bytes_var + " = if ptr_is_null(" + ptr_var + ") || " + rlen_var + " <= 0 { \"\".to_bytes() } else { bytes_from_ptr(" + ptr_var + ", " + rlen_var + ") }\n")
       for pf in post_frees {
         sb.write_string(pf + "\n")
       }

@@ -93,11 +93,15 @@ const char *demo_scheme(void) {
   return "pion-scheme";
 }
 
+const char *demo_null_str(void) {
+  return NULL;
+}
+
 const uint8_t *demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_len) {
   (void)tag_ptr;
   if (tag_len <= 0) {
     *out_len = 0;
-    return g_buf;
+    return NULL;
   }
   *out_len = g_buf_len;
   return g_buf;
@@ -107,7 +111,7 @@ const uint8_t *demo_read_buf(const char *tag_ptr, int32_t tag_len, int32_t *out_
 FFI_BRIDGE_PION = r'''
 extern "C" fn __mbt_c_ffi_ffi_start(data_dir_ptr : Ptr, data_dir_len : Int, cloud_ptr : Ptr, cloud_len : Int, beta : Int) -> Int = "demo_start"
 fn ffi_start(data_dir : String, cloud : String, beta : Int) -> Int {
-  let __ffi_res = __mbt_c_ffi_ffi_start(data_dir.as_cstr(), data_dir.length(), cloud.as_cstr(), cloud.length(), beta)
+  let __ffi_res = __mbt_c_ffi_ffi_start(data_dir.as_cstr(), data_dir.to_bytes().length(), cloud.as_cstr(), cloud.to_bytes().length(), beta)
   __ffi_res
 }
 
@@ -116,14 +120,21 @@ fn ffi_send_bytes(msg : String, data : Bytes) -> Unit {
   let __ffi_data_len = data.length()
   let __ffi_data_buf = ptr_alloc(if __ffi_data_len > 0 { __ffi_data_len.to_int64() } else { 1L })
   if __ffi_data_len > 0 { bytes_copy_to_ptr(data, 0, __ffi_data_buf, __ffi_data_len) }
-  __mbt_c_ffi_ffi_send_bytes(msg.as_cstr(), msg.length(), __ffi_data_buf, __ffi_data_len)
+  __mbt_c_ffi_ffi_send_bytes(msg.as_cstr(), msg.to_bytes().length(), __ffi_data_buf, __ffi_data_len)
   ptr_free(__ffi_data_buf)
 }
 
 extern "C" fn __mbt_c_ffi_ffi_scheme() -> Ptr = "demo_scheme"
 fn ffi_scheme() -> String {
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_scheme()
-  let __ffi_ret_str = cstr_to_str(__ffi_ret_ptr)
+  let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
+  __ffi_ret_str
+}
+
+extern "C" fn __mbt_c_ffi_ffi_null_str() -> Ptr = "demo_null_str"
+fn ffi_null_str() -> String {
+  let __ffi_ret_ptr = __mbt_c_ffi_ffi_null_str()
+  let __ffi_ret_str = if ptr_is_null(__ffi_ret_ptr) { "" } else { cstr_to_str(__ffi_ret_ptr) }
   __ffi_ret_str
 }
 
@@ -131,22 +142,25 @@ extern "C" fn __mbt_c_ffi_ffi_read_buf(tag_ptr : Ptr, tag_len : Int, __out_len :
 fn ffi_read_buf(tag : String) -> Bytes {
   let __ffi_out_len = ptr_alloc(4L)
   ptr_write_i32(__ffi_out_len, 0L, 0)
-  let __ffi_ret_ptr = __mbt_c_ffi_ffi_read_buf(tag.as_cstr(), tag.length(), __ffi_out_len)
+  let __ffi_ret_ptr = __mbt_c_ffi_ffi_read_buf(tag.as_cstr(), tag.to_bytes().length(), __ffi_out_len)
   let __ffi_ret_len = ptr_read_i32(__ffi_out_len, 0L)
   ptr_free(__ffi_out_len)
-  let __ffi_ret_bytes = bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len)
+  let __ffi_ret_bytes = if ptr_is_null(__ffi_ret_ptr) || __ffi_ret_len <= 0 { "".to_bytes() } else { bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len) }
   __ffi_ret_bytes
 }
 
 pub fn main(w : World) -> Int {
   let s = ffi_start("/tmp", "https://ex", 1)
+  let u = ffi_start("/你好🚀", "h", 0)
   let payload = "\x10\x20\x30".to_bytes()
   ffi_send_bytes("abcd", payload)
   let out = ffi_read_buf("ok")
+  let empty_b = ffi_read_buf("")
+  let null_s = ffi_null_str()
   let b0 = out[0].to_int()
   let b1 = out[1].to_int()
   let b2 = out[2].to_int()
-  io_println(w, s.to_string() + "|" + ffi_scheme() + "|" + out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string())
+  io_println(w, s.to_string() + "|" + u.to_string() + "|" + ffi_scheme() + "|" + null_s.length().to_string() + "|" + empty_b.length().to_string() + "|" + out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string())
   0
 }
 '''
@@ -236,8 +250,10 @@ def main():
         ffi_bin = os.path.join(tmp, "ffi_bridge_nat")
         run_cmd([args.pionc, "build", "-o", ffi_bin, ffi_pkg])
         ffi_out = run_cmd([ffi_bin])
-        # 4*100 + 10*10 + 1 + 1 + 2 = 504; 0x10^4=20, 0x20^4=36, 0x30^4=52
-        expected_ffi = "504|pion-scheme|3:20,36,52"
+        # s: 4*100 + 10*10 + 1 + 1 + 2 = 504
+        # u: "/你好🚀" is 1 + 3 + 3 + 4 = 11 UTF-8 bytes -> 11*100 + 1*10 + 0 + 1 + 2 = 1113
+        # null_s.length() = 0, empty_b.length() = 0; 0x10^4=20, 0x20^4=36, 0x30^4=52
+        expected_ffi = "504|1113|pion-scheme|0|0|3:20,36,52"
         assert ffi_out == expected_ffi, f"FFI bridge native mismatch: {ffi_out!r} != {expected_ffi!r}"
         print(f"[PASS] Pion native C-ABI FFI bridge: {ffi_out}")
 
