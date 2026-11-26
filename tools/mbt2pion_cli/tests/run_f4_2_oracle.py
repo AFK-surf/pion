@@ -482,8 +482,49 @@ def main():
             ("named_fn_escape", "fn mk(p : ArrayView[Int]) -> () -> Int { fn inner() -> Int { p[0] }; inner }\npub fn f(xs : Array[Int]) -> () -> Int { mk(xs[0:2]) }\n"),
             ("pat_fn_escape", "fn mk(p : ArrayView[Int]) -> (Int) -> Int { fn { 0 => p[0]; _ => 0 } }\npub fn f(xs : Array[Int]) -> (Int) -> Int { mk(xs[0:2]) }\n"),
             ("match_arrow_escape", "fn mk(flag : Bool, p : ArrayView[Int]) -> (Int) -> Int { match flag { true => _ => p[0]; false => _ => 0 } }\npub fn f(flag : Bool, xs : Array[Int]) -> (Int) -> Int { mk(flag, xs[0:2]) }\n"),
+            ("v8tupleshadow", "fn patch(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let (a, _) = (ys, 1); a[0] = 99; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { patch(xs[0:2], ys) }\n"),
+            ("v9ifisshadow", "fn patch(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let _ = a; if Some(ys) is Some(a) { a[0] = 99 }; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { patch(xs[0:2], ys) }\n"),
+            ("v10guardisshadow", "fn patch(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = [0]; let _ = a; guard Some(ys) is Some(a) else { return 0 }; a[0] = 99; p[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { patch(xs[0:2], ys) }\n"),
+            ("multi_arrow_shadow", "fn patch(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let out : Array[Int] = []; let _ = out; let _ = arr.mapi((_i, out) => { out[0] = 99; 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], ops : Array[Int]) -> Int { patch(arr, ops[0:2]) }\n"),
+            ("local_impl_add", "priv struct AddHook { xs : Array[Int] }\nimpl Add for AddHook with add(self, other) { let _ = other; self.xs[0] = 99; self }\nfn use_add(h : AddHook, v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\npub fn f(h : AddHook, ops : Array[Int]) -> Int { use_add(h, ops[0:2]) }\n"),
+            ("param_shadows_fn", "fn mark() -> Unit { () }\nfn sh(mark : () -> Unit, v : ArrayView[Int]) -> Int { mark(); v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { sh(cb, ops[0:2]) }\n"),
+            ("param_shadows_global", "let ys : Array[String] = []\nfn sh(ys : Array[Int], v : ArrayView[Int]) -> Int { ys[0] = 99; v[0] }\npub fn f(xs : Array[Int]) -> Int { sh(xs, xs[0:2]) }\n"),
+            ("callee_interp_mut", "fn mark(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn ic(ys : Array[Int], v : ArrayView[Int]) -> Int { let _ = \"\\{mark(ys)}\"; v[0] }\npub fn f(xs : Array[Int]) -> Int { ic(xs, xs[0:2]) }\n"),
+            ("callee_default_arg_mut", "fn mark(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn da(ys : Array[Int], v : ArrayView[Int], k? : Int = mark(ys)) -> Int { let _ = k; v[0] }\npub fn f(xs : Array[Int]) -> Int { da(xs, xs[0:2]) }\n"),
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
+
+        # 3l. Cross-package `@dep.Hook` equality and method dispatch inside RO_VIEW callee MUST fail closed
+        hook_src = os.path.join(work, "hookdep_src")
+        hook_out = os.path.join(work, "p_hookdep")
+        os.makedirs(hook_src)
+        os.makedirs(os.path.join(hook_out, "src"))
+        with open(os.path.join(hook_out, "pion.toml"), "w") as fh:
+            fh.write(f'[package]\nname = "hookdep"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        with open(os.path.join(hook_src, "hook.mbt"), "w") as fh:
+            fh.write(
+                "pub(all) struct Hook { xs : Array[Int] }\n"
+                "pub impl Eq for Hook with equal(self, other) { let _ = other; self.xs[0] = 99; true }\n"
+                "pub fn Hook::to_int(self : Hook) -> Int { self.xs[0] = 99; 0 }\n"
+            )
+        run_cmd([
+            bin_path, "--src", hook_src, "--out", os.path.join(hook_out, "src"), "--target", "native", "--mode", "publish",
+            "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
+        ])
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "dep_hook_eq",
+            "fn cmp_h(h : @hookdep.Hook, v : ArrayView[Int]) -> Int { if h == h { v[0] } else { 0 } }\n"
+            "pub fn f(h : @hookdep.Hook, ops : Array[Int]) -> Int { cmp_h(h, ops[0:2]) }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+            ["--dep", f"hookdep={hook_out}"],
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "dep_hook_to_int",
+            "fn ti_h(h : @hookdep.Hook, v : ArrayView[Int]) -> Int { let _ = h.to_int(); v[0] }\n"
+            "pub fn f(h : @hookdep.Hook, ops : Array[Int]) -> Int { ti_h(h, ops[0:2]) }\n",
+            "MBT2PION_BORROWED_ARRAY_SLICE",
+            ["--dep", f"hookdep={hook_out}"],
+        )
 
         print("PASS: Wave M2-F4 Track F4-2 4-Target Differential Oracle (Moon native == Moon wasm-gc == Pion native == Pion wasm32 + all negative gates)")
     finally:
