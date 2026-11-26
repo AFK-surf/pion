@@ -39,6 +39,7 @@ import PionProofs.QbeEcosystemUnboxFixedLen
 import PionProofs.QbeBinarySizeOpts
 import PionProofs.QbeCompileSpeedZ1
 import PionProofs.QbeRealWorkloadDataOpts
+import PionProofs.WaveAA3Drops
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -879,3 +880,49 @@ import PionProofs.QbeRealWorkloadDataOpts
 #print axioms QbeRealWorkloadDataOpts.SparseData.loop_blocks
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget
 #print axioms QbeRealWorkloadDataOpts.SparseData.leading_zero_budget_4096
+#print axioms PionWaveAA3Drops.guarded_eq_dec
+#print axioms PionWaveAA3Drops.insertSorted_append
+#print axioms PionWaveAA3Drops.foldl_insertDedup_sorted
+#print axioms PionWaveAA3Drops.sortUnique_of_sorted
+#print axioms PionWaveAA3Drops.slotHelper_trace
+#print axioms PionWaveAA3Drops.struct_drop_slots_equiv
+#print axioms PionWaveAA3Drops.map_add_strictSorted
+#print axioms PionWaveAA3Drops.niche_offset
+#print axioms PionWaveAA3Drops.niche_enum_drop_slots_equiv
+#print axioms PionWaveAA3Drops.niche_enum_drop_slots_equiv_zero
+#print axioms PionWaveAA3Drops.count_rcDec
+#print axioms PionWaveAA3Drops.count_flatMap_rcDec
+#print axioms PionWaveAA3Drops.slot_drop_alias_count
+#print axioms PionWaveAA3Drops.slot_drop_alias_twice
+#print axioms PionWaveAA3Drops.testBit_foldl_mask
+#print axioms PionWaveAA3Drops.testBit_slotMask
+#print axioms PionWaveAA3Drops.strictSorted_ext
+#print axioms PionWaveAA3Drops.slot_key_injective
+#print axioms PionWaveAA3Drops.slot_key_shared_body
+#print axioms PionWaveAA3Drops.taggedEnumDrop_nil
+#print axioms PionWaveAA3Drops.zero_rc_tagged_enum_null_drop_equiv
+#print axioms PionWaveAA3Drops.rc_tagged_enum_drop_needed
+#print axioms PionWaveAA3Drops.decDigits_ne_nil
+#print axioms PionWaveAA3Drops.decDigits_lt
+#print axioms PionWaveAA3Drops.decDigits_inj
+#print axioms PionWaveAA3Drops.map_digitChar_inj
+#print axioms PionWaveAA3Drops.decKey_inj
+#print axioms PionWaveAA3Drops.decKey_digits
+#print axioms PionWaveAA3Drops.hexChar_inj
+#print axioms PionWaveAA3Drops.hex4_inj
+#print axioms PionWaveAA3Drops.flatMap_hex4_inj
+#print axioms PionWaveAA3Drops.foldl_mask_lt
+#print axioms PionWaveAA3Drops.chunk_lt
+#print axioms PionWaveAA3Drops.testBit_chunk
+#print axioms PionWaveAA3Drops.flatMap_hex4_length
+#print axioms PionWaveAA3Drops.hexKey_length
+#print axioms PionWaveAA3Drops.hexKey_mem
+#print axioms PionWaveAA3Drops.le_maxSlot
+#print axioms PionWaveAA3Drops.namespaces_disjoint
+#print axioms PionWaveAA3Drops.dec_ne_hex
+#print axioms PionWaveAA3Drops.dec_ne_w
+#print axioms PionWaveAA3Drops.hex_ne_w
+#print axioms PionWaveAA3Drops.hexKey_eq_sets
+#print axioms PionWaveAA3Drops.suffix_injective
+#print axioms PionWaveAA3Drops.nodup_getElem_inj
+#print axioms PionWaveAA3Drops.table_index_contract
