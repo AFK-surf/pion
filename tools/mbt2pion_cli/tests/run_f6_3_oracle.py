@@ -487,6 +487,22 @@ pub fn run(xs : Array[Int], cb : (Int) -> Int) -> Int {
         "MBT2PION_BORROWED_ARRAY_SLICE",
     ),
     (
+        "neg_gate_d_labeled_for_slice",
+        r'''
+pub fn run(xs : Array[Int]) -> Int {
+  let mut acc = 0
+  outer~: for x in xs[1:] {
+    acc = acc + x
+    if x > 10 {
+      break outer~
+    }
+  }
+  acc
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
         "neg_gate_a_kept_iter2_shrink",
         r'''
 pub fn run() -> Int {
