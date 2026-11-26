@@ -547,6 +547,18 @@ fn format_pion_dep_line(world : World, alias_name : String, dep_dir : String) ->
   }
 }
 
+///| Exact `pionc` discovery predicates matching `drv_is_source_file` / `drv_is_test_source_file`:
+///| top-level in `src/`, no leading `.`, `.pion` suffix, and non-test vs `*_test.pion`.
+fn is_pionc_discoverable_source_file(rel : String) -> Bool {
+  rel.length() > 0 && rel.index_of("/") < 0 && !rel.starts_with(".") &&
+  rel.ends_with(".pion") && !rel.ends_with("_test.pion")
+}
+
+fn is_pionc_discoverable_test_file(rel : String) -> Bool {
+  rel.length() > 0 && rel.index_of("/") < 0 && !rel.starts_with(".") &&
+  rel.ends_with("_test.pion")
+}
+
 ///| Run `pionc check --json` against a lightweight post-swap verification view of `stage_dir`
 ///| (Astra Round 6 P0-2): maps all regular files to `real_stage/<rel>` and rewrites any symlink
 ///| (relative, `../OUT/...`, or absolute `/abs/OUT/...`) whose post-swap target falls inside
@@ -567,10 +579,26 @@ fn run_pionc_check_candidate_view(
   unmanaged_symlinks : Array[(String, String)],
   reexport_anchor : String,
 ) -> (Bool, String, String) {
+  // Reject any generated `.pion` file (source or test) that `pionc` / `pionc test` cannot discover
+  // (subdirectories or leading `.` filenames): `pionc` only discovers top-level non-dot `src/*.pion`.
+  for gf in final_files {
+    if gf.rel_path.ends_with("_test.pion") && !is_pionc_discoverable_test_file(gf.rel_path) {
+      let msg = "generated test file `" + gf.rel_path + "` will not be discovered by `pionc test` (must be a top-level non-dot `*_test.pion`)"
+      let diag_json = "{\"ok\":false,\"diagnostics\":[{\"file\":" + json_quote_str(gf.rel_path) + ",\"line\":1,\"col\":1,\"code\":\"E_UNDISCOVERED_TEST\",\"message\":" + json_quote_str(msg) + "}]}"
+      return (false, diag_json, "")
+    }
+    if gf.rel_path.ends_with(".pion") && !gf.rel_path.ends_with("_test.pion") && !is_pionc_discoverable_source_file(gf.rel_path) {
+      let msg = "generated source file `" + gf.rel_path + "` will not be discovered by `pionc` (must be a top-level non-dot `.pion`)"
+      let diag_json = "{\"ok\":false,\"diagnostics\":[{\"file\":" + json_quote_str(gf.rel_path) + ",\"line\":1,\"col\":1,\"code\":\"E_UNDISCOVERED_SOURCE\",\"message\":" + json_quote_str(msg) + "}]}"
+      return (false, diag_json, "")
+    }
+  }
   let rm_bin = if fs_exists(world, "/bin/rm") { "/bin/rm" } else { "rm" }
   let _ = proc_exec(world, [rm_bin, "-rf", scratch_dir])
   let src_view = join_path(scratch_dir, "src")
-  let _ = fs_mkdir_p(world, src_view)
+  if !fs_mkdir_p(world, src_view) {
+    return (false, "", "failed creating candidate check src dir: " + src_view)
+  }
   let toml_sb = StringBuilder()
   toml_sb.write_string("[package]\nname = \"mbt2pion_final_check\"\nversion = \"0.1.0\"\n")
   if deps.length() > 0 {
@@ -583,43 +611,16 @@ fn run_pionc_check_candidate_view(
       }
     }
   }
-  let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string())
+  match fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string()) {
+    Ok(_) => ()
+    Err(e) => return (false, "", "failed writing candidate check pion.toml: " + e)
+  }
 
   let real_out = resolve_canonical_path(cwd, clean_out_dir)
   let real_stage = resolve_canonical_path(cwd, stage_dir)
   let out_prefix = if real_out == "/" { "/" } else { real_out + "/" }
 
-  for dm in unmanaged_dirs {
-    let _ = fs_mkdir_p(world, join_path(src_view, dm.0))
-  }
-  for gf in final_files {
-    let dst = join_path(src_view, gf.rel_path)
-    let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-    let _ = fs_symlink(world, join_path(real_stage, gf.rel_path), dst)
-  }
-  for vc in verified_companions {
-    let dst = join_path(src_view, vc.0)
-    let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-    let _ = fs_symlink(world, join_path(real_stage, vc.0), dst)
-  }
-  for fm in unmanaged_files {
-    let real_src = join_path(real_stage, fm.0)
-    if fs_exists(world, real_src) {
-      let dst = join_path(src_view, fm.0)
-      let parent = dirname(dst)
-      if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-      let _ = fs_symlink(world, real_src, dst)
-    }
-  }
-  for sl in unmanaged_symlinks {
-    let rel = sl.0
-    let raw_target = sl.1
-    let dst = join_path(src_view, rel)
-    let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-    // Compute post-swap canonical target path (as if `rel` already lives inside `real_out`)
+  let resolve_symlink_view_target = fn(rel : String, raw_target : String) -> String {
     let post_target = if raw_target.starts_with("/") {
       resolve_canonical_path(cwd, raw_target)
     } else {
@@ -627,7 +628,7 @@ fn run_pionc_check_candidate_view(
       let base_dir = if link_dir.length() > 0 { join_path(real_out, link_dir) } else { real_out }
       resolve_canonical_path(cwd, join_path(base_dir, raw_target))
     }
-    let view_target = if post_target == real_out {
+    if post_target == real_out {
       real_stage
     } else if post_target.starts_with(out_prefix) {
       let inner_rel = post_target.slice(out_prefix.length(), post_target.length())
@@ -635,6 +636,58 @@ fn run_pionc_check_candidate_view(
     } else {
       post_target
     }
+  }
+
+  // Check 1: verify the exact on-disk output layout as consumers will see it (no injected flat links).
+  for dm in unmanaged_dirs {
+    if !fs_mkdir_p(world, join_path(src_view, dm.0)) {
+      return (false, "", "failed creating candidate check dir for " + dm.0)
+    }
+  }
+  for gf in final_files {
+    let real_src = join_path(real_stage, gf.rel_path)
+    let dst = join_path(src_view, gf.rel_path)
+    let parent = dirname(dst)
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      return (false, "", "failed creating candidate check parent dir for " + gf.rel_path)
+    }
+    if !fs_symlink(world, real_src, dst) {
+      return (false, "", "failed creating candidate check symlink for " + gf.rel_path)
+    }
+  }
+  for vc in verified_companions {
+    let real_src = join_path(real_stage, vc.0)
+    let dst = join_path(src_view, vc.0)
+    let parent = dirname(dst)
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      return (false, "", "failed creating candidate check parent dir for " + vc.0)
+    }
+    if !fs_symlink(world, real_src, dst) {
+      return (false, "", "failed creating candidate check symlink for " + vc.0)
+    }
+  }
+  for fm in unmanaged_files {
+    let real_src = join_path(real_stage, fm.0)
+    if fs_exists(world, real_src) {
+      let dst = join_path(src_view, fm.0)
+      let parent = dirname(dst)
+      if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+        return (false, "", "failed creating candidate check parent dir for " + fm.0)
+      }
+      if !fs_symlink(world, real_src, dst) {
+        return (false, "", "failed creating candidate check symlink for " + fm.0)
+      }
+    }
+  }
+  for sl in unmanaged_symlinks {
+    let rel = sl.0
+    let raw_target = sl.1
+    let dst = join_path(src_view, rel)
+    let parent = dirname(dst)
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      return (false, "", "failed creating candidate check parent dir for " + rel)
+    }
+    let view_target = resolve_symlink_view_target(rel, raw_target)
     if !fs_symlink(world, view_target, dst) {
       return (false, "", "failed creating candidate check symlink for " + rel)
     }
@@ -646,7 +699,10 @@ fn run_pionc_check_candidate_view(
     }
   }
   if reexport_anchor.length() > 0 {
-    let _ = fs_write(world, join_path(src_view, "__mbt_reexport_anchor.pion"), reexport_anchor)
+    match fs_write(world, join_path(src_view, "__mbt_reexport_anchor.pion"), reexport_anchor) {
+      Ok(_) => ()
+      Err(e) => return (false, "", "failed writing candidate check reexport anchor: " + e)
+    }
   }
   let check1 = match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
     Ok(out) => (true, out)
@@ -655,9 +711,157 @@ fn run_pionc_check_candidate_view(
   if !check1.0 || !is_pionc_check_clean_json(check1.1) {
     return (check1.0, check1.1, "")
   }
-  // Check 2 (Round 2 P1-9): `pionc check` skips `*_test.pion` files. If any test file exists in the
-  // candidate view, verify a second view where every `*_test.pion` is aliased to `*__mbt_test_chk.pion`
-  // so broken test files NEVER pass `publish --with-tests`!
+
+  // Check 1b: if any non-test `.pion` file is not directly discoverable by `pionc check <dir>`
+  // (e.g. in a subdirectory or with a leading `.`), run a separate flattened view with fixed-length
+  // short aliases so every published non-test `.pion` file is compiled and duplicate definitions are caught.
+  let is_hidden_or_subdir_source = fn(r : String) -> Bool {
+    r.ends_with(".pion") && !r.ends_with("_test.pion") && !is_pionc_discoverable_source_file(r)
+  }
+  let mut has_subdir_pion = false
+  for gf in final_files {
+    if is_hidden_or_subdir_source(gf.rel_path) {
+      has_subdir_pion = true
+      break
+    }
+  }
+  if !has_subdir_pion {
+    for vc in verified_companions {
+      if is_hidden_or_subdir_source(vc.0) {
+        has_subdir_pion = true
+        break
+      }
+    }
+  }
+  if !has_subdir_pion {
+    for fm in unmanaged_files {
+      if is_hidden_or_subdir_source(fm.0) {
+        has_subdir_pion = true
+        break
+      }
+    }
+  }
+  if !has_subdir_pion {
+    for sl in unmanaged_symlinks {
+      if is_hidden_or_subdir_source(sl.0) {
+        has_subdir_pion = true
+        break
+      }
+    }
+  }
+  if has_subdir_pion {
+    let sub_scratch = scratch_dir + "_sub"
+    let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+    let sub_src_view = join_path(sub_scratch, "src")
+    if !fs_mkdir_p(world, sub_src_view) {
+      return (false, "", "failed creating subdir check src dir: " + sub_src_view)
+    }
+    match fs_write(world, join_path(sub_scratch, "pion.toml"), toml_sb.to_string()) {
+      Ok(_) => ()
+      Err(e) => {
+        let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+        return (false, "", "failed writing subdir check pion.toml: " + e)
+      }
+    }
+    let used_sub_dsts : Map[String, Bool] = Map()
+    for gf in final_files {
+      if is_pionc_discoverable_source_file(gf.rel_path) { used_sub_dsts[gf.rel_path] = true }
+    }
+    for vc in verified_companions {
+      if is_pionc_discoverable_source_file(vc.0) { used_sub_dsts[vc.0] = true }
+    }
+    for fm in unmanaged_files {
+      if is_pionc_discoverable_source_file(fm.0) { used_sub_dsts[fm.0] = true }
+    }
+    for sl in unmanaged_symlinks {
+      if is_pionc_discoverable_source_file(sl.0) { used_sub_dsts[sl.0] = true }
+    }
+    let sub_aliases : Array[(String, String)] = []
+    let sub_seq : Array[Int] = [1]
+    let map_sub_rel = fn(r : String) -> Option[String] {
+      if !r.ends_with(".pion") || r.ends_with("_test.pion") {
+        return None
+      }
+      if is_pionc_discoverable_source_file(r) {
+        return Some(r)
+      }
+      let mut cand = "__mbt_sub_" + sub_seq[0].to_string() + ".pion"
+      while used_sub_dsts.contains(cand) {
+        sub_seq[0] = sub_seq[0] + 1
+        cand = "__mbt_sub_" + sub_seq[0].to_string() + ".pion"
+      }
+      sub_seq[0] = sub_seq[0] + 1
+      used_sub_dsts[cand] = true
+      sub_aliases.push((cand, r))
+      Some(cand)
+    }
+    for gf in final_files {
+      match map_sub_rel(gf.rel_path) {
+        Some(flat_name) =>
+        if !fs_symlink(world, join_path(real_stage, gf.rel_path), join_path(sub_src_view, flat_name)) {
+          let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+          return (false, "", "failed creating subdir check symlink for " + gf.rel_path)
+        }
+        None => ()
+      }
+    }
+    for vc in verified_companions {
+      match map_sub_rel(vc.0) {
+        Some(flat_name) =>
+        if !fs_symlink(world, join_path(real_stage, vc.0), join_path(sub_src_view, flat_name)) {
+          let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+          return (false, "", "failed creating subdir check symlink for " + vc.0)
+        }
+        None => ()
+      }
+    }
+    for fm in unmanaged_files {
+      let real_src = join_path(real_stage, fm.0)
+      if fs_exists(world, real_src) {
+        match map_sub_rel(fm.0) {
+          Some(flat_name) =>
+          if !fs_symlink(world, real_src, join_path(sub_src_view, flat_name)) {
+            let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+            return (false, "", "failed creating subdir check symlink for " + fm.0)
+          }
+          None => ()
+        }
+      }
+    }
+    for sl in unmanaged_symlinks {
+      match map_sub_rel(sl.0) {
+        Some(flat_name) => {
+          let view_target = resolve_symlink_view_target(sl.0, sl.1)
+          if !fs_symlink(world, view_target, join_path(sub_src_view, flat_name)) {
+            let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+            return (false, "", "failed creating subdir check symlink for " + sl.0)
+          }
+        }
+        None => ()
+      }
+    }
+    if reexport_anchor.length() > 0 {
+      match fs_write(world, join_path(sub_src_view, "__mbt_reexport_anchor.pion"), reexport_anchor) {
+        Ok(_) => ()
+        Err(e) => {
+          let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+          return (false, "", "failed writing subdir check reexport anchor: " + e)
+        }
+      }
+    }
+    let check_sub = match proc_exec_capture(world, [pionc_bin, "check", "--json", sub_scratch]) {
+      Ok(out) => (true, restore_probe_aliases(out, sub_aliases, sub_src_view))
+      Err(out) => (false, restore_probe_aliases(out, sub_aliases, sub_src_view))
+    }
+    let _ = proc_exec(world, [rm_bin, "-rf", sub_scratch])
+    if !check_sub.0 || !is_pionc_check_clean_json(check_sub.1) {
+      return (check_sub.0, check_sub.1, "")
+    }
+  }
+
+  // Check 2: `pionc check` skips `*_test.pion` files. If any test file exists in the candidate view,
+  // verify a separate view where every `*_test.pion` (and any subdir `.pion`) gets a fixed-length short
+  // top-level alias so broken test files NEVER pass `publish --with-tests`.
   let mut has_test_pion = false
   for gf in final_files {
     if gf.rel_path.ends_with("_test.pion") { has_test_pion = true; break }
@@ -678,33 +882,49 @@ fn run_pionc_check_candidate_view(
   let test_scratch = scratch_dir + "_tests"
   let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
   let test_src_view = join_path(test_scratch, "src")
-  let _ = fs_mkdir_p(world, test_src_view)
-  let _ = fs_write(world, join_path(test_scratch, "pion.toml"), toml_sb.to_string())
+  if !fs_mkdir_p(world, test_src_view) {
+    return (false, "", "failed creating test-check src dir: " + test_src_view)
+  }
+  match fs_write(world, join_path(test_scratch, "pion.toml"), toml_sb.to_string()) {
+    Ok(_) => ()
+    Err(e) => {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed writing test-check pion.toml: " + e)
+    }
+  }
   for dm in unmanaged_dirs {
-    let _ = fs_mkdir_p(world, join_path(test_src_view, dm.0))
+    if !fs_mkdir_p(world, join_path(test_src_view, dm.0)) {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed creating test-check dir for " + dm.0)
+    }
   }
   let used_test_dsts : Map[String, Bool] = Map()
   for gf in final_files {
-    if !gf.rel_path.ends_with("_test.pion") { used_test_dsts[gf.rel_path] = true }
+    if !gf.rel_path.ends_with("_test.pion") && gf.rel_path.index_of("/") < 0 { used_test_dsts[gf.rel_path] = true }
+  }
+  for vc in verified_companions {
+    if !vc.0.ends_with("_test.pion") && vc.0.index_of("/") < 0 { used_test_dsts[vc.0] = true }
   }
   for fm in unmanaged_files {
-    if !fm.0.ends_with("_test.pion") { used_test_dsts[fm.0] = true }
+    if !fm.0.ends_with("_test.pion") && fm.0.index_of("/") < 0 { used_test_dsts[fm.0] = true }
   }
   for sl in unmanaged_symlinks {
-    if !sl.0.ends_with("_test.pion") { used_test_dsts[sl.0] = true }
+    if !sl.0.ends_with("_test.pion") && sl.0.index_of("/") < 0 { used_test_dsts[sl.0] = true }
   }
   let alias_pairs : Array[(String, String)] = []
+  let test_seq : Array[Int] = [1]
+  // Only alias `pionc test`-discoverable top-level non-dot `*_test.pion` files; keep all hidden
+  // dot-files and subdirectory non-test files at their exact on-disk paths so Check 2 matches `pionc test`.
   let alias_test_rel = fn(r : String) -> String {
-    if !r.ends_with("_test.pion") {
+    if !is_pionc_discoverable_test_file(r) {
       return r
     }
-    let stem = r.slice(0, r.length() - 5)
-    let mut cand = stem + "__mbt_test_chk.pion"
-    let mut seq = 1
+    let mut cand = "__mbt_test_chk_" + test_seq[0].to_string() + ".pion"
     while used_test_dsts.contains(cand) {
-      cand = stem + "__mbt_test_chk_" + seq.to_string() + ".pion"
-      seq = seq + 1
+      test_seq[0] = test_seq[0] + 1
+      cand = "__mbt_test_chk_" + test_seq[0].to_string() + ".pion"
     }
+    test_seq[0] = test_seq[0] + 1
     used_test_dsts[cand] = true
     alias_pairs.push((cand, r))
     cand
@@ -712,7 +932,10 @@ fn run_pionc_check_candidate_view(
   for gf in final_files {
     let dst = join_path(test_src_view, alias_test_rel(gf.rel_path))
     let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed creating test-check parent dir for " + gf.rel_path)
+    }
     if !fs_symlink(world, join_path(real_stage, gf.rel_path), dst) {
       let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
       return (false, "", "failed creating test-check symlink for " + gf.rel_path)
@@ -721,7 +944,10 @@ fn run_pionc_check_candidate_view(
   for vc in verified_companions {
     let dst = join_path(test_src_view, alias_test_rel(vc.0))
     let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed creating test-check parent dir for " + vc.0)
+    }
     if !fs_symlink(world, join_path(real_stage, vc.0), dst) {
       let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
       return (false, "", "failed creating test-check symlink for " + vc.0)
@@ -732,7 +958,10 @@ fn run_pionc_check_candidate_view(
     if fs_exists(world, real_src) {
       let dst = join_path(test_src_view, alias_test_rel(fm.0))
       let parent = dirname(dst)
-      if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+      if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+        let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+        return (false, "", "failed creating test-check parent dir for " + fm.0)
+      }
       if !fs_symlink(world, real_src, dst) {
         let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
         return (false, "", "failed creating test-check symlink for " + fm.0)
@@ -744,33 +973,18 @@ fn run_pionc_check_candidate_view(
     let raw_target = sl.1
     let dst = join_path(test_src_view, alias_test_rel(rel))
     let parent = dirname(dst)
-    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-    let post_target = if raw_target.starts_with("/") {
-      resolve_canonical_path(cwd, raw_target)
-    } else {
-      let link_dir = dirname(rel)
-      let base_dir = if link_dir.length() > 0 { join_path(real_out, link_dir) } else { real_out }
-      resolve_canonical_path(cwd, join_path(base_dir, raw_target))
+    if parent.length() > 0 && !fs_mkdir_p(world, parent) {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed creating test-check parent dir for " + rel)
     }
-    let view_target = if post_target == real_out {
-      real_stage
-    } else if post_target.starts_with(out_prefix) {
-      let inner_rel = post_target.slice(out_prefix.length(), post_target.length())
-      join_path(real_stage, inner_rel)
-    } else {
-      post_target
-    }
+    let view_target = resolve_symlink_view_target(rel, raw_target)
     if !fs_symlink(world, view_target, dst) {
       let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
       return (false, "", "failed creating test-check symlink for " + rel)
     }
   }
   let remap_test_diag = fn(raw : String) -> String {
-    let mut cur = raw
-    for ap in alias_pairs {
-      cur = m2p::str_replace_all(cur, ap.0, ap.1)
-    }
-    cur
+    restore_probe_aliases(raw, alias_pairs, test_src_view)
   }
   let check2 = match proc_exec_capture(world, [pionc_bin, "check", "--json", test_scratch]) {
     Ok(out) => (true, remap_test_diag(out))
@@ -819,40 +1033,699 @@ fn json_quote_str(s : String) -> String {
   sb.to_string()
 }
 
-///| Verify that a `pionc check --server` NDJSON response is valid JSON with matching `id`,
-///| boolean `ok`, array `diagnostics`, and no `protocol_error`.
-fn is_valid_check_server_resp(raw : String, expected_id : Int) -> Bool {
-  let trimmed = raw.trim()
-  if trimmed.length() == 0 {
+fn json_is_hex(c : Int) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+fn json_is_ws(c : Int) -> Bool {
+  c == 32 || c == 9 || c == 10 || c == 13
+}
+
+///| Decode a single ASCII hex digit, or -1 if invalid.
+fn json_hex_digit(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 65 + 10
+  } else if c >= 97 && c <= 102 {
+    c - 97 + 10
+  } else {
+    -1
+  }
+}
+
+///| Strictly validate and decode an RFC 8259 JSON string at `pos[0]` (`"`), advancing `pos[0]` past closing `"`.
+fn json_decode_str_strict(s : String, n : Int, pos : Array[Int]) -> Option[String] {
+  let mut p = pos[0]
+  if p >= n || s.code_unit_at(p) != 34 {
+    return None
+  }
+  p = p + 1
+  let start = p
+  let mut has_escape = false
+  while p < n {
+    let c = s.code_unit_at(p)
+    if c == 34 {
+      pos[0] = p + 1
+      if !has_escape {
+        return Some(s.slice(start, p))
+      }
+      break
+    }
+    if c < 32 {
+      return None
+    }
+    if c == 92 {
+      has_escape = true
+      break
+    }
+    p = p + 1
+  }
+  if !has_escape {
+    return None
+  }
+  let sb = StringBuilder()
+  if p > start {
+    sb.write_string(s.slice(start, p))
+  }
+  let mut seg_start = p
+  while p < n {
+    let c = s.code_unit_at(p)
+    if c == 34 {
+      if p > seg_start {
+        sb.write_string(s.slice(seg_start, p))
+      }
+      pos[0] = p + 1
+      return Some(sb.to_string())
+    }
+    if c < 32 {
+      return None
+    }
+    if c == 92 {
+      if p > seg_start {
+        sb.write_string(s.slice(seg_start, p))
+      }
+      p = p + 1
+      if p >= n {
+        return None
+      }
+      let e = s.code_unit_at(p)
+      if e == 34 {
+        sb.write_char('"')
+        p = p + 1
+      } else if e == 92 {
+        sb.write_char('\\')
+        p = p + 1
+      } else if e == 47 {
+        sb.write_char('/')
+        p = p + 1
+      } else if e == 98 {
+        sb.write_char((8).unsafe_to_char())
+        p = p + 1
+      } else if e == 102 {
+        sb.write_char((12).unsafe_to_char())
+        p = p + 1
+      } else if e == 110 {
+        sb.write_char('\n')
+        p = p + 1
+      } else if e == 114 {
+        sb.write_char('\r')
+        p = p + 1
+      } else if e == 116 {
+        sb.write_char('\t')
+        p = p + 1
+      } else if e == 117 {
+        if p + 4 >= n {
+          return None
+        }
+        let h0 = json_hex_digit(s.code_unit_at(p + 1))
+        let h1 = json_hex_digit(s.code_unit_at(p + 2))
+        let h2 = json_hex_digit(s.code_unit_at(p + 3))
+        let h3 = json_hex_digit(s.code_unit_at(p + 4))
+        if h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0 {
+          return None
+        }
+        let cp = h0 * 4096 + h1 * 256 + h2 * 16 + h3
+        p = p + 5
+        if cp >= 0xD800 && cp <= 0xDBFF && p + 5 < n && s.code_unit_at(p) == 92 && s.code_unit_at(p + 1) == 117 {
+          let l0 = json_hex_digit(s.code_unit_at(p + 2))
+          let l1 = json_hex_digit(s.code_unit_at(p + 3))
+          let l2 = json_hex_digit(s.code_unit_at(p + 4))
+          let l3 = json_hex_digit(s.code_unit_at(p + 5))
+          if l0 >= 0 && l1 >= 0 && l2 >= 0 && l3 >= 0 {
+            let low = l0 * 4096 + l1 * 256 + l2 * 16 + l3
+            if low >= 0xDC00 && low <= 0xDFFF {
+              let full_cp = 0x10000 + (cp - 0xD800) * 1024 + (low - 0xDC00)
+              sb.write_char(full_cp.unsafe_to_char())
+              p = p + 6
+              seg_start = p
+              continue
+            }
+          }
+        }
+        if cp >= 0xD800 && cp <= 0xDFFF {
+          sb.write_char((0xFFFD).unsafe_to_char())
+        } else {
+          sb.write_char(cp.unsafe_to_char())
+        }
+      } else {
+        return None
+      }
+      seg_start = p
+    } else {
+      p = p + 1
+    }
+  }
+  None
+}
+
+///| Strictly validate a RFC 8259 JSON string starting at `pos[0]` (`"`), advancing `pos[0]` past closing `"`.
+fn json_skip_str_strict(s : String, n : Int, pos : Array[Int]) -> Bool {
+  let mut p = pos[0]
+  if p >= n || s.code_unit_at(p) != 34 {
     return false
   }
-  match json::parse(trimmed) {
-    Ok(v) => {
-      match json::obj_get(v, "protocol_error") {
-        Some(_) => return false
-        None => ()
-      }
-      let id_ok = match json::obj_get(v, "id") {
-        Some(iv) => match json::as_int(iv) { Some(n) => n == expected_id.to_int64(), None => false }
-        None => false
-      }
-      if !id_ok {
+  p = p + 1
+  while p < n {
+    let c = s.code_unit_at(p)
+    if c == 34 {
+      pos[0] = p + 1
+      return true
+    }
+    if c < 32 {
+      return false
+    }
+    if c == 92 {
+      p = p + 1
+      if p >= n {
         return false
       }
-      let ok_is_bool = match json::obj_get(v, "ok") {
-        Some(ov) => match json::as_bool(ov) { Some(_) => true, None => false }
-        None => false
-      }
-      if !ok_is_bool {
+      let e = s.code_unit_at(p)
+      if e == 34 || e == 92 || e == 47 || e == 98 || e == 102 || e == 110 || e == 114 || e == 116 {
+        p = p + 1
+      } else if e == 117 {
+        if p + 4 >= n {
+          return false
+        }
+        if !json_is_hex(s.code_unit_at(p + 1)) || !json_is_hex(s.code_unit_at(p + 2)) ||
+        !json_is_hex(s.code_unit_at(p + 3)) || !json_is_hex(s.code_unit_at(p + 4)) {
+          return false
+        }
+        p = p + 5
+      } else {
         return false
       }
-      match json::obj_get(v, "diagnostics") {
-        Some(dv) => match json::as_arr(dv) { Some(_) => true, None => false }
-        None => false
+    } else {
+      p = p + 1
+    }
+  }
+  false
+}
+
+///| Strictly validate any RFC 8259 JSON value at `pos[0]` without allocating AST nodes.
+fn json_skip_val_strict(s : String, n : Int, pos : Array[Int], depth : Int) -> Bool {
+  if depth > 512 {
+    return false
+  }
+  let mut p = pos[0]
+  while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+  if p >= n {
+    return false
+  }
+  let c = s.code_unit_at(p)
+  if c == 34 {
+    pos[0] = p
+    return json_skip_str_strict(s, n, pos)
+  }
+  if c == 123 {
+    p = p + 1
+    while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+    if p >= n {
+      return false
+    }
+    if s.code_unit_at(p) == 125 {
+      pos[0] = p + 1
+      return true
+    }
+    while true {
+      if p >= n || s.code_unit_at(p) != 34 {
+        return false
+      }
+      pos[0] = p
+      if !json_skip_str_strict(s, n, pos) {
+        return false
+      }
+      p = pos[0]
+      while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+      if p >= n || s.code_unit_at(p) != 58 {
+        return false
+      }
+      p = p + 1
+      pos[0] = p
+      if !json_skip_val_strict(s, n, pos, depth + 1) {
+        return false
+      }
+      p = pos[0]
+      while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+      if p >= n {
+        return false
+      }
+      let nc = s.code_unit_at(p)
+      if nc == 125 {
+        pos[0] = p + 1
+        return true
+      }
+      if nc != 44 {
+        return false
+      }
+      p = p + 1
+      while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+    }
+    return false
+  }
+  if c == 91 {
+    p = p + 1
+    while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+    if p >= n {
+      return false
+    }
+    if s.code_unit_at(p) == 93 {
+      pos[0] = p + 1
+      return true
+    }
+    while true {
+      pos[0] = p
+      if !json_skip_val_strict(s, n, pos, depth + 1) {
+        return false
+      }
+      p = pos[0]
+      while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+      if p >= n {
+        return false
+      }
+      let nc = s.code_unit_at(p)
+      if nc == 93 {
+        pos[0] = p + 1
+        return true
+      }
+      if nc != 44 {
+        return false
+      }
+      p = p + 1
+      while p < n && json_is_ws(s.code_unit_at(p)) { p = p + 1 }
+    }
+    return false
+  }
+  if c == 116 {
+    if p + 4 <= n && s.slice(p, p + 4) == "true" {
+      pos[0] = p + 4
+      return true
+    }
+    return false
+  }
+  if c == 102 {
+    if p + 5 <= n && s.slice(p, p + 5) == "false" {
+      pos[0] = p + 5
+      return true
+    }
+    return false
+  }
+  if c == 110 {
+    if p + 4 <= n && s.slice(p, p + 4) == "null" {
+      pos[0] = p + 4
+      return true
+    }
+    return false
+  }
+  // Strict RFC 8259 number
+  if c == 45 {
+    p = p + 1
+    if p >= n {
+      return false
+    }
+  }
+  let d0 = s.code_unit_at(p)
+  if d0 == 48 {
+    p = p + 1
+    if p < n && s.code_unit_at(p) >= 48 && s.code_unit_at(p) <= 57 {
+      return false
+    }
+  } else if d0 >= 49 && d0 <= 57 {
+    p = p + 1
+    while p < n && s.code_unit_at(p) >= 48 && s.code_unit_at(p) <= 57 {
+      p = p + 1
+    }
+  } else {
+    return false
+  }
+  if p < n && s.code_unit_at(p) == 46 {
+    p = p + 1
+    if p >= n || s.code_unit_at(p) < 48 || s.code_unit_at(p) > 57 {
+      return false
+    }
+    while p < n && s.code_unit_at(p) >= 48 && s.code_unit_at(p) <= 57 {
+      p = p + 1
+    }
+  }
+  if p < n && (s.code_unit_at(p) == 101 || s.code_unit_at(p) == 69) {
+    p = p + 1
+    if p < n && (s.code_unit_at(p) == 43 || s.code_unit_at(p) == 45) {
+      p = p + 1
+    }
+    if p >= n || s.code_unit_at(p) < 48 || s.code_unit_at(p) > 57 {
+      return false
+    }
+    while p < n && s.code_unit_at(p) >= 48 && s.code_unit_at(p) <= 57 {
+      p = p + 1
+    }
+  }
+  pos[0] = p
+  true
+}
+
+///| Zero-AST strict RFC 8259 streaming validator for `pionc check --server` NDJSON responses:
+///| verifies valid top-level JSON object (with closing `}` and no trailing garbage),
+///| unique matching 64-bit integer `id`, unique boolean `ok`, unique array `diagnostics`,
+///| strict RFC 8259 syntax on all nested values, and no `protocol_error`.
+fn is_valid_check_server_resp(raw : String, expected_id : Int) -> Bool {
+  let n = raw.length()
+  let pos : Array[Int] = [0]
+  while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+  if pos[0] >= n || raw.code_unit_at(pos[0]) != 123 {
+    return false
+  }
+  pos[0] = pos[0] + 1
+  let mut closed = false
+  let mut saw_id = false
+  let mut id_ok = false
+  let mut saw_ok = false
+  let mut ok_is_bool = false
+  let mut saw_diags = false
+  let mut diags_is_arr = false
+  let mut saw_proto_err = false
+  let mut expect_comma_or_end = false
+  while pos[0] < n {
+    while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+    if pos[0] >= n {
+      return false
+    }
+    let ch = raw.code_unit_at(pos[0])
+    if ch == 125 {
+      pos[0] = pos[0] + 1
+      closed = true
+      break
+    }
+    if expect_comma_or_end {
+      if ch != 44 {
+        return false
+      }
+      pos[0] = pos[0] + 1
+      while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n || raw.code_unit_at(pos[0]) != 34 {
+        return false
+      }
+    } else if ch != 34 {
+      return false
+    }
+    let key = match json_decode_str_strict(raw, n, pos) {
+      Some(k) => k
+      None => return false
+    }
+    while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+    if pos[0] >= n || raw.code_unit_at(pos[0]) != 58 {
+      return false
+    }
+    pos[0] = pos[0] + 1
+    while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+    if pos[0] >= n {
+      return false
+    }
+    let val_start = pos[0]
+    if !json_skip_val_strict(raw, n, pos, 1) {
+      return false
+    }
+    let val_end = pos[0]
+    let vc = raw.code_unit_at(val_start)
+    if key == "protocol_error" {
+      saw_proto_err = true
+    } else if key == "id" {
+      if saw_id {
+        return false
+      }
+      saw_id = true
+      let mut neg = false
+      let mut ip = val_start
+      if vc == 45 { neg = true; ip = ip + 1 }
+      let mut iv = 0L
+      let mut digits = 0
+      while ip < val_end {
+        let dc = raw.code_unit_at(ip)
+        if dc >= 48 && dc <= 57 {
+          if digits < 18 {
+            iv = iv * 10L + (dc - 48).to_int64()
+          }
+          digits = digits + 1
+          ip = ip + 1
+        } else {
+          break
+        }
+      }
+      if ip == val_end && digits > 0 && digits <= 18 {
+        let parsed = if neg { 0L - iv } else { iv }
+        id_ok = parsed == expected_id.to_int64()
+      }
+    } else if key == "ok" {
+      if saw_ok {
+        return false
+      }
+      saw_ok = true
+      let vslice = raw.slice(val_start, val_end)
+      if vslice == "true" || vslice == "false" {
+        ok_is_bool = true
+      }
+    } else if key == "diagnostics" {
+      if saw_diags {
+        return false
+      }
+      saw_diags = true
+      if vc == 91 {
+        diags_is_arr = true
       }
     }
-    Err(_) => false
+    expect_comma_or_end = true
   }
+  if !closed {
+    return false
+  }
+  while pos[0] < n && json_is_ws(raw.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+  pos[0] == n && !saw_proto_err && id_ok && ok_is_bool && diags_is_arr
+}
+
+///| Build collision-free fixed-length top-level temporary probe filenames for `*_test.pion` and
+///| subdirectory `.pion` files in `batch` (`pionc check <dir>` only scans top-level non-test `src/*.pion`).
+///| Real top-level files whose names happen to contain `__mbt_probe` are never renamed, and only
+///| aliases recorded in `temp_to_orig` are restored on output.
+fn build_check_batch_aliases(
+  batch : Array[(String, String)],
+) -> (Array[(String, String)], Array[(String, String)]) {
+  let existing : Map[String, Bool] = Map()
+  for pair in batch {
+    if pair.0.index_of("/") < 0 {
+      existing[pair.0] = true
+    }
+  }
+  let used_aliases : Map[String, Bool] = Map()
+  let aliased : Array[(String, String)] = []
+  let temp_to_orig : Array[(String, String)] = []
+  let mut seq = 1
+  for pair in batch {
+    if pair.0.ends_with(".pion") && !is_pionc_discoverable_source_file(pair.0) {
+      let mut cand = "__mbt_probe_" + seq.to_string() + ".pion"
+      while existing.contains(cand) || used_aliases.contains(cand) {
+        seq = seq + 1
+        cand = "__mbt_probe_" + seq.to_string() + ".pion"
+      }
+      seq = seq + 1
+      used_aliases[cand] = true
+      aliased.push((cand, pair.1))
+      temp_to_orig.push((cand, pair.0))
+    } else {
+      aliased.push(pair)
+    }
+  }
+  (aliased, temp_to_orig)
+}
+
+///| Walk JSON structure and record exact byte-range edits only for `"file"` string property values
+///| matching `exact_map`. Never touches `"message"` or any other field, and never does substring matching.
+fn collect_file_alias_edits(
+  s : String,
+  n : Int,
+  pos : Array[Int],
+  exact_map : Map[String, String],
+  edits : Array[(Int, Int, String)],
+  depth : Int,
+) -> Bool {
+  if depth > 512 {
+    return false
+  }
+  while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+  if pos[0] >= n {
+    return false
+  }
+  let c = s.code_unit_at(pos[0])
+  if c == 123 {
+    pos[0] = pos[0] + 1
+    while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+    if pos[0] >= n {
+      return false
+    }
+    if s.code_unit_at(pos[0]) == 125 {
+      pos[0] = pos[0] + 1
+      return true
+    }
+    while true {
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      let key = match json_decode_str_strict(s, n, pos) {
+        Some(k) => k
+        None => return false
+      }
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n || s.code_unit_at(pos[0]) != 58 {
+        return false
+      }
+      pos[0] = pos[0] + 1
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n {
+        return false
+      }
+      let vc = s.code_unit_at(pos[0])
+      if key == "file" && vc == 34 {
+        let vstart = pos[0]
+        match json_decode_str_strict(s, n, pos) {
+          Some(v) =>
+          match exact_map.get(v) {
+            Some(mapped) => edits.push((vstart, pos[0], json_quote_str(mapped)))
+            None => ()
+          }
+          None => return false
+        }
+      } else if vc == 123 || vc == 91 {
+        if !collect_file_alias_edits(s, n, pos, exact_map, edits, depth + 1) {
+          return false
+        }
+      } else {
+        if !json_skip_val_strict(s, n, pos, depth + 1) {
+          return false
+        }
+      }
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n {
+        return false
+      }
+      let nc = s.code_unit_at(pos[0])
+      if nc == 125 {
+        pos[0] = pos[0] + 1
+        return true
+      }
+      if nc != 44 {
+        return false
+      }
+      pos[0] = pos[0] + 1
+    }
+    return false
+  }
+  if c == 91 {
+    pos[0] = pos[0] + 1
+    while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+    if pos[0] >= n {
+      return false
+    }
+    if s.code_unit_at(pos[0]) == 93 {
+      pos[0] = pos[0] + 1
+      return true
+    }
+    while true {
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n {
+        return false
+      }
+      let vc = s.code_unit_at(pos[0])
+      if vc == 123 || vc == 91 {
+        if !collect_file_alias_edits(s, n, pos, exact_map, edits, depth + 1) {
+          return false
+        }
+      } else {
+        if !json_skip_val_strict(s, n, pos, depth + 1) {
+          return false
+        }
+      }
+      while pos[0] < n && json_is_ws(s.code_unit_at(pos[0])) { pos[0] = pos[0] + 1 }
+      if pos[0] >= n {
+        return false
+      }
+      let nc = s.code_unit_at(pos[0])
+      if nc == 93 {
+        pos[0] = pos[0] + 1
+        return true
+      }
+      if nc != 44 {
+        return false
+      }
+      pos[0] = pos[0] + 1
+    }
+    return false
+  }
+  json_skip_val_strict(s, n, pos, depth + 1)
+}
+
+///| Restore only the exact temporary `*_test.pion` probe aliases allocated for this check call,
+///| strictly within JSON `"file"` property values and strictly by full path match.
+fn restore_probe_aliases(
+  raw : String,
+  temp_to_orig : Array[(String, String)],
+  src_root : String,
+) -> String {
+  if temp_to_orig.length() == 0 {
+    return raw
+  }
+  let roots : Array[String] = []
+  if src_root.length() > 0 {
+    roots.push(src_root)
+    let canon = resolve_canonical_path("", src_root)
+    if canon.length() > 0 && canon != src_root {
+      roots.push(canon)
+    }
+  }
+  let exact_map : Map[String, String] = Map()
+  for entry in temp_to_orig {
+    let a = entry.0
+    let o = entry.1
+    let wa = m2p::str_replace_all(a, "/", "\\")
+    let wo = m2p::str_replace_all(o, "/", "\\")
+    exact_map["src/" + a] = "src/" + o
+    exact_map[a] = o
+    exact_map["src\\" + wa] = "src\\" + wo
+    if wa != a {
+      exact_map[wa] = wo
+    }
+    for root in roots {
+      let mut root_clean = root
+      while root_clean.length() > 1 && (root_clean.ends_with("/") || root_clean.ends_with("\\")) {
+        root_clean = root_clean.slice(0, root_clean.length() - 1)
+      }
+      let root_posix = m2p::str_replace_all(root_clean, "\\", "/")
+      let root_win = m2p::str_replace_all(root_clean, "/", "\\")
+      exact_map[root_posix + "/" + a] = root_posix + "/" + o
+      exact_map[root_win + "\\" + wa] = root_win + "\\" + wo
+      if root_clean != root_posix {
+        exact_map[root_clean + "/" + a] = root_clean + "/" + o
+      }
+    }
+  }
+  let n = raw.length()
+  let start = raw.index_of("{")
+  if start < 0 {
+    return raw
+  }
+  let pos : Array[Int] = [start]
+  let edits : Array[(Int, Int, String)] = []
+  if !collect_file_alias_edits(raw, n, pos, exact_map, edits, 0) || edits.length() == 0 {
+    return raw
+  }
+  let sb = StringBuilder()
+  let mut cur = 0
+  for ed in edits {
+    if ed.0 > cur {
+      sb.write_string(raw.slice(cur, ed.0))
+    }
+    sb.write_string(ed.2)
+    cur = ed.1
+  }
+  if cur < n {
+    sb.write_string(raw.slice(cur, n))
+  }
+  sb.to_string()
 }
 
 ///| Run `pionc check --json` on a batch of `(rel_path, content)` files in a clean scratch directory.
@@ -887,15 +1760,9 @@ fn run_pionc_check_batch_status(
     if inject_compat_import && imp_sb.to_string().length() > 0 {
       let _ = fs_write(world, join_path(src_root, "__mbt_dep_imports.pion"), imp_sb.to_string())
     }
-    for pair in batch {
-      // `pionc check` skips `*_test.pion` files; alias them during Stage A.5/B probe runs
-      // so test files get full type-directed probing & rewriting, then map filenames back!
-      let check_rel = if pair.0.ends_with("_test.pion") {
-        pair.0.slice(0, pair.0.length() - 5) + "__mbt_probe.pion"
-      } else {
-        pair.0
-      }
-      let fpath = join_path(src_root, check_rel)
+    let (aliased_batch, temp_to_orig) = build_check_batch_aliases(batch)
+    for pair in aliased_batch {
+      let fpath = join_path(src_root, pair.0)
       let parent = dirname(fpath)
       if parent.length() > 0 {
         let _ = fs_mkdir_p(world, parent)
@@ -903,8 +1770,8 @@ fn run_pionc_check_batch_status(
       let _ = fs_write(world, fpath, pair.1)
     }
     return match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
-      Ok(out) => (true, m2p::str_replace_all(out, "__mbt_probe.pion", ".pion"))
-      Err(out) => (false, m2p::str_replace_all(out, "__mbt_probe.pion", ".pion"))
+      Ok(out) => (true, restore_probe_aliases(out, temp_to_orig, src_root))
+      Err(out) => (false, restore_probe_aliases(out, temp_to_orig, src_root))
     }
   }
   let argv : Array[String] = [pionc_bin, "check", "--json"]
@@ -1655,6 +2522,95 @@ pub fn main(world : World) -> Int {
   let server_imp_src : Array[String] = [""]
   let check_server_dir = join_path(scratch_root, "check_server")
 
+  let run_server_rpc = fn(eff_batch : Array[(String, String)], include_types : Bool) -> Option[String] {
+    if server_disabled[0] {
+      return None
+    }
+    if server_handle[0] < 0 {
+      let _ = proc_exec(world, ["rm", "-rf", check_server_dir])
+      let srv_src = join_path(check_server_dir, "src")
+      let _ = fs_mkdir_p(world, srv_src)
+      let toml_sb = StringBuilder()
+      toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+      let imp_sb = StringBuilder()
+      let seen_dep : Map[String, Bool] = Map()
+      for dep in check_deps {
+        if !seen_dep.contains(dep.0) {
+          seen_dep[dep.0] = true
+          toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
+          imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
+        }
+      }
+      let imp_txt = imp_sb.to_string()
+      server_imp_src[0] = imp_txt
+      let _ = fs_write(world, join_path(check_server_dir, "pion.toml"), toml_sb.to_string())
+      if imp_txt.length() > 0 {
+        let _ = fs_write(world, join_path(srv_src, "__mbt_dep_imports.pion"), imp_txt)
+      }
+      let h = c_check_server_start(pionc_bin.as_cstr(), check_server_dir.as_cstr())
+      if h >= 0 {
+        server_handle[0] = h
+      } else {
+        server_disabled[0] = true
+        return None
+      }
+    }
+    if server_handle[0] >= 0 {
+      // Deduplicate root-relative paths (last wins, matching `fs_write` semantics) to satisfy strict JSON no-dup-keys.
+      let rel_order : Array[String] = []
+      let rel_src : Map[String, String] = Map()
+      if server_imp_src[0].length() > 0 {
+        let imp_key = "src/__mbt_dep_imports.pion"
+        rel_order.push(imp_key)
+        rel_src[imp_key] = server_imp_src[0]
+      }
+      let (aliased_batch, temp_to_orig) = build_check_batch_aliases(eff_batch)
+      for pair in aliased_batch {
+        let full_key = "src/" + pair.0
+        if !rel_src.contains(full_key) {
+          rel_order.push(full_key)
+        }
+        rel_src[full_key] = pair.1
+      }
+      server_req_id[0] = server_req_id[0] + 1
+      let req_sb = StringBuilder()
+      req_sb.write_string("{\"id\":")
+      req_sb.write_string(server_req_id[0].to_string())
+      req_sb.write_string(",\"files\":{")
+      let mut first_f = true
+      for rk in rel_order {
+        match rel_src.get(rk) {
+          Some(src_txt) => {
+            if !first_f { req_sb.write_string(",") }
+            first_f = false
+            req_sb.write_string(json_quote_str(rk))
+            req_sb.write_string(":")
+            req_sb.write_string(json_quote_str(src_txt))
+          }
+          None => ()
+        }
+      }
+      req_sb.write_string("},\"full_replace\":true")
+      if include_types {
+        req_sb.write_string(",\"include_types\":true")
+      }
+      req_sb.write_string("}")
+      let req_str = req_sb.to_string()
+      let req_id = server_req_id[0]
+      let rc = c_check_server_rpc(server_handle[0], req_str.as_cstr(), req_str.length())
+      if rc >= 0 {
+        let resp = cstr_to_str(c_check_server_last_resp(server_handle[0]))
+        if is_valid_check_server_resp(resp, req_id) {
+          return Some(restore_probe_aliases(resp, temp_to_orig, join_path(check_server_dir, "src")))
+        }
+      }
+      c_check_server_stop(server_handle[0])
+      server_handle[0] = -1
+      server_disabled[0] = true
+    }
+    None
+  }
+
   let check_cb = fn(batch : Array[(String, String)]) -> String {
     let eff_batch = if verified_companions.length() > 0 {
       let b : Array[(String, String)] = []
@@ -1664,88 +2620,9 @@ pub fn main(world : World) -> Int {
     } else {
       batch
     }
-    if !server_disabled[0] {
-      if server_handle[0] < 0 {
-        let _ = proc_exec(world, ["rm", "-rf", check_server_dir])
-        let srv_src = join_path(check_server_dir, "src")
-        let _ = fs_mkdir_p(world, srv_src)
-        let toml_sb = StringBuilder()
-        toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
-        let imp_sb = StringBuilder()
-        let seen_dep : Map[String, Bool] = Map()
-        for dep in check_deps {
-          if !seen_dep.contains(dep.0) {
-            seen_dep[dep.0] = true
-            toml_sb.write_string(format_pion_dep_line(world, dep.0, dep.1))
-            imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
-          }
-        }
-        let imp_txt = imp_sb.to_string()
-        server_imp_src[0] = imp_txt
-        let _ = fs_write(world, join_path(check_server_dir, "pion.toml"), toml_sb.to_string())
-        if imp_txt.length() > 0 {
-          let _ = fs_write(world, join_path(srv_src, "__mbt_dep_imports.pion"), imp_txt)
-        }
-        let h = c_check_server_start(pionc_bin.as_cstr(), check_server_dir.as_cstr())
-        if h >= 0 {
-          server_handle[0] = h
-        } else {
-          server_disabled[0] = true
-        }
-      }
-      if server_handle[0] >= 0 {
-        // Deduplicate root-relative paths (last wins, matching `fs_write` semantics) to satisfy strict JSON no-dup-keys.
-        let rel_order : Array[String] = []
-        let rel_src : Map[String, String] = Map()
-        if server_imp_src[0].length() > 0 {
-          let imp_key = "src/__mbt_dep_imports.pion"
-          rel_order.push(imp_key)
-          rel_src[imp_key] = server_imp_src[0]
-        }
-        for pair in eff_batch {
-          let check_rel = if pair.0.ends_with("_test.pion") {
-            pair.0.slice(0, pair.0.length() - 5) + "__mbt_probe.pion"
-          } else {
-            pair.0
-          }
-          let full_key = "src/" + check_rel
-          if !rel_src.contains(full_key) {
-            rel_order.push(full_key)
-          }
-          rel_src[full_key] = pair.1
-        }
-        server_req_id[0] = server_req_id[0] + 1
-        let req_sb = StringBuilder()
-        req_sb.write_string("{\"id\":")
-        req_sb.write_string(server_req_id[0].to_string())
-        req_sb.write_string(",\"files\":{")
-        let mut first_f = true
-        for rk in rel_order {
-          match rel_src.get(rk) {
-            Some(src_txt) => {
-              if !first_f { req_sb.write_string(",") }
-              first_f = false
-              req_sb.write_string(json_quote_str(rk))
-              req_sb.write_string(":")
-              req_sb.write_string(json_quote_str(src_txt))
-            }
-            None => ()
-          }
-        }
-        req_sb.write_string("},\"full_replace\":true}")
-        let req_str = req_sb.to_string()
-        let req_id = server_req_id[0]
-        let rc = c_check_server_rpc(server_handle[0], req_str.as_cstr(), req_str.length())
-        if rc >= 0 {
-          let resp = cstr_to_str(c_check_server_last_resp(server_handle[0]))
-          if is_valid_check_server_resp(resp, req_id) {
-            return m2p::str_replace_all(resp, "__mbt_probe.pion", ".pion")
-          }
-        }
-        c_check_server_stop(server_handle[0])
-        server_handle[0] = -1
-        server_disabled[0] = true
-      }
+    match run_server_rpc(eff_batch, false) {
+      Some(resp) => return resp
+      None => ()
     }
     let (_, raw_out) = run_pionc_check_batch_status(
       world,
@@ -1756,6 +2633,21 @@ pub fn main(world : World) -> Int {
       eff_batch,
     )
     raw_out
+  }
+
+  let query_types_cb = fn(batch : Array[(String, String)]) -> String {
+    let eff_batch = if verified_companions.length() > 0 {
+      let b : Array[(String, String)] = []
+      for item in batch { b.push(item) }
+      for vc in verified_companions { b.push((vc.0, vc.1)) }
+      b
+    } else {
+      batch
+    }
+    match run_server_rpc(eff_batch, true) {
+      Some(resp) => resp
+      None => ""
+    }
   }
 
   // Wave M1.2 A.5: load ALL target enums & fn signatures from `--dep` packages via `pionc doc --json`
@@ -1899,7 +2791,7 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  let res = m2p::transpile_package_with_abis_and_companions(
+  let res = m2p::transpile_package_with_query_types(
     sources,
     api_map,
     recipes,
@@ -1913,6 +2805,7 @@ pub fn main(world : World) -> Int {
     pre_diags,
     run_probes,
     check_cb,
+    query_types_cb,
   )
 
   if server_handle[0] >= 0 {
@@ -2412,12 +3305,18 @@ pub fn main(world : World) -> Int {
         fs_fatal_err = view_err
       } else if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
         let rem_diags = m2p::parse_pionc_diagnostics(chk_raw)
+        let first_detail = if rem_diags.length() > 0 {
+          let d0 = rem_diags[0]
+          "; first: [" + d0.code + "] " + d0.file + ": " + d0.message
+        } else {
+          ""
+        }
         final_diags.push(m2p::diag_error(
           "MBT2PION_FINAL_CHECK_FAILED",
           "<final_check>",
           1,
           1,
-          "final pionc check --json failed on candidate package (exit_ok=" + chk_ok.to_string() + ", diagnostics=" + rem_diags.length().to_string() + ")",
+          "final pionc check --json failed on candidate package (exit_ok=" + chk_ok.to_string() + ", diagnostics=" + rem_diags.length().to_string() + ")" + first_detail,
         ))
         final_blockers = final_blockers + 1
       }
