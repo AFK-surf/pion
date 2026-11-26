@@ -400,6 +400,8 @@ sh "$ROOT_DIR/tests/e2e/p31c_jsx_dot/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p32a_toolchain/run_e2e.sh" "$PIONC2"
 # P32-B: multi-package virtual [workspace], [workspace.dependencies], { workspace = true }, shared pion.lock, CLI --package/-p.
 sh "$ROOT_DIR/tests/e2e/p32b_workspace/run_e2e.sh" "$PIONC2"
+# P32-D: external path/git deps inherit `{ workspace = true }` from their own enclosing [workspace], never the consumer's.
+sh "$ROOT_DIR/tests/e2e/p32d_external_ws_dep/run_e2e.sh" "$PIONC2"
 # P32-C: amd64_sysv direct ELF64 XMM stack-arg encoding (>8 Double/Float + mixed GPR/XMM).
 sh "$ROOT_DIR/tests/e2e/p32c_abi_fp_stack/run_e2e.sh" "$PIONC2"
 # P33-B: multi-package incremental CAS for `pionc check` (.pionsig/.pionstub) & `pionc build --target wasm32` (.ssa/.wasm).
