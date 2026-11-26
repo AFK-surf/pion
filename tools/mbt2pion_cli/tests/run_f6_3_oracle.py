@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+r"""Wave F6-3a 4-Target Differential Oracle & Adversarial Soundness Suite:
+MoonBit native == MoonBit wasm-gc == Pion native == Pion wasm32.
+
+Positive 4-target parity cases:
+  1. Gate A: non-escaping local array `for v in faded { ... }; faded.clear(); faded.shrink_to_fit()`.
+  2. Gate B: pure `Array::search_by` penetrating method body `View::same`.
+  3. Gate C: pure immediate `.iter().any` / `.all` / `.find_first` penetrating `View::alive -> live`,
+     including an uncalled sibling closure containing `clear()` / `remove(0)`.
+  4. Gate D: `for x in recv()[lo():hi()]` where `hi()` appends `3` to `[1, 2]` and returns `3`
+     (exact trace `recv -> lo -> hi`, yields `2,3`), `[1,2,3][-2:99]` -> `1,2,3`, `[2:1]` -> empty,
+     empty array `arr[1:]`, and `for k in visible[1:]` with multiple `break`s.
+
+Negative fail-closed soundness cases (ALL 7 mutation_summary classes + Gate A/B/C/D adversaries):
+  1. Class 1: trait dispatch (`dyn Checker` / generic trait bound) inside callback -> fail-closed.
+  2. Class 2: operator `impl Add` mutating array inside callback -> fail-closed.
+  3. Class 3: re-entrant stored closure in array/struct called inside `.iter().any` -> fail-closed.
+  4. Class 3b: public API `KeyWhen::All(ws)` + `has : (String) -> Bool` callback -> fail-closed.
+  5. Class 4: unknown external / opaque callback mutating array -> fail-closed.
+  6. Class 5: generic `fn[T]` writing `Array[T]` called inside `.search_by` -> fail-closed.
+  7. Class 6: field reassignment `self.items = []` inside `.iter().any` -> fail-closed.
+  8. Class 7: mutating `Array` method / index write `ws[1] = ...` inside `for k in ws[1:]` -> fail-closed.
+  9. Gate A adversary: capacity 8, `[1]`, kept `let it = a.iter()`, `a.shrink_to_fit()`, `a[0] = 9` -> fail-closed.
+"""
+import argparse, json, os, shutil, subprocess, sys, tempfile
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
+COMPAT_DIR = os.path.join(REPO_ROOT, "tools", "mbt_compat")
+CLI_DIR = os.path.join(REPO_ROOT, "tools", "mbt2pion_cli")
+
+POSITIVE_MBT = r'''
+pub struct View {
+  id : Int
+  alive_flag : Bool
+}
+
+fn View::same(self : View, other : View) -> Bool {
+  self.id == other.id
+}
+
+fn live(v : View) -> Bool {
+  v.alive_flag && v.id > 0
+}
+
+fn View::alive(self : View) -> Bool {
+  live(self)
+}
+
+fn score(v : Int) -> Int {
+  v * 2 + 1
+}
+
+// Gate A: non-escaping local array allocated via `Array::make` iterated then cleared and shrunk
+// (unlocks `mutation_summary_allow_a` in drift_ledger)
+pub fn run_gate_a() -> String {
+  let faded : Array[Int] = Array::make(3, 10)
+  let mut total = 0
+  for v in faded {
+    total = total + score(v)
+  }
+  faded.clear()
+  faded.shrink_to_fit()
+  total.to_string() + ":" + faded.length().to_string()
+}
+
+// Gate B: pure `search_by` penetrating `View::same`
+pub fn run_gate_b() -> String {
+  let v1 = View::{ id: 1, alive_flag: true }
+  let v2 = View::{ id: 2, alive_flag: false }
+  let v3 = View::{ id: 3, alive_flag: true }
+  let entries : Array[(View, Int)] = [(v1, 100), (v2, 200), (v3, 300)]
+  let r1 = match entries.search_by(fn(e) { e.0.same(v2) }) {
+    Some(i) => i.to_string()
+    None => "none"
+  }
+  let missing = View::{ id: 99, alive_flag: true }
+  let r2 = match entries.search_by(fn(e) { e.0.same(missing) }) {
+    Some(i) => i.to_string()
+    None => "none"
+  }
+  r1 + "|" + r2
+}
+
+// Gate C: pure immediate `.iter().any` / `.all` / `.find_first` penetrating `View::alive -> live`,
+// with an uncalled sibling closure that contains `clear()` and `remove(0)`.
+pub fn run_gate_c() -> String {
+  let xs : Array[View] = [
+    View::{ id: 1, alive_flag: false },
+    View::{ id: 2, alive_flag: true },
+    View::{ id: 3, alive_flag: true },
+  ]
+  let sibling_mut = fn() {
+    if xs.length() > 0 {
+      let _ = xs.remove(0)
+    }
+    xs.clear()
+  }
+  let _ = sibling_mut
+  let has_any = xs.iter().any(fn(o) { o.alive() })
+  let all_alive = xs.iter().all(fn(o) { o.alive() })
+  let first_id = match xs.iter().find_first(fn(o) { o.alive() }) {
+    Some(v) => v.id
+    None => -1
+  }
+  has_any.to_string() + "|" + all_alive.to_string() + "|" + first_id.to_string() + "|" + xs.length().to_string()
+}
+
+fn run_slice_len_rebind(init : Array[Int]) -> Int {
+  let mut xs : Array[Int] = init
+  let get_lo = fn() -> Int {
+    xs = [8]
+    0
+  }
+  xs[get_lo():].length()
+}
+
+// Gate D: borrowed slice loops with exact eval order, clamping, empty array, and multiple breaks
+pub fn run_gate_d() -> String {
+  let trace : Array[String] = []
+  let arr : Array[Int] = [1, 2]
+  let get_recv = fn() -> Array[Int] {
+    trace.push("recv")
+    arr
+  }
+  let get_lo = fn() -> Int {
+    trace.push("lo")
+    1
+  }
+  let get_hi = fn() -> Int {
+    trace.push("hi")
+    arr.push(3)
+    3
+  }
+  let seen1 : Array[String] = []
+  for x in get_recv()[get_lo():get_hi()] {
+    seen1.push(x.to_string())
+  }
+
+  let base : Array[Int] = [1, 2, 3]
+  let seen2 : Array[String] = []
+  for x in base[-2:99] {
+    seen2.push(x.to_string())
+  }
+  let seen3 : Array[String] = []
+  for x in base[2:1] {
+    seen3.push(x.to_string())
+  }
+  let empty_a : Array[Int] = []
+  let seen4 : Array[String] = []
+  for x in empty_a[1:] {
+    seen4.push(x.to_string())
+  }
+
+  let visible : Array[View] = [
+    View::{ id: 10, alive_flag: true },
+    View::{ id: 20, alive_flag: true },
+    View::{ id: 30, alive_flag: false },
+    View::{ id: 40, alive_flag: true },
+  ]
+  let mut stop_id = -1
+  let seen5 : Array[String] = []
+  for k in visible[1:] {
+    if !k.alive() {
+      stop_id = k.id
+      break
+    }
+    seen5.push(k.id.to_string())
+    if k.id == 99 {
+      stop_id = 99
+      break
+    }
+  }
+
+  let mut xs_rebind : Array[Int] = [1, 2, 3]
+  let get_lo_rebind = fn() -> Int {
+    xs_rebind = [8]
+    0
+  }
+  let seen6 : Array[String] = []
+  for x in xs_rebind[get_lo_rebind():] {
+    seen6.push(x.to_string())
+  }
+
+  let mut xs_rebind2 : Array[Int] = [1, 2, 3]
+  let get_lo_rebind2 = fn() -> Int {
+    xs_rebind2 = [8]
+    0
+  }
+  let seen7 : Array[String] = []
+  for x in xs_rebind2[get_lo_rebind2():xs_rebind2.length()] {
+    seen7.push(x.to_string())
+  }
+
+  let mut xs_rebind3 : Array[Int] = [1, 2, 3]
+  let get_lo_rebind3 = fn() -> Int {
+    xs_rebind3 = [8]
+    0
+  }
+  let seen8 : Array[String] = []
+  for x in xs_rebind3[get_lo_rebind3():].to_array() {
+    seen8.push(x.to_string())
+  }
+
+  let len_rebind4 = run_slice_len_rebind([1, 2, 3])
+
+  let lo_paren = fn(s : String) -> Int {
+    s.length()
+  }
+  let seen9 : Array[String] = []
+  for x in base[lo_paren(")"):3] {
+    seen9.push(x.to_string())
+  }
+  let seen10 : Array[String] = []
+  for x in base[0:lo_paren(")")] {
+    seen10.push(x.to_string())
+  }
+
+  trace.join(">") + ":" + seen1.join(",") + "|" +
+    seen2.join(",") + "|" + seen3.join(",") + "|" + seen4.join(",") + "|" +
+    seen5.join(",") + ":" + stop_id.to_string() + "|" +
+    seen6.join(",") + "|" + seen7.join(",") + "|" +
+    seen8.join(",") + "|" + len_rebind4.to_string() + "|" +
+    seen9.join(",") + "|" + seen10.join(",")
+}
+
+pub fn run_all() -> String {
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d()
+}
+'''
+
+NEGATIVE_CASES = [
+    (
+        "neg_class1_trait_dispatch",
+        r'''
+trait Pred {
+  test_it(Self) -> Bool
+}
+fn[T : Pred] run(xs : Array[T]) -> Bool {
+  xs.iter().any(fn(x) { x.test_it() })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_class2_impl_add_mutates",
+        r'''
+struct BadNum {
+  xs : Array[Int]
+}
+impl Add for BadNum with add(self, other) {
+  self.xs.clear()
+  other
+}
+fn run(xs : Array[Int], b : BadNum) -> Int? {
+  xs.search_by(fn(_x) {
+    let _ = b + b
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_class3_reentrant_stored_closure",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  let killer = fn() { xs.clear() }
+  let box_cb : Array[() -> Unit] = [killer]
+  xs.iter().any(fn(x) {
+    (box_cb[0])()
+    x > 0
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_class3b_keywhen_param_cb",
+        r'''
+pub(all) enum KeyWhen {
+  All(Array[String])
+}
+pub fn matches(kw : KeyWhen, has : (String) -> Bool) -> Bool {
+  match kw {
+    All(ws) => ws.iter().all(fn(k) { has(k) })
+  }
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_class5_generic_array_write",
+        r'''
+fn[T] push_any(xs : Array[T], v : T) -> Unit {
+  xs.push(v)
+}
+pub fn run(xs : Array[Int]) -> Int? {
+  xs.search_by(fn(x) {
+    push_any(xs, x)
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_class6_field_reassign",
+        r'''
+struct Bag {
+  mut items : Array[Int]
+}
+fn Bag::reset(self : Bag) -> Unit {
+  self.items = []
+}
+pub fn run(b : Bag) -> Bool {
+  b.items.iter().any(fn(x) {
+    b.reset()
+    x > 0
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_class7_slice_loop_index_write",
+        r'''
+pub fn run(ws : Array[Int]) -> Int {
+  let mut acc = 0
+  for k in ws[1:] {
+    ws[0] = k
+    acc = acc + k
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
+    ),
+    (
+        "neg_gate_a_cap8_kept_iter_shrink",
+        r'''
+pub fn run() -> Int {
+  let a : Array[Int] = Array::new(capacity=8)
+  a.push(1)
+  let it = a.iter()
+  a.shrink_to_fit()
+  a[0] = 9
+  match it.head() {
+    Some(v) => v
+    None => -1
+  }
+}
+''',
+        "MBT2PION_ARRAY_SHRINK_ITER",
+    ),
+    (
+        "neg_class2_impl_eq_with_equal",
+        r'''
+struct EvilEq {
+  xs : Array[Int]
+}
+impl Eq for EvilEq with equal(self, other) {
+  self.xs.clear()
+  let _ = other
+  true
+}
+pub fn run(xs : Array[Int], a : EvilEq, b : EvilEq) -> Int? {
+  xs.search_by(fn(_x) {
+    a == b
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_class2_unary_neg_newline",
+        r'''
+struct EvilNeg {
+  xs : Array[Int]
+}
+impl Neg for EvilNeg with neg(self) {
+  self.xs.clear()
+  self
+}
+pub fn run(xs : Array[Int], b : EvilNeg) -> Int? {
+  xs.search_by(fn(_x) {
+    let y = 1
+    let _ = y
+    let _ =
+    -(b)
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_iter_next_lazy_mut",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  let it = xs.iter().map(fn(x) {
+    xs.clear()
+    x
+  })
+  xs.iter().any(fn(_x) {
+    let _ = it.next()
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_static_hof_fixed_array_makei",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    let _ = FixedArray::makei(1, fn(_) {
+      xs.clear()
+      0
+    })
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_static_hof_option_map",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    let _ = Option::map(Some(1), fn(_) {
+      xs.clear()
+      0
+    })
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_pattern_shadow_pure_fn",
+        r'''
+fn helper() -> Unit {
+  ()
+}
+pub fn run(xs : Array[Int], opt : (() -> Unit)?) -> Bool {
+  xs.iter().any(fn(_x) {
+    match opt {
+      Some(helper) => helper()
+      None => ()
+    }
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_gate_c_fresh_local_reentrant",
+        r'''
+pub fn run() -> Bool {
+  let xs : Array[Int] = [1, 2, 3]
+  let k = fn() { xs.clear() }
+  let bs : Array[() -> Unit] = [k]
+  xs.iter().any(fn(_) {
+    (bs[0])()
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_gate_d_opaque_cb_slice",
+        r'''
+pub fn run(xs : Array[Int], cb : (Int) -> Int) -> Int {
+  let mut acc = 0
+  for x in xs[1:] {
+    acc = acc + cb(x)
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
+    ),
+    (
+        "neg_gate_d_labeled_for_slice",
+        r'''
+pub fn run(xs : Array[Int]) -> Int {
+  let mut acc = 0
+  outer~: for x in xs[1:] {
+    acc = acc + x
+    if x > 10 {
+      break outer~
+    }
+  }
+  acc
+}
+pub fn probe(x : Int) -> Int {
+  x + 1
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r7_top_let_labeled_loop",
+        r'''
+let value : Int = outer~: for x in [3] { break outer~ x } nobreak { 4 }
+pub fn get_value() -> Int {
+  value
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r7_interp_labeled_loop",
+        r'''
+pub fn run() -> Int {
+  "\{outer~: for x in [3] { break outer~ x } nobreak { 4 }}".length()
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r8_nested_interp_rbrace_labeled_loop",
+        r'''fn pick(_s : String, x : Int) -> Int { x }
+pub fn probe() -> Int {
+  "\{pick("\{"}"}", outer~: for x in [3] { break outer~ x } nobreak { 4 })}".length()
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r8_nested_interp_lbrace_labeled_loop",
+        r'''fn pick(_s : String, x : Int) -> Int { x }
+pub fn probe() -> Int {
+  "\{pick("\{"{"}", outer~: for x in [3] { break outer~ x } nobreak { 4 })}".length()
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_r8_keyword_label_loop",
+        r'''pub fn probe() -> Int {
+  not~: loop 3 { v => break not~ v }
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_gate_a_kept_iter2_shrink",
+        r'''
+pub fn run() -> Int {
+  let a : Array[Int] = Array::make(3, 1)
+  let it = a.iter2()
+  a.shrink_to_fit()
+  a[0] = 9
+  let _ = it
+  a.length()
+}
+''',
+        "MBT2PION_ARRAY_SHRINK_ITER",
+    ),
+    (
+        "neg_r3_bare_iife_gate_b",
+        r'''
+pub fn run(xs : Array[Int]) -> Int? {
+  let mut n = 0
+  xs.search_by(fn(_x) {
+    n = n + 1
+    fn() { xs.clear() }()
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_r3_bare_iife_gate_c",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    fn() { xs.clear() }()
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_shadow_for_outer_array_type",
+        r'''
+struct Item {
+  id : Int
+}
+pub fn run(a : Array[Int], items : Array[Item], groups : Array[Array[Item]]) -> Bool {
+  let _ = a
+  items.iter().any(fn(it) {
+    for a in groups {
+      a.push(it)
+    }
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_shadow_unknown_let_gate_d",
+        r'''
+struct Item {
+  id : Int
+}
+pub fn run(a : Array[Int], cond : Bool, items : Array[Item]) -> Int {
+  let _ = a
+  let mut acc = 0
+  for it in items[0:1] {
+    let a = if cond { items } else { items }
+    a.push(it)
+    acc = acc + it.id
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
+    ),
+    (
+        "neg_r3_struct_pat_shadow_pure_fn",
+        r'''
+struct Box {
+  cb : () -> Unit
+}
+fn helper() -> Unit {
+  ()
+}
+pub fn run(xs : Array[Int], b : Box) -> Bool {
+  xs.iter().any(fn(_x) {
+    match b {
+      { cb: helper } => helper()
+    }
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_qualified_pipe_gate_d",
+        r'''
+struct W {
+  n : Int
+}
+fn W::grow(xs : Array[Int]) -> Unit {
+  xs.push(9)
+}
+pub fn run(xs : Array[Int]) -> Int {
+  let mut acc = 0
+  for v in xs[0:2] {
+    xs |> W::grow
+    acc = acc + v
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
+    ),
+]
+
+
+def run_cmd(cmd, cwd=None, check=True, env=None):
+    p = subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({p.returncode}): {' '.join(cmd)}\nSTDOUT:\n{p.stdout}\nSTDERR:\n{p.stderr}"
+        )
+    return p
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pionc", required=True)
+    args = ap.parse_args()
+    pionc = os.path.abspath(args.pionc)
+
+    moon = shutil.which("moon")
+    if not moon:
+        cand = os.path.expanduser("~/.moon/bin/moon")
+        if os.path.isfile(cand):
+            moon = cand
+    node = shutil.which("node")
+    if not moon or not node:
+        print(f"FAIL: missing required tools: moon={moon} node={node}", file=sys.stderr)
+        sys.exit(2)
+
+    with tempfile.TemporaryDirectory(prefix="f6_3_oracle_") as tmp:
+        # 1. Build mbt2pion CLI
+        cli_bin = os.path.join(tmp, "mbt2pion_cli")
+        run_cmd([pionc, "build", "-o", cli_bin, CLI_DIR], cwd=REPO_ROOT)
+
+        # 2. Run MoonBit native & wasm-gc reference oracle
+        mbt_dir = os.path.join(tmp, "mbt_ref")
+        os.makedirs(os.path.join(mbt_dir, "src"), exist_ok=True)
+        with open(os.path.join(mbt_dir, "moon.mod"), "w") as f:
+            f.write('name = "oracle/f63"\n')
+        with open(os.path.join(mbt_dir, "src", "moon.pkg"), "w") as f:
+            f.write('options("is-main": true)\n')
+        with open(os.path.join(mbt_dir, "src", "main.mbt"), "w") as f:
+            f.write(POSITIVE_MBT + "\nfn main {\n  println(run_all())\n}\n")
+
+        moon_native_out = run_cmd([moon, "run", "--target", "native", "src"], cwd=mbt_dir).stdout.strip()
+        moon_wasm_out = run_cmd([moon, "run", "--target", "wasm-gc", "src"], cwd=mbt_dir).stdout.strip()
+        if moon_native_out != moon_wasm_out:
+            raise RuntimeError(f"MoonBit native vs wasm-gc mismatch:\n  native: {moon_native_out}\n  wasm-gc: {moon_wasm_out}")
+        print(f"[MOONBIT] native == wasm-gc: {moon_native_out}")
+
+        # 3. Transpile positive package with mbt2pion
+        src_dir = os.path.join(tmp, "pos_src")
+        out_dir = os.path.join(tmp, "pos_out")
+        ledger_path = os.path.join(tmp, "pos_ledger.json")
+        os.makedirs(src_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(src_dir, "lib.mbt"), "w") as f:
+            f.write(POSITIVE_MBT)
+        with open(os.path.join(src_dir, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        run_cmd([
+            cli_bin,
+            "--src", src_dir,
+            "--out", out_dir,
+            "--drift-ledger", ledger_path,
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+
+        # Verify drift_ledger records allow entries for B, C, D (and A where applicable)
+        with open(ledger_path) as f:
+            ledger = json.load(f)
+        cats = set(e.get("category", "") for e in ledger.get("entries", []))
+        print(f"[LEDGER] categories: {sorted(cats)} unresolved={ledger.get('unresolved_entries')}")
+        if ledger.get("unresolved_entries", 1) != 0:
+            raise RuntimeError(f"Unexpected unresolved ledger entries: {ledger}")
+        for req_cat in ("mutation_summary_allow_a", "mutation_summary_allow_b", "mutation_summary_allow_c", "mutation_summary_allow_d"):
+            if req_cat not in cats:
+                raise RuntimeError(f"Missing expected allow ledger category `{req_cat}` in {sorted(cats)}")
+
+        # 4. Build & run Pion native and wasm32
+        with open(os.path.join(out_dir, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "f63_app"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        with open(os.path.join(out_dir, "main.pion"), "w") as f:
+            f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_all())\n  0\n}\n")
+
+        pion_native_bin = os.path.join(tmp, "f63_native")
+        run_cmd([pionc, "build", "-o", pion_native_bin, out_dir], cwd=REPO_ROOT)
+        pion_native_out = run_cmd([pion_native_bin]).stdout.strip()
+
+        pion_wasm_bin = os.path.join(tmp, "f63_wasm.wasm")
+        run_cmd([pionc, "build", "--target", "wasm32", "-o", pion_wasm_bin, out_dir], cwd=REPO_ROOT)
+        pion_wasm_out = run_cmd([node, os.path.join(REPO_ROOT, "runtime", "pion_wasm_rt.mjs"), pion_wasm_bin]).stdout.strip()
+
+        if pion_native_out != moon_native_out:
+            raise RuntimeError(f"Pion native mismatch!\n  expected: {moon_native_out}\n  got:      {pion_native_out}")
+        if pion_wasm_out != moon_native_out:
+            raise RuntimeError(f"Pion wasm32 mismatch!\n  expected: {moon_native_out}\n  got:      {pion_wasm_out}")
+        print(f"[PION] native == wasm32 == MoonBit: {pion_native_out}")
+
+        # 5. Negative adversarial fail-closed cases:
+        #    (a) Verify EVERY negative case is valid MoonBit via `moon check`
+        #    (b) Verify `mbt2pion --mode publish` exits non-zero, emits no `--out`,
+        #        does not fail via accidental `E_PARSE`, emits expected gate diagnostic,
+        #        and records NO `mutation_summary_allow_*` in ledger.
+        for name, mbt_code, expected_diag in NEGATIVE_CASES:
+            nmod = os.path.join(tmp, f"{name}_mod")
+            nsrc = os.path.join(nmod, "src")
+            nout = os.path.join(tmp, f"{name}_out")
+            nrep = os.path.join(tmp, f"{name}_rep.json")
+            nreport = os.path.join(tmp, f"{name}_report.json")
+            os.makedirs(nsrc, exist_ok=True)
+            with open(os.path.join(nmod, "moon.mod"), "w") as f:
+                f.write(f'name = "neg/{name}"\n')
+            with open(os.path.join(nsrc, "moon.pkg"), "w") as f:
+                f.write("")
+            with open(os.path.join(nsrc, "bad.mbt"), "w") as f:
+                f.write(mbt_code)
+            mc = run_cmd([moon, "check"], cwd=nmod, check=False)
+            if mc.returncode != 0:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` IS NOT VALID MOONBIT (`moon check` failed rc={mc.returncode}):\n{mc.stdout}\n{mc.stderr}"
+                )
+            with open(os.path.join(nsrc, "moon.pkg.json"), "w") as f:
+                f.write("{}\n")
+            p = run_cmd([
+                cli_bin,
+                "--src", nsrc,
+                "--out", nout,
+                "--drift-ledger", nrep,
+                "--report", nreport,
+                "--pionc", pionc,
+                "--mbt-compat", COMPAT_DIR,
+                "--no-fmt",
+                "--mode", "publish",
+            ], cwd=REPO_ROOT, check=False)
+            combined_err = p.stdout + "\n" + p.stderr
+            if p.returncode == 0 or os.path.exists(nout):
+                raise RuntimeError(
+                    f"SOUNDNESS FAILURE: negative case `{name}` was NOT fail-closed! rc={p.returncode}, out_exists={os.path.exists(nout)}\n{combined_err}"
+                )
+            if "E_PARSE" in combined_err:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` failed with accidental E_PARSE instead of gate `{expected_diag}`:\n{combined_err}"
+                )
+            if expected_diag and expected_diag not in combined_err:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` did not emit expected diagnostic `{expected_diag}`:\n{combined_err}"
+                )
+            if os.path.exists(nrep):
+                with open(nrep) as rf:
+                    nledger = json.load(rf)
+                ncats = [e.get("category", "") for e in nledger.get("entries", [])]
+                allow_hits = [c for c in ncats if c.startswith("mutation_summary_allow_")]
+                if allow_hits:
+                    raise RuntimeError(
+                        f"SOUNDNESS FAILURE: negative case `{name}` unexpectedly logged allow categories {allow_hits}"
+                    )
+            if name == "neg_gate_d_labeled_for_slice":
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:run") != "unsupported" or disps.get("fn:probe") != "transpiled":
+                    raise RuntimeError(
+                        f"REPORT DISPOSITION MISMATCH for `{name}`: expected fn:run=unsupported, fn:probe=transpiled; got {disps}"
+                    )
+            elif name in ("neg_r8_nested_interp_rbrace_labeled_loop", "neg_r8_nested_interp_lbrace_labeled_loop"):
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:probe") != "unsupported" or "bad.mbt:3:21" not in combined_err:
+                    raise RuntimeError(
+                        f"REPORT/LOC MISMATCH for `{name}`: expected bad.mbt:3:21 and fn:probe=unsupported; got disps={disps}\n{combined_err}"
+                    )
+            elif name == "neg_r8_keyword_label_loop":
+                with open(nreport) as rf:
+                    rep_json = json.load(rf)
+                disps = {d.get("decl"): d.get("disposition") for d in rep_json.get("dispositions", [])}
+                if disps.get("fn:probe") != "unsupported" or "bad.mbt:2:3" not in combined_err:
+                    raise RuntimeError(
+                        f"REPORT/LOC MISMATCH for `{name}`: expected bad.mbt:2:3 and fn:probe=unsupported; got disps={disps}\n{combined_err}"
+                    )
+            print(f"[NEG PASS] {name}: moon check OK, fail-closed with {expected_diag} (rc={p.returncode})")
+
+        # 6. Cross-package dependency mutation negative case (Class 4):
+        #    `dep::mutate(xs)` clears `xs`; consumer calls `@dep.mutate(xs)` inside `.iter().any(...)`.
+        xp_mod = os.path.join(tmp, "xp_mod")
+        xp_dep = os.path.join(xp_mod, "dep")
+        xp_app = os.path.join(xp_mod, "app")
+        xp_dep_pkg = os.path.join(tmp, "xp_dep_pkg")
+        xp_dep_out = os.path.join(xp_dep_pkg, "src")
+        xp_app_out = os.path.join(tmp, "xp_app_out")
+        xp_app_rep = os.path.join(tmp, "xp_app_rep.json")
+        os.makedirs(xp_dep, exist_ok=True)
+        os.makedirs(xp_app, exist_ok=True)
+        os.makedirs(xp_dep_out, exist_ok=True)
+        with open(os.path.join(xp_dep_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "dep"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        with open(os.path.join(xp_mod, "moon.mod"), "w") as f:
+            f.write('name = "neg/xp"\n')
+        with open(os.path.join(xp_dep, "moon.pkg"), "w") as f:
+            f.write("")
+        with open(os.path.join(xp_dep, "lib.mbt"), "w") as f:
+            f.write("pub fn mutate(xs : Array[Int]) -> Unit {\n  xs.clear()\n}\n")
+        with open(os.path.join(xp_app, "moon.pkg"), "w") as f:
+            f.write('import {\n  "neg/xp/dep" @dep,\n}\n')
+        with open(os.path.join(xp_app, "lib.mbt"), "w") as f:
+            f.write("pub fn run(xs : Array[Int]) -> Bool {\n  xs.iter().any(fn(_x) {\n    @dep.mutate(xs)\n    true\n  })\n}\n")
+        mc_xp = run_cmd([moon, "check"], cwd=xp_mod, check=False)
+        if mc_xp.returncode != 0:
+            raise RuntimeError(f"Cross-pkg negative case failed `moon check`:\n{mc_xp.stdout}\n{mc_xp.stderr}")
+        with open(os.path.join(xp_dep, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        with open(os.path.join(xp_app, "moon.pkg.json"), "w") as f:
+            f.write('{"import": [{"path": "neg/xp/dep", "alias": "dep"}]}\n')
+        run_cmd([
+            cli_bin,
+            "--src", xp_dep,
+            "--out", xp_dep_out,
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        p_xp = run_cmd([
+            cli_bin,
+            "--src", xp_app,
+            "--out", xp_app_out,
+            "--dep", f"dep={xp_dep_pkg}",
+            "--drift-ledger", xp_app_rep,
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT, check=False)
+        xp_err = p_xp.stdout + "\n" + p_xp.stderr
+        if p_xp.returncode == 0 or os.path.exists(xp_app_out) or "E_PARSE" in xp_err or "MBT2PION_ARRAY_ITER_MUTATION" not in xp_err:
+            raise RuntimeError(
+                f"SOUNDNESS FAILURE: cross-package dep mutation was NOT fail-closed with MBT2PION_ARRAY_ITER_MUTATION! rc={p_xp.returncode}\n{xp_err}"
+            )
+        if os.path.exists(xp_app_rep):
+            with open(xp_app_rep) as rf:
+                xp_ledger = json.load(rf)
+            xp_cats = [e.get("category", "") for e in xp_ledger.get("entries", [])]
+            xp_allow = [c for c in xp_cats if c.startswith("mutation_summary_allow_")]
+            if xp_allow:
+                raise RuntimeError(
+                    f"SOUNDNESS FAILURE: cross-package dep mutation unexpectedly logged allow categories {xp_allow}"
+                )
+        print(f"[NEG PASS] neg_class4_cross_pkg_dep_mut: moon check OK, fail-closed with MBT2PION_ARRAY_ITER_MUTATION (rc={p_xp.returncode})")
+
+    print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases: ALL OK")
+
+
+if __name__ == "__main__":
+    main()

@@ -1860,7 +1860,8 @@ pub fn run_stage_b_with_ops_deps_and_qt(
 
   let mut need_qt_for_capacity = false
   for f in cur_files {
-    if str_has(f.content, "shrink_to_fit") || str_has(f.content, ".iter(") {
+    if str_has(f.content, "shrink_to_fit") || str_has(f.content, ".iter(") ||
+    str_has(f.content, "__mbt_slice_borrow") || str_has(f.content, ".search_by(") {
       need_qt_for_capacity = true
       break
     }
@@ -1919,6 +1920,8 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     let mut round_pkg_fns : Option[Map[String, StageBPkgFn]] = None
     let round_file_tokens : Map[String, Array[Token]] = Map()
     let mut round_shrink_pkg : Option[ShrinkPkg] = None
+    let mut round_shrink_pkg_summary : Option[ShrinkPkg] = None
+    let mut round_mut_summary : Option[PkgMutationSummary] = None
     let mut round_sort_key_env : Option[SortKeyEnv] = None
     let get_all_round_tokens = fn() -> Array[Array[Token]] {
       let out : Array[Array[Token]] = []
@@ -1926,6 +1929,42 @@ pub fn run_stage_b_with_ops_deps_and_qt(
         out.push(stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, cf.rel_path, cf.content))
       }
       out
+    }
+    let get_mut_summary = fn() -> PkgMutationSummary {
+      match round_mut_summary {
+        Some(ms) => ms
+        None => {
+          let toks = get_all_round_tokens()
+          let rels : Array[String] = []
+          let contents : Array[String] = []
+          for cf in cur_files {
+            rels.push(cf.rel_path)
+            contents.push(cf.content)
+          }
+          let qt_use = if round0_qt.ok && !any_round_changed { round0_qt } else { empty_pkg_query_types() }
+          let ms = collect_pkg_mutation_summary(toks, rels, contents, qt_use, dep_methods, op_lookup)
+          round_mut_summary = Some(ms)
+          ms
+        }
+      }
+    }
+    let get_shrink_pkg_summary = fn() -> ShrinkPkg {
+      match round_shrink_pkg_summary {
+        Some(sp) => sp
+        None => {
+          let toks = get_all_round_tokens()
+          let rels : Array[String] = []
+          let contents : Array[String] = []
+          for cf in cur_files {
+            rels.push(cf.rel_path)
+            contents.push(cf.content)
+          }
+          let qt_use = if round0_qt.ok && !any_round_changed { round0_qt } else { empty_pkg_query_types() }
+          let sp = collect_shrink_pkg_tokens_with_summary(toks, rels, contents, qt_use, get_mut_summary())
+          round_shrink_pkg_summary = Some(sp)
+          sp
+        }
+      }
     }
     let build_shrink_pkg = fn() -> ShrinkPkg {
       let toks = get_all_round_tokens()
@@ -1993,6 +2032,29 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       }
       let mutated_lines : Map[Int, Bool] = Map()
       let mut file_changed = false
+      // Gate D: Rewrite provably read-only `for x in arr[lo:hi]` borrowed-slice loops into
+      // MoonBit-exact clamped index `while` loops before Stage A.5 sees `__mbt_slice_borrow`.
+      if str_has(f.content, "__mbt_slice_borrow") {
+        let ftoks_d = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+        let file_qfi_d : Option[QtFileIndex] = if round0_qt.ok && file_vers.get(f.rel_path) == Some(0) {
+          round0_qt.files.get(f.rel_path)
+        } else {
+          None
+        }
+        if stage_b_rewrite_borrowed_slice_for_loops(
+          lines,
+          ftoks_d,
+          get_mut_summary(),
+          f.rel_path,
+          f.content,
+          file_qfi_d,
+          get_used_idents(),
+          mutated_lines,
+          drift_ledger,
+        ) {
+          file_changed = true
+        }
+      }
       for d in pdiags {
         if !(d.file == f.rel_path || d.file.ends_with("/" + f.rel_path)) {
           continue
@@ -2048,6 +2110,11 @@ pub fn run_stage_b_with_ops_deps_and_qt(
             } else {
               match lookup_missing_method_helper(rty, mname) {
                 Some(helper) => {
+                  let file_qfi_opt : Option[QtFileIndex] = if round0_qt.ok && file_vers.get(f.rel_path) == Some(0) {
+                    round0_qt.files.get(f.rel_path)
+                  } else {
+                    None
+                  }
                   if helper == "mbt_compat::arr_retain" || helper == "mbt_compat::arr_filter_map" ||
                   helper == "mbt_compat::arr_search_by" || helper == "mbt_compat::arr_sort_by_key" {
                     let pkg_fns = match round_pkg_fns {
@@ -2060,17 +2127,53 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                         m
                       }
                     }
-                    stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
+                    if helper == "mbt_compat::arr_search_by" {
+                      let probe_diags : Array[Diag] = []
+                      stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, probe_diags)
+                      let ftoks_b = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+                      let elem_ty_b = ms_extract_array_elem_ty(rty)
+                      let ms_safe = stage_b_check_search_by_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, file_qfi_opt, elem_ty_b, d.line, d.col, probe_diags.length() > 0, drift_ledger)
+                      if !ms_safe {
+                        if probe_diags.length() > 0 {
+                          for pd in probe_diags {
+                            let mut dup = false
+                            for existing in diags {
+                              if existing.code == pd.code && existing.file == pd.file && existing.line == pd.line && existing.col == pd.col {
+                                dup = true
+                                break
+                              }
+                            }
+                            if !dup {
+                              diags.push(pd)
+                            }
+                          }
+                        } else {
+                          let mut dup = false
+                          for existing in diags {
+                            if existing.code == "MBT2PION_UNSUPPORTED_SYNTAX" && existing.file == f.rel_path && existing.line == d.line && existing.col == d.col {
+                              dup = true
+                              break
+                            }
+                          }
+                          if !dup {
+                            diags.push(diag_error(
+                              "MBT2PION_UNSUPPORTED_SYNTAX",
+                              f.rel_path,
+                              d.line,
+                              d.col,
+                              "callback in `Array::search_by(...)` may mutate receiver or aliased array (fail-closed by mutation_summary)",
+                            ))
+                          }
+                        }
+                      }
+                    } else {
+                      stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
+                    }
                   }
                   let mut skip_rewrite = false
-                  let file_qfi_opt : Option[QtFileIndex] = if round0_qt.ok && file_vers.get(f.rel_path) == Some(0) {
-                    round0_qt.files.get(f.rel_path)
-                  } else {
-                    None
-                  }
                   if helper == "mbt_compat::arr_shrink_to_fit" {
                     let ftoks = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
-                    if !stage_b_check_shrink_snapshot_cached(ftoks, get_shrink_pkg(), f.rel_path, f.content, file_qfi_opt, d.line, d.col, diags) {
+                    if !stage_b_check_shrink_snapshot_with_summary(ftoks, get_shrink_pkg(), get_shrink_pkg_summary(), get_mut_summary(), f.rel_path, f.content, file_qfi_opt, d.line, d.col, diags, drift_ledger) {
                       skip_rewrite = true
                     }
                   }
@@ -2083,7 +2186,8 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                   if helper == "mbt_compat::arr_iter" {
                     let _ = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
                     let decl_tys = if round0_qt.ok { get_shrink_pkg().declared_types } else { Map() }
-                    if !stage_b_check_kept_iter(round_file_tokens, f.rel_path, f.content, file_qfi_opt, decl_tys, d.line, d.col, diags) {
+                    let elem_ty_c = ms_extract_array_elem_ty(rty)
+                    if !stage_b_check_kept_iter_with_summary(round_file_tokens, get_mut_summary(), f.rel_path, f.content, file_qfi_opt, decl_tys, elem_ty_c, d.line, d.col, diags, drift_ledger) {
                       skip_rewrite = true
                     }
                   }
@@ -3517,4 +3621,517 @@ fn stage_b_check_push_iter_arg(
     ))
   }
   -1
+}
+
+// ---------------------------------------------------------------------------
+// Wave F6-3a: Unified `mutation_summary` integration for Gates A, B, C, D
+// ---------------------------------------------------------------------------
+
+fn stage_b_record_mutation_allow(
+  drift_ledger : Array[DriftEntry],
+  category : String,
+  file : String,
+  line : Int,
+  col : Int,
+  expr : String,
+  resolution : String,
+  detail : String,
+) -> Unit {
+  for e in drift_ledger {
+    if e.category == category && e.file == file && e.line == line && e.col == col {
+      return
+    }
+  }
+  drift_ledger.push(DriftEntry::{
+    category,
+    file,
+    line,
+    col,
+    expr,
+    resolution,
+    status: "resolved",
+    detail,
+  })
+}
+
+///| Gate A: `Array::shrink_to_fit()` backed by `PkgMutationSummary` + allow ledger.
+fn stage_b_check_shrink_snapshot_with_summary(
+  tokens : Array[Token],
+  shrink_pkg : ShrinkPkg,
+  shrink_pkg_summary : ShrinkPkg,
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  let mut name_i = -1
+  let mut best = 1000000
+  let mut ti = 1
+  while ti + 1 < tokens.length() {
+    if tokens[ti].raw == "shrink_to_fit" && tokens[ti - 1].kind == TokenKind::Dot && tokens[ti].line == line &&
+    tokens[ti + 1].kind == TokenKind::LParen {
+      let dist = if tokens[ti].col >= col { tokens[ti].col - col } else { col - tokens[ti].col }
+      if dist < best {
+        best = dist
+        name_i = ti
+      }
+    }
+    ti = ti + 1
+  }
+  if name_i < 0 {
+    return false
+  }
+  let (why, allowed_by_ms) = shrink_snapshot_hazard_with_summary(
+    tokens,
+    name_i,
+    shrink_pkg,
+    shrink_pkg_summary,
+    mut_summary,
+    content,
+    qfi_opt,
+  )
+  if why.length() == 0 {
+    if allowed_by_ms {
+      stage_b_record_mutation_allow(
+        drift_ledger,
+        "mutation_summary_allow_a",
+        f_rel,
+        line,
+        col,
+        "shrink_to_fit",
+        "mbt_compat::arr_shrink_to_fit",
+        "mutation_summary proved no live iterator/view can observe shrink_to_fit",
+      )
+    }
+    return true
+  }
+  for existing in diags {
+    if existing.code == "MBT2PION_ARRAY_SHRINK_ITER" && existing.file == f_rel && existing.line == line {
+      return false
+    }
+  }
+  diags.push(diag_error(
+    "MBT2PION_ARRAY_SHRINK_ITER",
+    f_rel,
+    line,
+    col,
+    "`Array::shrink_to_fit()` is not supported where a buffer snapshot may observe it: " + why +
+    " (fail-closed: MoonBit moves the elements to a new buffer, a Pion `Array` keeps one storage)",
+  ))
+  false
+}
+
+///| Gate B: `Array::search_by(cb)` callback purity backed by `PkgMutationSummary` + allow ledger.
+fn stage_b_check_search_by_with_summary(
+  tokens : Array[Token],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  elem_ty : String,
+  line : Int,
+  col : Int,
+  record_allow : Bool,
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  let n = tokens.length() - 1
+  let mut dot_i = -1
+  let mut best_dist = 1000000
+  let mut ti = 0
+  while ti + 2 < n {
+    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == "search_by" &&
+    tokens[ti + 2].kind == TokenKind::LParen && tokens[ti + 1].line == line {
+      let dist = if tokens[ti + 1].col >= col { tokens[ti + 1].col - col } else { col - tokens[ti + 1].col }
+      if dist < best_dist {
+        best_dist = dist
+        dot_i = ti
+      }
+    }
+    ti = ti + 1
+  }
+  if dot_i <= 0 {
+    return false
+  }
+  let arg_s = dot_i + 3
+  let arg_e = find_matching_delim(tokens, dot_i + 2)
+  if arg_s >= arg_e {
+    return false
+  }
+  let body_open = outermost_body_open(tokens, dot_i)
+  if body_open < 0 {
+    return false
+  }
+  let active_gen = enclosing_fn_generic_params(tokens, body_open)
+  let sum = summarize_callback_arg(mut_summary, tokens, arg_s, arg_e, body_open, content, qfi_opt, elem_ty, active_gen)
+  if !summary_may_mutate_array(sum, elem_ty) {
+    if record_allow {
+      stage_b_record_mutation_allow(
+        drift_ledger,
+        "mutation_summary_allow_b",
+        f_rel,
+        line,
+        col,
+        "search_by",
+        "mbt_compat::arr_search_by",
+        "mutation_summary proved search_by callback cannot mutate Array[" + elem_ty + "]",
+      )
+    }
+    return true
+  }
+  false
+}
+
+///| Gate C: Immediate `.iter().(any|all|find_first)(cb)` backed by `PkgMutationSummary` + allow ledger.
+fn stage_b_check_kept_iter_with_summary(
+  file_tokens : Map[String, Array[Token]],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  declared_types : Map[String, Bool],
+  elem_ty : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  let tokens = match file_tokens.get(f_rel) {
+    Some(ts) => ts
+    None => {
+      let ts = lex_moonbit(content)
+      file_tokens[f_rel] = ts
+      ts
+    }
+  }
+  let mut dot_i = -1
+  let mut best = 1000000
+  let mut ti = 1
+  while ti + 2 < tokens.length() {
+    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == "iter" && tokens[ti + 2].kind == TokenKind::LParen &&
+    tokens[ti + 1].line == line {
+      let dist = if tokens[ti + 1].col >= col { tokens[ti + 1].col - col } else { col - tokens[ti + 1].col }
+      if dist < best {
+        best = dist
+        dot_i = ti
+      }
+    }
+    ti = ti + 1
+  }
+  if dot_i < 0 {
+    return false
+  }
+  let mut why = kept_iter_hazard_with_qt(tokens, dot_i, content, qfi_opt, declared_types)
+  if why.length() == 0 {
+    // Soundness check: for immediate `.iter().(any|all|find_first)(cb)` on ANY named receiver
+    // (including fresh locals, which can still be mutated via stored closures), always require
+    // `mutation_summary` to rule out trait/operator/indirect-closure mutations.
+    let close_p = find_matching_delim(tokens, dot_i + 2)
+    let is_imm_pred = close_p == dot_i + 3 && close_p + 3 < tokens.length() &&
+    tokens[close_p + 1].kind == TokenKind::Dot &&
+    (tokens[close_p + 2].raw == "any" || tokens[close_p + 2].raw == "all" || tokens[close_p + 2].raw == "find_first") &&
+    tokens[close_p + 3].kind == TokenKind::LParen
+    if is_imm_pred && !is_array_literal_end(tokens, dot_i - 1) {
+      match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
+        Some(_) => return true
+        None => why = "callback in immediate `.iter()." + tokens[close_p + 2].raw + "(...)` may mutate the array (trait/operator/opaque/mutating call)"
+      }
+    } else {
+      return true
+    }
+  } else {
+    match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
+      Some(detail) => {
+        stage_b_record_mutation_allow(
+          drift_ledger,
+          "mutation_summary_allow_c",
+          f_rel,
+          line,
+          col,
+          ".iter()",
+          "mbt_compat::arr_iter",
+          detail,
+        )
+        return true
+      }
+      None => ()
+    }
+  }
+  for existing in diags {
+    if existing.code == "MBT2PION_ARRAY_ITER_MUTATION" && existing.file == f_rel && existing.line == line {
+      return false
+    }
+  }
+  diags.push(diag_error(
+    "MBT2PION_ARRAY_ITER_MUTATION",
+    f_rel,
+    line,
+    col,
+    "a kept `Array::iter()` is not supported where its array changes in a way MoonBit's buffer snapshot would not see: " +
+    why + " (fail-closed)",
+  ))
+  false
+}
+
+fn stage_b_is_simple_ident(s : String) -> Bool {
+  if s.length() == 0 {
+    return false
+  }
+  let c0 = s.code_unit_at(0)
+  let ok0 = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95
+  if !ok0 {
+    return false
+  }
+  let mut k = 1
+  while k < s.length() {
+    let c = s.code_unit_at(k)
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+    if !ok {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Gate D: Rewrite provably read-only `for <vars> in <arr[lo:hi]> { <body> }` borrowed-slice loops
+///| (emitted by Stage A as `mbt_compat::__mbt_slice_borrow(...)` or `({ let __mbt_sl_N = ...; mbt_compat::__mbt_slice_borrow(...) })`)
+///| into MoonBit-exact clamped index `while` loops:
+///|   1. Evaluate `recv` -> `lo` -> `hi` once in order;
+///|   2. Take `len = recv.length()` AFTER `hi` finishes;
+///|   3. Clamp `lo` and `hi` to `[0, len]`, with `hi_c = max(lo_c, hi_c0)`;
+///|   4. Advance index before body so `break`/`continue` preserve exact control targets.
+fn stage_b_rewrite_borrowed_slice_for_loops(
+  lines : Array[String],
+  tokens : Array[Token],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  used_idents : Map[String, Bool],
+  mutated_lines : Map[Int, Bool],
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  let n = tokens.length() - 1
+  let mut any_changed = false
+  let mut i = 0
+  while i + 5 < n {
+    if tokens[i].raw == "for" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
+      let mut j = i + 1
+      let mut in_i = -1
+      let mut d = 0
+      while j < n {
+        let jk = tokens[j].kind
+        if d == 0 && jk == TokenKind::LBrace {
+          break
+        }
+        if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { d = d + 1 }
+        else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && tokens[j].raw == "in" && in_i < 0 { in_i = j }
+        j = j + 1
+      }
+      if in_i > i + 1 && j < n && tokens[j].kind == TokenKind::LBrace {
+        let lb = j
+        let rb = find_matching_delim(tokens, lb)
+        let for_lidx = tokens[i].line - 1
+        let lb_lidx = tokens[lb].line - 1
+        let rb_lidx = if rb > lb { tokens[rb].line - 1 } else { -1 }
+        let has_leading_label = i > 0 && tokens[i - 1].kind == TokenKind::Colon
+        let has_trailing_else = rb > lb && rb + 1 < n && tokens[rb + 1].raw == "else"
+        if rb > lb && for_lidx == lb_lidx && for_lidx >= 0 && rb_lidx < lines.length() &&
+        !has_leading_label && !has_trailing_else &&
+        !mutated_lines.contains(for_lidx) && !mutated_lines.contains(rb_lidx) {
+          let is_s = in_i + 1
+          let is_e = lb
+          // Recognize Form 1: `mbt_compat::__mbt_slice_borrow(recv, lo, hi)`
+          // or Form 2: `({ let <tmp> = <recv_init>; mbt_compat::__mbt_slice_borrow(<tmp>, lo, hi) })`
+          let mut matched_form = 0
+          let mut tmp_name = ""
+          let mut recv_s = -1
+          let mut recv_e = -1
+          let mut lo_s = -1
+          let mut lo_e = -1
+          let mut hi_s = -1
+          let mut hi_e = -1
+          if is_s + 4 < is_e && tokens[is_s].raw == "mbt_compat" &&
+          tokens[is_s + 1].kind == TokenKind::ColonColon &&
+          tokens[is_s + 2].raw == "__mbt_slice_borrow" &&
+          tokens[is_s + 3].kind == TokenKind::LParen &&
+          find_matching_delim(tokens, is_s + 3) == is_e - 1 {
+            let sargs = ms_split_call_args(tokens, is_s + 3, is_e - 1)
+            if sargs.length() == 3 {
+              matched_form = 1
+              recv_s = sargs[0].0
+              recv_e = sargs[0].1
+              lo_s = sargs[1].0
+              lo_e = sargs[1].1
+              hi_s = sargs[2].0
+              hi_e = sargs[2].1
+            }
+          } else if is_s + 10 < is_e && tokens[is_s].kind == TokenKind::LParen &&
+          find_matching_delim(tokens, is_s) == is_e - 1 &&
+          tokens[is_s + 1].kind == TokenKind::LBrace &&
+          find_matching_delim(tokens, is_s + 1) == is_e - 2 &&
+          tokens[is_s + 2].raw == "let" &&
+          tokens[is_s + 3].kind == TokenKind::Ident &&
+          tokens[is_s + 4].kind == TokenKind::Eq {
+            let mut semi_i = -1
+            let mut sd = 0
+            let mut sk = is_s + 5
+            while sk < is_e - 2 {
+              let skk = tokens[sk].kind
+              if skk == TokenKind::LParen || skk == TokenKind::LBracket || skk == TokenKind::LBrace { sd = sd + 1 }
+              else if skk == TokenKind::RParen || skk == TokenKind::RBracket || skk == TokenKind::RBrace { if sd > 0 { sd = sd - 1 } }
+              else if sd == 0 && skk == TokenKind::Semi { semi_i = sk; break }
+              sk = sk + 1
+            }
+            if semi_i > is_s + 5 && semi_i + 5 < is_e - 2 &&
+            tokens[semi_i + 1].raw == "mbt_compat" &&
+            tokens[semi_i + 2].kind == TokenKind::ColonColon &&
+            tokens[semi_i + 3].raw == "__mbt_slice_borrow" &&
+            tokens[semi_i + 4].kind == TokenKind::LParen &&
+            find_matching_delim(tokens, semi_i + 4) == is_e - 3 {
+              let sargs = ms_split_call_args(tokens, semi_i + 4, is_e - 3)
+              if sargs.length() == 3 {
+                matched_form = 2
+                tmp_name = tokens[is_s + 3].raw
+                recv_s = is_s + 5
+                recv_e = semi_i
+                lo_s = sargs[1].0
+                lo_e = sargs[1].1
+                hi_s = sargs[2].0
+                hi_e = sargs[2].1
+              }
+            }
+          }
+          if matched_form > 0 && recv_s >= 0 && recv_e > recv_s {
+            let fn_body_open = outermost_body_open(tokens, i)
+            let active_gen = enclosing_fn_generic_params(tokens, fn_body_open)
+            // Resolve receiver type (must be proven `Array[...]`, never `String`/`Bytes`/`FixedArray`/`ArrayView`/unknown)
+            let mut recv_ty = match qfi_opt {
+              Some(qfi) =>
+              match qt_lookup_expr_span_ty(qfi, content, tokens[recv_s].start_byte, tokens[recv_e - 1].end_byte, true) {
+                Some(t) => t
+                None => ""
+              }
+              None => ""
+            }
+            if recv_ty.length() == 0 {
+              // Fallback: infer from local parameter / `let` / struct field / function return types
+              let vt_in : Map[String, String] = Map()
+              if fn_body_open >= 0 {
+                let fstart = fn_start_of(tokens, fn_body_open)
+                if fstart >= 0 {
+                  let mut p = fstart + 1
+                  while p < fn_body_open && tokens[p].kind != TokenKind::LParen { p = p + 1 }
+                  if p < fn_body_open && tokens[p].kind == TokenKind::LParen {
+                    let rp = find_matching_delim(tokens, p)
+                    if rp < fn_body_open {
+                      ms_parse_fn_params(tokens, p, rp, vt_in)
+                    }
+                  }
+                }
+                let fbc = find_matching_delim(tokens, fn_body_open)
+                ms_collect_local_var_types(mut_summary, tokens, fn_body_open + 1, fbc, content, qfi_opt, vt_in)
+              }
+              recv_ty = ms_infer_expr_ty(mut_summary, tokens, recv_e - 1, content, qfi_opt, vt_in)
+            }
+            let rt_clean = ms_strip_pkg_prefix(recv_ty)
+            if rt_clean.starts_with("Array[") && rt_clean.ends_with("]") {
+              let elem_ty = ms_extract_array_elem_ty(rt_clean)
+              let vars_str = content.slice(tokens[i + 1].start_byte, tokens[in_i - 1].end_byte).trim()
+              let comma_idx = vars_str.index_of(",")
+              let mut vars_ok = false
+              let loop_vt : Map[String, String] = Map()
+              if comma_idx >= 0 {
+                let iv_nm = vars_str.slice(0, comma_idx).trim()
+                let ev_nm = vars_str.slice(comma_idx + 1, vars_str.length()).trim()
+                if stage_b_is_simple_ident(iv_nm) && stage_b_is_simple_ident(ev_nm) {
+                  vars_ok = true
+                  loop_vt[iv_nm] = "Int"
+                  if elem_ty.length() > 0 { loop_vt[ev_nm] = elem_ty }
+                }
+              } else if stage_b_is_simple_ident(vars_str) {
+                vars_ok = true
+                if elem_ty.length() > 0 { loop_vt[vars_str] = elem_ty }
+              }
+              let body_sum = if vars_ok {
+                summarize_expr_span(mut_summary, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, loop_vt, active_gen)
+              } else {
+                FnMutationSummary::empty()
+              }
+              let elem_check = if ms_ty_contains_generic(elem_ty, active_gen) { "" } else { elem_ty }
+              if vars_ok && !summary_may_mutate_array(body_sum, elem_check) {
+                let recv_str = content.slice(tokens[recv_s].start_byte, tokens[recv_e - 1].end_byte).trim()
+                let lo_str = content.slice(tokens[lo_s].start_byte, tokens[lo_e - 1].end_byte).trim()
+                let hi_str = content.slice(tokens[hi_s].start_byte, tokens[hi_e - 1].end_byte).trim()
+                let tag = for_lidx.to_string()
+                let rv_var = if matched_form == 2 { tmp_name } else { fresh_stage_b_ident(used_idents, "__mbt_slr_" + tag) }
+                let lo_var = fresh_stage_b_ident(used_idents, "__mbt_slo_" + tag)
+                let hi_var = fresh_stage_b_ident(used_idents, "__mbt_shi_" + tag)
+                let len_var = fresh_stage_b_ident(used_idents, "__mbt_sln_" + tag)
+                let loc_var = fresh_stage_b_ident(used_idents, "__mbt_slc_" + tag)
+                let hic0_var = fresh_stage_b_ident(used_idents, "__mbt_sh0_" + tag)
+                let hic_var = fresh_stage_b_ident(used_idents, "__mbt_shc_" + tag)
+                let idx_var = fresh_stage_b_ident(used_idents, "__mbt_sli_" + tag)
+                let bind_stmts = if comma_idx >= 0 {
+                  let idx_v = vars_str.slice(0, comma_idx).trim()
+                  let el_v = vars_str.slice(comma_idx + 1, vars_str.length()).trim()
+                  "let " + idx_v + " = " + idx_var + " - " + loc_var + "; let " + el_v + " = " + rv_var + "[" + idx_var + "]"
+                } else {
+                  "let " + vars_str + " = " + rv_var + "[" + idx_var + "]"
+                }
+                let for_col0 = tokens[i].col - 1
+                let lb_col0 = tokens[lb].col - 1
+                let rb_col0 = tokens[rb].col - 1
+                let cur_ln = lines[for_lidx]
+                if for_col0 >= 0 && lb_col0 > for_col0 && lb_col0 < cur_ln.length() {
+                  let prefix = cur_ln.slice(0, for_col0)
+                  let open_hdr = prefix + "{ let " + rv_var + " = " + recv_str +
+                  "; let " + lo_var + " = " + lo_str +
+                  "; let " + hi_var + " = " + hi_str +
+                  "; let " + len_var + " = " + rv_var + ".length()" +
+                  "; let " + loc_var + " = if " + lo_var + " < 0 { 0 } else if " + lo_var + " > " + len_var + " { " + len_var + " } else { " + lo_var + " }" +
+                  "; let " + hic0_var + " = if " + hi_var + " < 0 { 0 } else if " + hi_var + " > " + len_var + " { " + len_var + " } else { " + hi_var + " }" +
+                  "; let " + hic_var + " = if " + hic0_var + " > " + loc_var + " { " + hic0_var + " } else { " + loc_var + " }" +
+                  "; let mut " + idx_var + " = " + loc_var +
+                  "; while " + idx_var + " < " + hic_var + " { " + bind_stmts + "; " + idx_var + " = " + idx_var + " + 1; "
+                  if rb_lidx == for_lidx {
+                    let body_part = cur_ln.slice(lb_col0 + 1, rb_col0)
+                    let after_part = cur_ln.slice(rb_col0 + 1, cur_ln.length())
+                    lines[for_lidx] = open_hdr + body_part + " } }" + after_part
+                  } else {
+                    let first_rest = cur_ln.slice(lb_col0 + 1, cur_ln.length())
+                    lines[for_lidx] = open_hdr + first_rest
+                    let cln = lines[rb_lidx]
+                    lines[rb_lidx] = cln.slice(0, rb_col0) + " } }" + cln.slice(rb_col0 + 1, cln.length())
+                  }
+                  mutated_lines[for_lidx] = true
+                  mutated_lines[rb_lidx] = true
+                  any_changed = true
+                  stage_b_record_mutation_allow(
+                    drift_ledger,
+                    "mutation_summary_allow_d",
+                    f_rel,
+                    tokens[i].line,
+                    tokens[i].col,
+                    recv_str + "[" + lo_str + ":" + hi_str + "]",
+                    "clamped_index_while_loop",
+                    "mutation_summary proved borrowed slice loop body cannot mutate Array[" + elem_ty + "]",
+                  )
+                  i = rb + 1
+                  continue
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  any_changed
 }
