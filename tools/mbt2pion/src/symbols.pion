@@ -734,7 +734,9 @@ pub struct SymbolTable {
   canon_struct_ambig : Map[String, Bool]
   canon_has_structs_meta : Map[String, Bool]
   canon_reexports_type : Map[String, AbiReexport]
+  canon_reexports_type_ambig : Map[String, Bool]
   canon_reexports_value : Map[String, AbiReexport]
+  canon_reexports_value_ambig : Map[String, Bool]
   dep_reexport_cycles : Map[String, String]
   verified_abi_deps : Map[String, Bool]
   dep_struct_val_fields : Map[String, String]
@@ -796,7 +798,9 @@ pub fn empty_symbol_table() -> SymbolTable {
     canon_struct_ambig: Map(),
     canon_has_structs_meta: Map(),
     canon_reexports_type: Map(),
+    canon_reexports_type_ambig: Map(),
     canon_reexports_value: Map(),
+    canon_reexports_value_ambig: Map(),
     dep_reexport_cycles: Map(),
     verified_abi_deps: Map(),
     dep_struct_val_fields: Map(),
@@ -871,8 +875,11 @@ pub fn symtab_load_dep_abi(st : SymbolTable, dep_name : String, abi : PackageAbi
       variants: en.variants,
     }
     let ckey = canon_pkg + "::" + en.name
-    if st.canon_enum_schemas.contains(ckey) {
+    if st.canon_enum_schemas.contains(ckey) || st.canon_reexports_type.contains(ckey) {
       st.canon_enum_ambig[ckey] = true
+      if st.canon_reexports_type.contains(ckey) {
+        st.canon_reexports_type_ambig[ckey] = true
+      }
     } else {
       st.canon_enum_schemas[ckey] = canon_en
     }
@@ -931,8 +938,11 @@ pub fn symtab_load_dep_abi(st : SymbolTable, dep_name : String, abi : PackageAbi
           complete: s.complete,
         }
         let ckey = canon_pkg + "::" + s.name
-        if st.canon_struct_schemas.contains(ckey) {
+        if st.canon_struct_schemas.contains(ckey) || st.canon_reexports_type.contains(ckey) {
           st.canon_struct_ambig[ckey] = true
+          if st.canon_reexports_type.contains(ckey) {
+            st.canon_reexports_type_ambig[ckey] = true
+          }
         } else {
           st.canon_struct_schemas[ckey] = canon_s
         }
@@ -964,10 +974,28 @@ pub fn symtab_load_dep_abi(st : SymbolTable, dep_name : String, abi : PackageAbi
     let crkey = canon_pkg + "::" + r.name
     if r.kind == "type" {
       st.dep_reexports_type[rkey] = r
-      st.canon_reexports_type[crkey] = r
+      if st.canon_struct_schemas.contains(crkey) || st.canon_enum_schemas.contains(crkey) {
+        st.canon_reexports_type_ambig[crkey] = true
+        st.canon_struct_ambig[crkey] = true
+        st.canon_enum_ambig[crkey] = true
+      } else {
+        match st.canon_reexports_type.get(crkey) {
+          Some(prev) =>
+          if prev.target_pkg != r.target_pkg || prev.target_name != r.target_name {
+            st.canon_reexports_type_ambig[crkey] = true
+          }
+          None => st.canon_reexports_type[crkey] = r
+        }
+      }
     } else if r.kind == "value" {
       st.dep_reexports_value[rkey] = r
-      st.canon_reexports_value[crkey] = r
+      match st.canon_reexports_value.get(crkey) {
+        Some(prev) =>
+        if prev.target_pkg != r.target_pkg || prev.target_name != r.target_name {
+          st.canon_reexports_value_ambig[crkey] = true
+        }
+        None => st.canon_reexports_value[crkey] = r
+      }
     }
   }
 }
@@ -979,7 +1007,8 @@ pub enum ForeignStructUpdateInfo {
   Unknown(String)
 }
 
-///| Internal helper: resolve `(pkg, name)` through import-alias re-export first, then canonical re-export hops.
+///| Internal helper: resolve `(pkg, name)` through import-alias re-export first, then strictly
+///| canonical re-export hops (NEVER falling back to import-alias maps after hopping!).
 ///| Returns `Ok((orig_pkg, orig_name, hopped))` where `hopped == true` iff at least one re-export hop occurred.
 fn symtab_resolve_type_provenance(
   st : SymbolTable,
@@ -999,13 +1028,19 @@ fn symtab_resolve_type_provenance(
     let re_opt = if !hopped {
       match st.dep_reexports_type.get(vk) {
         Some(r) => Some(r)
-        None => if st.dep_pkg_names.contains(cur_pkg) { None } else { st.canon_reexports_type.get(vk) }
+        None =>
+        if st.dep_pkg_names.contains(cur_pkg) {
+          None
+        } else if st.canon_reexports_type_ambig.contains(vk) {
+          return Err("ambiguous canonical `pub using` (type) for `" + vk + "`")
+        } else {
+          st.canon_reexports_type.get(vk)
+        }
       }
+    } else if st.canon_reexports_type_ambig.contains(vk) {
+      return Err("ambiguous canonical `pub using` (type) for `" + vk + "`")
     } else {
-      match st.canon_reexports_type.get(vk) {
-        Some(r) => Some(r)
-        None => st.dep_reexports_type.get(vk)
-      }
+      st.canon_reexports_type.get(vk)
     }
     match re_opt {
       Some(re) => {
@@ -1020,7 +1055,7 @@ fn symtab_resolve_type_provenance(
 }
 
 ///| Resolve `(pkg, name)` in the type namespace through loaded re-export chains
-///| to its canonical defining `(orig_pkg, orig_name)`. Fail-closed on cycles.
+///| to its canonical defining `(orig_pkg, orig_name)`. Fail-closed on cycles or canonical ambiguity.
 pub fn symtab_resolve_canonical_type(
   st : SymbolTable,
   pkg : String,
@@ -1033,7 +1068,7 @@ pub fn symtab_resolve_canonical_type(
 }
 
 ///| Resolve `(pkg, name)` in the value namespace through loaded re-export chains
-///| to its canonical defining `(orig_pkg, orig_name)`. Fail-closed on cycles.
+///| to its canonical defining `(orig_pkg, orig_name)`. Fail-closed on cycles or canonical ambiguity.
 pub fn symtab_resolve_canonical_value(
   st : SymbolTable,
   pkg : String,
@@ -1052,13 +1087,19 @@ pub fn symtab_resolve_canonical_value(
     let re_opt = if !hopped {
       match st.dep_reexports_value.get(vk) {
         Some(r) => Some(r)
-        None => if st.dep_pkg_names.contains(cur_pkg) { None } else { st.canon_reexports_value.get(vk) }
+        None =>
+        if st.dep_pkg_names.contains(cur_pkg) {
+          None
+        } else if st.canon_reexports_value_ambig.contains(vk) {
+          return Err("ambiguous canonical `pub using` (value) for `" + vk + "`")
+        } else {
+          st.canon_reexports_value.get(vk)
+        }
       }
+    } else if st.canon_reexports_value_ambig.contains(vk) {
+      return Err("ambiguous canonical `pub using` (value) for `" + vk + "`")
     } else {
-      match st.canon_reexports_value.get(vk) {
-        Some(r) => Some(r)
-        None => st.dep_reexports_value.get(vk)
-      }
+      st.canon_reexports_value.get(vk)
     }
     match re_opt {
       Some(re) => {
@@ -1073,8 +1114,8 @@ pub fn symtab_resolve_canonical_value(
 }
 
 ///| Finalize transitive `pub using` re-export metadata after all `--dep` ABIs are loaded:
-///| aliases re-exported enum/struct/val-rename metadata to their canonical origin schemas
-///| and reports any cyclic re-export chains fail-closed.
+///| aliases re-exported enum/struct/val-rename metadata strictly from canonical origin schemas
+///| and reports any cyclic or ambiguous re-export chains fail-closed.
 pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> Unit {
   for rkey in sorted_map_keys(st.dep_reexports_type) {
     let cc = rkey.index_of("::")
@@ -1089,21 +1130,13 @@ pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> U
       Ok((orig_pkg, orig_name, _)) => {
         let orig_key = orig_pkg + "::" + orig_name
         if !st.canon_enum_ambig.contains(orig_key) {
-          let en_opt = match st.canon_enum_schemas.get(orig_key) {
-            Some(e) => Some(e)
-            None => st.enum_schemas.get(orig_key)
-          }
-          match en_opt {
+          match st.canon_enum_schemas.get(orig_key) {
             Some(en_schema) => st.enum_schemas[rkey] = en_schema
             None => ()
           }
         }
         if !st.canon_struct_ambig.contains(orig_key) {
-          let st_opt = match st.canon_struct_schemas.get(orig_key) {
-            Some(s) => Some(s)
-            None => st.struct_schemas.get(orig_key)
-          }
-          match st_opt {
+          match st.canon_struct_schemas.get(orig_key) {
             Some(st_schema) => st.struct_schemas[rkey] = st_schema
             None => ()
           }
@@ -1132,7 +1165,7 @@ pub fn symtab_finalize_dep_reexports(st : SymbolTable, diags : Array[Diag]) -> U
 
 ///| Look up a cross-package `AbiStructSchema` by `(pkg, type_name)`, chasing `pub using` provenance.
 ///| Direct imports consult the import-alias index first (load-order invariant); re-export hops consult
-///| the canonical-package index.
+///| strictly the canonical-package index (never falling back to import-alias maps).
 pub fn symtab_lookup_struct_schema(
   st : SymbolTable,
   pkg : String,
@@ -1153,10 +1186,7 @@ pub fn symtab_lookup_struct_schema(
           }
         }
       } else if !st.canon_struct_ambig.contains(key) {
-        match st.canon_struct_schemas.get(key) {
-          Some(s) => Some(s)
-          None => st.struct_schemas.get(key)
-        }
+        st.canon_struct_schemas.get(key)
       } else {
         None
       }
@@ -1195,26 +1225,21 @@ pub fn symtab_query_foreign_struct_update_with_targs(
     Err(msg) => return ForeignStructUpdateInfo::Rejected(msg)
   }
   let orig_key = orig_pkg + "::" + orig_name
-  if hopped && st.canon_struct_ambig.contains(orig_key) {
+  if (hopped || !st.dep_pkg_names.contains(orig_pkg)) && st.canon_struct_ambig.contains(orig_key) {
     return ForeignStructUpdateInfo::Rejected("ambiguous canonical struct `" + orig_key + "` across multiple dependencies")
   }
   let schema_opt = if !hopped {
     match st.struct_schemas.get(orig_key) {
       Some(s) => Some(s)
       None =>
-      if st.dep_has_structs_meta.contains(orig_pkg) {
+      if st.dep_pkg_names.contains(orig_pkg) {
         None
-      } else if !st.canon_struct_ambig.contains(orig_key) {
-        st.canon_struct_schemas.get(orig_key)
       } else {
-        None
+        st.canon_struct_schemas.get(orig_key)
       }
     }
   } else {
-    match st.canon_struct_schemas.get(orig_key) {
-      Some(s) => Some(s)
-      None => st.struct_schemas.get(orig_key)
-    }
+    st.canon_struct_schemas.get(orig_key)
   }
   match schema_opt {
     Some(schema) => {
@@ -1247,13 +1272,10 @@ pub fn symtab_query_foreign_struct_update_with_targs(
       let has_meta_opt = if !hopped {
         match st.dep_has_structs_meta.get(orig_pkg) {
           Some(b) => Some(b)
-          None => st.canon_has_structs_meta.get(orig_pkg)
+          None => if st.dep_pkg_names.contains(orig_pkg) { None } else { st.canon_has_structs_meta.get(orig_pkg) }
         }
       } else {
-        match st.canon_has_structs_meta.get(orig_pkg) {
-          Some(b) => Some(b)
-          None => st.dep_has_structs_meta.get(orig_pkg)
-        }
+        st.canon_has_structs_meta.get(orig_pkg)
       }
       match has_meta_opt {
         Some(false) =>
@@ -1283,7 +1305,7 @@ pub fn symtab_query_foreign_struct_update(
 
 ///| Look up an `AbiEnumSchema` by `(pkg, enum_name)`, chasing `pub using` canonical provenance.
 ///| Direct imports consult `enum_schemas` (import-alias index) first; canonical re-export targets
-///| consult `canon_enum_schemas` (canonical-package index) so aliased deps resolve cleanly!
+///| consult strictly `canon_enum_schemas` (never falling back to import-alias maps).
 pub fn symtab_lookup_enum_schema(
   st : SymbolTable,
   pkg : String,
@@ -1311,10 +1333,7 @@ pub fn symtab_lookup_enum_schema(
           }
         }
       } else if !st.canon_enum_ambig.contains(orig_key) {
-        match st.canon_enum_schemas.get(orig_key) {
-          Some(en) => Some(en)
-          None => st.enum_schemas.get(orig_key)
-        }
+        st.canon_enum_schemas.get(orig_key)
       } else {
         None
       }
