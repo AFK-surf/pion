@@ -163,9 +163,30 @@ pub fn run_gate_d() -> String {
     }
   }
 
+  let mut xs_rebind : Array[Int] = [1, 2, 3]
+  let get_lo_rebind = fn() -> Int {
+    xs_rebind = [8]
+    0
+  }
+  let seen6 : Array[String] = []
+  for x in xs_rebind[get_lo_rebind():] {
+    seen6.push(x.to_string())
+  }
+
+  let mut xs_rebind2 : Array[Int] = [1, 2, 3]
+  let get_lo_rebind2 = fn() -> Int {
+    xs_rebind2 = [8]
+    0
+  }
+  let seen7 : Array[String] = []
+  for x in xs_rebind2[get_lo_rebind2():xs_rebind2.length()] {
+    seen7.push(x.to_string())
+  }
+
   trace.join(">") + ":" + seen1.join(",") + "|" +
     seen2.join(",") + "|" + seen3.join(",") + "|" + seen4.join(",") + "|" +
-    seen5.join(",") + ":" + stop_id.to_string()
+    seen5.join(",") + ":" + stop_id.to_string() + "|" +
+    seen6.join(",") + "|" + seen7.join(",")
 }
 
 pub fn run_all() -> String {
@@ -180,10 +201,11 @@ NEGATIVE_CASES = [
 trait Pred {
   test_it(Self) -> Bool
 }
-fn run[T : Pred](xs : Array[T]) -> Bool {
+fn[T : Pred] run(xs : Array[T]) -> Bool {
   xs.iter().any(fn(x) { x.test_it() })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_class2_impl_add_mutates",
@@ -195,13 +217,14 @@ impl Add for BadNum with add(self, other) {
   self.xs.clear()
   other
 }
-fn run(xs : Array[Int], b : BadNum) -> Option[Int] {
+fn run(xs : Array[Int], b : BadNum) -> Int? {
   xs.search_by(fn(_x) {
     let _ = b + b
     false
   })
 }
 ''',
+        "Array::search_by",
     ),
     (
         "neg_class3_reentrant_stored_closure",
@@ -215,6 +238,7 @@ pub fn run(xs : Array[Int]) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_class3b_keywhen_param_cb",
@@ -228,6 +252,7 @@ pub fn matches(kw : KeyWhen, has : (String) -> Bool) -> Bool {
   }
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_class5_generic_array_write",
@@ -235,13 +260,14 @@ pub fn matches(kw : KeyWhen, has : (String) -> Bool) -> Bool {
 fn[T] push_any(xs : Array[T], v : T) -> Unit {
   xs.push(v)
 }
-pub fn run(xs : Array[Int]) -> Option[Int] {
+pub fn run(xs : Array[Int]) -> Int? {
   xs.search_by(fn(x) {
     push_any(xs, x)
     false
   })
 }
 ''',
+        "Array::search_by",
     ),
     (
         "neg_class6_field_reassign",
@@ -259,6 +285,7 @@ pub fn run(b : Bag) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_class7_slice_loop_index_write",
@@ -272,6 +299,7 @@ pub fn run(ws : Array[Int]) -> Int {
   acc
 }
 ''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
     ),
     (
         "neg_gate_a_cap8_kept_iter_shrink",
@@ -288,6 +316,7 @@ pub fn run() -> Int {
   }
 }
 ''',
+        "MBT2PION_ARRAY_SHRINK_ITER",
     ),
     (
         "neg_class2_impl_eq_with_equal",
@@ -300,12 +329,13 @@ impl Eq for EvilEq with equal(self, other) {
   let _ = other
   true
 }
-pub fn run(xs : Array[Int], a : EvilEq, b : EvilEq) -> Option[Int] {
+pub fn run(xs : Array[Int], a : EvilEq, b : EvilEq) -> Int? {
   xs.search_by(fn(_x) {
     a == b
   })
 }
 ''',
+        "Array::search_by",
     ),
     (
         "neg_class2_unary_neg_newline",
@@ -317,7 +347,7 @@ impl Neg for EvilNeg with neg(self) {
   self.xs.clear()
   self
 }
-pub fn run(xs : Array[Int], b : EvilNeg) -> Option[Int] {
+pub fn run(xs : Array[Int], b : EvilNeg) -> Int? {
   xs.search_by(fn(_x) {
     let y = 1
     let _ = y
@@ -327,6 +357,7 @@ pub fn run(xs : Array[Int], b : EvilNeg) -> Option[Int] {
   })
 }
 ''',
+        "Array::search_by",
     ),
     (
         "neg_iter_next_lazy_mut",
@@ -342,6 +373,7 @@ pub fn run(xs : Array[Int]) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_static_hof_fixed_array_makei",
@@ -356,6 +388,7 @@ pub fn run(xs : Array[Int]) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_static_hof_option_map",
@@ -370,6 +403,7 @@ pub fn run(xs : Array[Int]) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_pattern_shadow_pure_fn",
@@ -377,7 +411,7 @@ pub fn run(xs : Array[Int]) -> Bool {
 fn helper() -> Unit {
   ()
 }
-pub fn run(xs : Array[Int], opt : Option[() -> Unit]) -> Bool {
+pub fn run(xs : Array[Int], opt : (() -> Unit)?) -> Bool {
   xs.iter().any(fn(_x) {
     match opt {
       Some(helper) => helper()
@@ -387,6 +421,7 @@ pub fn run(xs : Array[Int], opt : Option[() -> Unit]) -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_gate_c_fresh_local_reentrant",
@@ -401,6 +436,7 @@ pub fn run() -> Bool {
   })
 }
 ''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
         "neg_gate_d_labeled_for_slice",
@@ -416,6 +452,7 @@ pub fn run(xs : Array[Int]) -> Int {
   acc
 }
 ''',
+        "NO_ALLOW_D",
     ),
     (
         "neg_gate_a_kept_iter2_shrink",
@@ -429,6 +466,110 @@ pub fn run() -> Int {
   a.length()
 }
 ''',
+        "MBT2PION_ARRAY_SHRINK_ITER",
+    ),
+    (
+        "neg_r3_bare_iife_gate_b",
+        r'''
+pub fn run(xs : Array[Int]) -> Int? {
+  let mut n = 0
+  xs.search_by(fn(_x) {
+    n = n + 1
+    fn() { xs.clear() }()
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_r3_bare_iife_gate_c",
+        r'''
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(_x) {
+    fn() { xs.clear() }()
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_shadow_for_outer_array_type",
+        r'''
+struct Item {
+  id : Int
+}
+pub fn run(a : Array[Int], items : Array[Item], groups : Array[Array[Item]]) -> Bool {
+  let _ = a
+  items.iter().any(fn(it) {
+    for a in groups {
+      a.push(it)
+    }
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_shadow_unknown_let_gate_d",
+        r'''
+struct Item {
+  id : Int
+}
+pub fn run(a : Array[Int], cond : Bool, items : Array[Item]) -> Int {
+  let _ = a
+  let mut acc = 0
+  for it in items[0:1] {
+    let a = if cond { items } else { items }
+    a.push(it)
+    acc = acc + it.id
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
+    ),
+    (
+        "neg_r3_struct_pat_shadow_pure_fn",
+        r'''
+struct Box {
+  cb : () -> Unit
+}
+fn helper() -> Unit {
+  ()
+}
+pub fn run(xs : Array[Int], b : Box) -> Bool {
+  xs.iter().any(fn(_x) {
+    match b {
+      { cb: helper } => helper()
+    }
+    true
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_qualified_pipe_gate_d",
+        r'''
+struct W {
+  n : Int
+}
+fn W::grow(xs : Array[Int]) -> Unit {
+  xs.push(9)
+}
+pub fn run(xs : Array[Int]) -> Int {
+  let mut acc = 0
+  for v in xs[0:2] {
+    xs |> W::grow
+    acc = acc + v
+  }
+  acc
+}
+''',
+        "MBT2PION_BORROWED_ARRAY_SLICE",
     ),
 ]
 
@@ -535,33 +676,128 @@ def main():
             raise RuntimeError(f"Pion wasm32 mismatch!\n  expected: {moon_native_out}\n  got:      {pion_wasm_out}")
         print(f"[PION] native == wasm32 == MoonBit: {pion_native_out}")
 
-        # 5. Negative adversarial fail-closed cases: EVERY ONE MUST fail closed (non-zero exit, no --out emitted)
-        for name, mbt_code in NEGATIVE_CASES:
-            nsrc = os.path.join(tmp, f"{name}_src")
+        # 5. Negative adversarial fail-closed cases:
+        #    (a) Verify EVERY negative case is valid MoonBit via `moon check`
+        #    (b) Verify `mbt2pion --mode publish` exits non-zero, emits no `--out`,
+        #        does not fail via accidental `E_PARSE`, emits expected gate diagnostic,
+        #        and records NO `mutation_summary_allow_*` in ledger.
+        for name, mbt_code, expected_diag in NEGATIVE_CASES:
+            nmod = os.path.join(tmp, f"{name}_mod")
+            nsrc = os.path.join(nmod, "src")
             nout = os.path.join(tmp, f"{name}_out")
-            nrep = os.path.join(tmp, f"{name}_rep")
+            nrep = os.path.join(tmp, f"{name}_rep.json")
             os.makedirs(nsrc, exist_ok=True)
+            with open(os.path.join(nmod, "moon.mod"), "w") as f:
+                f.write(f'name = "neg/{name}"\n')
+            with open(os.path.join(nsrc, "moon.pkg"), "w") as f:
+                f.write("")
             with open(os.path.join(nsrc, "bad.mbt"), "w") as f:
                 f.write(mbt_code)
+            mc = run_cmd([moon, "check"], cwd=nmod, check=False)
+            if mc.returncode != 0:
+                raise RuntimeError(
+                    f"NEGATIVE CASE `{name}` IS NOT VALID MOONBIT (`moon check` failed rc={mc.returncode}):\n{mc.stdout}\n{mc.stderr}"
+                )
             with open(os.path.join(nsrc, "moon.pkg.json"), "w") as f:
                 f.write("{}\n")
             p = run_cmd([
                 cli_bin,
                 "--src", nsrc,
                 "--out", nout,
-                "--drift-ledger", nrep + ".json",
+                "--drift-ledger", nrep,
                 "--pionc", pionc,
                 "--mbt-compat", COMPAT_DIR,
                 "--no-fmt",
                 "--mode", "publish",
             ], cwd=REPO_ROOT, check=False)
+            combined_err = p.stdout + "\n" + p.stderr
             if p.returncode == 0 or os.path.exists(nout):
                 raise RuntimeError(
-                    f"SOUNDNESS FAILURE: negative case `{name}` was NOT fail-closed! rc={p.returncode}, out_exists={os.path.exists(nout)}\n{p.stdout}\n{p.stderr}"
+                    f"SOUNDNESS FAILURE: negative case `{name}` was NOT fail-closed! rc={p.returncode}, out_exists={os.path.exists(nout)}\n{combined_err}"
                 )
-            print(f"[NEG PASS] {name}: fail-closed (rc={p.returncode})")
+            if expected_diag != "NO_ALLOW_D":
+                if "E_PARSE" in combined_err:
+                    raise RuntimeError(
+                        f"NEGATIVE CASE `{name}` failed with accidental E_PARSE instead of gate `{expected_diag}`:\n{combined_err}"
+                    )
+                if expected_diag and expected_diag not in combined_err:
+                    raise RuntimeError(
+                        f"NEGATIVE CASE `{name}` did not emit expected diagnostic `{expected_diag}`:\n{combined_err}"
+                    )
+            if os.path.exists(nrep):
+                with open(nrep) as rf:
+                    nledger = json.load(rf)
+                ncats = [e.get("category", "") for e in nledger.get("entries", [])]
+                allow_hits = [c for c in ncats if c.startswith("mutation_summary_allow_")]
+                if allow_hits:
+                    raise RuntimeError(
+                        f"SOUNDNESS FAILURE: negative case `{name}` unexpectedly logged allow categories {allow_hits}"
+                    )
+            print(f"[NEG PASS] {name}: moon check OK, fail-closed with {expected_diag} (rc={p.returncode})")
 
-    print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES)} adversarial fail-closed cases: ALL OK")
+        # 6. Cross-package dependency mutation negative case (Class 4):
+        #    `dep::mutate(xs)` clears `xs`; consumer calls `@dep.mutate(xs)` inside `.iter().any(...)`.
+        xp_mod = os.path.join(tmp, "xp_mod")
+        xp_dep = os.path.join(xp_mod, "dep")
+        xp_app = os.path.join(xp_mod, "app")
+        xp_dep_pkg = os.path.join(tmp, "xp_dep_pkg")
+        xp_dep_out = os.path.join(xp_dep_pkg, "src")
+        xp_app_out = os.path.join(tmp, "xp_app_out")
+        xp_app_rep = os.path.join(tmp, "xp_app_rep.json")
+        os.makedirs(xp_dep, exist_ok=True)
+        os.makedirs(xp_app, exist_ok=True)
+        os.makedirs(xp_dep_out, exist_ok=True)
+        with open(os.path.join(xp_dep_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "dep"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        with open(os.path.join(xp_mod, "moon.mod"), "w") as f:
+            f.write('name = "neg/xp"\n')
+        with open(os.path.join(xp_dep, "moon.pkg"), "w") as f:
+            f.write("")
+        with open(os.path.join(xp_dep, "lib.mbt"), "w") as f:
+            f.write("pub fn mutate(xs : Array[Int]) -> Unit {\n  xs.clear()\n}\n")
+        with open(os.path.join(xp_app, "moon.pkg"), "w") as f:
+            f.write('import {\n  "neg/xp/dep" @dep,\n}\n')
+        with open(os.path.join(xp_app, "lib.mbt"), "w") as f:
+            f.write("pub fn run(xs : Array[Int]) -> Bool {\n  xs.iter().any(fn(_x) {\n    @dep.mutate(xs)\n    true\n  })\n}\n")
+        mc_xp = run_cmd([moon, "check"], cwd=xp_mod, check=False)
+        if mc_xp.returncode != 0:
+            raise RuntimeError(f"Cross-pkg negative case failed `moon check`:\n{mc_xp.stdout}\n{mc_xp.stderr}")
+        with open(os.path.join(xp_dep, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        with open(os.path.join(xp_app, "moon.pkg.json"), "w") as f:
+            f.write('{"import": [{"path": "neg/xp/dep", "alias": "dep"}]}\n')
+        run_cmd([
+            cli_bin,
+            "--src", xp_dep,
+            "--out", xp_dep_out,
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        p_xp = run_cmd([
+            cli_bin,
+            "--src", xp_app,
+            "--out", xp_app_out,
+            "--dep", f"dep={xp_dep_pkg}",
+            "--drift-ledger", xp_app_rep,
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT, check=False)
+        xp_err = p_xp.stdout + "\n" + p_xp.stderr
+        if p_xp.returncode == 0 or os.path.exists(xp_app_out) or "MBT2PION_ARRAY_ITER_MUTATION" not in xp_err:
+            raise RuntimeError(
+                f"SOUNDNESS FAILURE: cross-package dep mutation was NOT fail-closed with MBT2PION_ARRAY_ITER_MUTATION! rc={p_xp.returncode}\n{xp_err}"
+            )
+        print(f"[NEG PASS] neg_class4_cross_pkg_dep_mut: moon check OK, fail-closed with MBT2PION_ARRAY_ITER_MUTATION (rc={p_xp.returncode})")
+
+    print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases: ALL OK")
 
 
 if __name__ == "__main__":
