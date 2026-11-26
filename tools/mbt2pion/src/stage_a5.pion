@@ -1057,6 +1057,67 @@ fn collect_pkg_shadowed_builtins(files : Array[GeneratedFile]) -> Map[String, Bo
   shadowed
 }
 
+fn pattern_tokens_bind_ident(tokens : Array[Token], s : Int, e : Int, name : String) -> Bool {
+  let mut k = s
+  let mut td = 0
+  let mut in_ty = false
+  while k < e {
+    let tk = tokens[k]
+    if in_ty {
+      if td == 0 && (tk.kind == TokenKind::Comma || tk.kind == TokenKind::RParen || tk.kind == TokenKind::Eq) {
+        in_ty = false
+      } else {
+        if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { td = td + 1 }
+        else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { if td > 0 { td = td - 1 } }
+        k = k + 1
+        continue
+      }
+    }
+    if tk.kind == TokenKind::Colon {
+      in_ty = true
+      td = 0
+      k = k + 1
+      continue
+    }
+    if tk.raw == name &&
+    !(k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) &&
+    !(k + 1 < e && tokens[k + 1].kind == TokenKind::ColonColon) {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+fn find_stmt_rhs_end(tokens : Array[Token], start : Int, limit : Int) -> Int {
+  let mut k = start
+  let mut d = 0
+  while k < limit {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Eof { break }
+    if d == 0 {
+      if tk.kind == TokenKind::Semi || tk.kind == TokenKind::RBrace {
+        break
+      }
+      if k > start && tk.newline_before {
+        let prev = tokens[k - 1]
+        let is_cont = tk.kind == TokenKind::Dot || tk.kind == TokenKind::ColonColon ||
+        tk.raw == "else" || tk.raw == "&&" || tk.raw == "||" ||
+        is_u16_arith_or_bit_raw(tk.raw) || is_u16_cmp_raw(tk.raw) ||
+        prev.raw == "=" || prev.raw == "&&" || prev.raw == "||" || prev.raw == "|>" ||
+        is_u16_arith_or_bit_raw(prev.raw) || is_u16_cmp_raw(prev.raw)
+        if !is_cont {
+          break
+        }
+      }
+    }
+    if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { d = d + 1 }
+    else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+    k = k + 1
+  }
+  k
+}
+
 fn is_ident_shadowed_in_enclosing_item(
   tokens : Array[Token],
   site_tok : Int,
@@ -1086,44 +1147,241 @@ fn is_ident_shadowed_in_enclosing_item(
     }
     k = k + 1
   }
-  let mut item_end = n
-  let mut d2 = 0
-  let mut seen_brace = false
-  let mut m = item_start
-  while m < n {
-    let tk = tokens[m]
-    if tk.kind == TokenKind::LBrace {
-      d2 = d2 + 1
-      seen_brace = true
-    } else if tk.kind == TokenKind::RBrace {
-      if d2 > 0 { d2 = d2 - 1 }
-      if seen_brace && d2 == 0 {
-        item_end = m + 1
-        break
-      }
+  // Find opening `{` of the enclosing item body (if any) and check fn header params before it
+  let mut body_lbrace = -1
+  let mut hdr_d = 0
+  let mut h = item_start
+  while h < site_tok {
+    let tk = tokens[h]
+    if hdr_d == 0 && tk.kind == TokenKind::LBrace {
+      body_lbrace = h
+      break
     }
-    m = m + 1
+    if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket { hdr_d = hdr_d + 1 }
+    else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket { if hdr_d > 0 { hdr_d = hdr_d - 1 } }
+    h = h + 1
   }
-  let mut j = item_start
-  while j < item_end {
-    if tokens[j].raw == name {
-      if j > 0 && tokens[j - 1].kind == TokenKind::Dot {
-        j = j + 1
-        continue
+  if tokens[item_start].raw == "fn" {
+    let hdr_limit = if body_lbrace >= 0 { body_lbrace } else { site_tok }
+    let mut p = item_start + 1
+    while p < hdr_limit && tokens[p].kind != TokenKind::LParen {
+      if tokens[p].kind == TokenKind::LBracket {
+        let rb = find_matching_delim(tokens, p)
+        if rb > p { p = rb + 1; continue }
       }
-      let is_call_syntax = j + 1 < item_end && tokens[j + 1].kind == TokenKind::LParen
-      let mut is_fn_decl = j > 0 && tokens[j - 1].raw == "fn"
-      if !is_fn_decl && j > 0 && tokens[j - 1].kind == TokenKind::RBracket && !tokens[j].newline_before {
-        let lb = find_matching_open_delim_back(tokens, j - 1)
-        if lb > 0 && tokens[lb - 1].raw == "fn" {
-          is_fn_decl = true
-        }
-      }
-      if !is_call_syntax || is_fn_decl {
+      p = p + 1
+    }
+    if p < hdr_limit && tokens[p].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, p)
+      if rp > p && rp <= hdr_limit && pattern_tokens_bind_ident(tokens, p + 1, rp, name) {
         return true
       }
     }
+  }
+  if body_lbrace < 0 {
+    return false
+  }
+  // Forward lexical scope stack from `body_lbrace` strictly up to `site_tok`
+  let block_shadowed : Array[Bool] = []
+  let block_lbraces : Array[Int] = []
+  let mut j = body_lbrace
+  while j < site_tok {
+    let tk = tokens[j]
+    if tk.kind == TokenKind::LBrace {
+      block_shadowed.push(false)
+      block_lbraces.push(j)
+      j = j + 1
+      continue
+    }
+    if tk.kind == TokenKind::RBrace {
+      if block_shadowed.length() > 0 {
+        let _ = block_shadowed.pop()
+        let _ = block_lbraces.pop()
+      }
+      j = j + 1
+      continue
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "let" {
+      let mut pat_s = j + 1
+      if pat_s < site_tok && tokens[pat_s].kind == TokenKind::Keyword && tokens[pat_s].raw == "mut" {
+        pat_s = pat_s + 1
+      }
+      let mut eq_idx = -1
+      let mut pd = 0
+      let mut pk = pat_s
+      while pk < n {
+        let ptk = tokens[pk]
+        if pd == 0 && ptk.kind == TokenKind::Eq {
+          eq_idx = pk
+          break
+        }
+        if pd == 0 && (ptk.kind == TokenKind::Semi || ptk.kind == TokenKind::RBrace || (pk > pat_s && ptk.newline_before)) {
+          break
+        }
+        if ptk.kind == TokenKind::LParen || ptk.kind == TokenKind::LBracket || ptk.kind == TokenKind::LBrace { pd = pd + 1 }
+        else if ptk.kind == TokenKind::RParen || ptk.kind == TokenKind::RBracket || ptk.kind == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+        pk = pk + 1
+      }
+      if eq_idx > pat_s && pattern_tokens_bind_ident(tokens, pat_s, eq_idx, name) {
+        let rhs_end = find_stmt_rhs_end(tokens, eq_idx + 1, n)
+        if site_tok >= rhs_end && block_shadowed.length() > 0 {
+          block_shadowed[block_shadowed.length() - 1] = true
+        }
+      }
+      j = j + 1
+      continue
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+      let mut ni = j + 1
+      if ni < n && tokens[ni].kind == TokenKind::LBracket {
+        let rb = find_matching_delim(tokens, ni)
+        if rb > ni { ni = rb + 1 }
+      }
+      if ni < n && (tokens[ni].kind == TokenKind::Ident || tokens[ni].kind == TokenKind::UpperIdent) {
+        if tokens[ni].raw == name && block_shadowed.length() > 0 {
+          block_shadowed[block_shadowed.length() - 1] = true
+        }
+        ni = ni + 1
+        if ni < n && tokens[ni].kind == TokenKind::LBracket {
+          let rb = find_matching_delim(tokens, ni)
+          if rb > ni { ni = rb + 1 }
+        }
+      }
+      if ni < n && tokens[ni].kind == TokenKind::LParen {
+        let rp = find_matching_delim(tokens, ni)
+        if rp > ni {
+          let mut lb = rp + 1
+          let mut ld = 0
+          while lb < n {
+            if ld == 0 && tokens[lb].kind == TokenKind::LBrace { break }
+            if ld == 0 && (tokens[lb].kind == TokenKind::Semi || tokens[lb].kind == TokenKind::RBrace) { lb = -1; break }
+            if tokens[lb].kind == TokenKind::LParen || tokens[lb].kind == TokenKind::LBracket { ld = ld + 1 }
+            else if tokens[lb].kind == TokenKind::RParen || tokens[lb].kind == TokenKind::RBracket { if ld > 0 { ld = ld - 1 } }
+            lb = lb + 1
+          }
+          if lb > rp && lb < n && tokens[lb].kind == TokenKind::LBrace {
+            let rb = find_matching_delim(tokens, lb)
+            if lb < site_tok && site_tok < rb && pattern_tokens_bind_ident(tokens, ni + 1, rp, name) {
+              return true
+            }
+          }
+        }
+      }
+      j = j + 1
+      continue
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "for" {
+      let mut in_idx = -1
+      let mut fd = 0
+      let mut fk = j + 1
+      while fk < n {
+        if fd == 0 && tokens[fk].kind == TokenKind::Keyword && tokens[fk].raw == "in" { in_idx = fk; break }
+        if fd == 0 && (tokens[fk].kind == TokenKind::LBrace || tokens[fk].kind == TokenKind::Semi) { break }
+        if tokens[fk].kind == TokenKind::LParen || tokens[fk].kind == TokenKind::LBracket { fd = fd + 1 }
+        else if tokens[fk].kind == TokenKind::RParen || tokens[fk].kind == TokenKind::RBracket { if fd > 0 { fd = fd - 1 } }
+        fk = fk + 1
+      }
+      if in_idx > j + 1 && pattern_tokens_bind_ident(tokens, j + 1, in_idx, name) {
+        let mut lb = in_idx + 1
+        let mut ld = 0
+        while lb < n {
+          if ld == 0 && tokens[lb].kind == TokenKind::LBrace { break }
+          if tokens[lb].kind == TokenKind::LParen || tokens[lb].kind == TokenKind::LBracket { ld = ld + 1 }
+          else if tokens[lb].kind == TokenKind::RParen || tokens[lb].kind == TokenKind::RBracket { if ld > 0 { ld = ld - 1 } }
+          lb = lb + 1
+        }
+        if lb < n && tokens[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(tokens, lb)
+          if lb < site_tok && site_tok < rb {
+            return true
+          }
+        }
+      }
+      j = j + 1
+      continue
+    }
+    if tk.kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, j)
+      if rp > j && rp + 1 < n && tokens[rp + 1].kind == TokenKind::FatArrow &&
+      pattern_tokens_bind_ident(tokens, j + 1, rp, name) {
+        let body_end = if rp + 2 < n && tokens[rp + 2].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(tokens, rp + 2)
+          if rb > rp + 2 { rb + 1 } else { n }
+        } else {
+          find_stmt_rhs_end(tokens, rp + 2, n)
+        }
+        if rp + 1 < site_tok && site_tok < body_end {
+          return true
+        }
+      }
+    }
+    if tk.kind == TokenKind::FatArrow {
+      let arm_end = if j + 1 < n && tokens[j + 1].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(tokens, j + 1)
+        if rb > j + 1 { rb + 1 } else { n }
+      } else {
+        find_stmt_rhs_end(tokens, j + 1, n)
+      }
+      if j < site_tok && site_tok < arm_end {
+        let mut pat_s = j
+        let mut pd = 0
+        while pat_s > body_lbrace {
+          let ptk = tokens[pat_s - 1]
+          if pd == 0 && (ptk.kind == TokenKind::LBrace || ptk.kind == TokenKind::Semi || ptk.kind == TokenKind::FatArrow) {
+            break
+          }
+          if pd == 0 && pat_s < j && tokens[pat_s].newline_before {
+            break
+          }
+          if ptk.kind == TokenKind::RParen || ptk.kind == TokenKind::RBracket || ptk.kind == TokenKind::RBrace { pd = pd + 1 }
+          else if ptk.kind == TokenKind::LParen || ptk.kind == TokenKind::LBracket || ptk.kind == TokenKind::LBrace { if pd > 0 { pd = pd - 1 } }
+          pat_s = pat_s - 1
+        }
+        let mut pat_e = j
+        let mut gd = 0
+        let mut gk = pat_s
+        while gk < j {
+          if gd == 0 && tokens[gk].kind == TokenKind::Keyword && tokens[gk].raw == "if" {
+            pat_e = gk
+            break
+          }
+          if tokens[gk].kind == TokenKind::LParen || tokens[gk].kind == TokenKind::LBracket || tokens[gk].kind == TokenKind::LBrace { gd = gd + 1 }
+          else if tokens[gk].kind == TokenKind::RParen || tokens[gk].kind == TokenKind::RBracket || tokens[gk].kind == TokenKind::RBrace { if gd > 0 { gd = gd - 1 } }
+          gk = gk + 1
+        }
+        if pattern_tokens_bind_ident(tokens, pat_s, pat_e, name) {
+          return true
+        }
+      }
+    }
     j = j + 1
+  }
+  for sh in block_shadowed {
+    if sh { return true }
+  }
+  // Check hoisted local `fn [<T>] <name>` declared after `site_tok` directly inside any open ancestor block (never `let`)
+  for lb in block_lbraces {
+    let rb = find_matching_delim(tokens, lb)
+    if rb > site_tok {
+      let mut ad = 0
+      let mut ak = site_tok + 1
+      while ak < rb {
+        let atk = tokens[ak]
+        if atk.kind == TokenKind::LBrace { ad = ad + 1 }
+        else if atk.kind == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+        else if ad == 0 && atk.kind == TokenKind::Keyword && atk.raw == "fn" {
+          let mut ni = ak + 1
+          if ni < rb && tokens[ni].kind == TokenKind::LBracket {
+            let lrb = find_matching_delim(tokens, ni)
+            if lrb > ni { ni = lrb + 1 }
+          }
+          if ni < rb && tokens[ni].raw == name {
+            return true
+          }
+        }
+        ak = ak + 1
+      }
+    }
   }
   false
 }
