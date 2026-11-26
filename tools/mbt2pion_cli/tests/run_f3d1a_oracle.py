@@ -886,6 +886,115 @@ pub fn sort_field() -> Int {
   a[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes an indirect call"),
+    "user_length": (r'''
+struct Hook {
+  mut n : Int
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.n = self.n + 1
+  self.n
+}
+
+fn sort_user_length(xs : Array[Int], h : Hook) -> Unit {
+  xs.sort_by_key(fn(x) { h.length() + x })
+}
+
+pub fn user_length() -> Int {
+  let h = { n: 0 }
+  let a = [3, 1, 2]
+  sort_user_length(a, h)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
+    "user_get": (r'''
+struct Hook {
+  mut n : Int
+}
+
+fn Hook::get(self : Hook, x : Int) -> Int {
+  self.n = self.n + 1
+  x
+}
+
+fn sort_user_get(xs : Array[Int], h : Hook) -> Unit {
+  xs.sort_by_key(fn(x) { h.get(x) })
+}
+
+pub fn user_get() -> Int {
+  let h = { n: 0 }
+  let a = [3, 1, 2]
+  sort_user_get(a, h)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `get`)"),
+    "pipeline": (r'''
+fn sort_pipeline(xs : Array[Int], touch : (Int) -> Int) -> Unit {
+  xs.sort_by_key(fn(x) { x |> touch })
+}
+
+pub fn pipeline() -> Int {
+  let a = [3, 1, 2]
+  sort_pipeline(a, fn(x) {
+    a.push(8)
+    x
+  })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback pipes a value into a call"),
+    "index_call": (r'''
+fn sort_index_call(xs : Array[Int], fs : Array[(Int) -> Int]) -> Unit {
+  xs.sort_by_key(fn(x) { fs[0](x) })
+}
+
+pub fn index_call() -> Int {
+  let a = [3, 1, 2]
+  sort_index_call(a, [fn(x) {
+    a.push(8)
+    x
+  }])
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes an indirect call"),
+    "overload": (r'''
+struct K {
+  value : Int
+}
+
+impl Add for K with op_add(self, o) {
+  { value: self.value + o.value }
+}
+
+pub fn overload() -> Int {
+  let ks = [{ value: 3 }, { value: 1 }, { value: 2 }]
+  ks.sort_by_key(fn(k) { (k + k).value })
+  ks[0].value
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `"),
+    "interp_show": (r'''
+struct Hook {
+  mut n : Int
+}
+
+impl Show for Hook with output(self, logger) {
+  self.n = self.n + 1
+  logger.write_string("h")
+}
+
+fn sort_interp_show(xs : Array[Int], h : Hook) -> Unit {
+  xs.sort_by_key(fn(x) {
+    let _ = "\{h}"
+    x
+  })
+}
+
+pub fn interp_show() -> Int {
+  let h = { n: 0 }
+  let a = [3, 1, 2]
+  sort_interp_show(a, h)
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback interpolates a string"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
@@ -1024,7 +1133,7 @@ def main():
                         "`handed.pop(..)` runs while it is kept (in a closure defined before the iterator)",
                         "`.pop(..)` runs while an iterator of a computed array is kept (in a closure defined before the iterator)",
                         "key closure is not supported: the callback makes a call to `g(..)`",
-                        "(through `g` in a string interpolation)",
+                        "key closure is not supported: the callback interpolates a string",
                         "runs while an iterator of a computed array is kept", "(in a string interpolation)",
                         "comes from outside `trim_alias`"])
         for name, (src, code, needle) in FINAL_NEGS.items():
