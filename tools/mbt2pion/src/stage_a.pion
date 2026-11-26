@@ -10220,14 +10220,20 @@ fn classify_slice_consumer(
           }
           if !other_arg_refs_recv && trailing_args_pure {
             let callee_name = tokens[enclosing_lp - 1].raw
-            let target_elem_ty = extract_array_view_elem_f42(exp_t)
-            match ctx.symtab.fn_ret_types.get(callee_name) {
-              Some(ret_ty) =>
-              if !str_has(ret_ty, "ArrayView") && !str_has(ret_ty, "->") && !str_has(ret_ty, "Iter") &&
-              callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, target_elem_ty, 0) {
-                return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
+            let callee_shadowed = match lookup_scope_var(ctx, callee_name) {
+              Some(_) => true
+              None => false
+            }
+            if !callee_shadowed {
+              let target_elem_ty = extract_array_view_elem_f42(exp_t)
+              match ctx.symtab.fn_ret_types.get(callee_name) {
+                Some(ret_ty) =>
+                if !str_has(ret_ty, "ArrayView") && !str_has(ret_ty, "->") && !str_has(ret_ty, "Iter") &&
+                callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, target_elem_ty, 0) {
+                  return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
+                }
+                None => ()
               }
-              None => ()
             }
           }
         }
@@ -17896,14 +17902,24 @@ fn is_map_ret_type_f42(rt : String) -> Bool {
 }
 
 ///| True iff RHS at `rhs` is a provably Map/Option[Map]-returning direct call or `if ... { Some(call(...)) } else { None }` at statement boundary.
-fn is_map_rhs_f42(ctx : StageAContext, tokens : Array[Token], rhs : Int, fn_close : Int) -> Bool {
+fn is_map_rhs_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  rhs : Int,
+  fn_close : Int,
+  bound_scope : Array[(String, Int)],
+) -> Bool {
   if rhs >= fn_close {
     return false
   }
   if tokens[rhs].kind == TokenKind::Ident && rhs + 1 < fn_close && tokens[rhs + 1].kind == TokenKind::LParen {
     let rp = find_matching_delim(tokens, rhs + 1)
     if rp > rhs + 1 && rp < fn_close && is_stmt_end_f42(tokens, rp + 1, fn_close) {
-      match ctx.symtab.fn_ret_types.get(tokens[rhs].raw) {
+      let callee = tokens[rhs].raw
+      if bound_scope_has_f42(bound_scope, callee) {
+        return false
+      }
+      match ctx.symtab.fn_ret_types.get(callee) {
         Some(rt) => return is_map_ret_type_f42(rt)
         None => return false
       }
@@ -17940,7 +17956,11 @@ fn is_map_rhs_f42(ctx : StageAContext, tokens : Array[Token], rhs : Int, fn_clos
       is_stmt_end_f42(tokens, rb_if + 5, fn_close)) {
       return false
     }
-    match ctx.symtab.fn_ret_types.get(tokens[lb_if + 3].raw) {
+    let callee = tokens[lb_if + 3].raw
+    if bound_scope_has_f42(bound_scope, callee) {
+      return false
+    }
+    match ctx.symtab.fn_ret_types.get(callee) {
       Some(rt) => return is_map_ret_type_f42(rt)
       None => return false
     }
@@ -18000,7 +18020,7 @@ fn has_any_impl_f42(tokens : Array[Token]) -> Bool {
   let n = tokens.length()
   let mut k = 0
   while k < n {
-    if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "impl" {
+    if tokens[k].raw == "impl" {
       return true
     }
     k = k + 1
@@ -18107,6 +18127,11 @@ fn fn_has_no_nonfresh_mutation_f42(
   }
   let fresh_scope : Array[(String, Int, Bool)] = []
   let closure_scope : Array[(String, Int, Bool)] = []
+  for ic in inline_closure_params.keys() {
+    if map_bool_get_f42(inline_closure_params, ic) {
+      closure_scope.push((ic, 0, true))
+    }
+  }
   let map_scope : Array[(String, Int, Bool)] = []
   let mut bdepth = 0
   let mut i = fn_open + 1
@@ -18115,7 +18140,7 @@ fn fn_has_no_nonfresh_mutation_f42(
     if tk.kind == TokenKind::PkgRef {
       return false
     }
-    if tk.kind == TokenKind::StringLit && str_has(tk.raw, "\\{") {
+    if tk.kind == TokenKind::InterpString || (tk.kind == TokenKind::StringLit && str_has(tk.raw, "\\{")) {
       return false
     }
     if tk.kind == TokenKind::UpperIdent && ctx.symtab.local_types.contains(tk.raw) {
@@ -18183,10 +18208,13 @@ fn fn_has_no_nonfresh_mutation_f42(
             }
             rk = rk + 1
           }
+          if rhs_refs_self && ctx.symtab.val_types.contains(vname) {
+            return false
+          }
           let can_trust = !is_mut && !reassigned.contains(vname) && !rhs_refs_self
           let is_fn_rhs = tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "fn"
           let is_fresh_rhs = !is_fn_rhs && let_rhs_is_fresh_alloc_f42(ctx, tokens, rhs, fn_close)
-          let is_map_rhs = is_map_rhs_f42(ctx, tokens, rhs, fn_close)
+          let is_map_rhs = is_map_rhs_f42(ctx, tokens, rhs, fn_close, bound_scope)
           bound_scope.push((vname, bdepth))
           fresh_scope.push((vname, bdepth, can_trust && is_fresh_rhs))
           closure_scope.push((vname, bdepth, can_trust && is_fn_rhs))
@@ -18334,12 +18362,14 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       }
     }
-    // Single-param `<ident> => ...` or multi-param `(a, b) => ...` arrow closure: reject if any param shadows a trusted local
+    // Single-param `<ident> => ...` or multi-param `(a, b) => ...` arrow closure: reject if any param shadows a trusted local, global, or local fn
     if tk.kind == TokenKind::Ident && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::FatArrow {
       let pn = tk.raw
-      if map_scope_lookup_f42(fresh_scope, pn) || map_scope_lookup_f42(closure_scope, pn) || map_scope_lookup_f42(map_scope, pn) {
+      if map_scope_lookup_f42(fresh_scope, pn) || map_scope_lookup_f42(closure_scope, pn) || map_scope_lookup_f42(map_scope, pn) ||
+      ctx.symtab.val_types.contains(pn) || ctx.symtab.local_fn_names.contains(pn) {
         return false
       }
+      bound_scope.push((pn, bdepth))
     } else if tk.kind == TokenKind::RParen && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::FatArrow {
       let mut lp = i - 1
       let mut pd = 1
@@ -18354,9 +18384,11 @@ fn fn_has_no_nonfresh_mutation_f42(
           if tokens[pk].kind == TokenKind::Ident &&
           !(pk > lp + 1 && (tokens[pk - 1].kind == TokenKind::Dot || tokens[pk - 1].kind == TokenKind::ColonColon)) {
             let pn = tokens[pk].raw
-            if map_scope_lookup_f42(fresh_scope, pn) || map_scope_lookup_f42(closure_scope, pn) || map_scope_lookup_f42(map_scope, pn) {
+            if map_scope_lookup_f42(fresh_scope, pn) || map_scope_lookup_f42(closure_scope, pn) || map_scope_lookup_f42(map_scope, pn) ||
+            ctx.symtab.val_types.contains(pn) || ctx.symtab.local_fn_names.contains(pn) {
               return false
             }
+            bound_scope.push((pn, bdepth))
           }
           pk = pk + 1
         }
@@ -18426,6 +18458,18 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       }
     }
+    // Reject free references to non-builtin / non-disjoint module globals (e.g. `let h : Hook` in same or split file)
+    if tk.kind == TokenKind::Ident &&
+    !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
+    !bound_scope_has_f42(bound_scope, tk.raw) && !ctx.symtab.local_fn_names.contains(tk.raw) {
+      match ctx.symtab.val_types.get(tk.raw) {
+        Some(vt) =>
+        if !(is_closed_builtin_ty_f42(ctx, vt.trim()) || is_disjoint_global_array_f42(ctx, tk.raw, target_elem_ty)) {
+          return false
+        }
+        None => ()
+      }
+    }
     if (tk.kind == TokenKind::EqEq || tk.kind == TokenKind::BangEq) && has_custom_eq {
       return false
     }
@@ -18469,6 +18513,12 @@ fn fn_has_no_nonfresh_mutation_f42(
             return false
           }
         } else {
+          let is_pure_container_mut = (m == "push" || m == "pop" || m == "insert" || m == "remove" ||
+            m == "clear" || m == "set" || m == "swap" || m == "reverse" || m == "truncate" || m == "resize") &&
+          !is_method_shadowed_f42(ctx, m)
+          if !is_pure_container_mut {
+            return false
+          }
           if !(i >= 2 && tokens[i - 2].kind == TokenKind::Ident &&
             !(i >= 3 && (tokens[i - 3].kind == TokenKind::Dot || tokens[i - 3].kind == TokenKind::ColonColon))) {
             return false
@@ -18489,7 +18539,8 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       } else {
         let g = tk.raw
-        if g == "ignore" || g == "physical_equal" || map_scope_lookup_f42(closure_scope, g) || map_bool_get_f42(inline_closure_params, g) {
+        if ((g == "ignore" || g == "physical_equal") && !bound_scope_has_f42(bound_scope, g)) ||
+        map_scope_lookup_f42(closure_scope, g) {
           ()
         } else if !bound_scope_has_f42(bound_scope, g) && ctx.symtab.local_fn_names.contains(g) {
           let call_rp = find_matching_delim(tokens, i + 1)
@@ -18510,8 +18561,7 @@ fn fn_has_no_nonfresh_mutation_f42(
                   ae = ae + 1
                 }
                 let is_inline_fn = (as_idx < ae && tokens[as_idx].kind == TokenKind::Keyword && tokens[as_idx].raw == "fn") ||
-                (as_idx + 1 == ae && tokens[as_idx].kind == TokenKind::Ident &&
-                  (map_bool_get_f42(inline_closure_params, tokens[as_idx].raw) || map_scope_lookup_f42(closure_scope, tokens[as_idx].raw)))
+                (as_idx + 1 == ae && tokens[as_idx].kind == TokenKind::Ident && map_scope_lookup_f42(closure_scope, tokens[as_idx].raw))
                 if is_inline_fn && a_pos < g_params.length() && g_params[a_pos].length() > 0 {
                   child_inline[g_params[a_pos]] = true
                 }
