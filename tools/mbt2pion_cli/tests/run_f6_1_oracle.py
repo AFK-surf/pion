@@ -281,6 +281,14 @@ fn yes_helper(_x : Int) -> Bool {
   true
 }
 
+fn yes_bool(_b : Bool) -> Bool {
+  true
+}
+
+fn opt_none() -> Int? {
+  Option::None
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -346,7 +354,20 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 9
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string()
+  // R7 P1-1: call-arg `yes_bool(... is ...)` and negated `!(... is ...)` MUST NOT leak into `&&`
+  let p7 = try {
+    let _ = yes_bool(Some(1) is Some(always_fail_g)) && yes_helper(always_fail_g())
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  let p8 = try {
+    let _ = !(opt_none() is Some(always_fail_g)) && yes_helper(always_fail_g())
+    good_or_fail(false) + 42
+  } catch {
+    _ => 7
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -521,7 +542,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -711,6 +732,42 @@ def main():
             tr_pw = run_cmd([args.pionc, "run", "--target", "wasm32", tr_pd]).stdout.strip()
             assert tr_pn == "1" and tr_pw == "1", f"Transitive dep Pion ({ord_name}) mismatch: nat={tr_pn!r} wasm={tr_pw!r}"
         print("[f6-1-oracle] PASS R6 P1-1 transitive dep y->x->down(x @y) in all 3 --dep configs: 4-target == 1")
+
+        # 3a-5. R7 P2-2 4-target check: duplicate --dep aliases pointing to the SAME verified package MUST NOT fail as ambiguous
+        dup_m = os.path.join(work, "dup_moon")
+        for sub in ("down", "cmd"):
+            os.makedirs(os.path.join(dup_m, sub))
+        for rel, txt in [
+            ("moon.mod", 'name = "f6/tr"\n'),
+            ("y/moon.pkg", "\n"),
+            ("y/y.mbt", "pub fn get() -> Int { 2 }\n"),
+            ("down/moon.pkg", 'import { "f6/tr/y" @other }\n'),
+            ("down/down.mbt", "pub fn run_dup() -> Int { @other.get() }\n"),
+            ("cmd/moon.pkg", 'import { "f6/tr/down" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@down.run_dup().to_string()) }\n"),
+        ]:
+            os.makedirs(os.path.dirname(os.path.join(dup_m, rel)), exist_ok=True)
+            with open(os.path.join(dup_m, rel), "w") as f:
+                f.write(txt)
+        dup_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=dup_m).stdout.strip()
+        dup_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=dup_m).stdout.strip()
+        assert dup_mn == "2" and dup_mw == "2", f"Dup alias Moon mismatch: nat={dup_mn!r} wgc={dup_mw!r}"
+
+        for ord_name, dep_flags in [
+            ("yo", ["--dep", f"y={tr_py}", "--dep", f"other={tr_py}"]),
+            ("oy", ["--dep", f"other={tr_py}", "--dep", f"y={tr_py}"]),
+        ]:
+            dup_pd = os.path.join(work, f"dup_pd_{ord_name}")
+            os.makedirs(os.path.join(dup_pd, "src"))
+            with open(os.path.join(dup_pd, "pion.toml"), "w") as f:
+                f.write(f'[package]\nname = "dup_down_{ord_name}"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\ny = {{ path = "{tr_py}" }}\n')
+            run_cmd([bin_path, "--src", os.path.join(dup_m, "down"), "--out", os.path.join(dup_pd, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, *dep_flags, "--pionc", args.pionc])
+            with open(os.path.join(dup_pd, "src", "main.pion"), "w") as f:
+                f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_dup().to_string())\n  0\n}\n")
+            dup_pn = run_cmd([args.pionc, "run", dup_pd]).stdout.strip()
+            dup_pw = run_cmd([args.pionc, "run", "--target", "wasm32", dup_pd]).stdout.strip()
+            assert dup_pn == "2" and dup_pw == "2", f"Dup alias Pion ({ord_name}) mismatch: nat={dup_pn!r} wasm={dup_pw!r}"
+        print("[f6-1-oracle] PASS R7 P2-2 duplicate --dep aliases to same verified package (both orders): 4-target == 2")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
