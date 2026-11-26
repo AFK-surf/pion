@@ -38,6 +38,17 @@ import(process.argv[1]).then(async ({ runWasmBytes }) => {
 ' "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" "$wasm_path" "$expected_rc"
 }
 
+SHARD_IDX=0
+SHARD_CNT=1
+if [ -n "${PION_SHARD:-}" ]; then
+  SHARD_IDX="${PION_SHARD%%/*}"
+  SHARD_CNT="${PION_SHARD#*/}"
+fi
+shard_has() {
+  [ "$SHARD_CNT" -le 1 ] || [ $(( $1 % SHARD_CNT )) -eq "$SHARD_IDX" ]
+}
+
+if shard_has 0; then
 echo "=== Wave J1 E2E [1/3]: 2,500-term && with is-bindings + short-circuit (Native + Wasm32) ==="
 mkdir -p "$TMP_DIR/and_sc" "$TMP_DIR/cas_and"
 python3 - "$TMP_DIR/and_sc/main.pion" <<'PY'
@@ -78,6 +89,8 @@ if command -v node >/dev/null 2>&1; then
   echo "  wasm32 2500-term &&+is short-circuit: exit=15 (OK)"
 fi
 
+fi
+if shard_has 1; then
 echo "=== Wave J1 E2E [2/3]: Dual-file cold/hot CAS top-level const init ==="
 # (2a) Default-arg cold + hot CAS rebuild
 mkdir -p "$TMP_DIR/def" "$TMP_DIR/cas_def"
@@ -219,6 +232,8 @@ test "$nonfn_rc" -ne 0
 printf '%s' "$nonfn_out" | grep -q "E_TYPE_MISMATCH"
 echo "  non-function mk()() check --json: rc=$nonfn_rc E_TYPE_MISMATCH (OK)"
 
+fi
+if shard_has 2; then
 echo "=== Wave J1 E2E [3/3]: Cross-package monomorphized generic calling library closure const (Native + Wasm32) ==="
 mkdir -p "$TMP_DIR/xpkg/lib/src" "$TMP_DIR/xpkg/app/src" "$TMP_DIR/cas_xpkg"
 cat > "$TMP_DIR/xpkg/lib/pion.toml" <<'EOF'
@@ -265,6 +280,8 @@ if command -v node >/dev/null 2>&1; then
   echo "  xpkg mono library closure const wasm32: exit=25 (OK)"
 fi
 
+fi
+if shard_has 3; then
 echo "=== Wave J1 E2E [4/4]: Bool scalar casts (Native+Wasm32) & cross-pkg/indirect/alias #fcallp ==="
 # 4a. Bool scalar casts: true/false as Double, Float, Int64 (Native + Wasm32)
 mkdir -p "$TMP_DIR/bcast" "$TMP_DIR/cas_bcast"
@@ -338,6 +355,8 @@ out_cbx2=$("$TMP_DIR/cbx_hot")
 test "$out_cbx2" = "yoyoyo"
 echo "  xpkg util::call0 + twice + alias_apply cold/hot CAS: $out_cbx1 -> $out_cbx2 (OK)"
 
+fi
+if shard_has 4; then
 echo "=== Wave J1 E2E [5/5]: Local callable closures, branch callbacks & as Char scalar validation ==="
 # 5a. Local zero-arg closure call (cold + hot CAS), self-cycle E_CONST_CYCLE, and ignore_cb(f)
 mkdir -p "$TMP_DIR/lc_ok" "$TMP_DIR/cas_lc" "$TMP_DIR/lc_cyc"
@@ -468,6 +487,8 @@ if command -v node >/dev/null 2>&1; then
   echo "  as Char Unicode scalar validation wasm32: exit=77 (OK)"
 fi
 
+fi
+if shard_has 5; then
 echo "=== Wave J1 E2E [6/6]: Local higher-order #fcallp, shared mut slots & exact/non-exact callees ==="
 # 6a. Local higher-order closure `#fcallp` (cold + hot CAS, self-cycle, ignore)
 mkdir -p "$TMP_DIR/r8_ho" "$TMP_DIR/cas_r8_ho" "$TMP_DIR/r8_ho_cyc"
@@ -627,6 +648,8 @@ out_e2=$("$TMP_DIR/r8_ex_hot")
 test "$out_e2" = "qq!q"
 echo "  incomplete local targets + exhaustive branch callee cold/hot CAS: $out_e1 -> $out_e2 (OK)"
 
+fi
+if shard_has 6; then
 echo "=== Wave J1 E2E [7/7]: Shadowed closure param depth, [read_b][0](), exact #fslot & __slot_ignore ==="
 mkdir -p "$TMP_DIR/r9_ok" "$TMP_DIR/cas_r9" "$TMP_DIR/r9_cyc"
 cat > "$TMP_DIR/r9_ok/a.pion" <<'EOF'
@@ -713,6 +736,8 @@ test "$r9_cyc_rc" -ne 0
 printf '%s' "$r9_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R9 shadowed param depth + [read_b][0]() + exact #fslot + __slot_ignore cold/hot CAS ($rc1 -> $rc2) & self-cycle (OK)"
 
+fi
+if shard_has 7; then
 echo "=== Wave J1 E2E [8/8]: EMutArg slot invalidation, container projection/writes, decl-kind prefix & #fslot alias ==="
 mkdir -p "$TMP_DIR/r10_ok" "$TMP_DIR/cas_r10"
 cat > "$TMP_DIR/r10_ok/a.pion" <<'EOF'
@@ -833,6 +858,8 @@ out_r10_2=$("$TMP_DIR/r10_hot")
 test "$out_r10_2" = "ok:23:7:7:7:2:23"
 echo "  R10 EMutArg + container projection/writes + decl-kind prefix + #fslot alias cold/hot CAS: $out_r10_1 -> $out_r10_2 (OK)"
 
+fi
+if shard_has 8; then
 echo "=== Wave J1 E2E [9/9]: Shared container slots (\$cslot_), reverse, mut-param #fmutw/#fmutlink & let mut fs ==="
 mkdir -p "$TMP_DIR/r11_ok" "$TMP_DIR/cas_r11" "$TMP_DIR/r11_cyc"
 cat > "$TMP_DIR/r11_ok/a.pion" <<'EOF'
@@ -967,6 +994,8 @@ test "$r11_cyc_rc" -ne 0
 printf '%s' "$r11_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R11 shared \$cslot_ + reverse + #fmutw/#fmutlink + let mut fs cold/hot CAS ($out_r11_1 -> $out_r11_2) & self-cycle (OK)"
 
+fi
+if shard_has 9; then
 echo "=== Wave J1 E2E [10/10]: R12 independent cold/hot CAS for mut container rebind, param alias, user get & assign-LHS precision ==="
 # 10a: Reassigned mutable container (`let mut fs = [zero]; fs = [read_b]; let f = fs[0]; f()`)
 mkdir -p "$TMP_DIR/r12_1" "$TMP_DIR/cas_r12_1"
@@ -1099,6 +1128,8 @@ test "$r12_cyc_rc" -ne 0
 printf '%s' "$r12_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R12 independent cold/hot CAS (rebind $out_r12_1a->$out_r12_1b, palias $out_r12_2a->$out_r12_2b, userget $out_r12_3a->$out_r12_3b, nocall $out_r12_4a->$out_r12_4b) & call-cycle (OK)"
 
+fi
+if shard_has 10; then
 echo "=== Wave J1 E2E [11/11]: R13 independent cold/hot CAS for old/new alias, assign param alias, conditional #fcbw & alias direct_callp ==="
 # 11a: Rebind preserves old_a (0) while new_a sees rebound container (19 -> 29)
 mkdir -p "$TMP_DIR/r13_1old" "$TMP_DIR/r13_1new" "$TMP_DIR/cas_r13_1new"
@@ -1253,6 +1284,8 @@ test "$r13_cyc_rc" -ne 0
 printf '%s' "$r13_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R13 independent cold/hot CAS (old=$out_r13_1old, new $out_r13_1a->$out_r13_1b, assign $out_r13_2a->$out_r13_2b, cb $out_r13_3a->$out_r13_3b/un=$out_r13_3un, clear $out_r13_4a->$out_r13_4b) & call-cycle (OK)"
 
+fi
+if shard_has 11; then
 echo "=== Wave J1 E2E [12/12]: R14 independent cold/hot CAS for rebound shared cslot, #fcbcall, block env & alias forwarding ==="
 # 12a: Rebound mut container shares new $cslot with new_a while old_a keeps 0
 mkdir -p "$TMP_DIR/r14_1" "$TMP_DIR/cas_r14_1"
@@ -1403,6 +1436,8 @@ test "$r14_cyc_rc" -ne 0
 printf '%s' "$r14_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R14 independent cold/hot CAS (share $out_r14_1a->$out_r14_1b, cbcall $out_r14_2a->$out_r14_2b/un=$out_r14_2un, blk $out_r14_3a->$out_r14_3b, fwd $out_r14_4a->$out_r14_4b) & apply-cycle (OK)"
 
+fi
+if shard_has 12; then
 echo "=== Wave J1 E2E [13/13]: R15 independent cold/hot CAS for escaping anon closure alias, conditional cslots, SLetTuple & #fcbcallfwd ==="
 # 13a: Escaping anonymous closures capturing param alias (tail + return + struct field)
 mkdir -p "$TMP_DIR/r15_1" "$TMP_DIR/cas_r15_1"
@@ -1588,6 +1623,8 @@ test "$r15_4_cyc_rc" -ne 0
 printf '%s' "$r15_4_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R15 independent cold/hot CAS (esc $out_r15_1a->$out_r15_1b, cond $out_r15_2a->$out_r15_2b, tuple $out_r15_3a->$out_r15_3b/top $out_r15_3ta->$out_r15_3tb, cbfwd $out_r15_4a->$out_r15_4b) & cycles (OK)"
 
+fi
+if shard_has 13; then
 echo "=== Wave J1 E2E [14/14]: R16 independent cold/hot CAS for escaping named closure & while-loop cond_depth ==="
 # 14a: Escaping named closure local (tail + return + struct field)
 mkdir -p "$TMP_DIR/r16_1" "$TMP_DIR/cas_r16_1"
@@ -1701,6 +1738,8 @@ out_r16_3b=$("$TMP_DIR/r16_3_hot")
 test "$out_r16_3b" = "31"
 echo "  R16 independent cold/hot CAS (named $out_r16_1a->$out_r16_1b, ign $out_r16_2a->$out_r16_2b, while $out_r16_3a->$out_r16_3b) & apply-cycle (OK)"
 
+fi
+if shard_has 14; then
 echo "=== Wave J1 E2E [15/15]: R17 independent cold/hot CAS for loop back-edge, &&/|| cond_depth, SLetTuple swap & escaping cb->named cb ==="
 # 15a: Loop back-edge `while i < 2 { fs[0] = read_b; fs = right; i = i + 1 }` (17 -> 23)
 mkdir -p "$TMP_DIR/r17_1" "$TMP_DIR/cas_r17_1"
@@ -1898,6 +1937,8 @@ test "$r17_4_cyc_rc" -ne 0
 printf '%s' "$r17_4_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R17 independent cold/hot CAS (loop $out_r17_1a->$out_r17_1b, sc $out_r17_2a->$out_r17_2b, swap $out_r17_3a->$out_r17_3b, esc $out_r17_4a->$out_r17_4b/ign $out_r17_4ia->$out_r17_4ib) & apply-cycle (OK)"
 
+fi
+if shard_has 15; then
 echo "=== Wave J1 E2E [16/16]: R18 independent cold/hot CAS for 9-step shift loop, while-cond/SFor, match guard & SLetTuple block/if ==="
 # 16a: 9-step shift chain (`f0..f8 -> right`) cold/hot CAS (17 -> 23)
 mkdir -p "$TMP_DIR/r18_1" "$TMP_DIR/cas_r18_1"
@@ -2160,6 +2201,8 @@ out_r18_5b=$("$TMP_DIR/r18_5_hot")
 test "$out_r18_5b" = "53:53"
 echo "  R18b pure fn-var shift loop + SLetTuple if-branch cond_depth cold/hot CAS ($out_r18_5a -> $out_r18_5b) (OK)"
 
+fi
+if shard_has 16; then
 echo "=== Wave J1 E2E [17/17]: R19 independent cold/hot CAS & cycles for 65-step fallback, loop closure rescan, single-pass SLetTuple & match payload binding ==="
 # 17a: 65-step shift chain (f0..f64 -> right, 66-round loop > 64-round cap) independent cold/hot CAS (61 -> 63) + cycle
 mkdir -p "$TMP_DIR/r19_1" "$TMP_DIR/cas_r19_1" "$TMP_DIR/r19_1_cyc"
@@ -2448,6 +2491,8 @@ test "$r19_4b_cyc_rc" -ne 0
 printf '%s' "$r19_4b_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R19 independent cold/hot CAS ($r19_shift65_status, cb $out_r19_2a->$out_r19_2b, tup $out_r19_3a->$out_r19_3b, match-direct $out_r19_4aa->$out_r19_4ab, match-indirect $out_r19_4ba->$out_r19_4bb) & 5x cycles (OK)"
 
+fi
+if shard_has 17; then
 echo "=== Wave J1 E2E [18/18]: R20 two-phase pat bind, positional payload_evals & if/guard is cond pat bind ==="
 # 18a: multi-field shadowing pattern `match (left, right) { (right, dst) => { dst[0] = read_b } }; right[0]()` (71 -> 73) + cycle
 mkdir -p "$TMP_DIR/r20_1" "$TMP_DIR/cas_r20_1" "$TMP_DIR/r20_1_cyc"
@@ -2781,6 +2826,8 @@ test "$r20_7_cyc_rc" -ne 0
 printf '%s' "$r20_7_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R20 Opus additions cold/hot CAS (tup-match $out_r20_5a->$out_r20_5b, and-is $out_r20_6a->$out_r20_6b, if-ctor $out_r20_7a->$out_r20_7b) & 2x cycles (OK)"
 
+fi
+if shard_has 18; then
 echo "=== Wave J1 E2E [19/19]: R20b ground-truth ctor_call & cslot_unknown write/method propagation ==="
 # 19a: PascalCase fn / closure const / static method calls must report E_CONST_CYCLE
 mkdir -p "$TMP_DIR/r20b_1a" "$TMP_DIR/r20b_1b" "$TMP_DIR/r20b_1c"
@@ -2989,6 +3036,8 @@ test "$r20b_5_cyc_rc" -ne 0
 printf '%s' "$r20b_5_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R20b ground-truth ctor_call & cslot_unknown (1char-var ok=$out_r20b_2, if-dst $out_r20b_5a->$out_r20b_5b) & 7x cycles (OK)"
 
+fi
+if shard_has 19; then
 echo "=== Wave J1 E2E [20/20]: R21 hot/cold custom ctor consistency, Factory::V, SLetTuple ident, extract_callable if/match & precise branch cslots ==="
 # 20a: Opus hot/cold dual-file custom enum ctor consistency: Wrap(arr), Pair::Both(left, right), Wrap(read_b)
 mkdir -p "$TMP_DIR/r21_1a" "$TMP_DIR/cas_r21_1a" "$TMP_DIR/r21_1a_cyc"
@@ -3365,6 +3414,8 @@ test "$r21_5c_cyc_rc" -ne 0
 printf '%s' "$r21_5c_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R21 cold/hot CAS (wrap $out_r21_1aa->$out_r21_1ab, pair $out_r21_1ba->$out_r21_1bb, fwrap $out_r21_1ca->$out_r21_1cb, factory $out_r21_2a->$out_r21_2b, tup-id $out_r21_3a->$out_r21_3b, match-f $out_r21_4ma->$out_r21_4mb, if-f $out_r21_4ia->$out_r21_4ib, third=$out_r21_5a, install $out_r21_5ba->$out_r21_5bb) & 6x cycles (OK)"
 
+fi
+if shard_has 20; then
 echo "=== Wave J1 E2E [21/21]: R22 lowercase enum ctor?: fallback, Array::new cslot, branch call-arg, extract_callable cond_depth & block SLetTuple/SGuard ==="
 # 21a: Lowercase enum variants `wrap(arr)`, `Box::wrap(arr)`, `FWrap::wrap(read_b)` cold/hot CAS + cycles
 mkdir -p "$TMP_DIR/r22_1a" "$TMP_DIR/cas_r22_1a" "$TMP_DIR/r22_1b" "$TMP_DIR/cas_r22_1b" "$TMP_DIR/r22_1_cyc"
@@ -3650,6 +3701,8 @@ test "$r22_5_cyc_rc" -ne 0
 printf '%s' "$r22_5_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R22 cold/hot CAS (lwrap $out_r22_1aa->$out_r22_1ab, lfwrap $out_r22_1ba->$out_r22_1bb, arr-new=$out_r22_2, br-arg $out_r22_3a->$out_r22_3b/third=$out_r22_3t, cd $out_r22_4a->$out_r22_4b, blk-tup $out_r22_5ta->$out_r22_5tb, blk-guard $out_r22_5ga->$out_r22_5gb) & 4x cycles (OK)"
 
+fi
+if shard_has 21; then
 echo "=== Wave J1 E2E [22/22]: R23 match eval_let cond_depth, Option/Result qualified ctors & Array/FixedArray::make ==="
 # 22a: `match flag { true => { dst = right; 1 }, false => 0 }; dst[0] = read_b; left[0]()` cold/hot CAS (23 -> 29) + cycle
 mkdir -p "$TMP_DIR/r23_1" "$TMP_DIR/cas_r23_1" "$TMP_DIR/r23_1_cyc"
@@ -3757,6 +3810,8 @@ test "$r23_2_cyc_rc" -ne 0
 printf '%s' "$r23_2_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R23 cold/hot CAS (match-cd $out_r23_1a->$out_r23_1b, make-save=$out_r23_2s, make-call $out_r23_2a->$out_r23_2b) & 2x cycles (OK)"
 
+fi
+if shard_has 22; then
 echo "=== Wave J1 E2E [23/23]: R24 struct fn field push, direct make[0]() & param fill Array/FixedArray::make ==="
 # 23a: struct fn field `holder.push(read_b)` cold/hot CAS (53 -> 59) + `holder.push(read_a)` cycle
 mkdir -p "$TMP_DIR/r24_1" "$TMP_DIR/cas_r24_1" "$TMP_DIR/r24_1_cyc"
@@ -3887,6 +3942,8 @@ test "$r24_3_cyc_rc" -ne 0
 printf '%s' "$r24_3_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R24 cold/hot CAS (holder-push $out_r24_1a->$out_r24_1b, make-idx $out_r24_2a->$out_r24_2b, param-save=$out_r24_3s, param-call $out_r24_3a->$out_r24_3b) & 3x cycles (OK)"
 
+fi
+if shard_has 23; then
 echo "=== Wave J1 E2E [24/24]: R24b struct fn field shadowing unrelated method & 0-arg holder.run() / fire(holder) ==="
 # 24a: `Other::push` + `Other::run` + `Holder` fn fields cold/hot CAS (79:83 -> 83:89) + 2x cycles
 mkdir -p "$TMP_DIR/r24b_1" "$TMP_DIR/cas_r24b_1" "$TMP_DIR/r24b_1_cyc1" "$TMP_DIR/r24b_1_cyc2"
@@ -4020,6 +4077,8 @@ test "$r24b_2_cyc2_rc" -ne 0
 printf '%s' "$r24b_2_cyc2_out" | grep -q "E_CONST_CYCLE"
 echo "  R24b cold/hot CAS (shadow $out_r24b_1a->$out_r24b_1b, zero-arg/fire $out_r24b_2a->$out_r24b_2b) & 4x cycles (OK)"
 
+fi
+if shard_has 24; then
 echo "=== Wave J1 E2E [25/25]: R25 dyn/generic trait dispatch, exact struct fn field, generic Holder[T].get & top-level const struct ==="
 # 25a: `dyn Read` & `via[T : Read]` cold/hot CAS (101:101 -> 103:103) + 2x cycles
 mkdir -p "$TMP_DIR/r25_1" "$TMP_DIR/cas_r25_1" "$TMP_DIR/r25_1_cyc1" "$TMP_DIR/r25_1_cyc2"
@@ -4202,6 +4261,8 @@ test "$r25_4_cyc_rc" -ne 0
 printf '%s' "$r25_4_cyc_out" | grep -q "E_CONST_CYCLE"
 echo "  R25 cold/hot CAS (trait $out_r25_1a->$out_r25_1b, field-ok=$out_r25_2, gen-get $out_r25_3a->$out_r25_3b, top-H-ok=$out_r25_4s/ord $out_r25_4a->$out_r25_4b) & 5x cycles (OK)"
 
+fi
+if shard_has 25; then
 echo "=== Wave J1 E2E [26/26]: R25b non-exact struct fn field init & top-level #cfdef callback param propagation ==="
 mkdir -p "$TMP_DIR/r25b_1" "$TMP_DIR/cas_r25b_1" "$TMP_DIR/r25b_1_cyc1" "$TMP_DIR/r25b_1_cyc2" "$TMP_DIR/r25b_2" "$TMP_DIR/cas_r25b_2" "$TMP_DIR/r25b_2_cyc1" "$TMP_DIR/r25b_2_cyc2"
 cat > "$TMP_DIR/r25b_1/a.pion" <<'EOF'
@@ -4314,6 +4375,8 @@ test "$r25b_2_cyc2_rc" -ne 0
 printf '%s' "$r25b_2_cyc2_out" | grep -q "E_CONST_CYCLE"
 echo "  R25b cold/hot CAS (nonexact $out_r25b_1a->$out_r25b_1b, top-H-cb $out_r25b_2a->$out_r25b_2b) & 4x cycles (OK)"
 
+fi
+if shard_has 26; then
 echo "=== Wave J1 E2E [27/27]: R26 unified @field::, #fret, #fieldw/#fieldp & #cfspread (all 16 Opus probes + 5 Astra blockers) ==="
 # Run all 16 Opus probes (cycle + 2-file cold 7 -> hot 9)
 python3 - "$TMP_DIR/r26_opus" <<'PYEOF'
@@ -4442,6 +4505,8 @@ test "$r26_a_rc3" -ne 0
 printf '%s' "$r26_a_c3" | grep -q "E_CONST_CYCLE"
 echo "  R26 unified: 16/16 Opus probes (cyc + cold 7->hot 9) & Astra #2-#5 ($out_r26_aa->$out_r26_ab + 3x cycles) (OK)"
 
+fi
+if shard_has 27; then
 echo "=== Wave J1 E2E [28/28]: R27 alias factory \$ret:, shadowed local ret & type-qualified reachability-gated #fieldw/#fieldp ==="
 mkdir -p "$TMP_DIR/r27_1" "$TMP_DIR/cas_r27_1" "$TMP_DIR/r27_1_cyc" "$TMP_DIR/r27_2" "$TMP_DIR/cas_r27_2" "$TMP_DIR/r27_3" "$TMP_DIR/cas_r27_3"
 cat > "$TMP_DIR/r27_1/a.pion" <<'EOF'
@@ -4528,6 +4593,8 @@ out_r27_3b=$("$TMP_DIR/r27_3_hot")
 test "$out_r27_3b" = "0"
 echo "  R27 cold/hot CAS (alias-factory $out_r27_1a->$out_r27_1b + cyc, shadow-ret $out_r27_2a->$out_r27_2b, other+dead-write $out_r27_3a->$out_r27_3b) (OK)"
 
+fi
+if shard_has 28; then
 echo "=== Wave J1 E2E [29/29]: R28 param factory \$retp:, multi-level outer()(), @ci:, gated fdef, isolated locals & Opus indirect/dyn/spread ==="
 mkdir -p "$TMP_DIR/r28_1a" "$TMP_DIR/cas_r28_1a" "$TMP_DIR/r28_1a_cyc" \
          "$TMP_DIR/r28_1b" "$TMP_DIR/cas_r28_1b" "$TMP_DIR/r28_1b_cyc" \
@@ -4767,6 +4834,8 @@ set +e; r28_c=$("$PIONC" check --json "$TMP_DIR/r28_op3_cyc/main.pion" 2>&1); r2
 test "$r28_rc" -ne 0; printf '%s' "$r28_c" | grep -q "E_CONST_CYCLE"
 echo "  R28 cold/hot CAS (param-factory $out_r28_1ac->$out_r28_1ah, outer()() $out_r28_1bc->$out_r28_1bh, @ci:/fdef/isolated 0->0, Opus indirect/dyn/spread 7->9) & 7x cycles (OK)"
 
+fi
+if shard_has 29; then
 echo "=== Wave J1 E2E [30/30]: R29 EIs isolated shadow, @fdef: def_ctx, #fdefcb & context-sensitive \$retp: ==="
 mkdir -p "$TMP_DIR/r29_1" "$TMP_DIR/cas_r29_1" "$TMP_DIR/r29_1_cyc" \
          "$TMP_DIR/r29_2" "$TMP_DIR/cas_r29_2" "$TMP_DIR/r29_2_cyc" \
@@ -4898,6 +4967,8 @@ set +e; r29_c=$("$PIONC" check --json "$TMP_DIR/r29_4_cyc/main.pion" 2>&1); r29_
 test "$r29_rc" -ne 0; printf '%s' "$r29_c" | grep -q "E_CONST_CYCLE"
 echo "  R29 cold/hot CAS (eis-shadow $out_r29_1c->$out_r29_1h, inline-fdef 0->0, fdefcb $out_r29_3c->$out_r29_3h, ctx-retp $out_r29_4c->$out_r29_4h) & 4x cycles (OK)"
 
+fi
+if shard_has 30; then
 echo "=== Wave J1 E2E [31/31]: R30 default param refs, nested fdef cb, 8/9-level \$retp:, alias \$retp: & Opus 4+1 default cb ==="
 mkdir -p \
   "$TMP_DIR/r30_1a" "$TMP_DIR/cas_r30_1a" "$TMP_DIR/r30_1a_ok" "$TMP_DIR/cas_r30_1a_ok" "$TMP_DIR/r30_1a_cyc" \
@@ -5310,6 +5381,8 @@ test "$("$TMP_DIR/r30_o5_h")" = "0"
 
 echo "  R30 cold/hot CAS (fdef-val $out_r30_1ac->$out_r30_1ah, fdef-call $out_r30_1bc->$out_r30_1bh, nested-fdef $out_r30_2c->$out_r30_2h, depth8/9 $out_r30_3ac->$out_r30_3ah/$out_r30_3bc->$out_r30_3bh, alias-retp $out_r30_4c->$out_r30_4h, Opus 4+1 7->9/0->0) & 10x cycles (OK)"
 
+fi
+if shard_has 31; then
 echo "=== Wave J1 E2E [32/32]: R31 default arg lexical hygiene (no SIGSEGV), active_fdef rescan & 65/66-level transitive ret ==="
 mkdir -p \
   "$TMP_DIR/r31_1_d1" "$TMP_DIR/cas_r31_1_d1" \
@@ -5505,6 +5578,8 @@ done
 
 echo "  R31 cold/hot CAS (hygiene 0->0/$out_r31_d2c->$out_r31_d2h + Opus no-SIGSEGV 0/0, fdef-rescan $out_r31_2c->$out_r31_2h/0, depth65/66 7->9/7->9) & 5x cycles (OK)"
 
+fi
+if shard_has 32; then
 echo "=== Wave J1 E2E [33/33]: R32 default arg llbc K-hygiene, closure return=42 & generic T default_expr ==="
 mkdir -p \
   "$TMP_DIR/r32_k" "$TMP_DIR/cas_r32_k" \
@@ -5537,6 +5612,8 @@ test "$("$TMP_DIR/r32_gen_b")" = "0"
 
 echo "  R32 runtime (outer(9)==7, default-closure return==42, generic g(7)+caller(\"hi\")==0) (OK)"
 
+fi
+if shard_has 33; then
 echo "=== Wave J1 E2E [34/34]: R33 cross-pkg default K/Item/generic T, DImpl decl check & forbid ? in default_expr ==="
 mkdir -p \
   "$TMP_DIR/r33_xpkg/dep/src" "$TMP_DIR/r33_xpkg/app/src" "$TMP_DIR/cas_r33_xpkg" \
@@ -5598,6 +5675,8 @@ test "$("$TMP_DIR/r33_try_ok_b")" = "42"
 
 echo "  R33 runtime (xpkg K/Item/id_len==7, forbid ? E_TYPE_MISMATCH, default-closure ?==42) (OK)"
 
+fi
+if shard_has 34; then
 echo "=== Wave J1 E2E [35/35]: R34 default arg break/continue, xpkg is-binding & private Item lazy import ==="
 mkdir -p \
   "$TMP_DIR/r34_brk_bad" "$TMP_DIR/r34_loop_ok" "$TMP_DIR/cas_r34_loop_ok" \
@@ -5683,6 +5762,8 @@ test "$r34_prc" -ne 0; printf '%s' "$r34_p" | grep -q "E_PRIVATE_SYMBOL"
 
 echo "  R34 runtime (own-loop==4, xpkg is+priv-Item==113, bare break E_TYPE_MISMATCH, direct priv Item E_PRIVATE_SYMBOL) (OK)"
 
+fi
+if shard_has 35; then
 echo "=== Wave J1 E2E [36/36]: R35 private enum ctors, 3-pkg dep->bridge->app isolation, alias hijack & value && is-scoping ==="
 mkdir -p \
   "$TMP_DIR/r35/dep/src" "$TMP_DIR/r35/bridge/src" "$TMP_DIR/r35/decoy/src" \
@@ -5841,6 +5922,8 @@ test "$("$TMP_DIR/r35_val_and_b")" = "0"
 
 echo "  R35 runtime (priv-enum val/call E_PRIVATE_SYMBOL, 3-pkg isolation E_PRIVATE_SYMBOL, alias-hijack==16 debug+--release, val-and==0) (OK)"
 
+fi
+if shard_has 36; then
 echo "=== Wave J1 E2E [37/37]: R36 canonical Ty lookup vs alias, missing struct in aliased pkg, PVariant resolved visibility & FnInfo.is_imported ==="
 mkdir -p \
   "$TMP_DIR/r36/dep/src" "$TMP_DIR/r36/decoy/src" \
@@ -6048,6 +6131,8 @@ test "$("$TMP_DIR/r36_lib_struct_rel_b")" = "7"
 
 echo "  R36 runtime (canon-Ty 11:22 debug+--release, missing-struct E_TYPE_MISMATCH/lib==7, PVariant==3/priv E_PRIVATE_SYMBOL, struct-Lib-collision==7 debug+--release) (OK)"
 
+fi
+if shard_has 37; then
 echo "=== Wave J1 E2E [38/38]: R37 probe EStructLit no double-redirect, omitted struct lit, static method fn-value & PVariant enum identity ==="
 mkdir -p \
   "$TMP_DIR/r37/dep/src" "$TMP_DIR/r37/decoy/src" \
@@ -6241,6 +6326,8 @@ test "$("$TMP_DIR/r37_rev_rel_b")" = "1:2|1:2|1:2|5:22|1:2|5:22"
 
 echo "  R37 runtime (pick/tag 11:22:22:11:11, omitted-lit 7:8, PVariant mismatch/ok==3, Opus a1-a5 reversed-field debug+--release) (OK)"
 
+fi
+if shard_has 38; then
 echo "=== Wave J1 E2E [39/39]: R38 mono_pkg generic struct layout, trait alias vs dyn lookup & unqualified .Variant default_expr ==="
 mkdir -p \
   "$TMP_DIR/r38/dep/src" "$TMP_DIR/r38/decoy/src" \
@@ -6341,6 +6428,8 @@ test "$("$TMP_DIR/r38_dv_rel_b")" = "14"
 
 echo "  R38 runtime (mono_pkg make_gen 11:22 + dyn trait 22:11 debug+--release, unqualified .Hit xpkg default==14 debug+--release) (OK)"
 
+fi
+if shard_has 39; then
 echo "=== Wave J1 E2E [40/40]: R39 source trait visibility/aliasing (private impl, aliased bound & xpkg private dyn default) ==="
 mkdir -p \
   "$TMP_DIR/r39/dep/src" "$TMP_DIR/r39/decoy/src" \
@@ -6435,6 +6524,8 @@ test "$r39_dbrc" -ne 0; printf '%s' "$r39_db" | grep -q "E_PRIVATE_SYMBOL"
 
 echo "  R39 runtime (priv impl E_PRIVATE_SYMBOL, aliased bound E_UNKNOWN_TRAIT, xpkg priv dyn default==0 debug+--release / direct E_PRIVATE_SYMBOL) (OK)"
 
+fi
+if shard_has 40; then
 echo "=== Wave J1 E2E [41/41]: R40 cross-pkg default_expr calling private dyn Trait methods with qualified Item param/ret ==="
 mkdir -p \
   "$TMP_DIR/r40/dep/src" "$TMP_DIR/r40/app_ok/src" "$TMP_DIR/cas_r40_ok" "$TMP_DIR/cas_r40_ok_rel" \
@@ -6500,6 +6591,8 @@ test "$r40_brc" -ne 0; printf '%s' "$r40_b" | grep -q "E_PRIVATE_SYMBOL"
 
 echo "  R40 runtime (xpkg priv dyn Trait methods==808 debug+--release with colliding local Item, direct dyn dep::Hidden E_PRIVATE_SYMBOL) (OK)"
 
+fi
+if shard_has 41; then
 echo "=== Wave J1 E2E [42/42]: R41 Opus run6.sh mono_pkg nominal Ty, method lookup & unqualified helper call under alias hijack ==="
 mkdir -p \
   "$TMP_DIR/r41/dep/src" "$TMP_DIR/r41/decoy/src" \
@@ -6580,6 +6673,8 @@ test "$("$TMP_DIR/r41_rel_b")" = "5:10|hi:lo|105|5/10|A/B"
 
 echo "  R41 runtime (Opus run6.sh use_t/use_h/bonus/dyn-Tag 5:10|hi:lo|105|5/10|A/B debug+--release) (OK)"
 
+fi
+if shard_has 42; then
 echo "=== Wave J1 E2E [43/43]: R42 no __mono_pkg__ sentinel collision & mono_pkg ECall(EPath) defining-pkg alias resolution ==="
 mkdir -p \
   "$TMP_DIR/r42/real/src" "$TMP_DIR/r42/decoy/src" \
@@ -6662,6 +6757,8 @@ test "$("$TMP_DIR/r42_rel_b")" = "1004|105|105|100:100"
 
 echo "  R42 runtime (no __mono_pkg__ collision 1004|105, mono_pkg default_arg==105, mono_pkg tools::bonus 100:100 debug+--release) (OK)"
 
+fi
+if shard_has 43; then
 echo "=== Wave J1 E2E [44/44]: R43 unified qbe_resolve_path_pkg (scalar opt/POD inline, static method fn-val & default-arg cb) ==="
 mkdir -p \
   "$TMP_DIR/r43/real/src" "$TMP_DIR/r43/decoy/src" \
@@ -6749,6 +6846,8 @@ test "$("$TMP_DIR/r43_rel_b")" = "100:100|100:100|100"
 
 echo "  R43 runtime (unified qbe_resolve_path_pkg: pick/pod 100:100, static Item::tag 100:100, default-cb 100 debug+--release) (OK)"
 
+fi
+if shard_has 44; then
 echo "=== Wave J1 E2E [45/45]: R44 enum static-method fn-value & mono_pkg qualified enum ctor alias isolation ==="
 mkdir -p \
   "$TMP_DIR/r44/real/src" "$TMP_DIR/r44/decoy/src" \
@@ -6827,6 +6926,8 @@ test "$("$TMP_DIR/r44_rel_b")" = "100:100|1"
 
 echo "  R44 runtime (enum static Mode::tag 100:100 + mono_pkg real::E::Hit(7)==1 debug+--release) (OK)"
 
+fi
+if shard_has 45; then
 echo "=== Wave J1 E2E [46/46]: R45 --release xpkg inline boxing of private dyn Trait vtable method slots ==="
 mkdir -p \
   "$TMP_DIR/r45/dep/src" "$TMP_DIR/r45/app/src" \
@@ -6871,6 +6972,8 @@ fi
 
 echo "  R45 runtime+SSA (private dyn Hidden vtable wrap slot & dep::run()==7 debug+--release) (OK)"
 
+fi
+if shard_has 46; then
 echo "=== Wave J1 E2E [47/47]: R46/R47 self-pkg qualified canonical dyn Trait (app::Local) dispatch, boxing & import-as-app alias isolation ==="
 mkdir -p \
   "$TMP_DIR/r46/decoy/src" "$TMP_DIR/r46/app/src" \
@@ -6925,6 +7028,8 @@ test "$("$TMP_DIR/r46_rel_b")" = "7:7:7:7:7"
 
 echo "  R46/R47 runtime (self-pkg canonical dyn app::Local + import decoy as app==7:7:7:7:7 debug+--release) (OK)"
 
+fi
+if shard_has 47; then
 echo "=== Wave J1 E2E [48/48]: R49 PR #34 Opus+Astra blockers (default return, non-fn shadow, chained fwd, #fdeffwd, unit EPath & hot-loop 2500+) ==="
 mkdir -p \
   "$TMP_DIR/r49_ret_r1" "$TMP_DIR/r49_ret_r2" "$TMP_DIR/r49_ret_r7" "$TMP_DIR/r49_ret_r3" "$TMP_DIR/cas_r49_r3" \
@@ -7142,6 +7247,8 @@ test "$("$TMP_DIR/r49_sum_b")" = "5000"
 
 echo "  R49 PR #34 Opus+Astra blockers (default-ret, non-fn shadow 7->9, chained-fwd 7->9/0, #fdeffwd 7->9/0, unit EPath 10:2, hot-loop 2500+==5000) (OK)"
 
+fi
+if shard_has 48; then
 echo "=== Wave J1 E2E [49/49]: R50 PR #34 final Opus+Astra edge cases (fwd-edge 3 consumers, __probe__ user fn, generic TParam non-callable in body & default_expr, xpkg non-fn param shadow in default_expr) ==="
 mkdir -p "$TMP_DIR/r50_fwd" "$TMP_DIR/r50_fwd_cyc" "$TMP_DIR/r50_probe" \
   "$TMP_DIR/r50_tp_run" "$TMP_DIR/r50_tp_cyc1" "$TMP_DIR/r50_tp_cyc2" "$TMP_DIR/r50_tp_cas" \
@@ -7275,6 +7382,8 @@ test "$("$TMP_DIR/r50_xdef_rel_b")" = "8"
 
 echo "  R50 PR #34 final Opus+Astra fixes (fwd-edge 7->9, __probe__==0, TParam 42:42:42 & 7:7->9:9, xpkg default_expr==8) (OK)"
 
+fi
+if shard_has 49; then
 echo "=== Wave J1 E2E [50/50]: R51 ground-truth call_pkg unification (mono TParam/let/closure, xpkg default_expr 10-case matrix & private TFn const, 6x cycle + cold/hot CAS 7->9) ==="
 mkdir -p "$TMP_DIR/r51_local" \
   "$TMP_DIR/r51_xpkg/dep/src" "$TMP_DIR/r51_xpkg/app/src" \
@@ -7542,6 +7651,8 @@ test "$("$TMP_DIR/r51_tp_h")" = "9"
 
 echo "  R51 ground-truth call_pkg unification (local 42x5, xpkg 10-case matrix, 6x cycle + cold/hot CAS 7->9) (OK)"
 
+fi
+if shard_has 50; then
 echo "=== Wave J1 E2E [51/51]: R52 Astra #1-#5 + Opus Note 2 (Option::None/Some hygiene, call_nonlocal builtin/probe, non-exact hot CAS, const-closure RC guard, q1/q2 & match/is shadow) ==="
 mkdir -p "$TMP_DIR/r52_opt" "$TMP_DIR/r52_bi" "$TMP_DIR/r52_probe" \
   "$TMP_DIR/r52_nonex_cyc" "$TMP_DIR/r52_nonex_cas" \
@@ -7662,9 +7773,7 @@ test "$("$TMP_DIR/r52_rc_b")" = "6"
 PION_CACHE_DIR="$TMP_DIR/cas_r52_rc_rel" "$PIONC" build --release -o "$TMP_DIR/r52_rc_rel_b" "$TMP_DIR/r52_rc/main.pion"
 test "$("$TMP_DIR/r52_rc_rel_b")" = "6"
 CC_BIN="${CC:-cc}"
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/r52_asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/r52_pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/r52_libpionrt_asan.a" "$TMP_DIR/r52_pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/r52_libpionrt_asan.a"; then
   for R52_MODE in "" --release; do
     "$PIONC" build $R52_MODE --emit-obj "$TMP_DIR/r52_rc.o" "$TMP_DIR/r52_rc/main.pion"
     "$CC_BIN" -fsanitize=address "$TMP_DIR/r52_rc.o" "$TMP_DIR/r52_libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/r52_rc_asan"
@@ -7720,6 +7829,8 @@ test "$("$TMP_DIR/r52_mis_h")" = "9:9"
 
 echo "  R52 Astra #1-#5 + Opus Note 2 (Option::None/Some 7:7:5, math_sqrt==3, probe==42, non-exact 7->9, const-clo RC==6, q1/q2==42:42, match/is 7:7->9:9) (OK)"
 
+fi
+if shard_has 51; then
 echo "=== Wave J1 E2E [52/52]: R53 final Astra #1-#2 (xpkg mono_pkg builtin isolation, pkg-const alias & unannotated closure param hot CAS 7->9) ==="
 mkdir -p "$TMP_DIR/r53_xbi/dep/src" "$TMP_DIR/r53_xbi/app/src" \
   "$TMP_DIR/r53_cal_cyc" "$TMP_DIR/r53_cal_cas" \
@@ -7815,6 +7926,8 @@ test "$("$TMP_DIR/r53_ucl_h")" = "9"
 
 echo "  R53 final Astra #1-#2 (xpkg math_sqrt==3.0, const-alias 7->9, unannotated closure param 7->9) (OK)"
 
+fi
+if shard_has 52; then
 echo "=== Wave J1 E2E [53/53]: R54 Astra #1-#3 (xpkg default_expr builtin isolation, container-wrapped param local alias & unannotated factory alias hot CAS 7->9) ==="
 mkdir -p "$TMP_DIR/r54_xdef/dep/src" "$TMP_DIR/r54_xdef/app/src" \
   "$TMP_DIR/r54_wrap_cyc" "$TMP_DIR/r54_wrap_cas" \
@@ -7912,6 +8025,8 @@ test "$("$TMP_DIR/r54_fac_h")" = "9"
 
 echo "  R54 Astra #1-#3 (xpkg default builtin==3.0, Some(f) alias 7->9, unannotated factory alias 7->9) (OK)"
 
+fi
+if shard_has 53; then
 echo "=== Wave J1 E2E [54/54]: R55 Astra #1-#2 (xpkg default_expr shadowed enum ctor & cold/hot CAS init-order parity via call?:) ==="
 mkdir -p "$TMP_DIR/r55_xctor/dep/src" "$TMP_DIR/r55_xctor/app/src" "$TMP_DIR/r55_ord"
 
@@ -7968,6 +8083,8 @@ test "$("$TMP_DIR/r55_ord_h")" = "0:1:2"
 
 echo "  R55 Astra #1-#2 (xpkg shadowed enum ctor==7, cold/hot CAS init-order parity 0:1:1 -> 0:1:2) (OK)"
 
+fi
+if shard_has 54; then
 echo "=== Wave J1 E2E [55/55]: R56 Astra #1-#2 (unconditional call?: ambig + tc_nonlocal_builtin: shadowed enum ctor & ignore builtin zero false cycles) ==="
 mkdir -p "$TMP_DIR/r56_ctor" "$TMP_DIR/r56_ign"
 
@@ -8014,6 +8131,8 @@ test "$("$TMP_DIR/r56_ign_h")" = "0:2"
 
 echo "  R56 Astra #1-#2 (shadowed enum ctor & ignore builtin cold/hot/release 0:1 -> 0:2, zero false cycles) (OK)"
 
+fi
+if shard_has 55; then
 echo "=== Wave J1 E2E [56/56]: R57 sig_is_ctor_call skips forwarded param/alias arg (Some(f)+ignore(7) ok, unpacked g(7) cycle + 7->9 CAS) ==="
 mkdir -p "$TMP_DIR/r57_ok" "$TMP_DIR/r57_cyc" "$TMP_DIR/r57_cas"
 
@@ -8135,6 +8254,8 @@ printf '%s' "$r58_cyc2_out" | grep -q "E_CONST_CYCLE"
 
 echo "  R58 .Some(f) & Some(move f) (ok dev/release/hot 0:0:1 -> 0:0:2, .Some(move f) unpacked & Some(f(7)) E_CONST_CYCLE) (OK)"
 
+fi
+if shard_has 56; then
 echo "=== Wave J1 E2E [57/57]: R59 Opus blockers (param_forward_ctor, alias_forward_ctor, const_opt_closure, param_ctor_nocall_clean) ==="
 mkdir -p "$TMP_DIR/r59_pfc_cyc1" "$TMP_DIR/r59_pfc_cyc2" "$TMP_DIR/r59_pfc_cas" \
          "$TMP_DIR/r59_afc_cyc" "$TMP_DIR/r59_afc_cas" \
@@ -8273,6 +8394,8 @@ test "$("$TMP_DIR/r59_nc_h")" = "0:2"
 
 echo "  R59 Opus blockers (param_forward_ctor 7:7->9:9, alias_forward_ctor 7->9, const_opt_closure 7->9 & ok=0, param_ctor_nocall_clean 0:1->0:2) (OK)"
 
+fi
+if shard_has 57; then
 echo "=== Wave J1 E2E [58/58]: R61 package-level let Some shadowing builtin ctor (cold/hot CAS 16:1 -> 16:2 -> 18:2) ==="
 mkdir -p "$TMP_DIR/r61_some"
 cat > "$TMP_DIR/r61_some/a.pion" <<'EOF'
@@ -8298,6 +8421,8 @@ PION_CACHE_DIR="$TMP_DIR/cas_r61_some" "$PIONC" build -o "$TMP_DIR/r61_some_h2" 
 test "$("$TMP_DIR/r61_some_h2")" = "18:2"
 echo "  R61 let Some shadowing builtin ctor (cold/hot CAS 16:1 -> 16:2 -> 18:2) (OK)"
 
+fi
+if shard_has 58; then
 echo "=== Wave J1 E2E [59/59]: R63 cross-pkg mono payload enum ctor resolves via mono_pkg alias, never caller g.tc.enums ==="
 mkdir -p "$TMP_DIR/r63_mono/src" "$TMP_DIR/r63_mono/paint2/src" "$TMP_DIR/r63_mono/lg/src" "$TMP_DIR/r63_mono/app/src"
 cat > "$TMP_DIR/r63_mono/pion.toml" <<'EOF'
@@ -8386,6 +8511,8 @@ PION_CACHE_DIR="$TMP_DIR/cas_r63_rel" "$PIONC" build --release -o "$TMP_DIR/r63_
 test "$("$TMP_DIR/r63_rel")" = "7"
 echo "  R63 cross-pkg mono payload enum ctor (dev==7, --release==7) (OK)"
 
+fi
+if shard_has 59; then
 echo "=== Wave J1 E2E [60/60]: P2 R5 cross-pkg 3-segment aliased EPath (paint::E::Hit) blocks LICM hoist ==="
 mkdir -p "$TMP_DIR/p2_r5_alias/src" "$TMP_DIR/p2_r5_alias/paint2/src" "$TMP_DIR/p2_r5_alias/lg/src" "$TMP_DIR/p2_r5_alias/app/src"
 cat > "$TMP_DIR/p2_r5_alias/pion.toml" <<'EOF'
@@ -8495,4 +8622,5 @@ awk '
 ' "$TMP_DIR/p2_r5_mono.ssa"
 echo "  P2 R5 3-segment aliased EPath paint::E::Hit (dev==1214:44, --release==1214:44, SSA no-hoist) (OK)"
 
+fi
 echo "PASS: wave_j1_soundness"

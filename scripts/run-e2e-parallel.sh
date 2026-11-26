@@ -23,11 +23,14 @@
 set -eu
 
 JOBS="${PION_E2E_JOBS:-}"
+SHARD="${PION_E2E_SHARD:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     -j) JOBS="$2"; shift 2 ;;
     -j*) JOBS="${1#-j}"; shift ;;
-    *) echo "usage: run-e2e-parallel.sh [-j N] < commands" >&2; exit 2 ;;
+    --shard) SHARD="$2"; shift 2 ;;
+    --shard=*) SHARD="${1#--shard=}"; shift ;;
+    *) echo "usage: run-e2e-parallel.sh [-j N] [--shard i/N] < commands" >&2; exit 2 ;;
   esac
 done
 
@@ -50,6 +53,7 @@ def usable_cpus():
     return max(1, n)
 
 jobs_arg = sys.argv[1]
+shard_arg = sys.argv[2]
 jobs = int(jobs_arg) if jobs_arg else min(usable_cpus(), 8)
 if jobs < 1:
     sys.exit("run-e2e-parallel: -j must be >= 1")
@@ -57,10 +61,21 @@ verbose = os.environ.get("PION_E2E_VERBOSE") == "1"
 
 cmds = [l.strip() for l in sys.stdin.read().splitlines()]
 cmds = [c for c in cmds if c and not c.startswith("#")]
+if shard_arg:
+    m = re.fullmatch(r"(\d+)/(\d+)", shard_arg)
+    if not m:
+        sys.exit("run-e2e-parallel: --shard must be i/N (0 <= i < N)")
+    si, sn = int(m.group(1)), int(m.group(2))
+    if sn < 1 or si < 0 or si >= sn:
+        sys.exit("run-e2e-parallel: invalid --shard %s" % shard_arg)
+    # Strided assignment on the LPT-ordered list balances heavy suites evenly.
+    cmds = [c for idx, c in enumerate(cmds) if idx % sn == si]
 
 def name_of(cmd):
     m = re.search(r"([A-Za-z0-9_.-]+/(?:e2e|tests)/[A-Za-z0-9_.-]+/run_[A-Za-z0-9_]+\.sh|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/run_[A-Za-z0-9_]+\.sh|scripts/[A-Za-z0-9_.-]+\.sh)", cmd)
-    return m.group(1) if m else cmd[:80]
+    base = m.group(1) if m else cmd[:80]
+    sm = re.search(r"PION_SHARD=([0-9]+/[0-9]+)", cmd)
+    return "%s [%s]" % (base, sm.group(1)) if sm else base
 
 procs = set()
 proc_lock = threading.Lock()  # guards procs + the stopping check before each Popen
@@ -175,4 +190,4 @@ print("run-e2e-parallel: %d passed, %d failed, wall %.1fs (serial sum %.1fs)" % 
 for cmd, rc, _ in failed:
     print("FAIL: %s (exit %d)" % (name_of(cmd), rc), file=sys.stderr)
 sys.exit(1 if failed else 0)
-' "$JOBS"
+' "$JOBS" "$SHARD"

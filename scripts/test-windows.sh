@@ -11,6 +11,7 @@ mkdir -p "$OUT_DIR"
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
 }
+T_GATE_START="$(now_ms)"
 
 TMP_DIR="$(mktemp -d)"
 . "$ROOT_DIR/scripts/bg-lib.sh"
@@ -485,3 +486,11 @@ verify_bench mandelbrot_mt "6351041 721219984" -- 4
 verify_bench hashmap_str "200000 208681440 205599 815496841"
 
 echo "ALL WINDOWS X86_64 (amd64_win) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"
+GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+echo "test-windows.sh total duration: ${GATE_ELAPSED_S}s"
+if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "::warning title=CI duration > 60s::test-windows.sh took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 300s)"
+  fi
+  echo "[WARN] test-windows.sh took ${GATE_ELAPSED_S}s (> 60s target)"
+fi

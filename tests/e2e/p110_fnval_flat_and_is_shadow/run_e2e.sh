@@ -130,9 +130,7 @@ fi
 
 # 3. ASan/LSan (dev & --release)
 CC_BIN="${CC:-cc}"
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   printf '#!/bin/sh\nexec "%s" -fsanitize=address "$@"\n' "$CC_BIN" > "$TMP_DIR/cc_asan.sh"
   chmod +x "$TMP_DIR/cc_asan.sh"
   for MODE in "" --release; do
