@@ -13115,15 +13115,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           if has_hash_derive {
             ctx.symtab.hashable_types[sname] = true
           }
-          if has_eq_derive {
-            match ctx.symtab.struct_field_types.get(sname) {
-              Some(fm) =>
-              if should_prescan_compat_eq_struct(fm, struct_added_g.length() > 0, ctx.symtab.custom_eq_types) {
-                ctx.symtab.custom_eq_types[sname] = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(sname)
-              }
-              None => ()
-            }
-          }
+          let _ = has_eq_derive
           i = rb + 1
           continue
         } else if lb < n && tokens[lb].kind == TokenKind::LParen {
@@ -13739,6 +13731,11 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         tokens[i + 4].raw == "with" && tokens[i + 5].raw == "output" {
           ctx.symtab.show_impl_types[tokens[i + 3].raw] = true
         }
+      }
+      if t.kind == TokenKind::Keyword && t.raw == "impl" && i + 5 < n && tokens[i + 1].raw == "Eq" &&
+      tokens[i + 2].raw == "for" && tokens[i + 3].kind == TokenKind::UpperIdent &&
+      tokens[i + 4].raw == "with" && tokens[i + 5].raw == "equal" {
+        ctx.symtab.custom_impl_eq_types[tokens[i + 3].raw] = true
       }
       if t.kind == TokenKind::Keyword && t.raw == "trait" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
         next_autofill = false
@@ -14487,10 +14484,39 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
         }
 
-        let use_native_derive_eq = if kind_kw == "struct" {
-          should_use_native_derive_eq_struct(field_types, type_added_generics.length() > 0, ctx.symtab.custom_eq_types)
+        let generics = if lb > i + 2 {
+          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
         } else {
-          should_use_native_derive_eq_enum(enum_variants, type_added_generics.length() > 0, ctx.symtab.custom_eq_types)
+          ""
+        }
+        let type_vis = if kind_kw == "struct" {
+          if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
+        } else {
+          // §6 Enum visibility:
+          // - `pub(all)` / `pub(open)` -> `pub enum` (`can_match: true, can_construct: true` in ABI)
+          // - `pub enum` (readonly externally) -> `pub enum` (`can_match: true, can_construct: false` in ABI)
+          // - bare `enum` / `priv enum` -> private; fails closed (`MBT2PION_UNSUPPORTED_VISIBILITY`) if exposed in `pub` sig.
+          if pub_fields || vis.length() > 0 {
+            "pub "
+          } else if explicit_priv {
+            ""
+          } else if ctx.symtab.pub_sig_referenced_types.contains(tname) {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_VISIBILITY",
+              sf.rel_path,
+              decl_line,
+              decl_col,
+              "abstract/read-only enum `" + tname + "` is referenced in a public signature, but Pion `pub enum` cannot hide constructors (use `pub(all)` or overlay)",
+            ))
+            ""
+          } else {
+            ""
+          }
+        }
+        let use_native_derive_eq = if kind_kw == "struct" {
+          should_use_native_derive_eq_struct(field_types)
+        } else {
+          should_use_native_derive_eq_enum(enum_variants)
         }
         for d in pending_derives {
           if d == "Debug" {
@@ -14530,15 +14556,8 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              // Synthesize recursive structural equality function for compat-only Eq fields (Bytes/MbtJson/OrderedSet)
-              let eq_fn_name = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname)
-              ctx.symtab.custom_eq_types[tname] = eq_fn_name
-              let eq_body = if kind_kw == "struct" {
-                gen_struct_eq_body("a", "b", field_types, ctx.symtab.custom_eq_types)
-              } else {
-                gen_enum_eq_body("a", "b", enum_variants, ctx.symtab.custom_eq_types)
-              }
-              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  " + eq_body + "\n}\n")
+              // Direct `Bytes` field/payload: synthesize native Pion `[pub] impl[T : Eq, ...] Eq`
+              recipe_impls_sb.write_string(gen_bytes_derive_eq_impl(type_vis, tname, type_added_generics, kind_kw == "struct", field_types, enum_variants))
             } else if d == "Hash" {
               let mut all_hashable = true
               if kind_kw == "struct" {
@@ -14569,18 +14588,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 }
                 recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
-                // §5: When both `Eq` and `Hash` are derived, also emit `impl mbt_compat::MapKey`!
+                // §5: When `Hash` is derived alongside `#derive(Eq)` or built-in `impl Eq`, emit `impl mbt_compat::MapKey`!
                 let mut also_has_eq = false
                 for pd in pending_derives {
                   if pd == "Eq" { also_has_eq = true }
                 }
-                if also_has_eq {
-                  let mk_eq_body = if use_native_derive_eq {
-                    "self == other"
-                  } else {
-                    ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname) + "(self, other)"
-                  }
-                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    " + mk_eq_body + "\n  }\n}\n")
+                if also_has_eq || (!ctx.symtab.local_types.contains("Eq") && ctx.symtab.custom_impl_eq_types.contains(tname)) {
+                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    self == other\n  }\n}\n")
                 }
               }
             }
@@ -14610,39 +14624,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
         }
 
-        let generics = if lb > i + 2 {
-          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
-        } else {
-          ""
-        }
         let derive_prefix = if pion_derives.length() > 0 {
           "#derive(" + join_comma(pion_derives) + ")\n"
         } else {
           ""
-        }
-        let type_vis = if kind_kw == "struct" {
-          if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
-        } else {
-          // §6 Enum visibility:
-          // - `pub(all)` / `pub(open)` -> `pub enum` (`can_match: true, can_construct: true` in ABI)
-          // - `pub enum` (readonly externally) -> `pub enum` (`can_match: true, can_construct: false` in ABI)
-          // - bare `enum` / `priv enum` -> private; fails closed (`MBT2PION_UNSUPPORTED_VISIBILITY`) if exposed in `pub` sig.
-          if pub_fields || vis.length() > 0 {
-            "pub "
-          } else if explicit_priv {
-            ""
-          } else if ctx.symtab.pub_sig_referenced_types.contains(tname) {
-            ctx.diags.push(diag_error(
-              "MBT2PION_UNSUPPORTED_VISIBILITY",
-              sf.rel_path,
-              decl_line,
-              decl_col,
-              "abstract/read-only enum `" + tname + "` is referenced in a public signature, but Pion `pub enum` cannot hide constructors (use `pub(all)` or overlay)",
-            ))
-            ""
-          } else {
-            ""
-          }
         }
         let decl_code = derive_prefix + type_vis + kind_kw + " " + tname + generics + " {\n" + body_sb.to_string() + "}" + recipe_impls_sb.to_string()
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[decl_end - 1].end_byte)
@@ -14750,9 +14735,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           }
           fi = f_end + 1
         }
+        let generics = if lb > i + 2 {
+          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
+        } else {
+          ""
+        }
+        let type_vis = if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
         let mut pion_derives : Array[String] = []
         let mut recipe_impls_sb = StringBuilder()
-        let use_native_derive_eq = should_use_native_derive_eq_struct(field_types, type_added_generics.length() > 0, ctx.symtab.custom_eq_types)
+        let use_native_derive_eq = should_use_native_derive_eq_struct(field_types)
         for d in pending_derives {
           if d == "Debug" {
             continue
@@ -14783,10 +14774,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             if d == "Eq" && use_native_derive_eq {
               pion_derives.push("Eq")
             } else if d == "Eq" {
-              let eq_fn_name = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname)
-              ctx.symtab.custom_eq_types[tname] = eq_fn_name
-              let eq_body = gen_struct_eq_body("a", "b", field_types, ctx.symtab.custom_eq_types)
-              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  " + eq_body + "\n}\n")
+              recipe_impls_sb.write_string(gen_bytes_derive_eq_impl(type_vis, tname, type_added_generics, true, field_types, []))
             } else if d == "Hash" {
               let mut all_hashable = true
               for ft in field_types {
@@ -14805,18 +14793,13 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
                 let hc_body = gen_struct_hash_combine_body("self", "hasher", field_types)
                 recipe_impls_sb.write_string("\nimpl mbt_compat::MbtHash for " + tname + " {\n  fn hash_combine(self : " + tname + ", hasher : mbt_compat::MbtHasher) -> Unit {\n    " + hc_body + "\n  }\n}\n")
                 recipe_impls_sb.write_string("\npub fn " + tname + "::hash(self : " + tname + ") -> Int {\n  mbt_compat::mbt_hash(self)\n}\n")
-                // §5: When both `Eq` and `Hash` are derived, also emit `impl mbt_compat::MapKey`!
+                // §5: When `Hash` is derived alongside `#derive(Eq)` or built-in `impl Eq`, emit `impl mbt_compat::MapKey`!
                 let mut also_has_eq = false
                 for pd in pending_derives {
                   if pd == "Eq" { also_has_eq = true }
                 }
-                if also_has_eq {
-                  let mk_eq_body = if use_native_derive_eq {
-                    "self == other"
-                  } else {
-                    ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname) + "(self, other)"
-                  }
-                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    " + mk_eq_body + "\n  }\n}\n")
+                if also_has_eq || (!ctx.symtab.local_types.contains("Eq") && ctx.symtab.custom_impl_eq_types.contains(tname)) {
+                  recipe_impls_sb.write_string("\nimpl mbt_compat::MapKey for " + tname + " {\n  fn key_hash(self : " + tname + ") -> Int {\n    mbt_compat::mbt_hash(self)\n  }\n  fn key_eq(self : " + tname + ", other : " + tname + ") -> Bool {\n    self == other\n  }\n}\n")
                 }
               }
             }
@@ -14836,17 +14819,11 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             }
           }
         }
-        let generics = if lb > i + 2 {
-          lower_type_tokens_checked(ctx, tokens, i + 2, lb, sf.rel_path)
-        } else {
-          ""
-        }
         let derive_prefix = if pion_derives.length() > 0 {
           "#derive(" + join_comma(pion_derives) + ")\n"
         } else {
           ""
         }
-        let type_vis = if vis.length() > 0 { vis } else if explicit_priv { "" } else { "pub " }
         let decl_code = derive_prefix + type_vis + "struct " + tname + generics + " {\n" + body_sb.to_string() + "}" + recipe_impls_sb.to_string()
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[decl_end - 1].end_byte)
         out_sb.write_string(attrs_trivia.to_string() + kept_attrs.to_string() + vis_trivia)
@@ -15746,7 +15723,11 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
     None => ()
   }
   if t == "Bytes" {
-    return "mbt_compat::bytes_eq(" + a + ", " + b + ")"
+    let ba = "__ba_" + depth.to_string()
+    let bb = "__bb_" + depth.to_string()
+    let bi = "__bi_" + depth.to_string()
+    let beq = "__beq_" + depth.to_string()
+    return "{ let " + ba + " = " + a + "; let " + bb + " = " + b + "; let mut " + beq + " = " + ba + ".length() == " + bb + ".length(); if " + beq + " { let mut " + bi + " = 0; while " + bi + " < " + ba + ".length() { if " + ba + "[" + bi + "] != " + bb + "[" + bi + "] { " + beq + " = false; break }; " + bi + " = " + bi + " + 1 } }; " + beq + " }"
   }
   if t == "MbtJson" || t == "mbt_compat::MbtJson" {
     return "mbt_compat::mbt_json_eq(" + a + ", " + b + ")"
@@ -15776,8 +15757,21 @@ fn gen_eq_expr(a : String, b : String, ty : String, depth : Int, custom_eq : Map
     let inner_eq = gen_eq_expr(ax, bx, inner, depth + 1, custom_eq)
     return "match (" + a + ", " + b + ") { (Some(" + ax + "), Some(" + bx + ")) => " + inner_eq + ", (None, None) => true, _ => false }"
   }
-  if t.starts_with("Array[") && t.ends_with("]") {
-    let inner = t.slice(6, t.length() - 1).trim()
+  if t.starts_with("Result[") && t.ends_with("]") {
+    let args = split_tuple_types(t.slice(7, t.length() - 1))
+    if args.length() == 2 {
+      let ok_a = "__ra_" + depth.to_string()
+      let ok_b = "__rb_" + depth.to_string()
+      let err_a = "__ea_" + depth.to_string()
+      let err_b = "__eb_" + depth.to_string()
+      let ok_eq = gen_eq_expr(ok_a, ok_b, args[0], depth * 2 + 1, custom_eq)
+      let err_eq = gen_eq_expr(err_a, err_b, args[1], depth * 2 + 2, custom_eq)
+      return "match (" + a + ", " + b + ") { (Ok(" + ok_a + "), Ok(" + ok_b + ")) => " + ok_eq + ", (Err(" + err_a + "), Err(" + err_b + ")) => " + err_eq + ", _ => false }"
+    }
+  }
+  if (t.starts_with("Array[") || t.starts_with("FixedArray[") || t.starts_with("ImmArray[")) && t.ends_with("]") {
+    let open_idx = t.index_of("[")
+    let inner = t.slice(open_idx + 1, t.length() - 1).trim()
     let idx = "__ai_" + depth.to_string()
     let eqv = "__aeq_" + depth.to_string()
     let elem_eq = gen_eq_expr(a + "[" + idx + "]", b + "[" + idx + "]", inner, depth + 1, custom_eq)

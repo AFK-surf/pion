@@ -43,6 +43,15 @@ pub(all) struct DepCustom {
 pub impl Eq for DepCustom with equal(a, b) {
   a.key == b.key
 }
+
+#derive(Hash)
+pub(all) struct DepHashKey {
+  id : Int
+}
+
+pub impl Eq for DepHashKey with equal(a, b) {
+  a.id == b.id
+}
 '''
 
 F3D1B_MBT = r'''
@@ -138,6 +147,73 @@ pub(all) enum KeyEnum {
   KSome(Option[Int], Array[Int])
 }
 
+// 6. R2: Top-down forward-declared Bytes & Json chains + 3-level enum chain + generic BytesBox + GenBox[Json/Set]
+#derive(Eq)
+pub(all) struct OuterB {
+  m : MidB
+}
+
+#derive(Eq)
+pub(all) struct MidB {
+  l : LeafB
+}
+
+#derive(Eq)
+pub(all) struct LeafB {
+  data : Bytes
+}
+
+#derive(Eq)
+pub(all) struct OuterJ {
+  m : MidJ
+}
+
+#derive(Eq)
+pub(all) struct MidJ {
+  l : LeafJ
+}
+
+#derive(Eq)
+pub(all) struct LeafJ {
+  j : Json
+}
+
+#derive(Eq)
+pub(all) struct OuterE3 {
+  mid : MidE3
+}
+
+#derive(Eq)
+pub(all) struct MidE3 {
+  inner : InnerE
+  n : Int
+}
+
+#derive(Eq)
+pub(all) enum InnerE {
+  Raw(Bytes)
+  Num(Int)
+}
+
+#derive(Eq)
+priv struct BytesBox[T] {
+  v : T
+  data : Bytes
+}
+
+#derive(Eq)
+pub(all) struct GenBox[T] {
+  v : T
+}
+
+pub(all) struct SelfEq {
+  v : Int
+}
+
+impl Eq for SelfEq with equal(a : SelfEq, b : SelfEq) -> Bool {
+  a.v == b.v
+}
+
 pub fn run_all() -> String {
   // Case 1: non-primitive #derive(Eq) + H2 nested custom impl Eq + single-eval !=
   let h1 = [0]
@@ -200,7 +276,31 @@ pub fn run_all() -> String {
   let v2 = me.get(KSome(Some(3), [1, 2])).unwrap_or("miss")
   let line5 = "F3d1b-5:\{v1},\{v2}"
 
-  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5
+  // Case 6: R2 forward-declared Bytes/Json/enum chains, generic BytesBox & GenBox[Json/Set], cross-pkg Hash+impl Eq MapKey, Self
+  let ob1 : OuterB = { m: { l: { data: b"abc" } } }
+  let ob2 : OuterB = { m: { l: { data: b"abc" } } }
+  let ob3 : OuterB = { m: { l: { data: b"abd" } } }
+  let oj1 : OuterJ = { m: { l: { j: Json::number(3.5) } } }
+  let oj2 : OuterJ = { m: { l: { j: Json::number(3.5) } } }
+  let oj3 : OuterJ = { m: { l: { j: Json::string("no") } } }
+  let oe1 : OuterE3 = { mid: { inner: Raw(b"xy"), n: 1 } }
+  let oe2 : OuterE3 = { mid: { inner: Raw(b"xy"), n: 1 } }
+  let oe3 : OuterE3 = { mid: { inner: Num(2), n: 1 } }
+  let bb1 : BytesBox[Int] = { v: 7, data: b"ok" }
+  let bb2 : BytesBox[Int] = { v: 7, data: b"ok" }
+  let bb3 : BytesBox[Int] = { v: 7, data: b"no" }
+  let gbj1 : GenBox[Json] = { v: Json::array([Json::number(1.0), Json::boolean(true)]) }
+  let gbj2 : GenBox[Json] = { v: Json::array([Json::number(1.0), Json::boolean(true)]) }
+  let gbs1 : GenBox[Set[Int]] = { v: Set::from_array([1, 2]) }
+  let gbs2 : GenBox[Set[Int]] = { v: Set::from_array([2, 1]) }
+  let mdep : Map[@dep_eq.DepHashKey, Int] = {}
+  mdep[{ id: 9 }] = 42
+  let dep_v = mdep.get({ id: 9 }).unwrap_or(-1)
+  let se1 : SelfEq = { v: 5 }
+  let se2 : SelfEq = { v: 5 }
+  let line6 = "F3d1b-6:\{ob1 == ob2 && ob1 != ob3},\{oj1 == oj2 && oj1 != oj3},\{oe1 == oe2 && oe1 != oe3},\{bb1 == bb2 && bb1 != bb3},\{gbj1 == gbj2},\{gbs1 == gbs2},\{dep_v},\{se1 == se2}"
+
+  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6
 }
 '''
 
@@ -324,7 +424,8 @@ def main():
             "F3d1b-2:true,false,true,true,true\n"
             "F3d1b-3:false,hits=1\n"
             "F3d1b-4:true,true,true\n"
-            "F3d1b-5:100,ok"
+            "F3d1b-5:100,ok\n"
+            "F3d1b-6:true,true,true,true,true,true,42,true"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
