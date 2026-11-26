@@ -1,0 +1,386 @@
+///| Wave M2-F4 Track F4-3 unit tests:
+///| 1. ABI v2 `structs` metadata: export, canonical JSON, legacy v2 backward compat,
+///|    strict validation (duplicates, out-of-order, priv-field constructibility, tparam arity),
+///|    and `symbols.pion` foreign struct update query API.
+///| 2. Cross-package enum metadata & `pub using` v2 canonical provenance:
+///|    separate value vs type namespaces, diamond convergence, conflict/cycle/private-hop rejection,
+///|    and re-exported enum/struct metadata preservation (`Buffer`, `InPlace::Phone(island~)`, `Key(.., ..)`).
+///| 3. `lower_is_chain.pion` nested `as` bindings on non-struct sub-patterns.
+
+test "F4-3: ABI v2 structs legacy compat vs present structs & query API" {
+  // 1. Legacy v2 ABI (structs: None) keeps canonical payload & sha256 identical (no "structs" key!)
+  let legacy = empty_package_abi("leg")
+  let leg_payload = render_canonical_abi_payload(legacy)
+  assert_true(!str_has(leg_payload, "\"structs\""), "legacy ABI omits structs key")
+  let leg_sha = compute_abi_payload_sha256(legacy)
+  let leg_pion = "// abi-sha256: " + leg_sha + "\npub fn f() -> Int { 1 }\n"
+  let leg_json = render_abi_json(legacy, [("lib.pion", leg_pion)])
+  let d_leg : Array[Diag] = []
+  let p_leg = verify_and_parse_dep_abi("leg", "/tmp/leg", [("lib.pion", leg_pion)], Some(leg_json), d_leg)
+  match p_leg {
+    Some(abi_l) => {
+      assert_true(abi_l.structs is None, "legacy parsed ABI has structs == None")
+      let st = empty_symbol_table()
+      symtab_load_dep_abi(st, "leg", abi_l)
+      match symtab_query_foreign_struct_update(st, "leg::Point") {
+        ForeignStructUpdateInfo::Unknown(_) => ()
+        _ => assert_true(false, "legacy ABI without structs must report Unknown")
+      }
+    }
+    None => assert_true(false, "legacy v2 ABI must verify cleanly")
+  }
+
+  // 2. New v2 ABI with empty structs: Some([]) serializes `"structs":[]` and distinguishes from None
+  let empty_st_abi = PackageAbi::{
+    package_name: "emp",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    publishable: true,
+  }
+  let emp_sha = compute_abi_payload_sha256(empty_st_abi)
+  let emp_pion = "// abi-sha256: " + emp_sha + "\npub fn g() -> Int { 2 }\n"
+  let emp_json = render_abi_json(empty_st_abi, [("lib.pion", emp_pion)])
+  assert_true(str_has(emp_json, "\"structs\":[]"), "Some([]) serializes empty structs array")
+  let d_emp : Array[Diag] = []
+  match verify_and_parse_dep_abi("emp", "/tmp/emp", [("lib.pion", emp_pion)], Some(emp_json), d_emp) {
+    Some(abi_e) => {
+      match abi_e.structs {
+        Some(xs) => assert_true(xs.length() == 0, "empty structs parsed as Some([])")
+        None => assert_true(false, "expected Some([])")
+      }
+      let st = empty_symbol_table()
+      symtab_load_dep_abi(st, "emp", abi_e)
+      match symtab_query_foreign_struct_update(st, "emp::Missing") {
+        ForeignStructUpdateInfo::Rejected(_) => ()
+        _ => assert_true(false, "missing struct in dep with structs=[] must be Rejected")
+      }
+    }
+    None => assert_true(false, "empty structs ABI must verify")
+  }
+
+  // 3. Full struct extraction & query API (Box[T] with `val` rename, MixedPriv, ReadonlyS)
+  let src = SourceFile::{
+    rel_path: "defs.mbt",
+    content: "pub(all) struct Box[T] {\n  mut val : T\n  count : Int\n}\npub(all) struct MixedPriv {\n  pub x : Int\n  priv secret : Int\n}\npub struct ReadonlyS {\n  a : Int\n}\npriv struct Hidden {\n  h : Int\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(res.blockers == 0, "transpile defs.mbt succeeds")
+  match res.abi.structs {
+    Some(sts) => {
+      assert_true(sts.length() == 3, "only 3 pub structs exported (Hidden excluded)")
+      // Sorted: Box, MixedPriv, ReadonlyS
+      let box_s = sts[0]
+      let mix_s = sts[1]
+      let ro_s = sts[2]
+      assert_true(box_s.name == "Box" && box_s.type_params.length() == 1 && box_s.type_params[0] == "T", "Box type_params")
+      assert_true(box_s.fields.length() == 2 && box_s.fields[0].src_name == "val" && box_s.fields[0].emit_name == "val_" && box_s.fields[0].is_mut && box_s.fields[0].visibility == "pub", "Box field 0")
+      assert_true(box_s.fields[1].src_name == "count" && !box_s.fields[1].is_mut, "Box field 1")
+      assert_true(abi_struct_is_externally_expandable(box_s), "Box is expandable")
+      assert_true(mix_s.name == "MixedPriv" && !mix_s.can_construct && !mix_s.can_update && !abi_struct_is_externally_expandable(mix_s), "MixedPriv not expandable")
+      assert_true(mix_s.fields.length() == 2 && mix_s.fields[1].visibility == "priv", "MixedPriv priv field recorded")
+      assert_true(ro_s.name == "ReadonlyS" && !ro_s.can_construct && !ro_s.can_update && !abi_struct_is_externally_expandable(ro_s), "ReadonlyS not expandable")
+
+      // Query API checks
+      let st = empty_symbol_table()
+      symtab_load_dep_abi(st, "dep", res.abi)
+      match symtab_query_foreign_struct_update_with_targs(st, "dep::Box", 1) {
+        ForeignStructUpdateInfo::Expandable(s) => assert_true(s.fields.length() == 2 && s.fields[0].emit_name == "val_", "Box expandable with 1 targ")
+        _ => assert_true(false, "Box with 1 targ should be Expandable")
+      }
+      match symtab_query_foreign_struct_update_with_targs(st, "dep::Box", 2) {
+        ForeignStructUpdateInfo::Rejected(_) => ()
+        _ => assert_true(false, "Box with wrong targ count must be Rejected")
+      }
+      match symtab_query_foreign_struct_update(st, "dep::MixedPriv") {
+        ForeignStructUpdateInfo::Rejected(_) => ()
+        _ => assert_true(false, "MixedPriv must be Rejected")
+      }
+      match symtab_query_foreign_struct_update(st, "dep::ReadonlyS") {
+        ForeignStructUpdateInfo::Rejected(_) => ()
+        _ => assert_true(false, "ReadonlyS must be Rejected")
+      }
+    }
+    None => assert_true(false, "new transpiler must emit structs: Some(...)")
+  }
+}
+
+test "F4-3: ABI v2 structs tamper, duplicate, out-of-order & tparam arity rejection" {
+  let good_s = AbiStructSchema::{
+    pkg: "d",
+    name: "Pair",
+    type_params: ["A", "B"],
+    fields: [
+      AbiStructField::{ src_name: "a", emit_name: "a", is_mut: true, visibility: "pub", ty: "A" },
+      AbiStructField::{ src_name: "b", emit_name: "b", is_mut: false, visibility: "pub", ty: "B" },
+    ],
+    can_construct: true,
+    can_update: true,
+    complete: true,
+  }
+  let good_abi = PackageAbi::{
+    package_name: "d",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([good_s]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    publishable: true,
+  }
+  let sha = compute_abi_payload_sha256(good_abi)
+  let pion_ok = "// abi-sha256: " + sha + "\npub struct Pair[A, B] { mut a : A; b : B }\n"
+  let json_ok = render_abi_json(good_abi, [("lib.pion", pion_ok)])
+
+  // Good passes
+  let d_ok : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", pion_ok)], Some(json_ok), d_ok) is Some(_), "valid structs ABI passes")
+
+  // Wrong tparam arity vs `.pion` (`struct Pair[A]` vs ABI `["A", "B"]`) -> rejected!
+  let pion_bad_tp = "// abi-sha256: " + sha + "\npub struct Pair[A] { mut a : A; b : Int }\n"
+  let json_bad_tp = render_abi_json(good_abi, [("lib.pion", pion_bad_tp)])
+  let d_tp : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", pion_bad_tp)], Some(json_bad_tp), d_tp) is None && d_tp.length() > 0 && d_tp[0].code == "MBT2PION_DEP_ABI_ERROR", "tparam arity mismatch rejected")
+
+  // Tampered is_mut without updating sha256 -> rejected!
+  let d_tamp : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", pion_ok)], Some(str_replace_all(json_ok, "\"is_mut\":true", "\"is_mut\":false")), d_tamp) is None && d_tamp.length() > 0 && d_tamp[0].code == "MBT2PION_DEP_ABI_ERROR", "tampered is_mut rejected")
+
+  // Duplicate field in ABI -> rejected!
+  let dup_s = AbiStructSchema::{
+    pkg: "d",
+    name: "Dup",
+    type_params: [],
+    fields: [
+      AbiStructField::{ src_name: "x", emit_name: "x", is_mut: false, visibility: "pub", ty: "Int" },
+      AbiStructField::{ src_name: "x", emit_name: "x2", is_mut: false, visibility: "pub", ty: "Int" },
+    ],
+    can_construct: true,
+    can_update: true,
+    complete: true,
+  }
+  let dup_abi = PackageAbi::{ package_name: "d", enums: [], struct_val_fields: [], structs: Some([dup_s]), companion_files: [], op_impls: [], reexports: [], publishable: true }
+  let dup_sha = compute_abi_payload_sha256(dup_abi)
+  let dup_pion = "// abi-sha256: " + dup_sha + "\npub struct Dup { x : Int }\n"
+  let dup_json = render_abi_json(dup_abi, [("lib.pion", dup_pion)])
+  let d_dup : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", dup_pion)], Some(dup_json), d_dup) is None && d_dup.length() > 0 && d_dup[0].code == "MBT2PION_DEP_ABI_ERROR", "duplicate field rejected")
+
+  // Claiming can_construct: true on struct with priv field -> rejected!
+  let bad_priv_s = AbiStructSchema::{
+    pkg: "d",
+    name: "Sneaky",
+    type_params: [],
+    fields: [
+      AbiStructField::{ src_name: "x", emit_name: "x", is_mut: false, visibility: "priv", ty: "Int" },
+    ],
+    can_construct: true,
+    can_update: true,
+    complete: true,
+  }
+  let bad_priv_abi = PackageAbi::{ package_name: "d", enums: [], struct_val_fields: [], structs: Some([bad_priv_s]), companion_files: [], op_impls: [], reexports: [], publishable: true }
+  let bp_sha = compute_abi_payload_sha256(bad_priv_abi)
+  let bp_pion = "// abi-sha256: " + bp_sha + "\npub struct Sneaky { x : Int }\n"
+  let bp_json = render_abi_json(bad_priv_abi, [("lib.pion", bp_pion)])
+  let d_bp : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", bp_pion)], Some(bp_json), d_bp) is None && d_bp.length() > 0 && d_bp[0].code == "MBT2PION_DEP_ABI_ERROR", "priv field with can_construct=true rejected")
+}
+
+test "F4-3: pub using v2 dual-namespace, diamond, conflict, cycle, private hop & enum provenance" {
+  let doc_orig = "{\"packages\":[{\"name\":\"orig\",\"items\":[{\"kind\":\"enum\",\"name\":\"InPlace\",\"sig\":\"pub enum InPlace { Phone(Int) }\"},{\"kind\":\"enum\",\"name\":\"Key\",\"sig\":\"pub enum Key { Key(Int, Int, Int) }\"},{\"kind\":\"struct\",\"name\":\"Buffer\",\"sig\":\"pub struct Buffer { n : Int }\"},{\"kind\":\"fn\",\"name\":\"Buffer\",\"sig\":\"pub fn Buffer() -> Int\"}]}]}"
+  let doc_orig2 = "{\"packages\":[{\"name\":\"orig2\",\"items\":[{\"kind\":\"enum\",\"name\":\"InPlace\",\"sig\":\"pub enum InPlace { Other }\"}]}]}"
+  let orig_abi = PackageAbi::{
+    package_name: "orig",
+    enums: [
+      AbiEnumSchema::{
+        pkg: "orig",
+        name: "InPlace",
+        can_match: true,
+        can_construct: true,
+        variants: [AbiEnumVariant::{ name: "Phone", fields: [AbiEnumField::{ label: "island", ty: "Int" }] }],
+      },
+      AbiEnumSchema::{
+        pkg: "orig",
+        name: "Key",
+        can_match: true,
+        can_construct: false,
+        variants: [AbiEnumVariant::{
+          name: "Key",
+          fields: [
+            AbiEnumField::{ label: "", ty: "Int" },
+            AbiEnumField::{ label: "", ty: "Int" },
+            AbiEnumField::{ label: "", ty: "Int" },
+          ],
+        }],
+      },
+    ],
+    struct_val_fields: [],
+    structs: Some([
+      AbiStructSchema::{
+        pkg: "orig",
+        name: "Buffer",
+        type_params: [],
+        fields: [AbiStructField::{ src_name: "n", emit_name: "n", is_mut: true, visibility: "pub", ty: "Int" }],
+        can_construct: true,
+        can_update: true,
+        complete: true,
+      },
+    ]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    publishable: true,
+  }
+  let mid1_abi = PackageAbi::{
+    package_name: "mid1",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "InPlace", kind: "type", target_pkg: "orig", target_name: "InPlace" },
+      AbiReexport::{ name: "Key", kind: "type", target_pkg: "orig", target_name: "Key" },
+      AbiReexport::{ name: "Buffer", kind: "type", target_pkg: "orig", target_name: "Buffer" },
+      AbiReexport::{ name: "Buffer", kind: "value", target_pkg: "orig", target_name: "Buffer" },
+    ],
+    publishable: true,
+  }
+  let mid2_same_abi = PackageAbi::{
+    package_name: "mid2",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "InPlace", kind: "type", target_pkg: "orig", target_name: "InPlace" },
+    ],
+    publishable: true,
+  }
+  let mid2_conflict_abi = PackageAbi::{
+    package_name: "mid2",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "InPlace", kind: "type", target_pkg: "orig2", target_name: "InPlace" },
+    ],
+    publishable: true,
+  }
+
+  // 1. Identical-origin diamond + dual-namespace `type Buffer, Buffer` succeeds!
+  let d_dia : Array[Diag] = []
+  let (_, re_dia) = preprocess_pub_using_v2(
+    [SourceFile::{ rel_path: "top.mbt", content: "pub using @mid1 { type InPlace, type Buffer, Buffer }\npub using @mid2 { type InPlace }\n", is_test: false }],
+    Map(),
+    Map(),
+    [doc_orig],
+    [("orig", orig_abi), ("mid1", mid1_abi), ("mid2", mid2_same_abi)],
+    d_dia,
+  )
+  assert_true(d_dia.length() == 0 && re_dia.length() == 3, "diamond identical origin + dual namespace succeeds")
+
+  // 2. Conflicting-origin diamond fails closed!
+  let d_conf : Array[Diag] = []
+  let (_, _) = preprocess_pub_using_v2(
+    [SourceFile::{ rel_path: "top.mbt", content: "pub using @mid1 { type InPlace }\npub using @mid2 { type InPlace }\n", is_test: false }],
+    Map(),
+    Map(),
+    [doc_orig, doc_orig2],
+    [("orig", orig_abi), ("mid1", mid1_abi), ("mid2", mid2_conflict_abi)],
+    d_conf,
+  )
+  assert_true(d_conf.length() > 0 && d_conf[0].code == "MBT2PION_DEP_ABI_ERROR", "conflicting diamond rejected")
+
+  // 3. Private hop (priv_mid has no reexport for InPlace) fails closed!
+  let priv_mid_abi = empty_package_abi("priv_mid")
+  let d_priv : Array[Diag] = []
+  let (_, _) = preprocess_pub_using_v2(
+    [SourceFile::{ rel_path: "top.mbt", content: "pub using @priv_mid { type InPlace }\n", is_test: false }],
+    Map(),
+    Map(),
+    [doc_orig],
+    [("orig", orig_abi), ("priv_mid", priv_mid_abi)],
+    d_priv,
+  )
+  assert_true(d_priv.length() > 0 && d_priv[0].code == "MBT2PION_DEP_ABI_ERROR", "private hop rejected")
+
+  // 4. Cycle in dep reexports fails closed!
+  let cyc_a = PackageAbi::{ package_name: "ca", enums: [], struct_val_fields: [], structs: Some([]), companion_files: [], op_impls: [], reexports: [AbiReexport::{ name: "X", kind: "type", target_pkg: "cb", target_name: "X" }], publishable: true }
+  let cyc_b = PackageAbi::{ package_name: "cb", enums: [], struct_val_fields: [], structs: Some([]), companion_files: [], op_impls: [], reexports: [AbiReexport::{ name: "X", kind: "type", target_pkg: "ca", target_name: "X" }], publishable: true }
+  let d_cyc : Array[Diag] = []
+  let (_, _) = preprocess_pub_using_v2(
+    [SourceFile::{ rel_path: "top.mbt", content: "pub using @ca { type X }\n", is_test: false }],
+    Map(),
+    Map(),
+    [],
+    [("ca", cyc_a), ("cb", cyc_b)],
+    d_cyc,
+  )
+  assert_true(d_cyc.length() > 0 && d_cyc[0].code == "MBT2PION_DEP_ABI_ERROR", "cyclic reexport rejected")
+
+  // 5. Re-exported enum & struct provenance preserved in SymbolTable!
+  let st = empty_symbol_table()
+  symtab_load_dep_abi(st, "orig", orig_abi)
+  symtab_load_dep_abi(st, "mid1", mid1_abi)
+  let d_fin : Array[Diag] = []
+  symtab_finalize_dep_reexports(st, d_fin)
+  assert_true(d_fin.length() == 0, "finalize reexports clean")
+  match symtab_validate_enum_variant_use(st, "mid1", "InPlace", "Phone", 0, ["island"], false, false) {
+    Ok((sc, _)) => assert_true(sc.pkg == "orig" && sc.name == "InPlace", "re-exported InPlace::Phone(island~) preserves canonical orig")
+    Err(e) => assert_true(false, "InPlace::Phone(island~) should succeed: " + e)
+  }
+  match symtab_validate_enum_variant_use(st, "mid1", "InPlace", "Phone", 0, ["wrong"], false, false) {
+    Err(_) => ()
+    Ok(_) => assert_true(false, "unknown label must fail")
+  }
+  match symtab_validate_enum_variant_use(st, "mid1", "Key", "Key", 1, [], true, true) {
+    Ok(_) => ()
+    Err(e) => assert_true(false, "Key(a, ..) pattern should succeed: " + e)
+  }
+  match symtab_validate_enum_variant_use(st, "mid1", "Key", "Key", 1, [], true, false) {
+    Err(_) => ()
+    Ok(_) => assert_true(false, "rest pattern in constructor expression must fail")
+  }
+  match symtab_validate_enum_variant_use(st, "mid1", "Key", "Key", 3, [], false, false) {
+    Err(_) => ()
+    Ok(_) => assert_true(false, "readonly enum Key construction must fail")
+  }
+  match symtab_query_foreign_struct_update(st, "mid1::Buffer") {
+    ForeignStructUpdateInfo::Expandable(s) => assert_true(s.pkg == "orig" && s.name == "Buffer", "re-exported Buffer struct query resolves to orig")
+    _ => assert_true(false, "re-exported Buffer should be Expandable")
+  }
+}
+
+test "F4-3: lower_is_chain nested as on non-struct sub-patterns" {
+  let src = SourceFile::{
+    rel_path: "is_as.mbt",
+    content: "pub fn f(opt : (Int, Int)?) -> Int {\n  let pair = 99\n  if opt is Some((a, b) as pair) && pair.0 + a > 0 {\n    pair.1 + b\n  } else {\n    pair\n  }\n}\npub fn g(opt : Int??) -> Int {\n  let inner = 77\n  guard opt is Some(Some(x) as inner) && inner is Some(y) else { return inner }\n  x + y\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(res.blockers == 0, "nested as in if/guard is-chain lowers with 0 blockers")
+  assert_true(res.files.length() > 0 && !str_has(res.files[0].content, " as "), "no raw ` as ` remains in generated Pion")
+
+  // Negative: or-pattern with nested `as` must remain fail-closed!
+  let bad_src = SourceFile::{
+    rel_path: "bad_as.mbt",
+    content: "priv enum E { A(Int); B(Int) }\npub fn h(opt : E?) -> Int {\n  if opt is Some((A(v) | B(v)) as e) && v > 0 { let _ = e; v } else { 0 }\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(bad_res.blockers > 0, "or-pattern with nested as must fail closed")
+}

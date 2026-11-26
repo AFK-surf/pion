@@ -247,11 +247,242 @@ fn sort_abi_reexports(xs : Array[AbiReexport]) -> Array[AbiReexport] {
   for x in xs { out.push(x) }
   let mut i = 1
   while i < out.length() {
-    let key = out[i]; let mut j = i - 1
-    while j >= 0 && str_cmp(out[j].name, key.name) > 0 { out[j + 1] = out[j]; j = j - 1 }
-    out[j + 1] = key; i = i + 1
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 {
+      let nc = str_cmp(out[j].name, key.name)
+      let move_right = if nc != 0 { nc > 0 } else { str_cmp(out[j].kind, key.kind) > 0 }
+      if move_right {
+        out[j + 1] = out[j]
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    out[j + 1] = key
+    i = i + 1
   }
   out
+}
+
+fn sort_abi_structs(xs : Array[AbiStructSchema]) -> Array[AbiStructSchema] {
+  let out : Array[AbiStructSchema] = []
+  for x in xs {
+    out.push(x)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].name, key.name) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| True iff `s` is complete, externally constructible & updatable, and has zero `priv` fields.
+pub fn abi_struct_is_externally_expandable(s : AbiStructSchema) -> Bool {
+  if !s.complete || !s.can_construct || !s.can_update {
+    return false
+  }
+  for f in s.fields {
+    if f.visibility != "pub" || f.src_name.length() == 0 || f.emit_name.length() == 0 {
+      return false
+    }
+  }
+  true
+}
+
+///| Extract exported `pub` / `pub(all)` braced struct schemas from non-test MoonBit sources,
+///| preserving exact field declaration order, mutability, visibility, type params, and rename map.
+pub fn collect_exported_abi_structs(
+  sources : Array[SourceFile],
+  self_pkg : String,
+  symtab : SymbolTable,
+  recipes : Recipes,
+  struct_field_renames : Map[String, Map[String, String]],
+  target : String,
+) -> Array[AbiStructSchema] {
+  let out : Array[AbiStructSchema] = []
+  let seen_structs : Map[String, Bool] = Map()
+  for sf in sources {
+    if sf.is_test {
+      continue
+    }
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    let mut next_cfg_excluded = false
+    while i < n {
+      let t = tokens[i]
+      if t.kind == TokenKind::LBrace {
+        depth = depth + 1
+        i = i + 1
+        continue
+      }
+      if t.kind == TokenKind::RBrace {
+        if depth > 0 { depth = depth - 1 }
+        i = i + 1
+        continue
+      }
+      if depth == 0 && t.kind == TokenKind::Attr {
+        if t.raw.starts_with("#cfg") {
+          match eval_cfg_attr(t.raw, target) {
+            Some(true) => ()
+            _ => next_cfg_excluded = true
+          }
+        }
+        i = i + 1
+        continue
+      }
+      if depth == 0 && next_cfg_excluded {
+        next_cfg_excluded = false
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "struct" &&
+      i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        let is_pub = is_decl_pub(tokens, i)
+        if !is_pub {
+          i = i + 1
+          continue
+        }
+        let mut is_pub_all = false
+        if i >= 4 && tokens[i - 1].kind == TokenKind::RParen && tokens[i - 3].kind == TokenKind::LParen &&
+        tokens[i - 4].kind == TokenKind::Keyword && tokens[i - 4].raw == "pub" &&
+        (tokens[i - 2].raw == "all" || tokens[i - 2].raw == "open") {
+          is_pub_all = true
+        }
+        let sname = tokens[i + 1].raw
+        let mut lb = i + 2
+        let mut tparams : Array[String] = []
+        let added_g : Array[String] = []
+        if lb < n && tokens[lb].kind == TokenKind::LBracket {
+          let close_gb = find_matching_delim(tokens, lb)
+          tparams = collect_generic_param_names(tokens, lb, close_gb)
+          for gp in tparams {
+            if !symtab.active_generics.contains(gp) {
+              symtab.active_generics[gp] = true
+              added_g.push(gp)
+            }
+          }
+          lb = close_gb + 1
+        }
+        if lb < n && tokens[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(tokens, lb)
+          if !seen_structs.contains(sname) {
+            seen_structs[sname] = true
+            let fields : Array[AbiStructField] = []
+            let seen_src : Map[String, Bool] = Map()
+            let seen_emit : Map[String, Bool] = Map()
+            let mut complete = true
+            let mut has_priv_field = false
+            let mut fi = lb + 1
+            while fi < rb {
+              if tokens[fi].kind == TokenKind::Semi || tokens[fi].kind == TokenKind::Comma {
+                fi = fi + 1
+                continue
+              }
+              let mut fvis = "pub"
+              let mut fmut = false
+              if tokens[fi].kind == TokenKind::Keyword && tokens[fi].raw == "pub" {
+                fvis = "pub"
+                fi = fi + 1
+                if fi < rb && tokens[fi].kind == TokenKind::LParen {
+                  fi = find_matching_delim(tokens, fi) + 1
+                }
+              } else if tokens[fi].kind == TokenKind::Keyword && tokens[fi].raw == "priv" {
+                fvis = "priv"
+                has_priv_field = true
+                fi = fi + 1
+              }
+              if fi < rb && tokens[fi].kind == TokenKind::Keyword && tokens[fi].raw == "mut" {
+                fmut = true
+                fi = fi + 1
+              }
+              if fi >= rb {
+                complete = false
+                break
+              }
+              if tokens[fi].kind != TokenKind::Ident && tokens[fi].kind != TokenKind::Keyword {
+                complete = false
+                fi = fi + 1
+                continue
+              }
+              let raw_f = tokens[fi].raw
+              let emit_f = match struct_field_renames.get(sname) {
+                Some(rm) => match rm.get(raw_f) { Some(en) => en, None => rename_keyword_ident(raw_f) }
+                None => rename_keyword_ident(raw_f)
+              }
+              let mut fc = fi + 1
+              while fc < rb && tokens[fc].kind != TokenKind::Colon {
+                fc = fc + 1
+              }
+              let mut f_end = if fc < rb { fc + 1 } else { fi + 1 }
+              let mut fd = 0
+              while f_end < rb {
+                let fk = tokens[f_end].kind
+                if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace {
+                  fd = fd + 1
+                } else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace {
+                  fd = fd - 1
+                } else if fd == 0 && (fk == TokenKind::Semi || fk == TokenKind::Comma || tokens[f_end].newline_before) {
+                  break
+                }
+                f_end = f_end + 1
+              }
+              let fty = if fc < rb && f_end > fc + 1 {
+                lower_type_tokens(tokens, fc + 1, f_end, symtab, recipes).trim()
+              } else {
+                complete = false
+                ""
+              }
+              if raw_f.length() == 0 || emit_f.length() == 0 || fty.length() == 0 ||
+              seen_src.contains(raw_f) || seen_emit.contains(emit_f) {
+                complete = false
+              } else {
+                seen_src[raw_f] = true
+                seen_emit[emit_f] = true
+                fields.push(AbiStructField::{
+                  src_name: raw_f,
+                  emit_name: emit_f,
+                  is_mut: fmut,
+                  visibility: fvis,
+                  ty: fty,
+                })
+              }
+              fi = f_end
+            }
+            let can_ext = is_pub_all && !has_priv_field && complete
+            out.push(AbiStructSchema::{
+              pkg: self_pkg,
+              name: sname,
+              type_params: tparams,
+              fields: fields,
+              can_construct: can_ext,
+              can_update: can_ext,
+              complete: complete,
+            })
+          }
+          for gp in added_g {
+            symtab.active_generics.remove(gp)
+          }
+          i = rb + 1
+          continue
+        }
+        for gp in added_g {
+          symtab.active_generics.remove(gp)
+        }
+      }
+      i = i + 1
+    }
+  }
+  sort_abi_structs(out)
 }
 
 ///| Exact compiler-aligned library source check (`compiler/src/cli/main.pion:188`):
@@ -552,6 +783,40 @@ fn abi_payload_to_json_opts(
     json_field("enums", json_arr(enum_arr)),
     json_field("struct_val_fields", json_arr(val_arr)),
   ]
+  if schema_ver >= 2 {
+    match abi.structs {
+      Some(raw_structs) => {
+        let sorted_sts = sort_abi_structs(raw_structs)
+        let st_arr : Array[json::JsonValue] = []
+        for st in sorted_sts {
+          let tp_arr : Array[json::JsonValue] = []
+          for tp in st.type_params {
+            tp_arr.push(json_str(tp))
+          }
+          let sf_arr : Array[json::JsonValue] = []
+          for f in st.fields {
+            sf_arr.push(json_obj([
+              json_field("src_name", json_str(f.src_name)),
+              json_field("emit_name", json_str(f.emit_name)),
+              json_field("is_mut", json_bool(f.is_mut)),
+              json_field("visibility", json_str(f.visibility)),
+              json_field("ty", json_str(f.ty)),
+            ]))
+          }
+          st_arr.push(json_obj([
+            json_field("name", json_str(st.name)),
+            json_field("type_params", json_arr(tp_arr)),
+            json_field("can_construct", json_bool(st.can_construct)),
+            json_field("can_update", json_bool(st.can_update)),
+            json_field("complete", json_bool(st.complete)),
+            json_field("fields", json_arr(sf_arr)),
+          ]))
+        }
+        fields.push(json_field("structs", json_arr(st_arr)))
+      }
+      None => ()
+    }
+  }
   if schema_ver >= 2 && abi.companion_files.length() > 0 {
     let sorted_comps = sort_abi_companions(abi.companion_files)
     let comp_arr : Array[json::JsonValue] = []
@@ -834,8 +1099,30 @@ pub fn verify_and_parse_dep_abi(
             return None
           }
           seen_enums[ename] = true
-          let can_match = j_bool(eit, "can_match", false)
-          let can_construct = j_bool(eit, "can_construct", false)
+          let can_match = match json::obj_get(eit, "can_match") {
+            Some(v) => match json::as_bool(v) {
+              Some(b) => b
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `can_match` on enum `" + ename + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => false
+          }
+          let can_construct = match json::obj_get(eit, "can_construct") {
+            Some(v) => match json::as_bool(v) {
+              Some(b) => b
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `can_construct` on enum `" + ename + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => false
+          }
+          if can_construct && !can_match {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "enum `" + ename + "` in dep `" + dep_name + "` declares `can_construct: true` with `can_match: false`"))
+            return None
+          }
           let variants : Array[AbiEnumVariant] = []
           let seen_vars : Map[String, Bool] = Map()
           match json::obj_get(eit, "variants") {
@@ -880,14 +1167,20 @@ pub fn verify_and_parse_dep_abi(
                           fields.push(AbiEnumField::{ label: flbl, ty: fty })
                         }
                       }
-                      None => ()
+                      None => {
+                        diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `fields` on variant `" + ename + "::" + vname + "` in dep `" + dep_name + "`"))
+                        return None
+                      }
                     }
                     None => ()
                   }
                   variants.push(AbiEnumVariant::{ name: vname, fields: fields })
                 }
               }
-              None => ()
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `variants` on enum `" + ename + "` in dep `" + dep_name + "`"))
+                return None
+              }
             }
             None => ()
           }
@@ -934,6 +1227,270 @@ pub fn verify_and_parse_dep_abi(
       None => ()
     }
     None => ()
+  }
+
+  let mut parsed_structs : Option[Array[AbiStructSchema]] = None
+  if sv >= 2 {
+    match json::obj_get(payload_v, "structs") {
+      Some(stv) => {
+        let sitems = match json::as_arr(stv) {
+          Some(a) => a
+          None => {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "invalid `structs` field (expected array) in dep `" + dep_name + "`",
+            ))
+            return None
+          }
+        }
+        let sval_map : Map[String, String] = Map()
+        for sv_e in struct_vals {
+          sval_map[sv_e.struct_name] = sv_e.renamed_field
+        }
+        let structs_arr : Array[AbiStructSchema] = []
+        let seen_sts : Map[String, Bool] = Map()
+        let mut prev_sname = ""
+        for sit in sitems {
+          let sname = j_str(sit, "name", "")
+          if sname.length() == 0 || seen_sts.contains(sname) {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "invalid or duplicate struct `" + sname + "` in `mbt2pion_abi.json` for dep `" + dep_name + "`",
+            ))
+            return None
+          }
+          if prev_sname.length() > 0 && str_cmp(prev_sname, sname) > 0 {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "out-of-order `structs` entry `" + sname + "` after `" + prev_sname + "` in dep `" + dep_name + "`",
+            ))
+            return None
+          }
+          prev_sname = sname
+          seen_sts[sname] = true
+          let tparams : Array[String] = []
+          let seen_tp : Map[String, Bool] = Map()
+          match json::obj_get(sit, "type_params") {
+            Some(tpv) =>
+            match json::as_arr(tpv) {
+              Some(tpitems) => {
+                for tpit in tpitems {
+                  match json::as_str(tpit) {
+                    Some(tp) => {
+                      if tp.length() == 0 || seen_tp.contains(tp) {
+                        diags.push(diag_error(
+                          "MBT2PION_DEP_ABI_ERROR",
+                          dep_path + "/mbt2pion_abi.json",
+                          1,
+                          1,
+                          "invalid or duplicate type_param `" + tp + "` on struct `" + sname + "` in dep `" + dep_name + "`",
+                        ))
+                        return None
+                      }
+                      seen_tp[tp] = true
+                      tparams.push(tp)
+                    }
+                    None => {
+                      diags.push(diag_error(
+                        "MBT2PION_DEP_ABI_ERROR",
+                        dep_path + "/mbt2pion_abi.json",
+                        1,
+                        1,
+                        "non-string type_param on struct `" + sname + "` in dep `" + dep_name + "`",
+                      ))
+                      return None
+                    }
+                  }
+                }
+              }
+              None => {
+                diags.push(diag_error(
+                  "MBT2PION_DEP_ABI_ERROR",
+                  dep_path + "/mbt2pion_abi.json",
+                  1,
+                  1,
+                  "invalid `type_params` on struct `" + sname + "` in dep `" + dep_name + "`",
+                ))
+                return None
+              }
+            }
+            None => {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                dep_path + "/mbt2pion_abi.json",
+                1,
+                1,
+                "missing `type_params` on struct `" + sname + "` in dep `" + dep_name + "`",
+              ))
+              return None
+            }
+          }
+          let can_construct = match json::obj_get(sit, "can_construct") {
+            Some(v) => match json::as_bool(v) {
+              Some(b) => b
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `can_construct` on struct `" + sname + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => {
+              diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "missing `can_construct` on struct `" + sname + "` in dep `" + dep_name + "`"))
+              return None
+            }
+          }
+          let can_update = match json::obj_get(sit, "can_update") {
+            Some(v) => match json::as_bool(v) {
+              Some(b) => b
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `can_update` on struct `" + sname + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => {
+              diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "missing `can_update` on struct `" + sname + "` in dep `" + dep_name + "`"))
+              return None
+            }
+          }
+          let complete = match json::obj_get(sit, "complete") {
+            Some(v) => match json::as_bool(v) {
+              Some(b) => b
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `complete` on struct `" + sname + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => {
+              diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "missing `complete` on struct `" + sname + "` in dep `" + dep_name + "`"))
+              return None
+            }
+          }
+          let fitems = match json::obj_get(sit, "fields") {
+            Some(fv) => match json::as_arr(fv) {
+              Some(a) => a
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `fields` on struct `" + sname + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            None => {
+              diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "missing `fields` on struct `" + sname + "` in dep `" + dep_name + "`"))
+              return None
+            }
+          }
+          let sfields : Array[AbiStructField] = []
+          let seen_src : Map[String, Bool] = Map()
+          let seen_emit : Map[String, Bool] = Map()
+          let mut has_priv = false
+          for fit in fitems {
+            let src_n = j_str(fit, "src_name", "")
+            let emit_n = j_str(fit, "emit_name", "")
+            let vis = j_str(fit, "visibility", "")
+            let fty = j_str(fit, "ty", "")
+            let is_m = match json::obj_get(fit, "is_mut") {
+              Some(v) => match json::as_bool(v) {
+                Some(b) => b
+                None => {
+                  diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `is_mut` on field `" + src_n + "` of struct `" + sname + "` in dep `" + dep_name + "`"))
+                  return None
+                }
+              }
+              None => {
+                diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "missing `is_mut` on field `" + src_n + "` of struct `" + sname + "` in dep `" + dep_name + "`"))
+                return None
+              }
+            }
+            if src_n.length() == 0 || emit_n.length() == 0 || seen_src.contains(src_n) || seen_emit.contains(emit_n) {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                dep_path + "/mbt2pion_abi.json",
+                1,
+                1,
+                "invalid or duplicate field `" + src_n + "`/`" + emit_n + "` on struct `" + sname + "` in dep `" + dep_name + "`",
+              ))
+              return None
+            }
+            if vis != "pub" && vis != "priv" {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                dep_path + "/mbt2pion_abi.json",
+                1,
+                1,
+                "invalid visibility `" + vis + "` on field `" + src_n + "` of struct `" + sname + "` in dep `" + dep_name + "`",
+              ))
+              return None
+            }
+            if complete && fty.length() == 0 {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                dep_path + "/mbt2pion_abi.json",
+                1,
+                1,
+                "empty field type on complete struct `" + sname + "` field `" + src_n + "` in dep `" + dep_name + "`",
+              ))
+              return None
+            }
+            if vis == "priv" {
+              has_priv = true
+            }
+            if src_n == "val" {
+              match sval_map.get(sname) {
+                Some(expected_emit) =>
+                if expected_emit != emit_n {
+                  diags.push(diag_error(
+                    "MBT2PION_DEP_ABI_ERROR",
+                    dep_path + "/mbt2pion_abi.json",
+                    1,
+                    1,
+                    "struct `" + sname + "` `val` emit_name `" + emit_n + "` conflicts with `struct_val_fields` `" + expected_emit + "` in dep `" + dep_name + "`",
+                  ))
+                  return None
+                }
+                None => ()
+              }
+            }
+            seen_src[src_n] = true
+            seen_emit[emit_n] = true
+            sfields.push(AbiStructField::{
+              src_name: src_n,
+              emit_name: emit_n,
+              is_mut: is_m,
+              visibility: vis,
+              ty: fty,
+            })
+          }
+          if (can_construct || can_update) && (!complete || has_priv) {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "struct `" + sname + "` in dep `" + dep_name + "` claims external construct/update despite incomplete metadata or `priv` fields",
+            ))
+            return None
+          }
+          structs_arr.push(AbiStructSchema::{
+            pkg: dep_name,
+            name: sname,
+            type_params: tparams,
+            fields: sfields,
+            can_construct: can_construct,
+            can_update: can_update,
+            complete: complete,
+          })
+        }
+        parsed_structs = Some(structs_arr)
+      }
+      None => ()
+    }
   }
 
   let companion_files : Array[AbiCompanionFile] = []
@@ -1013,11 +1570,12 @@ pub fn verify_and_parse_dep_abi(
         let ritems = match json::as_arr(rev) { Some(a) => a, None => { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `reexports` field in dep `" + dep_name + "`")); return None } }
         for rit in ritems {
           let rn = j_str(rit, "name", ""); let rk = j_str(rit, "kind", ""); let rp = j_str(rit, "target_pkg", ""); let rt = j_str(rit, "target_name", "")
-          if rn.length() == 0 || (rk != "type" && rk != "value") || rp.length() == 0 || rt.length() == 0 || seen_reexports.contains(rn) {
-            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `reexports` entry `" + rn + "` in dep `" + dep_name + "`"))
+          let rkey = rk + ":" + rn
+          if rn.length() == 0 || (rk != "type" && rk != "value") || rp.length() == 0 || rt.length() == 0 || seen_reexports.contains(rkey) {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `reexports` entry `" + rn + "` (" + rk + ") in dep `" + dep_name + "`"))
             return None
           }
-          seen_reexports[rn] = true
+          seen_reexports[rkey] = true
           reexports.push(AbiReexport::{ name: rn, kind: rk, target_pkg: rp, target_name: rt })
         }
       }
@@ -1035,6 +1593,7 @@ pub fn verify_and_parse_dep_abi(
     package_name: pkg_field,
     enums: enums,
     struct_val_fields: struct_vals,
+    structs: parsed_structs,
     companion_files: companion_files,
     op_impls: op_impls,
     reexports: reexports,
@@ -1204,7 +1763,60 @@ pub fn verify_and_parse_dep_abi(
     ))
     return None
   }
+  // Cross-check declared `structs` type_params arity against generated `.pion` struct declarations!
+  match parsed_structs {
+    Some(sts) =>
+    if sts.length() > 0 {
+      let actual_tp_arity = collect_pion_struct_tparam_arity(gen_files)
+      for st in sts {
+        match actual_tp_arity.get(st.name) {
+          Some(actual_ar) =>
+          if actual_ar != st.type_params.length() {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "struct `" + st.name + "` in dep `" + dep_name + "` declares " + st.type_params.length().to_string() + " type params in ABI but `.pion` has " + actual_ar.to_string(),
+            ))
+            return None
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
   Some(parsed)
+}
+
+///| Collect top-level `struct Name[...]` generic parameter counts from `.pion` files.
+fn collect_pion_struct_tparam_arity(files : Array[(String, String)]) -> Map[String, Int] {
+  let out : Map[String, Int] = Map()
+  for pf in files {
+    let toks = lex_moonbit(pf.1)
+    let n = toks.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "struct" &&
+      i + 1 < n && toks[i + 1].kind == TokenKind::UpperIdent {
+        let sname = toks[i + 1].raw
+        if i + 2 < n && toks[i + 2].kind == TokenKind::LBracket {
+          let rb = find_matching_delim(toks, i + 2)
+          let gparams = collect_generic_param_names(toks, i + 2, rb)
+          out[sname] = gparams.length()
+        } else {
+          out[sname] = 0
+        }
+      }
+      i = i + 1
+    }
+  }
+  out
 }
 
 pub fn render_reexport_verify_anchor(reexports : Array[AbiReexport], dep_doc_jsons : Array[String]) -> String {
@@ -1263,4 +1875,439 @@ pub fn render_reexport_verify_anchor(reexports : Array[AbiReexport], dep_doc_jso
   }
   sb.write_string("  ()\n}\n")
   sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Track F4-3: Dual-Namespace `pub using` Canonical Provenance & Consumer Rewrite
+// ---------------------------------------------------------------------------
+
+struct DepPubIndexV2 {
+  pub_types : Map[String, Map[String, Bool]]
+  pub_values : Map[String, Map[String, Bool]]
+  known_pkgs : Map[String, Bool]
+  dep_re_type : Map[String, Map[String, AbiReexport]]
+  dep_re_value : Map[String, Map[String, AbiReexport]]
+}
+
+fn build_dep_pub_index_v2(
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+) -> DepPubIndexV2 {
+  let pub_types : Map[String, Map[String, Bool]] = Map()
+  let pub_values : Map[String, Map[String, Bool]] = Map()
+  let known_pkgs : Map[String, Bool] = Map()
+  let dep_re_type : Map[String, Map[String, AbiReexport]] = Map()
+  let dep_re_value : Map[String, Map[String, AbiReexport]] = Map()
+  for dj in dep_doc_jsons {
+    if dj.trim().length() == 0 { continue }
+    let root = match json::parse(dj) { Ok(v) => v, Err(_) => continue }
+    let pkgs = match json::obj_get(root, "packages") {
+      Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }
+      None => continue
+    }
+    let last_i = pkgs.length() - 1
+    let mut pi = 0
+    for pkg in pkgs {
+      let pname = j_str(pkg, "name", "")
+      let is_root = pi == last_i
+      pi = pi + 1
+      if pname.length() == 0 { continue }
+      if is_root { known_pkgs[pname] = true }
+      let tmap = match pub_types.get(pname) {
+        Some(m) => m
+        None => { let m : Map[String, Bool] = Map(); pub_types[pname] = m; m }
+      }
+      let vmap = match pub_values.get(pname) {
+        Some(m) => m
+        None => { let m : Map[String, Bool] = Map(); pub_values[pname] = m; m }
+      }
+      let items = match json::obj_get(pkg, "items") {
+        Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }
+        None => continue
+      }
+      for it in items {
+        let k = j_str(it, "kind", "")
+        let nm = j_str(it, "name", "")
+        if nm.length() == 0 { continue }
+        if k == "struct" || k == "enum" || k == "type" || k == "typealias" {
+          tmap[nm] = true
+        } else if k == "fn" || k == "let" || k == "const" || k == "var" || k == "val" || k == "global" {
+          vmap[nm] = true
+        }
+      }
+    }
+  }
+  for pair in dep_abis {
+    let dep_pkg = pair.0
+    let abi = pair.1
+    known_pkgs[dep_pkg] = true
+    let tmap = match pub_types.get(dep_pkg) {
+      Some(m) => m
+      None => { let m : Map[String, Bool] = Map(); pub_types[dep_pkg] = m; m }
+    }
+    for en in abi.enums {
+      tmap[en.name] = true
+    }
+    match abi.structs {
+      Some(sts) => {
+        for st in sts {
+          tmap[st.name] = true
+        }
+      }
+      None => ()
+    }
+    if abi.reexports.length() > 0 {
+      let rtmap : Map[String, AbiReexport] = Map()
+      let rvmap : Map[String, AbiReexport] = Map()
+      for r in abi.reexports {
+        if r.kind == "type" {
+          rtmap[r.name] = r
+        } else if r.kind == "value" {
+          rvmap[r.name] = r
+        }
+      }
+      if rtmap.length() > 0 { dep_re_type[dep_pkg] = rtmap }
+      if rvmap.length() > 0 { dep_re_value[dep_pkg] = rvmap }
+    }
+  }
+  DepPubIndexV2::{
+    pub_types: pub_types,
+    pub_values: pub_values,
+    known_pkgs: known_pkgs,
+    dep_re_type: dep_re_type,
+    dep_re_value: dep_re_value,
+  }
+}
+
+///| Resolve `(start_pkg, start_name)` in the specified namespace (`"type"` or `"value"`)
+///| to its canonical defining `(orig_pkg, orig_name)`. Fail-closed on cycles.
+fn resolve_reexport_chain_v2(
+  start_pkg : String,
+  start_name : String,
+  want_kind : String,
+  idx : DepPubIndexV2,
+  file : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+) -> Option[(String, String)] {
+  let re_map = if want_kind == "type" { idx.dep_re_type } else { idx.dep_re_value }
+  let mut cur_pkg = start_pkg
+  let mut cur_name = start_name
+  let visited : Map[String, Bool] = Map()
+  while true {
+    let vk = want_kind + ":" + cur_pkg + "::" + cur_name
+    if visited.contains(vk) {
+      diags.push(diag_error(
+        "MBT2PION_DEP_ABI_ERROR",
+        file,
+        line,
+        col,
+        "cyclic `pub using` (" + want_kind + ") involving `" + cur_pkg + "::" + cur_name + "`",
+      ))
+      return None
+    }
+    visited[vk] = true
+    match re_map.get(cur_pkg) {
+      Some(rmap) =>
+      match rmap.get(cur_name) {
+        Some(re) => {
+          cur_pkg = re.target_pkg
+          cur_name = re.target_name
+        }
+        None => break
+      }
+      None => break
+    }
+  }
+  Some((cur_pkg, cur_name))
+}
+
+///| Dual-namespace, diamond-safe, fail-closed `pub using` pre-pass.
+///| - Resolves `type` and `value` namespaces independently to canonical `(orig_pkg, orig_name)`.
+///| - Allows diamond forwarding iff all paths converge to the identical canonical origin in the same namespace.
+///| - Rejects private hops, cycles, conflicting origins, missing dep metadata, wrong kind, and unsupported forms.
+pub fn preprocess_pub_using_v2(
+  sources : Array[SourceFile],
+  pkg_aliases : Map[String, String],
+  moon_import_paths : Map[String, String],
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+  diags : Array[Diag],
+) -> (Array[SourceFile], Array[AbiReexport]) {
+  let idx = build_dep_pub_index_v2(dep_doc_jsons, dep_abis)
+  let out_sources : Array[SourceFile] = []
+  let reexports : Array[AbiReexport] = []
+  let seen_type_exports : Map[String, String] = Map()
+  let seen_value_exports : Map[String, String] = Map()
+  for sf in sources {
+    let toks = lex_moonbit(sf.content)
+    let n = toks.length() - 1
+    let edits : Array[(Int, Int, String)] = []
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "pub" &&
+      i + 3 < n && is_kw_or_id(toks[i + 1], "using") &&
+      toks[i + 2].kind == TokenKind::PkgRef && toks[i + 3].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(toks, i + 3)
+        match parse_using_block_items(toks, i + 3, rb) {
+          Some(items) => {
+            let raw_dep = toks[i + 2].raw.slice(1, toks[i + 2].raw.length())
+            let dep_pkg = resolve_dep_pkg_alias(raw_dep, pkg_aliases, moon_import_paths, idx.known_pkgs)
+            if !idx.known_pkgs.contains(dep_pkg) {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                sf.rel_path,
+                t.line,
+                t.col,
+                "`pub using` references package `" + dep_pkg + "` whose metadata is missing (fail-closed)",
+              ))
+            } else {
+              for it in items {
+                let kind = it.0
+                let nm = it.1
+                match resolve_reexport_chain_v2(dep_pkg, nm, kind, idx, sf.rel_path, t.line, t.col, diags) {
+                  Some((tpkg, tname)) => {
+                    let ok = idx.known_pkgs.contains(tpkg) && (if kind == "type" {
+                      match idx.pub_types.get(tpkg) { Some(m) => m.contains(tname), None => false }
+                    } else {
+                      match idx.pub_values.get(tpkg) { Some(m) => m.contains(tname), None => false }
+                    })
+                    if !ok {
+                      diags.push(diag_error(
+                        "MBT2PION_DEP_ABI_ERROR",
+                        sf.rel_path,
+                        t.line,
+                        t.col,
+                        "`pub using` target `" + tpkg + "::" + tname + "` (" + kind + ") missing, private, via private hop, or wrong kind",
+                      ))
+                    } else {
+                      let sig = tpkg + "::" + tname
+                      let seen_map = if kind == "type" { seen_type_exports } else { seen_value_exports }
+                      match seen_map.get(nm) {
+                        Some(prev) =>
+                        if prev != sig {
+                          diags.push(diag_error(
+                            "MBT2PION_DEP_ABI_ERROR",
+                            sf.rel_path,
+                            t.line,
+                            t.col,
+                            "conflicting `pub using` (" + kind + ") for `" + nm + "`: `" + prev + "` vs `" + sig + "`",
+                          ))
+                        }
+                        None => {
+                          seen_map[nm] = sig
+                          reexports.push(AbiReexport::{ name: nm, kind: kind, target_pkg: tpkg, target_name: tname })
+                        }
+                      }
+                    }
+                  }
+                  None => ()
+                }
+              }
+            }
+            edits.push((toks[i].start_byte, toks[i + 1].start_byte, ""))
+          }
+          None =>
+          diags.push(diag_error(
+            "MBT2PION_DEP_ABI_ERROR",
+            sf.rel_path,
+            t.line,
+            t.col,
+            "unsupported item form inside `pub using` block (fail-closed)",
+          ))
+        }
+        i = rb + 1
+        continue
+      }
+      i = i + 1
+    }
+    out_sources.push(if edits.length() > 0 {
+      SourceFile::{ rel_path: sf.rel_path, content: apply_byte_edits(sf.content, edits), is_test: sf.is_test }
+    } else {
+      sf
+    })
+  }
+  (out_sources, sort_abi_reexports(reexports))
+}
+
+fn rewrite_reexport_snippet_v2(
+  src : String,
+  file : String,
+  pkg_aliases : Map[String, String],
+  moon_import_paths : Map[String, String],
+  idx : DepPubIndexV2,
+  allow_using : Bool,
+  diags : Array[Diag],
+) -> (String, Bool) {
+  let toks = lex_moonbit(src)
+  let n = toks.length() - 1
+  let edits : Array[(Int, Int, String)] = []
+  let mut i = 0
+  let mut depth = 0
+  while i < n {
+    let t = toks[i]
+    if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+    if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+    if allow_using && depth == 0 && is_kw_or_id(t, "using") &&
+    i + 2 < n && toks[i + 1].kind == TokenKind::PkgRef && toks[i + 2].kind == TokenKind::LBrace {
+      let rb = find_matching_delim(toks, i + 2)
+      match parse_using_block_items(toks, i + 2, rb) {
+        Some(items) => {
+          let raw_pkg = toks[i + 1].raw.slice(1, toks[i + 1].raw.length())
+          let dep_pkg = resolve_dep_pkg_alias(raw_pkg, pkg_aliases, moon_import_paths, idx.known_pkgs)
+          let mut changed = dep_pkg != raw_pkg && idx.known_pkgs.contains(dep_pkg)
+          let by_pkg : Map[String, Array[String]] = Map()
+          let by_pkg_seen : Map[String, Map[String, Bool]] = Map()
+          for it in items {
+            let kind = it.0
+            let nm = it.1
+            let (tpkg, tname) = match resolve_reexport_chain_v2(dep_pkg, nm, kind, idx, file, t.line, t.col, diags) {
+              Some(p) => p
+              None => (dep_pkg, nm)
+            }
+            if tpkg != raw_pkg || tname != nm {
+              changed = true
+              if !idx.known_pkgs.contains(tpkg) {
+                diags.push(diag_error(
+                  "MBT2PION_DEP_ABI_ERROR",
+                  file,
+                  t.line,
+                  t.col,
+                  "missing transitive `--dep " + tpkg + "=...` for `" + nm + "`",
+                ))
+              }
+            }
+            let item_txt = if kind == "type" { "type " + tname } else { tname }
+            let seen = match by_pkg_seen.get(tpkg) {
+              Some(m) => m
+              None => { let m : Map[String, Bool] = Map(); by_pkg_seen[tpkg] = m; m }
+            }
+            if !seen.contains(item_txt) {
+              seen[item_txt] = true
+              let arr = match by_pkg.get(tpkg) {
+                Some(xs) => xs
+                None => { let xs : Array[String] = []; by_pkg[tpkg] = xs; xs }
+              }
+              arr.push(item_txt)
+            }
+          }
+          if changed {
+            let sb = StringBuilder()
+            let mut first = true
+            for pk in sorted_map_keys(by_pkg) {
+              if !first { sb.write_string("\n") }
+              first = false
+              let xs = match by_pkg.get(pk) { Some(v) => v, None => [] }
+              sb.write_string("using @" + pk + " { " + join_comma(xs) + " }")
+            }
+            edits.push((toks[i].start_byte, toks[rb].end_byte, sb.to_string()))
+          }
+        }
+        None => ()
+      }
+      i = rb + 1
+      continue
+    }
+    if t.kind == TokenKind::PkgRef && i + 2 < n && toks[i + 1].kind == TokenKind::Dot &&
+    (toks[i + 2].kind == TokenKind::UpperIdent || toks[i + 2].kind == TokenKind::Ident) {
+      let raw_pkg = t.raw.slice(1, t.raw.length())
+      let dep_pkg = resolve_dep_pkg_alias(raw_pkg, pkg_aliases, moon_import_paths, idx.known_pkgs)
+      let nm = toks[i + 2].raw
+      let t_opt : Option[AbiReexport] = match idx.dep_re_type.get(dep_pkg) { Some(m) => m.get(nm), None => None }
+      let v_opt : Option[AbiReexport] = match idx.dep_re_value.get(dep_pkg) { Some(m) => m.get(nm), None => None }
+      let chosen_kind_opt : Option[String] = match (t_opt, v_opt) {
+        (Some(_), None) => Some("type")
+        (None, Some(_)) => Some("value")
+        (Some(tr), Some(vr)) =>
+        if tr.target_pkg == vr.target_pkg && tr.target_name == vr.target_name {
+          Some("type")
+        } else {
+          let next_is_cc_or_br = i + 3 < n && (toks[i + 3].kind == TokenKind::ColonColon || toks[i + 3].kind == TokenKind::LBracket)
+          let next_is_lp = i + 3 < n && toks[i + 3].kind == TokenKind::LParen
+          let prev_is_type_ctx = i > 0 && (toks[i - 1].kind == TokenKind::Colon || toks[i - 1].kind == TokenKind::Arrow ||
+            (toks[i - 1].kind == TokenKind::Keyword && (toks[i - 1].raw == "type" || toks[i - 1].raw == "as")))
+          if next_is_cc_or_br || prev_is_type_ctx {
+            Some("type")
+          } else if next_is_lp {
+            Some("value")
+          } else {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              file,
+              t.line,
+              t.col,
+              "ambiguous dual-namespace re-export `@" + raw_pkg + "." + nm + "` (both type and value re-exported from different origins)",
+            ))
+            None
+          }
+        }
+        (None, None) => None
+      }
+      match chosen_kind_opt {
+        Some(ck) =>
+        match resolve_reexport_chain_v2(dep_pkg, nm, ck, idx, file, t.line, t.col, diags) {
+          Some((tpkg, tname)) =>
+          if !idx.known_pkgs.contains(tpkg) {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              file,
+              t.line,
+              t.col,
+              "missing transitive `--dep " + tpkg + "=...`",
+            ))
+          } else {
+            edits.push((toks[i].start_byte, toks[i + 2].end_byte, "@" + tpkg + "." + tname))
+          }
+          None => ()
+        }
+        None => ()
+      }
+      i = i + 3
+      continue
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let is_ml = t.kind == TokenKind::InterpMultiline
+      let mut any_ch = false
+      let sb = StringBuilder()
+      sb.write_string(if is_ml { "$|" } else { "\"" })
+      for p in split_interp_string(t.raw, is_ml) {
+        if p.is_expr {
+          let (ns, ch) = rewrite_reexport_snippet_v2(p.text, file, pkg_aliases, moon_import_paths, idx, false, diags)
+          if ch { any_ch = true }
+          sb.write_string("\\{" + ns + "}")
+        } else {
+          sb.write_string(p.text)
+        }
+      }
+      if !is_ml { sb.write_string("\"") }
+      if any_ch { edits.push((t.start_byte, t.end_byte, sb.to_string())) }
+    }
+    i = i + 1
+  }
+  if edits.length() > 0 { (apply_byte_edits(src, edits), true) } else { (src, false) }
+}
+
+pub fn rewrite_dep_reexports_v2(
+  sources : Array[SourceFile],
+  pkg_aliases : Map[String, String],
+  moon_import_paths : Map[String, String],
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+  diags : Array[Diag],
+) -> Array[SourceFile] {
+  let idx = build_dep_pub_index_v2(dep_doc_jsons, dep_abis)
+  if idx.dep_re_type.length() == 0 && idx.dep_re_value.length() == 0 && moon_import_paths.length() == 0 {
+    return sources
+  }
+  let out : Array[SourceFile] = []
+  for sf in sources {
+    let (ns, ch) = rewrite_reexport_snippet_v2(sf.content, sf.rel_path, pkg_aliases, moon_import_paths, idx, true, diags)
+    out.push(if ch { SourceFile::{ rel_path: sf.rel_path, content: ns, is_test: sf.is_test } } else { sf })
+  }
+  out
 }

@@ -3,12 +3,15 @@
 ///| 2. Strictly sound exhaustive array-slice `match` analysis (no guard, irrefutable elements,
 ///|    exact coverage of all non-negative lengths).
 
-///| Return true if pattern token range `[start, end)` contains any `as` keyword.
+///| Return true if pattern token range `[start, end)` contains any `as` keyword
+///| (excluding array rest-slice `.. as rest`).
 fn pattern_contains_as_kw(tokens : Array[Token], start : Int, end : Int) -> Bool {
   let mut k = start
   while k < end {
     if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "as" {
-      return true
+      if !(k > start && tokens[k - 1].kind == TokenKind::DotDot) {
+        return true
+      }
     }
     k = k + 1
   }
@@ -139,7 +142,8 @@ fn check_unsupported_pipe_as_in_cond(
   false
 }
 
-///| Find depth-0 `as <ident>` at the tail of pattern `[start, end)`, returning index of `as` or `-1`.
+///| Find depth-0 `as <ident>` at the tail of pattern `[start, end)`, returning index of `as` or `-1`
+///| (excluding array rest-slice `.. as rest`).
 fn find_top_level_as_kw(tokens : Array[Token], start : Int, end : Int) -> Int {
   let mut k = start
   let mut d = 0
@@ -150,11 +154,577 @@ fn find_top_level_as_kw(tokens : Array[Token], start : Int, end : Int) -> Int {
     } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
       if d > 0 { d = d - 1 }
     } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "as" {
-      return k
+      if !(k > start && tokens[k - 1].kind == TokenKind::DotDot) {
+        return k
+      }
     }
     k = k + 1
   }
   -1
+}
+
+fn range_has_top_comma(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && kk == TokenKind::Comma {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Peel outermost nested `as` bindings inside `(...)` and `[...]` sub-patterns of `[start, end)`
+///| (excluding `{ ... } as alias` which `peel_struct_patterns_in_pat` handles, and excluding `.. as rest`).
+///| Returns `(rewritten_tokens_with_eof, [(alias_var, sub_pat_start, sub_pat_end)])`.
+fn peel_nested_as_tokens(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+  as_obls : Array[(String, Int, Int)],
+) -> Array[Token] {
+  let out : Array[Token] = []
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LBrace {
+      // Leave `{ ... }` (and optional trailing `as ident`) untouched for `peel_struct_patterns_in_pat`
+      let cb = find_matching_delim(tokens, k)
+      let mut m = k
+      while m <= cb && m < end {
+        out.push(tokens[m])
+        m = m + 1
+      }
+      if cb + 2 < end && tokens[cb + 1].kind == TokenKind::Keyword && tokens[cb + 1].raw == "as" &&
+      (tokens[cb + 2].kind == TokenKind::Ident || tokens[cb + 2].kind == TokenKind::Underscore) {
+        out.push(tokens[cb + 1])
+        out.push(tokens[cb + 2])
+        k = cb + 3
+      } else {
+        k = cb + 1
+      }
+      continue
+    }
+    if tk == TokenKind::LParen || tk == TokenKind::LBracket {
+      let cp = find_matching_delim(tokens, k)
+      if cp < end && pattern_contains_as_kw(tokens, k + 1, cp) {
+        out.push(tokens[k])
+        let mut item_s = k + 1
+        while item_s < cp {
+          if tokens[item_s].kind == TokenKind::Comma {
+            out.push(tokens[item_s])
+            item_s = item_s + 1
+            continue
+          }
+          let mut item_e = item_s
+          let mut d = 0
+          while item_e < cp {
+            let ik = tokens[item_e].kind
+            if ik == TokenKind::LParen || ik == TokenKind::LBracket || ik == TokenKind::LBrace { d = d + 1 }
+            else if ik == TokenKind::RParen || ik == TokenKind::RBracket || ik == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+            else if d == 0 && ik == TokenKind::Comma { break }
+            item_e = item_e + 1
+          }
+          let mut val_s = item_s
+          let val_e = item_e
+          // Preserve optional labeled argument prefix `label=` inside constructor patterns
+          if (tokens[val_s].kind == TokenKind::Ident || tokens[val_s].kind == TokenKind::Keyword) &&
+          val_s + 1 < val_e && tokens[val_s + 1].kind == TokenKind::Eq {
+            out.push(tokens[val_s])
+            out.push(tokens[val_s + 1])
+            val_s = val_s + 2
+          }
+          // Strip balanced outer grouping parens around `[val_s, val_e)` (NEVER strip tuple parens `(a, b)`!)
+          let mut ps = val_s
+          let mut pe = val_e
+          while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen &&
+          find_matching_delim(tokens, ps) == pe - 1 &&
+          !range_has_top_comma(tokens, ps + 1, pe - 1) {
+            ps = ps + 1
+            pe = pe - 1
+          }
+          let top_as = find_top_level_as_kw(tokens, ps, pe)
+          // Check if the sub-pattern before `as` is a direct struct pattern `{ ... }` or `S::{ ... }`
+          let is_direct_struct_as = if top_as > ps {
+            (tokens[ps].kind == TokenKind::LBrace && find_matching_delim(tokens, ps) == top_as - 1) ||
+            (ps + 2 < top_as && tokens[ps].kind == TokenKind::UpperIdent &&
+              tokens[ps + 1].kind == TokenKind::ColonColon && tokens[ps + 2].kind == TokenKind::LBrace &&
+              find_matching_delim(tokens, ps + 2) == top_as - 1)
+          } else {
+            false
+          }
+          if top_as > ps && !is_direct_struct_as {
+            if top_as + 2 != pe || (tokens[top_as + 1].kind != TokenKind::Ident && tokens[top_as + 1].kind != TokenKind::Underscore) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_SYNTAX",
+                file,
+                tokens[top_as].line,
+                tokens[top_as].col,
+                "unsupported nested `as` alias form inside `is`-chain pattern (fail-closed)",
+              ))
+            } else if pattern_has_top_pipe(tokens, ps, top_as) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_SYNTAX",
+                file,
+                tokens[top_as].line,
+                tokens[top_as].col,
+                "or-pattern `|` combined with nested `as` binding inside `is`-chain is not supported (fail-closed)",
+              ))
+            } else {
+              let alias_tok = tokens[top_as + 1]
+              let is_wild = alias_tok.kind == TokenKind::Underscore || alias_tok.raw == "_"
+              let raw_emit_name = if is_wild {
+                let tmp = fresh_temp(ctx, "as")
+                ctx.synth_sp_temps[tmp] = true
+                tmp
+              } else {
+                alias_tok.raw
+              }
+              let resolved_alias = if is_wild { raw_emit_name } else { resolve_ident_in_scope(ctx, raw_emit_name) }
+              out.push(Token::{
+                kind: TokenKind::Ident,
+                raw: raw_emit_name,
+                leading_trivia: tokens[val_s].leading_trivia,
+                newline_before: tokens[val_s].newline_before,
+                line: tokens[val_s].line,
+                col: tokens[val_s].col,
+                start_byte: tokens[val_s].start_byte,
+                end_byte: tokens[val_e - 1].end_byte,
+              })
+              as_obls.push((resolved_alias, ps, top_as))
+            }
+          } else if pattern_contains_as_kw(tokens, val_s, val_e) {
+            let sub_toks = peel_nested_as_tokens(ctx, tokens, val_s, val_e, file, as_obls)
+            let mut si = 0
+            while si < sub_toks.length() {
+              out.push(sub_toks[si])
+              si = si + 1
+            }
+          } else {
+            let mut m = val_s
+            while m < val_e {
+              out.push(tokens[m])
+              m = m + 1
+            }
+          }
+          if item_e < cp && tokens[item_e].kind == TokenKind::Comma {
+            out.push(tokens[item_e])
+            item_s = item_e + 1
+          } else {
+            item_s = item_e
+          }
+        }
+        out.push(tokens[cp])
+        k = cp + 1
+        continue
+      }
+    }
+    out.push(tokens[k])
+    k = k + 1
+  }
+  out
+}
+
+fn finish_peeled_tokens(toks : Array[Token]) -> Array[Token] {
+  let res : Array[Token] = []
+  for t in toks {
+    res.push(t)
+  }
+  res.push(Token::{
+    kind: TokenKind::Eof,
+    raw: "",
+    leading_trivia: "",
+    newline_before: false,
+    line: 1,
+    col: 1,
+    start_byte: 0,
+    end_byte: 0,
+  })
+  res
+}
+
+///| Lower a single `(scrut_expr, pat_s..pat_e)` match obligation (supporting nested `as` and `{ ... }`)
+///| and then continue with remaining `as_obls[as_idx..]` -> `segs[next_seg_idx..]`.
+enum IsChainCont {
+  ExprCont(String)
+  BlockCont(Int, Int, Bool)
+}
+
+fn expand_is_chain_as_obls(
+  ctx : StageAContext,
+  orig_tokens : Array[Token],
+  as_obls : Array[(Array[Token], String, Int, Int)],
+  idx : Int,
+  segs : Array[(Int, Int)],
+  next_seg_idx : Int,
+  file : String,
+  cont : IsChainCont,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= as_obls.length() {
+    return match cont {
+      IsChainCont::ExprCont(then_expr) =>
+      lower_is_chain_segs(ctx, orig_tokens, segs, next_seg_idx, file, then_expr, fail_expr, bound_out, bound_seen)
+      IsChainCont::BlockCont(then_lb, then_rb, wrap_some) =>
+      lower_is_chain_segs_with_block(ctx, orig_tokens, segs, next_seg_idx, file, then_lb, then_rb, wrap_some, fail_expr, bound_out, bound_seen)
+    }
+  }
+  let (tokens, scrut_var, raw_ps, raw_pe) = as_obls[idx]
+  let mut ps = raw_ps
+  let mut pe = raw_pe
+  while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, ps) == pe - 1 &&
+  !range_has_top_comma(tokens, ps + 1, pe - 1) {
+    ps = ps + 1
+    pe = pe - 1
+  }
+  let tail_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  let mut oi = idx + 1
+  while oi < as_obls.length() {
+    tail_as_obls.push(as_obls[oi])
+    oi = oi + 1
+  }
+  if pattern_has_top_pipe(tokens, ps, pe) &&
+  (pattern_contains_as_kw(tokens, ps, pe) || pattern_contains_struct_pat(tokens, ps, pe)) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[ps].line,
+      tokens[ps].col,
+      "or-pattern `|` with `as` or struct pattern inside `is`-chain is not supported (fail-closed)",
+    ))
+  }
+  // Handle chained top-level `as` on this sub-pattern (e.g. `((Some(x) as b) as a)`)
+  let top_as = find_top_level_as_kw(tokens, ps, pe)
+  let mut inner_pe = pe
+  let mut chain_alias = ""
+  if top_as > ps {
+    if top_as + 2 == pe && (tokens[top_as + 1].kind == TokenKind::Ident || tokens[top_as + 1].kind == TokenKind::Underscore) {
+      let at = tokens[top_as + 1]
+      if at.kind != TokenKind::Underscore && at.raw != "_" {
+        chain_alias = resolve_ident_in_scope(ctx, at.raw)
+        record_is_chain_binder(ctx, chain_alias, "", bound_out, bound_seen)
+      }
+      inner_pe = top_as
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[top_as].line,
+        tokens[top_as].col,
+        "unsupported nested `as` alias form inside `is`-chain pattern (fail-closed)",
+      ))
+    }
+  }
+  let eff_scrut = if chain_alias.length() > 0 { chain_alias } else { scrut_var }
+  let child_as_raw : Array[(String, Int, Int)] = []
+  let peeled_toks = if pattern_contains_as_kw(tokens, ps, inner_pe) {
+    finish_peeled_tokens(peel_nested_as_tokens(ctx, tokens, ps, inner_pe, file, child_as_raw))
+  } else {
+    []
+  }
+  for cab in child_as_raw {
+    if !ctx.synth_sp_temps.contains(cab.0) {
+      record_is_chain_binder(ctx, cab.0, "", bound_out, bound_seen)
+    }
+  }
+  let next_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  for cab in child_as_raw { next_as_obls.push((tokens, cab.0, cab.1, cab.2)) }
+  for tab in tail_as_obls { next_as_obls.push(tab) }
+  let use_peeled = child_as_raw.length() > 0
+  let p_toks = if use_peeled { peeled_toks } else { tokens }
+  let p_s = if use_peeled { 0 } else { ps }
+  let p_e = if use_peeled { peeled_toks.length() - 1 } else { inner_pe }
+  let inner_body = if pattern_contains_struct_pat(p_toks, p_s, p_e) {
+    let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, p_toks, p_s, p_e, file)
+    let outer_pat = outer_pat_raw.trim()
+    for ob in raw_obls {
+      if !ctx.synth_sp_temps.contains(ob.0) {
+        record_is_chain_binder(ctx, ob.0, "", bound_out, bound_seen)
+      }
+    }
+    let ob_set : Map[String, Bool] = Map()
+    for ob in raw_obls { ob_set[ob.0] = true }
+    let outer_toks = lex_moonbit(outer_pat)
+    let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
+    for rb in outer_raw_bs {
+      if !ob_set.contains(rb) && !ctx.synth_sp_temps.contains(rb) {
+        record_is_chain_binder(ctx, rb, "", bound_out, bound_seen)
+      }
+    }
+    let expanded = expand_is_chain_struct_obls_with_as(
+      ctx,
+      p_toks,
+      orig_tokens,
+      raw_obls,
+      0,
+      next_as_obls,
+      segs,
+      next_seg_idx,
+      file,
+      cont,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    if is_irrefutable_simple_pat(outer_pat) {
+      if outer_pat == eff_scrut {
+        expanded
+      } else {
+        "{ let " + outer_pat + " = " + eff_scrut + "; " + expanded + " }"
+      }
+    } else {
+      "match " + eff_scrut + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
+    }
+  } else {
+    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    let raw_bs = collect_pattern_binders(p_toks, p_s, p_e)
+    for rb in raw_bs {
+      let bname = resolve_ident_in_scope(ctx, rb)
+      if !ctx.synth_sp_temps.contains(bname) {
+        record_is_chain_binder(ctx, bname, "", bound_out, bound_seen)
+      }
+    }
+    let next_s = expand_is_chain_as_obls(
+      ctx,
+      orig_tokens,
+      next_as_obls,
+      0,
+      segs,
+      next_seg_idx,
+      file,
+      cont,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    if is_irrefutable_simple_pat(pat_str) {
+      if pat_str == "_" {
+        next_s
+      } else if pat_str == eff_scrut {
+        next_s
+      } else {
+        "{ let " + pat_str + " = " + eff_scrut + "; " + next_s + " }"
+      }
+    } else {
+      "match " + eff_scrut + " { " + pat_str + " => " + next_s + ", _ => " + fail_expr + " }"
+    }
+  }
+  if chain_alias.length() > 0 {
+    "{ let " + chain_alias + " = " + scrut_var + "; " + inner_body + " }"
+  } else {
+    inner_body
+  }
+}
+
+///| Expand struct obligations `obls` (whose token indices reference `struct_toks`),
+///| then continue into `pending_as_obls`, then `segs[next_seg_idx..]`.
+fn expand_is_chain_struct_obls_with_as(
+  ctx : StageAContext,
+  struct_toks : Array[Token],
+  orig_toks : Array[Token],
+  obls : Array[(String, Int, Int, String)],
+  idx : Int,
+  pending_as_obls : Array[(Array[Token], String, Int, Int)],
+  segs : Array[(Int, Int)],
+  next_seg_idx : Int,
+  file : String,
+  cont : IsChainCont,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= obls.length() {
+    return expand_is_chain_as_obls(
+      ctx,
+      orig_toks,
+      pending_as_obls,
+      0,
+      segs,
+      next_seg_idx,
+      file,
+      cont,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+  }
+  let (bind_var, open_b, close_b, explicit_sname) = obls[idx]
+  let checks : Array[String] = []
+  let bind_fields : Array[(String, String, Bool)] = []
+  let next_obls : Array[(String, Int, Int, String)] = []
+  let mut oi = idx + 1
+  while oi < obls.length() {
+    next_obls.push(obls[oi])
+    oi = oi + 1
+  }
+  let combined_as : Array[(Array[Token], String, Int, Int)] = []
+  let mut fi = open_b + 1
+  while fi < close_b {
+    if struct_toks[fi].kind == TokenKind::Comma || struct_toks[fi].kind == TokenKind::DotDot {
+      fi = fi + 1
+      continue
+    }
+    let mut fe = fi
+    let mut fd = 0
+    while fe < close_b {
+      let fk = struct_toks[fe].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::Comma { break }
+      fe = fe + 1
+    }
+    let raw_f = struct_toks[fi].raw
+    let access_f = resolve_is_chain_struct_field(ctx, explicit_sname, raw_f, file, struct_toks[fi].line, struct_toks[fi].col)
+    if (struct_toks[fi].kind == TokenKind::Ident || struct_toks[fi].kind == TokenKind::Keyword) &&
+    fi + 2 < fe && struct_toks[fi + 1].kind == TokenKind::Colon {
+      let fexpr = bind_var + "." + access_f
+      let vs = fi + 2
+      if pattern_contains_struct_pat(struct_toks, vs, fe) {
+        let field_ty = if explicit_sname.length() > 0 {
+          match ctx.symtab.struct_field_types.get(explicit_sname) {
+            Some(fm) => match fm.get(raw_f) { Some(ft) => ft, None => "" }
+            None => ""
+          }
+        } else {
+          ""
+        }
+        let (peeled_pat, child_obls) = peel_struct_patterns_in_pat(ctx, struct_toks, vs, fe, file)
+        for cob in child_obls {
+          if !ctx.synth_sp_temps.contains(cob.0) {
+            record_is_chain_binder(ctx, cob.0, "", bound_out, bound_seen)
+          }
+          let csname = if cob.3.length() > 0 {
+            cob.3
+          } else {
+            infer_struct_name_from_ty_and_pat(ctx, field_ty, struct_toks, vs, fe, cob.1)
+          }
+          next_obls.push((cob.0, cob.1, cob.2, csname))
+        }
+        let pp = peeled_pat.trim()
+        bind_fields.push((fexpr, pp, is_irrefutable_simple_pat(pp)))
+      } else if pattern_contains_as_kw(struct_toks, vs, fe) {
+        let ftmp = fresh_temp(ctx, "fa")
+        ctx.synth_sp_temps[ftmp] = true
+        bind_fields.push((fexpr, ftmp, true))
+        combined_as.push((struct_toks, ftmp, vs, fe))
+      } else {
+        let mut has_binder = false
+        let mut bi = vs
+        while bi < fe {
+          if struct_toks[bi].kind == TokenKind::Ident && struct_toks[bi].raw != "_" &&
+          !(bi > vs && (struct_toks[bi - 1].kind == TokenKind::Dot || struct_toks[bi - 1].kind == TokenKind::ColonColon)) &&
+          !(bi + 1 < fe && struct_toks[bi + 1].kind == TokenKind::Colon) {
+            has_binder = true
+          }
+          bi = bi + 1
+        }
+        if has_binder {
+          register_simple_is_pat_binders(ctx, struct_toks, vs, fe, "", bound_out, bound_seen)
+          let pat_s = lower_expr_range(ctx, struct_toks, vs, fe, file, true).trim()
+          bind_fields.push((fexpr, pat_s, is_irrefutable_simple_pat(pat_s)))
+        } else if vs < fe {
+          let vt = struct_toks[vs]
+          if vs + 1 == fe && (vt.kind == TokenKind::Keyword && (vt.raw == "true" || vt.raw == "false") ||
+            vt.kind == TokenKind::IntLit || vt.kind == TokenKind::FloatLit || vt.kind == TokenKind::StringLit || vt.kind == TokenKind::CharLit) {
+            checks.push(fexpr + " == " + vt.raw)
+          } else {
+            let ps = lower_expr_range(ctx, struct_toks, vs, fe, file, true).trim()
+            if ps != "_" {
+              checks.push("(match " + fexpr + " { " + ps + " => true, _ => false })")
+            }
+          }
+        }
+      }
+    } else if struct_toks[fi].kind == TokenKind::Ident && fe == fi + 1 {
+      let bind_name = resolve_ident_in_scope(ctx, raw_f)
+      record_is_chain_binder(ctx, bind_name, "", bound_out, bound_seen)
+      bind_fields.push((bind_var + "." + access_f, bind_name, true))
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        struct_toks[fi].line,
+        struct_toks[fi].col,
+        "unsupported field pattern inside struct pattern",
+      ))
+    }
+    fi = fe + 1
+  }
+  for pas in pending_as_obls {
+    combined_as.push(pas)
+  }
+  let inner_s = expand_is_chain_struct_obls_with_as(
+    ctx,
+    struct_toks,
+    orig_toks,
+    next_obls,
+    0,
+    combined_as,
+    segs,
+    next_seg_idx,
+    file,
+    cont,
+    fail_expr,
+    bound_out,
+    bound_seen,
+  )
+  let mut wrapped = inner_s
+  if bind_fields.length() > 0 {
+    let mut all_irref = true
+    for bf in bind_fields {
+      if !bf.2 {
+        all_irref = false
+        break
+      }
+    }
+    if all_irref {
+      let lsb = StringBuilder()
+      lsb.write_string("{ ")
+      for bf in bind_fields {
+        lsb.write_string("let " + bf.1 + " = " + bf.0 + "; ")
+      }
+      lsb.write_string(wrapped + " }")
+      wrapped = lsb.to_string()
+    } else {
+      let scrut_e = if bind_fields.length() == 1 {
+        bind_fields[0].0
+      } else {
+        let es : Array[String] = []
+        for bf in bind_fields { es.push(bf.0) }
+        "(" + join_comma(es) + ")"
+      }
+      let pat_e = if bind_fields.length() == 1 {
+        bind_fields[0].1
+      } else {
+        let ps : Array[String] = []
+        for bf in bind_fields { ps.push(bf.1) }
+        "(" + join_comma(ps) + ")"
+      }
+      wrapped = "match " + scrut_e + " { " + pat_e + " => " + wrapped + ", _ => " + fail_expr + " }"
+    }
+  }
+  if checks.length() > 0 {
+    let csb = StringBuilder()
+    let mut ci = 0
+    while ci < checks.length() {
+      if ci > 0 { csb.write_string(" && ") }
+      csb.write_string(checks[ci])
+      ci = ci + 1
+    }
+    wrapped = "if (" + csb.to_string() + ") { " + wrapped + " } else { " + fail_expr + " }"
+  }
+  wrapped
 }
 
 ///| Collect ALL raw binder names introduced anywhere in an `is` pattern `[start, end)`
@@ -602,17 +1172,34 @@ fn lower_is_chain_segs(
     }
   }
   let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
-  let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
+  let raw_as_obls : Array[(String, Int, Int)] = []
+  let peeled_as_toks = if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
+    finish_peeled_tokens(peel_nested_as_tokens(ctx, tokens, pat_s, inner_pat_e, file, raw_as_obls))
+  } else {
+    []
+  }
+  let seg_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  for aob in raw_as_obls {
+    if !ctx.synth_sp_temps.contains(aob.0) {
+      record_is_chain_binder(ctx, aob.0, "", bound_out, bound_seen)
+    }
+    seg_as_obls.push((tokens, aob.0, aob.1, aob.2))
+  }
+  let use_peeled_as = raw_as_obls.length() > 0
+  let p_toks = if use_peeled_as { peeled_as_toks } else { tokens }
+  let p_s = if use_peeled_as { 0 } else { pat_s }
+  let p_e = if use_peeled_as { peeled_as_toks.length() - 1 } else { inner_pat_e }
+  let body_expr = if pattern_contains_struct_pat(p_toks, p_s, p_e) {
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, tokens, pat_s, inner_pat_e, file)
+    let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, p_toks, p_s, p_e, file)
     let obls : Array[(String, Int, Int, String)] = []
     for ob in raw_obls {
       let osname = if ob.3.length() > 0 {
         ob.3
       } else {
-        infer_struct_name_from_ty_and_pat(ctx, lhs_ty, tokens, pat_s, inner_pat_e, ob.1)
+        infer_struct_name_from_ty_and_pat(ctx, lhs_ty, p_toks, p_s, p_e, ob.1)
       }
       obls.push((ob.0, ob.1, ob.2, osname))
     }
@@ -630,30 +1217,23 @@ fn lower_is_chain_segs(
     let ob_set : Map[String, Bool] = Map()
     for ob in obls { ob_set[ob.0] = true }
     let outer_toks = lex_moonbit(outer_pat)
-    if pattern_contains_as_kw(outer_toks, 0, outer_toks.length() - 1) {
-      ctx.diags.push(diag_error(
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-        file,
-        tokens[pat_s].line,
-        tokens[pat_s].col,
-        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
-      ))
-    }
     let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
     for rb in outer_raw_bs {
       if !ob_set.contains(rb) && !ctx.synth_sp_temps.contains(rb) {
         record_is_chain_binder(ctx, rb, "", bound_out, bound_seen)
       }
     }
-    let expanded = expand_is_chain_struct_obls(
+    let expanded = expand_is_chain_struct_obls_with_as(
       ctx,
+      p_toks,
       tokens,
       obls,
       0,
+      seg_as_obls,
       segs,
       idx + 1,
       file,
-      then_expr,
+      IsChainCont::ExprCont(then_expr),
       fail_expr,
       bound_out,
       bound_seen,
@@ -668,24 +1248,37 @@ fn lower_is_chain_segs(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
-    if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
-      ctx.diags.push(diag_error(
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-        file,
-        tokens[pat_s].line,
-        tokens[pat_s].col,
-        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
-      ))
-    }
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let pat_str = lower_expr_range(ctx, tokens, pat_s, inner_pat_e, file, true).trim()
+    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
     if lhs_ty.length() > 0 {
       pop_expected_type(ctx)
     }
-    register_simple_is_pat_binders(ctx, tokens, pat_s, inner_pat_e, lhs_ty, bound_out, bound_seen)
-    let next_s = lower_is_chain_segs(ctx, tokens, segs, idx + 1, file, then_expr, fail_expr, bound_out, bound_seen)
+    if !use_peeled_as {
+      register_simple_is_pat_binders(ctx, p_toks, p_s, p_e, lhs_ty, bound_out, bound_seen)
+    } else {
+      let raw_bs = collect_pattern_binders(p_toks, p_s, p_e)
+      for rb in raw_bs {
+        let bname = resolve_ident_in_scope(ctx, rb)
+        if !ctx.synth_sp_temps.contains(bname) {
+          record_is_chain_binder(ctx, bname, "", bound_out, bound_seen)
+        }
+      }
+    }
+    let next_s = expand_is_chain_as_obls(
+      ctx,
+      tokens,
+      seg_as_obls,
+      0,
+      segs,
+      idx + 1,
+      file,
+      IsChainCont::ExprCont(then_expr),
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
     if is_irrefutable_simple_pat(pat_str) {
       if pat_str == "_" {
         "{ let _ = " + scrut_expr + "; " + next_s + " }"
@@ -952,17 +1545,34 @@ fn lower_is_chain_segs_with_block(
     }
   }
   let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
-  let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
+  let raw_as_obls : Array[(String, Int, Int)] = []
+  let peeled_as_toks = if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
+    finish_peeled_tokens(peel_nested_as_tokens(ctx, tokens, pat_s, inner_pat_e, file, raw_as_obls))
+  } else {
+    []
+  }
+  let seg_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  for aob in raw_as_obls {
+    if !ctx.synth_sp_temps.contains(aob.0) {
+      record_is_chain_binder(ctx, aob.0, "", bound_out, bound_seen)
+    }
+    seg_as_obls.push((tokens, aob.0, aob.1, aob.2))
+  }
+  let use_peeled_as = raw_as_obls.length() > 0
+  let p_toks = if use_peeled_as { peeled_as_toks } else { tokens }
+  let p_s = if use_peeled_as { 0 } else { pat_s }
+  let p_e = if use_peeled_as { peeled_as_toks.length() - 1 } else { inner_pat_e }
+  let body_expr = if pattern_contains_struct_pat(p_toks, p_s, p_e) {
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, tokens, pat_s, inner_pat_e, file)
+    let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, p_toks, p_s, p_e, file)
     let obls : Array[(String, Int, Int, String)] = []
     for ob in raw_obls {
       let osname = if ob.3.length() > 0 {
         ob.3
       } else {
-        infer_struct_name_from_ty_and_pat(ctx, lhs_ty, tokens, pat_s, inner_pat_e, ob.1)
+        infer_struct_name_from_ty_and_pat(ctx, lhs_ty, p_toks, p_s, p_e, ob.1)
       }
       obls.push((ob.0, ob.1, ob.2, osname))
     }
@@ -978,32 +1588,23 @@ fn lower_is_chain_segs_with_block(
     let ob_set : Map[String, Bool] = Map()
     for ob in obls { ob_set[ob.0] = true }
     let outer_toks = lex_moonbit(outer_pat)
-    if pattern_contains_as_kw(outer_toks, 0, outer_toks.length() - 1) {
-      ctx.diags.push(diag_error(
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-        file,
-        tokens[pat_s].line,
-        tokens[pat_s].col,
-        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
-      ))
-    }
     let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
     for rb in outer_raw_bs {
       if !ob_set.contains(rb) && !ctx.synth_sp_temps.contains(rb) {
         record_is_chain_binder(ctx, rb, "", bound_out, bound_seen)
       }
     }
-    let expanded = expand_is_chain_struct_obls_with_block(
+    let expanded = expand_is_chain_struct_obls_with_as(
       ctx,
+      p_toks,
       tokens,
       obls,
       0,
+      seg_as_obls,
       segs,
       idx + 1,
       file,
-      then_lb,
-      then_rb,
-      wrap_some,
+      IsChainCont::BlockCont(then_lb, then_rb, wrap_some),
       fail_expr,
       bound_out,
       bound_seen,
@@ -1018,32 +1619,33 @@ fn lower_is_chain_segs_with_block(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
-    if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
-      ctx.diags.push(diag_error(
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-        file,
-        tokens[pat_s].line,
-        tokens[pat_s].col,
-        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
-      ))
-    }
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let pat_str = lower_expr_range(ctx, tokens, pat_s, inner_pat_e, file, true).trim()
+    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
     if lhs_ty.length() > 0 {
       pop_expected_type(ctx)
     }
-    register_simple_is_pat_binders(ctx, tokens, pat_s, inner_pat_e, lhs_ty, bound_out, bound_seen)
-    let next_s = lower_is_chain_segs_with_block(
+    if !use_peeled_as {
+      register_simple_is_pat_binders(ctx, p_toks, p_s, p_e, lhs_ty, bound_out, bound_seen)
+    } else {
+      let raw_bs = collect_pattern_binders(p_toks, p_s, p_e)
+      for rb in raw_bs {
+        let bname = resolve_ident_in_scope(ctx, rb)
+        if !ctx.synth_sp_temps.contains(bname) {
+          record_is_chain_binder(ctx, bname, "", bound_out, bound_seen)
+        }
+      }
+    }
+    let next_s = expand_is_chain_as_obls(
       ctx,
       tokens,
+      seg_as_obls,
+      0,
       segs,
       idx + 1,
       file,
-      then_lb,
-      then_rb,
-      wrap_some,
+      IsChainCont::BlockCont(then_lb, then_rb, wrap_some),
       fail_expr,
       bound_out,
       bound_seen,
