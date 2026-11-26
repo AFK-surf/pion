@@ -460,6 +460,36 @@ fn pick_r16_lbl_bare_and(
   if x { g } else { 0 }
 }
 
+let r17_g : Bool = false
+
+fn g_true() -> Bool {
+  true
+}
+
+fn pick_r17_rec() -> Int {
+  let r17_g = true
+  fn rec(n : Int) -> Bool {
+    if n == 0 { true is _ == r17_g } else { rec(n - 1) }
+  }
+  if rec(2) { 1 } else { 0 }
+}
+
+fn pick_r17_interp(
+  x? : String = "\{true is _ == g_true()}",
+  g_true : () -> Bool,
+) -> Int {
+  let _ = g_true
+  x.length()
+}
+
+fn pick_r17_ml_and(
+  x? : Bool = (Some(true) is Some(g)) && true &&
+  g,
+  g~ : Bool,
+) -> Int {
+  if x && !g { 1 } else { 0 }
+}
+
 let top_shadow_block : Int = {
   let always_fail_g = 41
   always_fail_g + 1
@@ -748,7 +778,11 @@ fn case_r5_paren_and_guard() -> String {
   let p50 = pick_r16_pos_match_s(fn() { 9 })
   let p51 = pick_r16_lbl_paren_and(g=8)
   let p52 = pick_r16_lbl_bare_and(g=8)
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string()
+  // R17: rec local fn `is == g` capture, interp `is == g()` positional defer, multiline `&&` continuation
+  let p53 = pick_r17_rec()
+  let p54 = pick_r17_interp(fn() { false })
+  let p55 = pick_r17_ml_and(g=false)
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -828,6 +862,14 @@ NEGATIVE_CASES = [
     (
         "default_param_labeled_match_struct_shadow",
         "priv struct R16V { a : Int }\nfn g() -> Int { 2 }\npub fn p(x? : Int = match R16V::{ a: g() } { { a } => a }, g~ : () -> Int) -> Int { let _ = g; x }\n",
+    ),
+    (
+        "default_param_labeled_bare_is_cmp",
+        "fn g() -> Bool { true }\npub fn p(x? : Bool = true is _ == g(), g~ : () -> Bool) -> Int { let _ = g; if x { 1 } else { 0 } }\n",
+    ),
+    (
+        "default_param_labeled_newline_after_cmp",
+        "fn g() -> Bool { true }\nfn none_i() -> Int? { None }\npub fn p(x? : Bool = false ==\n(none_i() is Some(g)) && g(), g~ : () -> Bool) -> Int { let _ = g; if x { 1 } else { 0 } }\n",
     ),
     (
         "incomplete_bool_catch",
@@ -947,7 +989,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
