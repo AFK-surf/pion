@@ -46,6 +46,11 @@ pub(all) struct MixedPriv {
   priv secret : Int
 }
 
+pub(all) struct ValPair {
+  val : Int
+  val_ : Int
+}
+
 pub fn make_mixed(x : Int, s : Int) -> MixedPriv {
   MixedPriv::{ x: x, secret: s }
 }
@@ -85,7 +90,7 @@ pub fn make_box2(s : String, w : Int) -> Box[String] {
 '''
 
 MID1_MBT = r'''
-pub using @f43orig { type Buffer, type InPlace, type Key, buf_sum }
+pub using @f43orig { type Buffer, type InPlace, type Key, type ValPair, buf_sum }
 
 pub fn mid1_tag() -> Int {
   10
@@ -108,7 +113,7 @@ pub fn mid2_read_inplace(p : InPlace) -> Int {
 '''
 
 TOP_MBT = r'''
-pub using @f43mid1 { type Buffer, type InPlace, type Key, buf_sum }
+pub using @f43mid1 { type Buffer, type InPlace, type Key, type ValPair, buf_sum }
 
 pub fn top_sum(b : Buffer) -> Int {
   buf_sum(b) + @f43mid1.mid1_tag() + @f43mid2.mid2_tag()
@@ -150,9 +155,11 @@ pub fn run_reexport_and_structs() -> String {
   let b1 : @f43orig.Box[Int] = { item: 11, tag: 2 }
   let b2 : @f43orig2.Box[String] = @f43orig2.make_box2("ok", 9)
   let mp = @f43orig.make_mixed(5, 99)
+  let vp : @f43top.ValPair = @f43top.ValPair::{ val: 111, val_: 222 }
   ts.to_string() + "," + pv.to_string() + "," + kv.to_string() + "," +
   (b1.item + b1.tag).to_string() + "," + b2.label + ":" + b2.weight.to_string() + "," +
-  (mp.x + @f43orig.read_mixed_secret(mp)).to_string()
+  (mp.x + @f43orig.read_mixed_secret(mp)).to_string() + "," +
+  vp.val.to_string() + "," + vp.val_.to_string()
 }
 
 pub fn run_nested_as() -> String {
@@ -355,10 +362,11 @@ def main():
         # Verify ABI v2 `structs` metadata in `f43orig/src/mbt2pion_abi.json`
         orig_abi = json.load(open(os.path.join(p_orig, "src", "mbt2pion_abi.json")))
         sts = orig_abi["payload"]["structs"]
-        assert [s["name"] for s in sts] == ["Box", "Buffer", "MixedPriv"], f"unexpected structs: {sts}"
+        assert [s["name"] for s in sts] == ["Box", "Buffer", "MixedPriv", "ValPair"], f"unexpected structs: {sts}"
         assert sts[0]["type_params"] == ["T"] and sts[0]["can_construct"] is True and sts[0]["can_update"] is True
         assert sts[1]["fields"][0]["src_name"] == "val" and sts[1]["fields"][0]["emit_name"] == "val_" and sts[1]["fields"][0]["is_mut"] is True
         assert sts[2]["can_construct"] is False and sts[2]["can_update"] is False and sts[2]["fields"][1]["visibility"] == "priv"
+        assert sts[3]["fields"][0]["src_name"] == "val" and sts[3]["fields"][0]["emit_name"] == "val_1" and sts[3]["fields"][1]["src_name"] == "val_" and sts[3]["fields"][1]["emit_name"] == "val_"
 
         # Run Pion native & Pion wasm32 and assert 4-target exact parity!
         with open(os.path.join(p_app, "src", "main.pion"), "w") as fh:
@@ -367,7 +375,7 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_app])
 
         expected = (
-            "F43-1:50,42,30,13,ok:9,104\n"
+            "F43-1:50,42,30,13,ok:9,104,111,222\n"
             "F43-2:40,1887,999|24,777,777|105,105,24,555|20,49,26|p:1,r:1a,r:1b,p:2,p:3,r:3a,n:1,r:g1,n:2,n:3,r:c1,r:c2,r:d1,r:d2,r:d3"
         )
         assert moon_native == expected and moon_wasm == expected and pion_native == expected and pion_wasm == expected, (
