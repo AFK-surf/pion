@@ -520,7 +520,59 @@ fn case_r5_paren_and_guard() -> String {
   } catch {
     _ => 7
   }
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string()
+  // R12 P1 #1: compound assignment RHS `catch`
+  let p26 = {
+    let mut x = 3
+    x += always_fail_g() catch { _ => 9 }
+    x -= always_fail_g() catch { _ => 2 }
+    x *= always_fail_g() catch { _ => 3 }
+    x
+  }
+  // R12 P1 #2: comparison RHS `is` inside `if` / `guard` MUST NOT leak into body or `&&`
+  let p27 = try {
+    if false == opt_none() is Some(always_fail_g) {
+      let _ = always_fail_g()
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  let p28 = try {
+    guard false == opt_none() is Some(always_fail_g) else { return "0" }
+    let _ = always_fail_g()
+    42
+  } catch {
+    _ => 7
+  }
+  let p29 = try {
+    if false == opt_none() is Some(always_fail_g) && yes_helper(always_fail_g()) {
+      42
+    } else {
+      0
+    }
+  } catch {
+    _ => 7
+  }
+  // R12 P2 #4: bare block `{ ... } catch { ... }` + separate block on previous line
+  let p30 = {
+    let v = {
+      let _ = always_fail_g()
+      42
+    } catch {
+      _ => 4
+    }
+    v
+  }
+  let p31 = {
+    {
+      let _ = 1
+    }
+    let v = always_fail_g() catch { _ => 4 }
+    v
+  }
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -695,7 +747,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -1034,6 +1086,45 @@ def main():
         r9_pw = run_cmd([args.pionc, "run", "--target", "wasm32", r9_same_out]).stdout.strip()
         assert r9_pn == "2" and r9_pw == "2", f"R9 same canonical dir (/./) mismatch: nat={r9_pn!r} wasm={r9_pw!r}"
         print("[f6-1-oracle] PASS R9 P1-2 identical files_sha256 different dirs fail closed; same canonical dir (/./) == 2")
+
+        # 3a-8. R12 P1 #3: pure package with ZERO error keywords testing top-level let, default param, and interpolation `false == true is _`
+        pure_m = os.path.join(work, "pure_is_moon")
+        for sub in ("pure", "cmd"):
+            os.makedirs(os.path.join(pure_m, sub))
+        pure_src = (
+            "let flag : Bool = false == true is _\n"
+            "fn val1(x? : Bool = false == true is _) -> Bool { x }\n"
+            'pub fn run_pure() -> String {\n'
+            '  let a = if flag { 1 } else { 0 }\n'
+            '  let b = if val1() { 1 } else { 0 }\n'
+            '  let c = "\\{false == true is _}".length()\n'
+            '  a.to_string() + "," + b.to_string() + "," + c.to_string()\n'
+            '}\n'
+        )
+        for rel, txt in [
+            ("moon.mod", 'name = "f6/pure"\n'),
+            ("pure/moon.pkg", "\n"),
+            ("pure/pure.mbt", pure_src),
+            ("cmd/moon.pkg", 'import { "f6/pure/pure" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@pure.run_pure()) }\n"),
+        ]:
+            with open(os.path.join(pure_m, rel), "w") as f:
+                f.write(txt)
+        pure_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=pure_m).stdout.strip()
+        pure_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=pure_m).stdout.strip()
+        assert pure_mn == "0,0,5" and pure_mw == "0,0,5", f"R12 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
+
+        pure_pout = os.path.join(work, "pure_is_pion")
+        os.makedirs(os.path.join(pure_pout, "src"))
+        with open(os.path.join(pure_pout, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "pure"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(pure_m, "pure"), "--out", os.path.join(pure_pout, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        with open(os.path.join(pure_pout, "src", "main.pion"), "w") as f:
+            f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_pure())\n  0\n}\n")
+        pure_pn = run_cmd([args.pionc, "run", pure_pout]).stdout.strip()
+        pure_pw = run_cmd([args.pionc, "run", "--target", "wasm32", pure_pout]).stdout.strip()
+        assert pure_pn == "0,0,5" and pure_pw == "0,0,5", f"R12 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
+        print("[f6-1-oracle] PASS R12 P1 #3 pure no-error-keyword pkg (top-level let, default param, interp): 4-target == 0,0,5")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
