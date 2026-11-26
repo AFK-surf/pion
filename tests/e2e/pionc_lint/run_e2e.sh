@@ -561,6 +561,286 @@ if printf '%s' "$SYM_E_OUT" | grep -q '"edits"'; then
   exit 1
 fi
 
+# R4 P1-1 (Opus A): main calling a function defined in an out-of-package symlink must
+# type-check identically to `pionc check` (0 spurious E_*) while not linting the symlink.
+SYM_CALL_OUTSIDE="$TMP_DIR/sym_call_outside.pion"
+cat > "$SYM_CALL_OUTSIDE" <<'EOF'
+pub fn leaked() -> Int {
+  let mut unused_outside = 7
+  unused_outside
+}
+EOF
+SYM_CALL_PKG="$TMP_DIR/sym_call_pkg"
+mkdir -p "$SYM_CALL_PKG/src"
+cat > "$SYM_CALL_PKG/pion.toml" <<'EOF'
+[package]
+name = "sym_call_pkg"
+version = "0.1.0"
+EOF
+ln -s "$SYM_CALL_OUTSIDE" "$SYM_CALL_PKG/src/leak.pion"
+cat > "$SYM_CALL_PKG/src/main.pion" <<'EOF'
+pub fn main() -> Int {
+  leaked()
+}
+EOF
+"$PIONC" check "$SYM_CALL_PKG" >/dev/null
+SYM_CALL_OUT="$("$PIONC" lint --json "$SYM_CALL_PKG")"
+[ "$SYM_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: Opus A symlink caller regression: $SYM_CALL_OUT" >&2; exit 1; }
+
+# R4 P1-1 (Opus B): outer/lib.pion calling nested `src/nested.pion` (when `src/pion.toml`
+# exists) must type-check identically to `pionc check` (0 spurious E_*) without linting nested.
+OUTER_CALL_PKG="$TMP_DIR/outer_call_pkg"
+mkdir -p "$OUTER_CALL_PKG/src"
+cat > "$OUTER_CALL_PKG/pion.toml" <<'EOF'
+[package]
+name = "outer_call_pkg"
+version = "0.1.0"
+EOF
+cat > "$OUTER_CALL_PKG/lib.pion" <<'EOF'
+pub fn outer_ok() -> Int {
+  nested_dirty()
+}
+EOF
+cat > "$OUTER_CALL_PKG/src/pion.toml" <<'EOF'
+[package]
+name = "nested_call_pkg"
+version = "0.1.0"
+EOF
+cat > "$OUTER_CALL_PKG/src/nested.pion" <<'EOF'
+pub fn nested_dirty() -> Int {
+  let mut unused_mut = 7
+  unused_mut
+}
+EOF
+"$PIONC" check "$OUTER_CALL_PKG" >/dev/null
+OUTER_CALL_OUT="$("$PIONC" lint --json "$OUTER_CALL_PKG")"
+[ "$OUTER_CALL_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: Opus B nested caller regression: $OUTER_CALL_OUT" >&2; exit 1; }
+
+# R4 P2-1 (Astra): normal writable package file with E_TYPE_MISMATCH must retain machine edits.
+OWN_E_PKG="$TMP_DIR/own_e_pkg"
+mkdir -p "$OWN_E_PKG/src"
+cat > "$OWN_E_PKG/pion.toml" <<'EOF'
+[package]
+name = "own_e_pkg"
+version = "0.1.0"
+EOF
+cat > "$OWN_E_PKG/src/main.pion" <<'EOF'
+pub fn bad() -> Int {
+  let x = 1
+  x = 2
+  x
+}
+EOF
+set +e
+OWN_E_OUT="$("$PIONC" lint --json "$OWN_E_PKG")"
+OWN_E_RC=$?
+set -e
+[ "$OWN_E_RC" -ne 0 ] || { echo "FAIL: expected E_* on own_e_pkg" >&2; exit 1; }
+printf '%s' "$OWN_E_OUT" | grep -q '"code":"E_TYPE_MISMATCH"' || { echo "FAIL: missing E_TYPE_MISMATCH on own_e_pkg: $OWN_E_OUT" >&2; exit 1; }
+printf '%s' "$OWN_E_OUT" | grep -q '"edits":\[{' || { echo "FAIL: writable package file lost E_* machine edits: $OWN_E_OUT" >&2; exit 1; }
+
+# R4 P1-2 (Astra): All 3 cross-target `[targets]` counterexamples must still pass
+# `pionc check --target wasm32` after host `pionc lint --fix`.
+# Case 1: host-only file (no inactive target file) + shared caller with local `Box::num()`
+#         where wasm dep has conflicting signature.
+CT1_DIR="$TMP_DIR/ct1"
+mkdir -p "$CT1_DIR/dep/src" "$CT1_DIR/app/src"
+cat > "$CT1_DIR/dep/pion.toml" <<'EOF'
+[package]
+name = "dep"
+version = "0.1.0"
+
+[targets]
+"src/native.pion" = ["native"]
+"src/wasm.pion" = ["wasm32"]
+EOF
+cat > "$CT1_DIR/dep/src/native.pion" <<'EOF'
+pub fn num() -> Int { 1 }
+EOF
+cat > "$CT1_DIR/dep/src/wasm.pion" <<'EOF'
+pub fn num() -> String { "one" }
+EOF
+cat > "$CT1_DIR/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+dep = { path = "../dep" }
+
+[targets]
+"src/host.pion" = ["native"]
+EOF
+cat > "$CT1_DIR/app/src/host.pion" <<'EOF'
+import "dep" as Box
+
+pub fn host_fn() -> Int { Box::num() }
+EOF
+cat > "$CT1_DIR/app/src/caller.pion" <<'EOF'
+pub struct Box { v : Int }
+pub fn Box::num() -> Int { 2 }
+pub fn call_num() -> Int { Box::num() }
+EOF
+"$PIONC" check "$CT1_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT1_DIR/app" >/dev/null
+set +e
+"$PIONC" lint --fix --json "$CT1_DIR/app" >/dev/null
+set -e
+"$PIONC" check "$CT1_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT1_DIR/app" >/dev/null
+
+# Case 2: unconditional `one as Box` + wasm `two as Box` + shared caller.
+CT2_DIR="$TMP_DIR/ct2"
+mkdir -p "$CT2_DIR/one/src" "$CT2_DIR/two/src" "$CT2_DIR/app/src"
+cat > "$CT2_DIR/one/pion.toml" <<'EOF'
+[package]
+name = "one"
+version = "0.1.0"
+EOF
+cat > "$CT2_DIR/one/src/lib.pion" <<'EOF'
+pub fn num() -> Int { 1 }
+EOF
+cat > "$CT2_DIR/two/pion.toml" <<'EOF'
+[package]
+name = "two"
+version = "0.1.0"
+EOF
+cat > "$CT2_DIR/two/src/lib.pion" <<'EOF'
+pub fn num() -> String { "two" }
+EOF
+cat > "$CT2_DIR/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+one = { path = "../one" }
+two = { path = "../two" }
+
+[targets]
+"src/native.pion" = ["native"]
+"src/wasm.pion" = ["wasm32"]
+EOF
+cat > "$CT2_DIR/app/src/native.pion" <<'EOF'
+import "one" as Box
+
+pub fn accept(x : Int) -> Int { x }
+EOF
+cat > "$CT2_DIR/app/src/wasm.pion" <<'EOF'
+import "two" as Box
+
+pub fn accept(x : String) -> Int { x.length() }
+EOF
+cat > "$CT2_DIR/app/src/caller.pion" <<'EOF'
+pub fn call_it() -> Int { accept(Box::num()) }
+EOF
+"$PIONC" check "$CT2_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT2_DIR/app" >/dev/null
+set +e
+"$PIONC" lint --fix --json "$CT2_DIR/app" >/dev/null
+set -e
+"$PIONC" check "$CT2_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT2_DIR/app" >/dev/null
+
+# Case 3: shared caller `let mut s; s.call()` where native takes `self` and wasm takes `mut self`.
+CT3_DIR="$TMP_DIR/ct3"
+mkdir -p "$CT3_DIR/dep/src" "$CT3_DIR/app/src"
+cat > "$CT3_DIR/dep/pion.toml" <<'EOF'
+[package]
+name = "dep"
+version = "0.1.0"
+
+[targets]
+"src/native.pion" = ["native"]
+"src/wasm.pion" = ["wasm32"]
+EOF
+cat > "$CT3_DIR/dep/src/native.pion" <<'EOF'
+pub struct State { mut v : Int }
+pub fn State::mk() -> State { State::{ v: 1 } }
+pub fn State::call(self : State) -> Int { self.v }
+EOF
+cat > "$CT3_DIR/dep/src/wasm.pion" <<'EOF'
+pub struct State { mut v : Int }
+pub fn State::mk() -> State { State::{ v: 1 } }
+pub fn State::call(mut self : State) -> Int {
+  self.v = self.v + 1
+  self.v
+}
+EOF
+cat > "$CT3_DIR/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+dep = { path = "../dep" }
+EOF
+cat > "$CT3_DIR/app/src/caller.pion" <<'EOF'
+import "dep"
+
+pub fn run() -> Int {
+  let mut s = dep::State::mk()
+  s.call()
+}
+EOF
+"$PIONC" check "$CT3_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT3_DIR/app" >/dev/null
+CT3_OUT="$("$PIONC" lint --fix --json "$CT3_DIR/app")"
+printf '%s' "$CT3_OUT" | grep -q '"ok":true' || { echo "FAIL: CT3 cross-target mut self should lint clean: $CT3_OUT" >&2; exit 1; }
+"$PIONC" check "$CT3_DIR/app" >/dev/null
+"$PIONC" check --target wasm32 "$CT3_DIR/app" >/dev/null
+
+# R4 P1-3 (Astra): `pionc lint` and `pionc lint --fix` must NEVER create or modify `pion.lock`.
+GIT_DEP="$TMP_DIR/git_dep_repo"
+mkdir -p "$GIT_DEP/src"
+cat > "$GIT_DEP/pion.toml" <<'EOF'
+[package]
+name = "git_dep"
+version = "0.1.0"
+EOF
+cat > "$GIT_DEP/src/lib.pion" <<'EOF'
+pub fn answer() -> Int { 42 }
+EOF
+git -C "$GIT_DEP" init -q
+git -C "$GIT_DEP" config user.name "Test"
+git -C "$GIT_DEP" config user.email "test@example.com"
+git -C "$GIT_DEP" add -A
+git -C "$GIT_DEP" commit -q -m "init"
+
+GIT_APP="$TMP_DIR/git_app"
+mkdir -p "$GIT_APP/src"
+cat > "$GIT_APP/pion.toml" <<EOF
+[package]
+name = "git_app"
+version = "0.1.0"
+
+[dependencies]
+git_dep = { git = "file://$GIT_DEP" }
+EOF
+cat > "$GIT_APP/src/main.pion" <<'EOF'
+import "git_dep"
+
+pub fn main() -> Int {
+  let x = git_dep::answer()
+  x = 1
+  x
+}
+EOF
+set +e
+"$PIONC" lint --fix --json "$GIT_APP" >/dev/null
+set -e
+if [ -e "$GIT_APP/pion.lock" ]; then
+  echo "FAIL: pionc lint --fix created pion.lock!" >&2
+  exit 1
+fi
+set +e
+"$PIONC" lint --json "$GIT_APP" >/dev/null
+set -e
+if [ -e "$GIT_APP/pion.lock" ]; then
+  echo "FAIL: pionc lint created pion.lock!" >&2
+  exit 1
+fi
+
 # 12. Real examples/ packages lint clean, and strict dynamic dogfood check explicitly
 #     including all `compiler/src/core/*.pion` (including `lint*_test.pion`).
 for EX in examples/text_stats examples/http_loopback; do
@@ -575,12 +855,18 @@ if [ "$CORE_LINT_RC" -ne 0 ] && [ "$CORE_LINT_RC" -ne 1 ]; then
   echo "FAIL: unexpected exit code $CORE_LINT_RC from core dogfood lint" >&2
   exit 1
 fi
-python3 - "$CORE_LINT_OUT" "$ROOT_DIR/compiler/src/core" <<'PYEOF'
+python3 - "$CORE_LINT_OUT" "$ROOT_DIR/compiler/src/core" "$CORE_LINT_RC" <<'PYEOF'
 import glob, json, os, sys
 d = json.loads(sys.argv[1])
+rc = int(sys.argv[3])
 assert "error" not in d, f"unexpected error field in core dogfood JSON: {d}"
+assert isinstance(d.get("ok"), bool), f"missing/non-bool ok in core dogfood JSON: {d}"
 assert isinstance(d.get("diagnostics"), list), f"missing diagnostics array in core dogfood JSON: {d}"
 diags = d["diagnostics"]
+if rc == 0:
+    assert d["ok"] is True and len(diags) == 0, f"rc=0 mismatch: {d}"
+else:
+    assert rc == 1 and d["ok"] is False and len(diags) > 0, f"rc={rc} mismatch: {d}"
 e_diags = [x for x in diags if str(x.get("code", "")).startswith("E_")]
 if e_diags:
     print("FAIL: unexpected E_* diagnostics in core/*.pion dogfood:", e_diags, file=sys.stderr)
@@ -593,4 +879,4 @@ if bad:
     sys.exit(1)
 PYEOF
 
-echo "[PASS] pionc_lint E2E: single-file, 2-round --fix + idempotency, fmt-clean, E_* fail-fast, workspace/dep isolation, *_test.pion, [targets], [verify] 10000-line, symlink guards, alternating alias, rollback, prod/test isolation, CLI guards, examples/, dogfood"
+echo "[PASS] pionc_lint E2E: single-file, 2-round --fix + idempotency, fmt-clean, E_* fail-fast, workspace/dep isolation, *_test.pion, [targets], [verify] 10000-line, symlink guards, alternating alias, rollback, prod/test isolation, cross-target safety, read-only pion.lock, CLI guards, examples/, dogfood"
