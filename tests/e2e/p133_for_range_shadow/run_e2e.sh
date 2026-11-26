@@ -52,6 +52,20 @@ else
 fi
 HAVE_NODE=0
 command -v node >/dev/null 2>&1 && HAVE_NODE=1
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+fi
+
+run_bounded() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" 30 "$@"
+  else
+    "$@"
+  fi
+}
 
 N=0
 for MODE in dev release; do
@@ -61,7 +75,7 @@ for MODE in dev release; do
   fresh_cas
   "$PIONC" build $FLAG -o "$BASE" "$DIR/shadow.pion"
   set +e
-  "$BASE" > "$BASE.out" 2> "$BASE.err"
+  run_bounded "$BASE" > "$BASE.out" 2> "$BASE.err"
   RC=$?
   set -e
   check "$MODE native" "$BASE.out" "$BASE.err" "$RC"
@@ -71,7 +85,7 @@ for MODE in dev release; do
     "$PIONC" build $FLAG --emit-obj "$BASE.o" "$DIR/shadow.pion"
     "$CC_BIN" -fsanitize=address "$BASE.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$BASE.asan"
     set +e
-    ASAN_OPTIONS="$ASAN_OPTS" "$BASE.asan" > "$BASE.asan.out" 2> "$BASE.asan.err"
+    ASAN_OPTIONS="$ASAN_OPTS" run_bounded "$BASE.asan" > "$BASE.asan.out" 2> "$BASE.asan.err"
     RC=$?
     set -e
     check "$MODE ASan" "$BASE.asan.out" "$BASE.asan.err" "$RC"
@@ -81,7 +95,7 @@ for MODE in dev release; do
     fresh_cas
     "$PIONC" build $FLAG --target wasm32 -o "$BASE.wasm" "$DIR/shadow.pion"
     set +e
-    node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
+    run_bounded node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
     RC=$?
     set -e
     check "$MODE Wasm32" "$BASE.wout" "$BASE.werr" "$RC"
