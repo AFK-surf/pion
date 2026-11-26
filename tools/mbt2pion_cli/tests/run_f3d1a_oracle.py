@@ -1124,6 +1124,71 @@ pub fn trace_let_shadow() -> Int {
   a[0]
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", "the callback calls `.push(..)`, which is not a known pure method"),
+    "later_closure_shadow": (r'''
+let data : Array[Int] = [2, 1]
+
+fn key(x : Int) -> Int {
+  data.push(7)
+  x
+}
+
+fn sortit(xs : Array[Int]) -> Unit {
+  xs.sort_by_key(fn(x) { key(x) })
+  let key = fn(v : Int) { v }
+  ignore(key(0))
+}
+
+pub fn later_closure_shadow() -> Int {
+  sortit(data)
+  data[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `key(..)`"),
+    "closed_block_closure": (r'''
+let data : Array[Int] = [2, 1]
+
+fn key(x : Int) -> Int {
+  data.push(7)
+  x
+}
+
+fn sortit(xs : Array[Int]) -> Unit {
+  if true {
+    let key = fn(v : Int) { v }
+    ignore(key(0))
+  }
+  xs.sort_by_key(fn(x) { key(x) })
+}
+
+pub fn closed_block_closure() -> Int {
+  sortit(data)
+  data[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `key(..)`"),
+    "init_self_shadow": (r'''
+priv struct Hook {
+  items : Array[Int]
+}
+
+fn Hook::length(self : Hook) -> Int {
+  self.items.push(7)
+  0
+}
+
+let h : Hook = { items: [2, 1] }
+
+fn sortit(xs : Array[Int]) -> Unit {
+  let h : Array[Int] = {
+    xs.sort_by_key(fn(x) { x + h.length() })
+    [0]
+  }
+  ignore(h)
+}
+
+pub fn init_self_shadow() -> Int {
+  sortit(h.items)
+  h.items[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "not proven built-in (a user type defines `length`)"),
     "iter_interp": (r'''
 pub fn iter_interp() -> Int {
   let xs = [1, 2]
