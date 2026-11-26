@@ -233,14 +233,14 @@ theorem inst_dst_spec (inst : Inst) : inst_dst inst = ok (instDst inst) := by
 theorem contains_int_spec {xs : Pion.Array Std.I32} {x : Std.I32} {b : Bool}
     (h : contains_int xs x = ok b) : b = true ↔ x ∈ xs.val := by
   unfold contains_int at h
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
-  have key := scan_loop (fun i => contains_int_loop0.body xs x i) xs.val.length
+  have key := scan_loop (fun i => contains_int_loop0.body t xs x i) xs.val.length
     (fun k => ∀ hk : k < xs.val.length, xs.val[k] ≠ x) (fun _ b => b = true ∧ x ∈ xs.val) (fun _ => True)
     (by
       intro i c hi hc
       unfold contains_int_loop0.body at hc
-      obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-      obtain ⟨ht1, ht2⟩ := arr_length_ok ht
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, ht1] at hlt
@@ -323,15 +323,15 @@ theorem mem_facts_of {facts : Pion.Array Fact} {b : Std.I32} {out : Pion.Array F
 theorem fact_in_spec {fs : Pion.Array Fact} {vid : Std.I32} {zero b : Bool}
     (h : fact_in fs vid zero = ok b) : b = true ↔ ∃ fa ∈ fs.val, fa.vid = vid ∧ fa.zero = zero := by
   unfold fact_in at h
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
-  have key := scan_loop (fun i => fact_in_loop0.body fs vid zero i) fs.val.length
+  have key := scan_loop (fun i => fact_in_loop0.body t fs vid zero i) fs.val.length
     (fun k => ∀ hk : k < fs.val.length, ¬ (fs.val[k].vid = vid ∧ fs.val[k].zero = zero))
     (fun _ b => b = true ∧ ∃ fa ∈ fs.val, fa.vid = vid ∧ fa.zero = zero) (fun _ => True)
     (by
       intro i c hi hc
       unfold fact_in_loop0.body at hc
-      obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-      obtain ⟨ht1, ht2⟩ := arr_length_ok ht
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, ht1] at hlt
@@ -482,31 +482,31 @@ theorem dst_ok_true {nt : Std.I32} {inst : Inst} (h : dst_ok nt inst = ok true) 
 theorem dsts_ok_sound {f : Func} (h : dsts_ok f = ok true) :
     ∀ (b : Nat) (B : Block), f.blocks.val[b]? = some B → ∀ inst ∈ B.insts.val, DstOK f.ntemps inst := by
   unfold dsts_ok at h
+  obtain ⟨n, hn, h⟩ := bind_eq_ok h
+  obtain ⟨hn1, hn2⟩ := arr_length_ok hn
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
-  have key := scan_loop (fun i => dsts_ok_loop0.body f.blocks f i) f.blocks.val.length
+  have key := scan_loop (fun i => dsts_ok_loop0.body n f.blocks f i) f.blocks.val.length
     (fun k => ∀ B : Block, f.blocks.val[k]? = some B → ∀ inst ∈ B.insts.val, DstOK f.ntemps inst)
     (fun _ b => b = false) (fun _ => True)
     (by
       intro i c hi hc
       unfold dsts_ok_loop0.body at hc
-      obtain ⟨n, hn, hc⟩ := bind_eq_ok hc
-      obtain ⟨hn1, hn2⟩ := arr_length_ok hn
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, hn1] at hlt
         obtain ⟨B, hB, hc⟩ := bind_eq_ok hc
         obtain ⟨_, hBl, hBv⟩ := arr_get_ok hB
+        obtain ⟨m, hm, hc⟩ := bind_eq_ok hc
+        obtain ⟨hm1, hm2⟩ := arr_length_ok hm
         obtain ⟨s, hs, hc⟩ := bind_eq_ok hc
         left
         refine ⟨hlt, hn2, ?_⟩
-        have key1 := scan_loop (fun j => dsts_ok_loop1.body B.insts f j) B.insts.val.length
+        have key1 := scan_loop (fun j => dsts_ok_loop1.body m B.insts f j) B.insts.val.length
           (fun k => ∀ hk : k < B.insts.val.length, DstOK f.ntemps B.insts.val[k])
           (fun _ b => b = false) (fun _ => True)
           (by
             intro j c hj hc
             unfold dsts_ok_loop1.body at hc
-            obtain ⟨m, hm, hc⟩ := bind_eq_ok hc
-            obtain ⟨hm1, hm2⟩ := arr_length_ok hm
             split at hc
             · rename_i hjlt
               simp only [i32_lt_iff, hm1] at hjlt
@@ -577,14 +577,13 @@ theorem loop_early_ne {α γ : Type} (body : α → Result (ControlFlow α (Sum 
         | inl r => exact hb x _ hc r rfl
         | inr _ => trivial) x _ h trivial
 
-theorem wf_loop2_early (arms : Pion.Array PhiArm) (nb nt : Std.I32) :
-    ∀ x r, wf_code_loop2 arms nb nt x = ok (.inl r) → r ≠ 0#i32 := by
+theorem wf_loop2_early (n : Std.I32) (arms : Pion.Array PhiArm) (nb nt : Std.I32) :
+    ∀ x r, wf_code_loop2 n arms nb nt x = ok (.inl r) → r ≠ 0#i32 := by
   unfold wf_code_loop2
   apply loop_early_ne
   intro x c hc r hr
   subst hr
   simp only [wf_code_loop2.body] at hc
-  obtain ⟨t, -, hc⟩ := bind_eq_ok hc
   split at hc
   · obtain ⟨arm, -, hc⟩ := bind_eq_ok hc
     split at hc
@@ -595,8 +594,8 @@ theorem wf_loop2_early (arms : Pion.Array PhiArm) (nb nt : Std.I32) :
       · cases ok_inj' hc
   · cases ok_inj' hc
 
-theorem wf_loop1_early (phis : Pion.Array Phi) (nt nb : Std.I32) :
-    ∀ (x : Std.I32 × Pion.Array Std.I32) r, wf_code_loop1 phis nt nb x.1 x.2 = ok (.inl r) →
+theorem wf_loop1_early (n : Std.I32) (phis : Pion.Array Phi) (nt nb : Std.I32) :
+    ∀ (x : Std.I32 × Pion.Array Std.I32) r, wf_code_loop1 n phis nt nb x.1 x.2 = ok (.inl r) →
       r ≠ 0#i32 := by
   intro x r h
   unfold wf_code_loop1 at h
@@ -604,7 +603,6 @@ theorem wf_loop1_early (phis : Pion.Array Phi) (nt nb : Std.I32) :
   rintro ⟨i, defs⟩ c hc r hr
   subst hr
   simp only [wf_code_loop1.body] at hc
-  obtain ⟨t, -, hc⟩ := bind_eq_ok hc
   split at hc
   · obtain ⟨phi, -, hc⟩ := bind_eq_ok hc
     obtain ⟨t8, -, hc⟩ := bind_eq_ok hc
@@ -612,19 +610,20 @@ theorem wf_loop1_early (phis : Pion.Array Phi) (nt nb : Std.I32) :
     · cases ok_inj' hc; decide
     · obtain ⟨t10, -, hc⟩ := bind_eq_ok hc
       obtain ⟨defs1, -, hc⟩ := bind_eq_ok hc
+      obtain ⟨n2, -, hc⟩ := bind_eq_ok hc
       obtain ⟨s, hs, hc⟩ := bind_eq_ok hc
       cases s with
       | inl r' =>
         try simp only at hc
         cases ok_inj' hc
-        exact wf_loop2_early _ _ _ _ _ hs
+        exact wf_loop2_early _ _ _ _ _ _ hs
       | inr _ =>
         try simp only at hc
         cases ok_inj' hc
   · cases ok_inj' hc
 
-theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : Std.I32) :
-    ∀ (x : Std.I32 × Bool × Pion.Array Std.I32) r, wf_code_loop3 insts b f nt x.1 x.2.1 x.2.2 = ok (.inl r) →
+theorem wf_loop3_early (n : Std.I32) (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : Std.I32) :
+    ∀ (x : Std.I32 × Bool × Pion.Array Std.I32) r, wf_code_loop3 n insts b f nt x.1 x.2.1 x.2.2 = ok (.inl r) →
       r ≠ 0#i32 := by
   intro x r h
   unfold wf_code_loop3 at h
@@ -632,7 +631,6 @@ theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : 
   rintro ⟨i, seen, defs⟩ c hc r hr
   subst hr
   simp only [wf_code_loop3.body] at hc
-  obtain ⟨t, -, hc⟩ := bind_eq_ok hc
   split at hc
   · obtain ⟨inst, -, hc⟩ := bind_eq_ok hc
     obtain ⟨s, hs, hc⟩ := bind_eq_ok hc
@@ -727,23 +725,25 @@ theorem wf_code_sound {f : Func} (h : wf_code f = ok 0#i32) : WFc f := by
         obtain ⟨B5, hB5, hc⟩ := bind_eq_ok hc
         rw [hB] at hB5; cases ok_inj' hB5
         try simp only at hc
+        obtain ⟨n1, -, hc⟩ := bind_eq_ok hc
         obtain ⟨s1, hs1, hc⟩ := bind_eq_ok hc
         cases s1 with
         | inl r =>
           try simp only at hc
           rw [← ok_inj' hc]
-          exact wf_loop1_early B.phis f.ntemps nb (0#i32, defs) r hs1
+          exact wf_loop1_early n1 B.phis f.ntemps nb (0#i32, defs) r hs1
         | inr p1 =>
           obtain ⟨i1, defs1⟩ := p1
           try simp only at hc
           obtain ⟨B15, hB15, hc⟩ := bind_eq_ok hc
           rw [hB] at hB15; cases ok_inj' hB15
+          obtain ⟨n2, -, hc⟩ := bind_eq_ok hc
           obtain ⟨s2, hs2, hc⟩ := bind_eq_ok hc
           cases s2 with
           | inl r =>
             try simp only at hc
             rw [← ok_inj' hc]
-            exact wf_loop3_early B.insts b f f.ntemps (0#i32, false, defs1) r hs2
+            exact wf_loop3_early n2 B.insts b f f.ntemps (0#i32, false, defs1) r hs2
           | inr p2 =>
             obtain ⟨i2, seen2, defs2⟩ := p2
             try simp only at hc
@@ -2323,11 +2323,13 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
 theorem retarget_spec {fs : Pion.Array Fact} {b : Std.I32} {out : Pion.Array Fact}
     (h : retarget fs b = ok out) : out.val = fs.val.map (fun fa => qbe_tv.Fact.mk b fa.vid fa.zero) := by
   unfold retarget at h
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
   obtain ⟨i1, o1⟩ := r
   have := ok_inj' h
   subst this
-  have key := loop_ok_inv (fun (p : Std.I32 × Pion.Array Fact) => retarget_loop0.body fs b p.1 p.2)
+  have key := loop_ok_inv (fun (p : Std.I32 × Pion.Array Fact) => retarget_loop0.body t fs b p.1 p.2)
     (fun p => 0 ≤ p.1.val ∧ p.1.val ≤ fs.val.length ∧
       p.2.val = (fs.val.take p.1.val.toNat).map (fun fa => qbe_tv.Fact.mk b fa.vid fa.zero))
     (fun p => p.2.val = fs.val.map (fun fa => qbe_tv.Fact.mk b fa.vid fa.zero))
@@ -2336,8 +2338,6 @@ theorem retarget_spec {fs : Pion.Array Fact} {b : Std.I32} {out : Pion.Array Fac
       simp only at hi0 hil hio
       unfold retarget_loop0.body at hc
       simp only at hc
-      obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-      obtain ⟨ht1, ht2⟩ := arr_length_ok ht
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, ht1] at hlt
@@ -2373,6 +2373,7 @@ theorem edge_fact_set_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I3
   obtain ⟨q1, hq1, h⟩ := bind_eq_ok h
   obtain ⟨ef, vg1⟩ := q1
   try simp only [uncurry_apply_pair] at h
+  obtain ⟨t, -, h⟩ := bind_eq_ok h
   obtain ⟨q2, hq2, h⟩ := bind_eq_ok h
   obtain ⟨i1, out1⟩ := q2
   cases ok_inj' h
@@ -2380,14 +2381,13 @@ theorem edge_fact_set_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I3
   dsimp only at e1 d1 hef
   -- every pushed fact comes from `out` or `ef`
   have hmem : ∀ fa ∈ out1.val, fa ∈ out.val ∨ fa ∈ ef.val := by
-    have key := loop_ok_inv (fun (x : Std.I32 × Pion.Array Fact) => edge_fact_set_loop0.body ef x.1 x.2)
+    have key := loop_ok_inv (fun (x : Std.I32 × Pion.Array Fact) => edge_fact_set_loop0.body t ef x.1 x.2)
       (fun x => ∀ fa ∈ x.2.val, fa ∈ out.val ∨ fa ∈ ef.val)
       (fun x => ∀ fa ∈ x.2.val, fa ∈ out.val ∨ fa ∈ ef.val)
       (by
         rintro ⟨i, o⟩ c hio hc
         simp only at hio hc
         unfold edge_fact_set_loop0.body at hc
-        obtain ⟨t, -, hc⟩ := bind_eq_ok hc
         split at hc
         · obtain ⟨fa, hfa, hc⟩ := bind_eq_ok hc
           obtain ⟨_, hfl, hfv⟩ := arr_get_ok hfa
@@ -2443,6 +2443,8 @@ theorem check_facts_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pio
   have hnb := hinfo.nb
   have hlenle : f.blocks.val.length ≤ 2147483647 := by have := i32_val_le info.nb; omega
   unfold check_facts at h
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r0, hr0, h⟩ := bind_eq_ok h
   -- the scan over the predecessors of one fact's block
   have loop1 : ∀ (fa : qbe_tv.Fact) (vga : ValGraph), vg_extends vg vga → ValGraphDAG vga → 0 < fa.blk.val →
@@ -2578,7 +2580,7 @@ theorem check_facts_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pio
   let TabOK : ValGraph → Std.I32 → Pion.Array Bool → Prop := fun g mb m =>
     ∀ j, m.val[j]? = some false → j < g.nodes.val.length ∧ Indep g mb j
   have key := loop_ok_inv (fun (x : Std.I32 × ValGraph × Std.I32 × Pion.Array Bool) =>
-      match x with | (i, vg, mb, m) => check_facts_loop0.body facts info.nb info f vids i vg mb m)
+      match x with | (i, vg, mb, m) => check_facts_loop0.body t facts info.nb info f vids i vg mb m)
     (fun (x : Std.I32 × ValGraph × Std.I32 × Pion.Array Bool) => 0 ≤ x.1.val ∧ vg_extends vg x.2.1 ∧
       ValGraphDAG x.2.1 ∧ TabOK x.2.1 x.2.2.1 x.2.2.2 ∧
       ∀ k, k < x.1.val.toNat → ∀ hk : k < facts.val.length, Good x.2.1 (facts.val[k]))
@@ -2604,8 +2606,6 @@ theorem check_facts_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pio
   rintro ⟨ii, vgk, mbk, mk⟩ c ⟨hi0, hek, hdk, htk, hallk⟩ hc
   simp only at hi0 hek hdk htk hallk hc
   unfold check_facts_loop0.body at hc
-  obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   split at hc
   · rename_i hlt
     simp only [i32_lt_iff, ht1] at hlt
@@ -2865,15 +2865,15 @@ theorem avail_inst_ops_true {cur : Pion.Array Bool} {inst : Inst} (h : avail_ins
     have hxt : x = true := by cases x <;> simp_all
     rw [hxt] at hx
     refine ⟨avail_atom_true hx, ?_⟩
+    obtain ⟨t, ht, h⟩ := bind_eq_ok h
+    obtain ⟨ht1, ht2⟩ := arr_length_ok ht
     obtain ⟨r, hr, h⟩ := bind_eq_ok h
-    have key := scan_loop (fun i => avail_inst_ops_loop0.body args cur i) args.val.length
+    have key := scan_loop (fun i => avail_inst_ops_loop0.body t args cur i) args.val.length
       (fun k => ∀ hk : k < args.val.length, AvailAtom (fun t => cur.val[t]? = some true) args.val[k].arg)
       (fun _ b => b = false) (fun _ => True)
       (by
         intro i c hi hc
         unfold avail_inst_ops_loop0.body at hc
-        obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-        obtain ⟨ht1, ht2⟩ := arr_length_ok ht
         split at hc
         · rename_i hlt
           simp only [i32_lt_iff, ht1] at hlt
@@ -2964,8 +2964,9 @@ theorem avail_loop5 {nt : Std.I32} {av : Pion.Array Bool} {bI : Std.I32} :
   · rw [← ok_inj' hc]; exact ⟨hl, hall⟩
 
 /-- Then the phi destinations of the block. -/
-theorem avail_loop6 {phis : Pion.Array Phi} (P0 : Nat → Prop) :
-    ∀ (x : Std.I32 × Pion.Array Bool) r, check_avail_loop6 phis x.1 x.2 = ok r →
+theorem avail_loop6 {n6 : Std.I32} {phis : Pion.Array Phi} (P0 : Nat → Prop)
+    (ht1 : n6.val = phis.val.length) (ht2 : phis.val.length ≤ 2147483647) :
+    ∀ (x : Std.I32 × Pion.Array Bool) r, check_avail_loop6 n6 phis x.1 x.2 = ok r →
       (0 ≤ x.1.val ∧ ∀ t : Nat, x.2.val[t]? = some true → P0 t ∨ ∃ P ∈ phis.val, P.dst.val = t) →
       (r.2.val.length = x.2.val.length ∧
         (∀ t : Nat, r.2.val[t]? = some true → P0 t ∨ ∃ P ∈ phis.val, P.dst.val = t) ∧
@@ -2974,7 +2975,7 @@ theorem avail_loop6 {phis : Pion.Array Phi} (P0 : Nat → Prop) :
   intro x r h hx
   unfold check_avail_loop6 at h
   refine loop_ok_inv (fun (x : Std.I32 × Pion.Array Bool) =>
-      match x with | (i, cur) => check_avail_loop6.body phis i cur)
+      match x with | (i, cur) => check_avail_loop6.body n6 phis i cur)
     (fun (y : Std.I32 × Pion.Array Bool) => 0 ≤ y.1.val ∧ x.1.val ≤ y.1.val ∧ y.2.val.length = x.2.val.length ∧
       (∀ t : Nat, y.2.val[t]? = some true → P0 t ∨ ∃ P ∈ phis.val, P.dst.val = t) ∧
       ∀ k, x.1.val.toNat ≤ k → k < y.1.val.toNat → ∀ hk : k < phis.val.length,
@@ -2987,8 +2988,6 @@ theorem avail_loop6 {phis : Pion.Array Phi} (P0 : Nat → Prop) :
   rintro ⟨i, cur⟩ c ⟨hi0, hii, hl, hall, hdst⟩ hc
   simp only at hi0 hii hl hall hdst hc
   unfold check_avail_loop6.body at hc
-  obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   split at hc
   · rename_i hlt
     simp only [i32_lt_iff, ht1] at hlt
@@ -3030,9 +3029,11 @@ theorem b1_ne0 {b : Std.I32} (h0 : 0 ≤ b.val) (h1 : b.val < 2147483647) : Pion
   omega
 
 /-- The instructions of the block read only initialised temps. -/
-theorem avail_loop7 {insts : Pion.Array Inst} {bI : Std.I32} (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647)
+theorem avail_loop7 {n7 : Std.I32} {insts : Pion.Array Inst} {bI : Std.I32}
+    (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647)
+    (ht1 : n7.val = insts.val.length) (ht2 : insts.val.length ≤ 2147483647)
     (P1 : Nat → Prop) (n0 : Nat) :
-    ∀ (x : Std.I32 × Pion.Array Bool) r, check_avail_loop7 insts bI x.1 x.2 = ok r → x.1 = 0#i32 →
+    ∀ (x : Std.I32 × Pion.Array Bool) r, check_avail_loop7 n7 insts bI x.1 x.2 = ok r → x.1 = 0#i32 →
       x.2.val.length = n0 → (∀ t : Nat, x.2.val[t]? = some true → P1 t) →
       match r with
       | .inl e => e ≠ 0#i32
@@ -3045,7 +3046,7 @@ theorem avail_loop7 {insts : Pion.Array Inst} {bI : Std.I32} (hb0 : 0 ≤ bI.val
   intro x r h hx0 hxl hx
   unfold check_avail_loop7 at h
   refine loop_ok_inv (fun (x : Std.I32 × Pion.Array Bool) =>
-      match x with | (i, cur) => check_avail_loop7.body insts bI i cur)
+      match x with | (i, cur) => check_avail_loop7.body n7 insts bI i cur)
     (fun (y : Std.I32 × Pion.Array Bool) => 0 ≤ y.1.val ∧ y.2.val.length = n0 ∧
       (∀ t : Nat, y.2.val[t]? = some true → P1 t ∨ ∃ k' < y.1.val.toNat, ∃ hk' : k' < insts.val.length,
         (instDst insts.val[k']).val = t) ∧
@@ -3065,8 +3066,6 @@ theorem avail_loop7 {insts : Pion.Array Inst} {bI : Std.I32} (hb0 : 0 ≤ bI.val
   rintro ⟨i, cur⟩ c ⟨hi0, hl, hall, hdone⟩ hc
   simp only at hi0 hl hall hdone hc
   unfold check_avail_loop7.body at hc
-  obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   have hcurlt : ∀ t : Nat, cur.val[t]? = some true → t < n0 := by
     intro t' h'
     by_contra hc'
@@ -3525,8 +3524,10 @@ theorem avail_loop4 {nt : Std.I32} {av : Pion.Array Bool} {bI : Std.I32} {vids :
 
 /-- No temp available at the entry of `b` depends on a block of `xs`. -/
 theorem avail_loop3 {nt : Std.I32} {av : Pion.Array Bool} {bI : Std.I32} {vids : Pion.Array Std.I32}
-    {xs : Pion.Array Std.I32} {vg : ValGraph} (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647) :
-    ∀ i r, check_avail_loop3 xs vg nt av bI vids i = ok r → i = 0#i32 →
+    {n13 : Std.I32} {xs : Pion.Array Std.I32} {vg : ValGraph}
+    (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647)
+    (hn131 : n13.val = xs.val.length) (hn132 : xs.val.length ≤ 2147483647) :
+    ∀ i r, check_avail_loop3 n13 xs vg nt av bI vids i = ok r → i = 0#i32 →
       match r with
       | .inl e => e ≠ 0#i32
       | .inr _ => ∀ sb ∈ xs.val, ∀ y : Nat, y < nt.val.toNat →
@@ -3534,7 +3535,7 @@ theorem avail_loop3 {nt : Std.I32} {av : Pion.Array Bool} {bI : Std.I32} {vids :
           ∀ v, vids.val[y]? = some v → 0 ≤ v.val → Valid vg v ∧ Indep vg sb v.val.toNat := by
   intro i0 r h hi
   unfold check_avail_loop3 at h
-  have key := scan_loop (fun i => check_avail_loop3.body xs vg nt av bI vids i) xs.val.length
+  have key := scan_loop (fun i => check_avail_loop3.body n13 xs vg nt av bI vids i) xs.val.length
     (fun k => ∀ hk : k < xs.val.length, ∀ y : Nat, y < nt.val.toNat →
       av.get (Pion.I32.add (Pion.I32.mul bI nt) (i32n y)) = ok true →
       ∀ v, vids.val[y]? = some v → 0 ≤ v.val → Valid vg v ∧ Indep vg xs.val[k] v.val.toNat)
@@ -3542,8 +3543,6 @@ theorem avail_loop3 {nt : Std.I32} {av : Pion.Array Bool} {bI : Std.I32} {vids :
     (by
       intro j c hj hc
       unfold check_avail_loop3.body at hc
-      obtain ⟨n13, hn13, hc⟩ := bind_eq_ok hc
-      obtain ⟨hn131, hn132⟩ := arr_length_ok hn13
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, hn131] at hlt
@@ -3688,8 +3687,10 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             try simp only [uncurry_apply_pair] at hsres
             have hxs := avail_loop2 (0#i32, _) _ hq2 rfl
             dsimp only at hxs
+            obtain ⟨n13, hn13, hsres⟩ := bind_eq_ok hsres
+            obtain ⟨hn131, hn132⟩ := arr_length_ok hn13
             obtain ⟨s3, hs3, hsres⟩ := bind_eq_ok hsres
-            have h3 := avail_loop3 hb0 hb1 _ s3 hs3 rfl
+            have h3 := avail_loop3 hb0 hb1 hn131 hn132 _ s3 hs3 rfl
             cases s3 with
             | inl e =>
               simp only at hsres
@@ -3708,20 +3709,24 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             obtain ⟨B, hB, hsres⟩ := bind_eq_ok hsres
             obtain ⟨_, hBl, hBv⟩ := arr_get_ok hB
             have hBb : f.blocks.val[bI.val.toNat]? = some B := by rw [List.getElem?_eq_getElem hBl, hBv]
+            obtain ⟨n6, hn6, hsres⟩ := bind_eq_ok hsres
+            obtain ⟨hn61, hn62⟩ := arr_length_ok hn6
             obtain ⟨q6, hq6, hsres⟩ := bind_eq_ok hsres
             obtain ⟨i1, cur2⟩ := q6
             try simp only [uncurry_apply_pair] at hsres
-            have h6 := avail_loop6 (fun t => AvB av info.nt bI.val.toNat t) (0#i32, cur1) _ hq6
+            have h6 := avail_loop6 (fun t => AvB av info.nt bI.val.toNat t) hn61 hn62 (0#i32, cur1) _ hq6
               ⟨by simp, fun t ht => Or.inl (by
                 have := h5.2 t ht
                 unfold AvB; rw [← hbI]; exact this)⟩
             dsimp only at h6
             obtain ⟨B2, hB2, hsres⟩ := bind_eq_ok hsres
             rw [hB] at hB2; cases ok_inj' hB2
+            obtain ⟨n7, hn7, hsres⟩ := bind_eq_ok hsres
+            obtain ⟨hn71, hn72⟩ := arr_length_ok hn7
             obtain ⟨s7, hs7, hsres⟩ := bind_eq_ok hsres
             have hcl1 : cur1.val.length = info.nt.val.toNat := by
               rw [h5.1]; simp [Pion.Array.make, listMake]
-            have h7 := avail_loop7 hb0 hb1 (fun t => AvB av info.nt bI.val.toNat t ∨ ∃ P ∈ B.phis.val, P.dst.val = t)
+            have h7 := avail_loop7 hb0 hb1 hn71 hn72 (fun t => AvB av info.nt bI.val.toNat t ∨ ∃ P ∈ B.phis.val, P.dst.val = t)
               info.nt.val.toNat (0#i32, cur2) s7 hs7 rfl (by rw [h6.1, hcl1]) h6.2.1
             cases s7 with
             | inl e =>

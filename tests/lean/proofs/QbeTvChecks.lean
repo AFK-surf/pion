@@ -1363,16 +1363,16 @@ theorem src_enter_scope_ok_sound {vg : ValGraph} {tgt : Func} {tvid : Pion.Array
   unfold src_enter_scope_ok at h
   obtain ⟨B, hB, h1⟩ := bind_eq_ok h
   obtain ⟨_, hBl, hBv⟩ := arr_get_ok hB
+  obtain ⟨n, hn, h1⟩ := bind_eq_ok h1
+  obtain ⟨hn1, hn2⟩ := arr_length_ok hn
   obtain ⟨s, hs, h2⟩ := bind_eq_ok h1
-  have key := scan_loop (fun i => src_enter_scope_ok_loop0.body B.phis tvid vg sj i) B.phis.val.length
+  have key := scan_loop (fun i => src_enter_scope_ok_loop0.body n B.phis tvid vg sj i) B.phis.val.length
     (fun k => ∀ hk : k < B.phis.val.length, ∃ v, tvid.val[B.phis.val[k].dst.val.toNat]? = some v ∧
       0 ≤ B.phis.val[k].dst.val ∧ vid_mentions_blk vg v sj = ok false)
     (fun _ r => r = false) (fun _ => True)
     (by
       intro i c hi hc
       unfold src_enter_scope_ok_loop0.body at hc
-      obtain ⟨n, hn, hc⟩ := bind_eq_ok hc
-      obtain ⟨hn1, hn2⟩ := arr_length_ok hn
       split at hc
       · rename_i hlt
         have hlt' : i.val < B.phis.val.length := by simpa [i32_lt_iff, hn1] using hlt
@@ -2403,15 +2403,15 @@ theorem is_trivial_sound {f : Func} {b : Std.I32} (h : is_trivial f b = ok true)
     omega
   obtain ⟨B2, hB2, h3⟩ := bind_eq_ok h2
   rw [hB] at hB2; cases ok_inj' hB2
+  obtain ⟨n, hn, h3⟩ := bind_eq_ok h3
+  obtain ⟨hn1, hn2⟩ := arr_length_ok hn
   obtain ⟨s, hs, h4⟩ := bind_eq_ok h3
-  have key := scan_loop (fun i => is_trivial_loop0.body B.insts i) B.insts.val.length
+  have key := scan_loop (fun i => is_trivial_loop0.body n B.insts i) B.insts.val.length
     (fun k => ∀ hk : k < B.insts.val.length, NoWorld B.insts.val[k] ∧ leafB B.insts.val[k] = false)
     (fun _ r => r = false) (fun _ => True)
     (by
       intro i c hi hc
       unfold is_trivial_loop0.body at hc
-      obtain ⟨n, hn, hc⟩ := bind_eq_ok hc
-      obtain ⟨hn1, hn2⟩ := arr_length_ok hn
       split at hc
       · rename_i hlt
         have hlt' : i.val < B.insts.val.length := by simpa [i32_lt_iff, hn1] using hlt
