@@ -25,15 +25,17 @@ COMPAT_DIR = os.path.join(REPO_ROOT, "tools", "mbt_compat")
 CLI_DIR = os.path.join(REPO_ROOT, "tools", "mbt2pion_cli")
 
 APP_MBT = r'''
-// 1. String::code_unit_at(i) UTF-16 code units (ASCII + BMP + BOM + surrogate pair + trailing comma + eq/let)
+// 1. String::code_unit_at(i) UTF-16 code units (ASCII + BMP + BOM + surrogate pair + trailing comma + eq/compare/physical_equal/index)
 pub fn run_code_unit_at() -> String {
   let s_ascii = "abc"
   let s_bmp = "\u{2018}\u{2019}\u{FEFF}\u{4E2D}"
   let s_emoji = "\u{1F600}"
   let s_mix = "a\u{2018}\u{1F600}z"
-  let cu_low = s_emoji.code_unit_at(1)
-  let cu_trail = s_emoji.code_unit_at(1,)
   let eq_ok = if s_ascii.code_unit_at(0) == s_mix.code_unit_at(0) { 1 } else { 0 }
+  let peq_ok = if physical_equal("zz".code_unit_at(0), "zz".code_unit_at(1)) { 1 } else { 0 }
+  let idx_eq = if s_emoji[1] == s_emoji.code_unit_at(1) { 1 } else { 0 }
+  let lit_eq = if "a".code_unit_at(0) == 97 { 1 } else { 0 }
+  let cmp_v = "a".code_unit_at(0).compare("z".code_unit_at(0))
   let parts : Array[Int] = [
     s_ascii.code_unit_at(0).to_int(),
     s_bmp.code_unit_at(0).to_int(),
@@ -43,9 +45,12 @@ pub fn run_code_unit_at() -> String {
     s_emoji.length(),
     s_emoji.code_unit_at(0).to_int(),
     s_emoji.code_unit_at(s_emoji.length() - 1).to_int(),
-    cu_low.to_int(),
-    cu_trail.to_int(),
+    s_emoji.code_unit_at(1,).to_int(),
     eq_ok,
+    peq_ok,
+    idx_eq,
+    lit_eq,
+    cmp_v,
     s_mix.length(),
     s_mix.code_unit_at(0).to_int(),
     s_mix.code_unit_at(1).to_int(),
@@ -197,6 +202,7 @@ pub fn run_all() -> String {
   let s4 = sum_json_nums(j).to_string()
   let s5 = classify_code(0).to_string() + "," + classify_code(100).to_string() + "," + classify_code(255).to_string() + "," + classify_code(300).to_string() + "," + is_hex_char('7').to_string() + "," + is_hex_char('e').to_string() + "," + is_hex_char('g').to_string()
   let b = Badge::{ label: "ok", rank: 7 }
+  let _ = Debug::to_repr(b)
   let s6 = Show::to_string(b)
   "F51-CU:" + s1 + "\nF51-CTOR:" + s2 + "\nF51-SU:" + s3 + "\nF51-JSON:" + s4 + "\nF51-RNG:" + s5 + "\nF51-DBG:" + s6
 }
@@ -272,9 +278,9 @@ def main():
             "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc,
         ])
 
-        # Verify String::code_unit_at routed to mbt_compat::utf16_code_unit_at_u16 and no raw .code_unit_at( remains
+        # Verify String::code_unit_at routed to mbt_compat::utf16_code_unit_at and no raw .code_unit_at( remains
         gen_app = open(os.path.join(p_app, "src", "app.pion")).read()
-        assert "mbt_compat::utf16_code_unit_at_u16(" in gen_app, "expected mbt_compat::utf16_code_unit_at_u16 in generated code"
+        assert "mbt_compat::utf16_code_unit_at(" in gen_app, "expected mbt_compat::utf16_code_unit_at in generated code"
         assert ".code_unit_at(" not in gen_app, "raw String::code_unit_at must not remain in generated code"
         assert "pub fn Badge::to_repr(self : Badge) -> String" in gen_app, "impl Debug must lower to Badge::to_repr"
         assert "impl Debug for Badge" not in gen_app, "impl Debug must not be emitted in Pion output"
@@ -293,7 +299,7 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_app])
 
         expected = (
-            "F51-CU:97,8216,8217,65279,20013,2,55357,56832,56832,56832,1,5,97,8216,55357,56832,122\n"
+            "F51-CU:97,8216,8217,65279,20013,2,55357,56832,56832,1,1,1,1,-1,5,97,8216,55357,56832,122\n"
             "F51-CTOR:2,4,3\n"
             "F51-SU:1,20,3,8\n"
             "F51-JSON:13\n"
@@ -311,16 +317,21 @@ def main():
             "pub struct A { x : Int }\npub struct B { x : Int }\npub fn bad(v : Int) { let _ = { ..v, x: 1 } }\n",
             "MBT2PION_AMBIGUOUS_STRUCT_UPDATE",
         )
-        # 4b. Unchecked UInt16 wraparound arithmetic (`n + n` and `a - b`) must fail closed via MbtUInt16
+        # 4b. Unchecked UInt16 wraparound/escape contexts must fail closed with MBT2PION_UINT16_ESCAPE
         assert_publish_blocked(
             bin_path, args.pionc, work, "u16_add_wrap",
             'pub fn bad_add() -> Int { let n = "\\u{1F600}".code_unit_at(1); (n + n).to_int() }\n',
-            "MBT2PION_FINAL_CHECK_FAILED",
+            "MBT2PION_UINT16_ESCAPE",
         )
         assert_publish_blocked(
             bin_path, args.pionc, work, "u16_sub_wrap",
             'pub fn bad_sub() -> Int { let s = "ab"; (s.code_unit_at(0) - s.code_unit_at(1)).to_int() }\n',
-            "MBT2PION_FINAL_CHECK_FAILED",
+            "MBT2PION_UINT16_ESCAPE",
+        )
+        assert_publish_blocked(
+            bin_path, args.pionc, work, "u16_cmp_wrap_rhs",
+            'pub fn bad_cmp() -> Bool { "a".code_unit_at(0) == 65535 + 98 }\n',
+            "MBT2PION_UINT16_ESCAPE",
         )
 
         print("PASS: Wave M2-F5 Track F5-1 4-Target Differential Oracle (Moon native == Moon wasm-gc == Pion native == Pion wasm32)")

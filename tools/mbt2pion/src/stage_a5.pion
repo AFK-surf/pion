@@ -939,6 +939,227 @@ pub fn instrument_probes_for_file_with_api_map(
   instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes, Map())
 }
 
+fn is_u16_arith_or_bit_raw(r : String) -> Bool {
+  r == "+" || r == "-" || r == "*" || r == "/" || r == "%" ||
+  r == "&" || r == "|" || r == "^" || r == "<<" || r == ">>" || r == "~"
+}
+
+fn is_u16_cmp_raw(r : String) -> Bool {
+  r == "==" || r == "!=" || r == "<" || r == "<=" || r == ">" || r == ">="
+}
+
+fn is_u16_int_lit_0_65535(raw : String) -> Bool {
+  let n = raw.length()
+  if n == 0 { return false }
+  let mut base = 10
+  let mut i = 0
+  if n >= 2 && raw.code_unit_at(0) == 48 {
+    let c1 = raw.code_unit_at(1)
+    if c1 == 120 || c1 == 88 { base = 16; i = 2 }
+    else if c1 == 111 || c1 == 79 { base = 8; i = 2 }
+    else if c1 == 98 || c1 == 66 { base = 2; i = 2 }
+  }
+  let mut acc = 0
+  let mut seen = false
+  while i < n {
+    let c = raw.code_unit_at(i)
+    if c == 95 { i = i + 1; continue }
+    let d = if c >= 48 && c <= 57 { c - 48 }
+    else if c >= 97 && c <= 102 { c - 87 }
+    else if c >= 65 && c <= 70 { c - 55 }
+    else { -1 }
+    if d < 0 || d >= base { return false }
+    seen = true
+    acc = acc * base + d
+    if acc > 65535 { return false }
+    i = i + 1
+  }
+  seen && acc >= 0 && acc <= 65535
+}
+
+fn find_matching_open_delim_back(tokens : Array[Token], close_idx : Int) -> Int {
+  let ck = tokens[close_idx].kind
+  let mut d = 0
+  let mut k = close_idx
+  while k >= 0 {
+    let tk = tokens[k].kind
+    if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+      d = d + 1
+    } else if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+      d = d - 1
+      if d == 0 {
+        if (ck == TokenKind::RParen && tk == TokenKind::LParen) ||
+        (ck == TokenKind::RBracket && tk == TokenKind::LBracket) ||
+        (ck == TokenKind::RBrace && tk == TokenKind::LBrace) {
+          return k
+        }
+        return -1
+      }
+    }
+    k = k - 1
+  }
+  -1
+}
+
+fn is_safe_u16_peer_expr(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if s >= e { return false }
+  if e == s + 1 && tokens[s].kind == TokenKind::IntLit {
+    return is_u16_int_lit_0_65535(tokens[s].raw)
+  }
+  if tokens[e - 1].kind == TokenKind::RParen {
+    let lp = find_matching_open_delim_back(tokens, e - 1)
+    if lp < s { return false }
+    if lp >= s + 2 && tokens[lp - 2].kind == TokenKind::Dot &&
+    (tokens[lp - 1].raw == "code_unit_at" || tokens[lp - 1].raw.starts_with("mbt_code_unit_at_probe")) {
+      return find_receiver_start(tokens, lp - 3) == s
+    }
+    if lp == s + 3 && tokens[s].raw == "mbt_compat" &&
+    tokens[s + 1].kind == TokenKind::ColonColon && tokens[s + 2].raw == "utf16_code_unit_at" {
+      return true
+    }
+    return false
+  }
+  if tokens[e - 1].kind == TokenKind::RBracket {
+    let lb = find_matching_open_delim_back(tokens, e - 1)
+    if lb > s {
+      return find_receiver_start(tokens, lb - 1) == s
+    }
+  }
+  false
+}
+
+fn is_safe_code_unit_at_context(tokens : Array[Token], recv_start : Int, close_p : Int) -> Bool {
+  let n = tokens.length()
+  // Context A1: immediate safe widening/conversion/compare method chain
+  if close_p + 3 < n && tokens[close_p + 1].kind == TokenKind::Dot &&
+  tokens[close_p + 2].kind == TokenKind::Ident && tokens[close_p + 3].kind == TokenKind::LParen {
+    let m = tokens[close_p + 2].raw
+    if (m == "to_int" || m == "to_uint" || m == "to_int64" || m == "to_uint64" || m == "to_byte" || m == "to_string") &&
+    close_p + 4 < n && tokens[close_p + 4].kind == TokenKind::RParen {
+      return true
+    }
+    if m == "compare" {
+      return true
+    }
+  }
+  // Context A2: sole argument of `.compare(<site>)`
+  if recv_start >= 3 && tokens[recv_start - 1].kind == TokenKind::LParen &&
+  tokens[recv_start - 2].kind == TokenKind::Ident && tokens[recv_start - 2].raw == "compare" &&
+  tokens[recv_start - 3].kind == TokenKind::Dot &&
+  close_p + 1 < n && tokens[close_p + 1].kind == TokenKind::RParen {
+    return true
+  }
+  // For Context B/C, the site itself must not be directly adjacent to arithmetic/bitwise/postfix ops
+  if recv_start > 0 && is_u16_arith_or_bit_raw(tokens[recv_start - 1].raw) {
+    return false
+  }
+  if close_p + 1 < n {
+    let nxt = tokens[close_p + 1]
+    if is_u16_arith_or_bit_raw(nxt.raw) || nxt.kind == TokenKind::Dot ||
+    nxt.kind == TokenKind::LBracket || nxt.kind == TokenKind::LParen {
+      return false
+    }
+  }
+  // Context B1: `<site> <cmp> <peer>`
+  if close_p + 2 < n && is_u16_cmp_raw(tokens[close_p + 1].raw) {
+    let ps = close_p + 2
+    let mut pe = ps
+    let mut d = 0
+    while pe < n {
+      let tk = tokens[pe]
+      if tk.kind == TokenKind::Eof { break }
+      if d == 0 {
+        if tk.kind == TokenKind::Comma || tk.kind == TokenKind::RParen ||
+        tk.kind == TokenKind::RBracket || tk.kind == TokenKind::LBrace || tk.kind == TokenKind::RBrace ||
+        tk.kind == TokenKind::Semi || tk.kind == TokenKind::FatArrow ||
+        tk.raw == "&&" || tk.raw == "||" || is_u16_cmp_raw(tk.raw) ||
+        (pe > ps && tk.newline_before && !is_u16_arith_or_bit_raw(tk.raw) && tk.kind != TokenKind::Dot) ||
+        (tk.kind == TokenKind::Keyword && (tk.raw == "else" || tk.raw == "in" || tk.raw == "as")) {
+          break
+        }
+      }
+      if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { d = d + 1 }
+      else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      pe = pe + 1
+    }
+    if is_safe_u16_peer_expr(tokens, ps, pe) {
+      return true
+    }
+  }
+  // Context B2: `<peer> <cmp> <site>`
+  if recv_start >= 2 && is_u16_cmp_raw(tokens[recv_start - 1].raw) {
+    let pe = recv_start - 1
+    let mut ps = pe
+    let mut d = 0
+    while ps > 0 {
+      let tk = tokens[ps - 1]
+      if d == 0 {
+        if tk.kind == TokenKind::Comma || tk.kind == TokenKind::LParen ||
+        tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace ||
+        tk.kind == TokenKind::Semi || tk.kind == TokenKind::FatArrow ||
+        tk.raw == "&&" || tk.raw == "||" || tk.raw == "=" || is_u16_cmp_raw(tk.raw) ||
+        (tk.kind == TokenKind::Keyword && (tk.raw == "if" || tk.raw == "while" || tk.raw == "return" || tk.raw == "else" || tk.raw == "let")) {
+          break
+        }
+      }
+      if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace { d = d + 1 }
+      else if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace { if d > 0 { d = d - 1 } }
+      ps = ps - 1
+    }
+    if is_safe_u16_peer_expr(tokens, ps, pe) {
+      return true
+    }
+  }
+  // Context C: direct argument to `physical_equal(arg0, arg1)` with a safe peer
+  let mut scan_p = recv_start - 1
+  let mut pd = 0
+  let mut enc_lp = -1
+  while scan_p >= 0 {
+    let tk = tokens[scan_p]
+    if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace {
+      pd = pd + 1
+    } else if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+      if pd == 0 {
+        if tk.kind == TokenKind::LParen { enc_lp = scan_p }
+        break
+      }
+      pd = pd - 1
+    }
+    scan_p = scan_p - 1
+  }
+  if enc_lp >= 1 && (tokens[enc_lp - 1].raw == "physical_equal" || tokens[enc_lp - 1].raw == "int_compare") {
+    let enc_rp = find_matching_delim(tokens, enc_lp)
+    if enc_rp > close_p && enc_rp < n {
+      let args : Array[(Int, Int)] = []
+      let mut as_i = enc_lp + 1
+      let mut ad = 0
+      let mut ak = enc_lp + 1
+      while ak <= enc_rp {
+        if ak == enc_rp || (ad == 0 && tokens[ak].kind == TokenKind::Comma) {
+          if ak > as_i { args.push((as_i, ak)) }
+          as_i = ak + 1
+        } else {
+          let kk = tokens[ak].kind
+          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { ad = ad + 1 }
+          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+        }
+        ak = ak + 1
+      }
+      if args.length() == 2 {
+        let (a0s, a0e) = args[0]
+        let (a1s, a1e) = args[1]
+        if recv_start == a0s && close_p + 1 == a0e && is_safe_u16_peer_expr(tokens, a1s, a1e) {
+          return true
+        }
+        if recv_start == a1s && close_p + 1 == a1e && is_safe_u16_peer_expr(tokens, a0s, a0e) {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
 fn instrument_probes_for_file_with_safe(
   file : String,
   content : String,
@@ -1579,6 +1800,7 @@ fn instrument_probes_for_file_with_safe(
         let end_b = tokens[close_p].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         let arg_expr = content.slice(tokens[arg_s].start_byte, tokens[arg_e - 1].end_byte).trim()
+        let safe_u16 = is_safe_code_unit_at_context(tokens, recv_start, close_p)
         sites.push(ProbeSite::{
           probe_id: "",
           file: file,
@@ -1590,7 +1812,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: arg_expr,
-          assign_op: "",
+          assign_op: if safe_u16 { "safe_u16" } else { "" },
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -2084,7 +2306,7 @@ fn moonbit_show_helper(ty : String) -> Option[String] {
 ///| accepted only through the Stage A allowlist (a transpiled `impl Show ... with output` without an inherent
 ///| `fn T::to_string`); everything else (`Float`, `Byte`, `Bytes`, views, containers, tuples, generics) fails closed.
 fn is_show_trait_exact_type(ty : String) -> Bool {
-  ty == "Int" || ty == "Int64" || ty == "UInt" || ty == "UInt64" || ty == "Bool" || ty == "Char" || ty == "String" || ty == "mbt_compat::MbtUInt16"
+  ty == "Int" || ty == "Int64" || ty == "UInt" || ty == "UInt64" || ty == "Bool" || ty == "Char" || ty == "String"
 }
 
 ///| `assign_op` tag of a `mbt_slice_borrow_probe` site whose receiver is a proven-fresh allocation.
@@ -2171,17 +2393,37 @@ fn rewrite_for_probe_hygienic(
 
   if site.probe_kind == "mbt_code_unit_at_probe" {
     if resolved_type == "String" {
+      if site.assign_op != "safe_u16" {
+        diags.push(diag_error(
+          "MBT2PION_UINT16_ESCAPE",
+          site.file,
+          site.line,
+          site.col,
+          "String::code_unit_at(i) in unchecked UInt16 context (arithmetic/binding/escape) is not supported (fail-closed)",
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: "string_utf16_code_unit_at",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: site.lhs_expr + ".code_unit_at(" + site.rhs_expr + ")",
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "String.code_unit_at(i) outside safe UInt16 context",
+        })
+        return None
+      }
       drift_ledger.push(DriftEntry::{
         category: "string_utf16_code_unit_at",
         file: site.file,
         line: site.line,
         col: site.col,
         expr: site.lhs_expr + ".code_unit_at(" + site.rhs_expr + ")",
-        resolution: "mbt_compat::utf16_code_unit_at_u16",
+        resolution: "mbt_compat::utf16_code_unit_at",
         status: "resolved",
-        detail: "String.code_unit_at(i) routed to UTF-16 MbtUInt16 access",
+        detail: "String.code_unit_at(i) routed to UTF-16 code unit access",
       })
-      return Some("mbt_compat::utf16_code_unit_at_u16(" + site.lhs_expr + ", " + site.rhs_expr + ")")
+      return Some("mbt_compat::utf16_code_unit_at(" + site.lhs_expr + ", " + site.rhs_expr + ")")
     }
     return None
   }
