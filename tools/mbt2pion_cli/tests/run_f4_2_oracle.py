@@ -438,6 +438,11 @@ def main():
             ("callee_alias_mut", "fn am(a : Array[Int], v : ArrayView[Int]) -> Int { let al = a; al[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { am(a, ops[0:2]) }\n"),
             ("global_same_ty_mut", "let g : Array[Int] = [1, 2, 3]\nfn gm(v : ArrayView[Int]) -> Int { g[0] = 99; v[0] }\npub fn f(ops : Array[Int]) -> Int { gm(ops[0:2]) }\n"),
             ("callback_mut", "fn cm(cb : () -> Unit, v : ArrayView[Int]) -> Int { cb(); v[0] }\npub fn f(cb : () -> Unit, ops : Array[Int]) -> Int { cm(cb, ops[0:2]) }\n"),
+            ("block_alias_mut", "fn bam(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = { a }; alias_a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { bam(a, ops[0:2]) }\n"),
+            ("arr_lit_idx_mut", "fn alim(a : Array[Int], v : ArrayView[Int]) -> Int { let alias_a = [a][0]; alias_a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { alim(a, ops[0:2]) }\n"),
+            ("struct_lit_mut", "priv struct Hook { a : Array[Int] }\nfn Hook::wipe(self : Hook) -> Unit { self.a[0] = 99 }\nfn slm(a : Array[Int], v : ArrayView[Int]) -> Int { let h : Hook = { a: a }; h.wipe(); v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { slm(a, ops[0:2]) }\n"),
+            ("visited_inline_cb", "fn run_cb(cb : () -> Unit) -> Unit { cb() }\nfn two_c(ext : () -> Unit, v : ArrayView[Int]) -> Int { run_cb(fn() { () }); run_cb(ext); v[0] }\npub fn f(ext : () -> Unit, ops : Array[Int]) -> Int { two_c(ext, ops[0:2]) }\n"),
+            ("nested_map_arg_mut", "fn get_m() -> Map[String, Int] { Map([]) }\nfn pick(m : Map[String, Int], a : Array[Int]) -> Array[Int] { let _ = m; a }\nfn nma(a : Array[Int], v : ArrayView[Int]) -> Int { let x = pick(get_m(), a); x[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { nma(a, ops[0:2]) }\n"),
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
 

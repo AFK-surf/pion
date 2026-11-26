@@ -17771,24 +17771,48 @@ fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_
   }
 }
 
+///| True iff `idx` is at a statement boundary inside `fn_close`.
+fn is_stmt_end_f42(tokens : Array[Token], idx : Int, fn_close : Int) -> Bool {
+  idx >= fn_close || tokens[idx].newline_before ||
+  tokens[idx].kind == TokenKind::Semi || tokens[idx].kind == TokenKind::RBrace
+}
+
 ///| True iff the RHS of `let <x> [: Ty] = <rhs>` allocates a provably fresh local collection.
-fn let_rhs_is_fresh_alloc_f42(tokens : Array[Token], rhs_start : Int, fn_close : Int) -> Bool {
+fn let_rhs_is_fresh_alloc_f42(ctx : StageAContext, tokens : Array[Token], rhs_start : Int, fn_close : Int) -> Bool {
   if rhs_start >= fn_close {
     return false
   }
   let tk = tokens[rhs_start]
-  if tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
-    return true
+  if tk.kind == TokenKind::LBracket {
+    let cb = find_matching_delim(tokens, rhs_start)
+    return cb > rhs_start && cb < fn_close && is_stmt_end_f42(tokens, cb + 1, fn_close)
+  }
+  if tk.kind == TokenKind::LBrace {
+    let rb = find_matching_delim(tokens, rhs_start)
+    if rb <= rhs_start || rb >= fn_close || !is_stmt_end_f42(tokens, rb + 1, fn_close) {
+      return false
+    }
+    if rb == rhs_start + 1 {
+      return true
+    }
+    if rb > rhs_start + 2 &&
+    (tokens[rhs_start + 1].kind == TokenKind::StringLit || tokens[rhs_start + 1].kind == TokenKind::IntLit) &&
+    tokens[rhs_start + 2].kind == TokenKind::Colon {
+      return true
+    }
+    return false
   }
   if (tk.kind == TokenKind::UpperIdent && (tk.raw == "Map" || tk.raw == "StringBuilder")) &&
   rhs_start + 1 < fn_close && tokens[rhs_start + 1].kind == TokenKind::LParen {
-    return true
+    let rp = find_matching_delim(tokens, rhs_start + 1)
+    return rp > rhs_start + 1 && rp < fn_close && is_stmt_end_f42(tokens, rp + 1, fn_close)
   }
   if tk.kind == TokenKind::UpperIdent && (tk.raw == "Array" || tk.raw == "Map") &&
   rhs_start + 3 < fn_close && tokens[rhs_start + 1].kind == TokenKind::ColonColon &&
   tokens[rhs_start + 2].kind == TokenKind::Ident && tokens[rhs_start + 2].raw == "new" &&
   tokens[rhs_start + 3].kind == TokenKind::LParen {
-    return true
+    let rp = find_matching_delim(tokens, rhs_start + 3)
+    return rp > rhs_start + 3 && rp < fn_close && is_stmt_end_f42(tokens, rp + 1, fn_close)
   }
   let mut k = rhs_start
   let mut d = 0
@@ -17801,6 +17825,7 @@ fn let_rhs_is_fresh_alloc_f42(tokens : Array[Token], rhs_start : Int, fn_close :
     else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
     else if d == 0 && kk == TokenKind::Dot && k + 3 < fn_close &&
     tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == "copy" &&
+    !is_method_shadowed_f42(ctx, "copy") &&
     tokens[k + 2].kind == TokenKind::LParen && tokens[k + 3].kind == TokenKind::RParen {
       let after = k + 4
       if after >= fn_close || tokens[after].newline_before || tokens[after].kind == TokenKind::Semi || tokens[after].kind == TokenKind::RBrace {
@@ -17808,6 +17833,34 @@ fn let_rhs_is_fresh_alloc_f42(tokens : Array[Token], rhs_start : Int, fn_close :
       }
     }
     k = k + 1
+  }
+  false
+}
+
+///| True iff `m` maps `k` to `true`.
+fn map_bool_get_f42(m : Map[String, Bool], k : String) -> Bool {
+  match m.get(k) {
+    Some(b) => b
+    None => false
+  }
+}
+
+///| True iff `rt` is a Map/OrderedMap (or Option thereof) return type.
+fn is_map_ret_type_f42(rt : String) -> Bool {
+  let t = rt.trim()
+  t.starts_with("Map[") || t.starts_with("OrderedMap[") || t.starts_with("mbt_compat::OrderedMap[") ||
+  t.starts_with("Option[Map[") || t.starts_with("Option[OrderedMap[") || t.starts_with("Option[mbt_compat::OrderedMap[")
+}
+
+///| Lexical lookup in `mscope` stack `(name, depth, is_map)`.
+fn map_scope_lookup_f42(mscope : Array[(String, Int, Bool)], name : String) -> Bool {
+  let mut idx = mscope.length() - 1
+  while idx >= 0 {
+    let (n, _, v) = mscope[idx]
+    if n == name {
+      return v
+    }
+    idx = idx - 1
   }
   false
 }
@@ -17822,10 +17875,16 @@ fn fn_has_no_nonfresh_mutation_f42(
   inline_closure_params : Map[String, Bool],
   visited : Map[String, Bool],
 ) -> Bool {
-  if visited.contains(fn_name) {
+  let mut visit_key = fn_name + "|"
+  for ic in inline_closure_params.keys() {
+    if map_bool_get_f42(inline_closure_params, ic) {
+      visit_key = visit_key + ic + ","
+    }
+  }
+  if visited.contains(visit_key) {
     return true
   }
-  visited[fn_name] = true
+  visited[visit_key] = true
   let (param_names, fn_open, fn_close) = match find_top_level_fn_f42(tokens, fn_name) {
     Some(info) => info
     None => return false
@@ -17834,10 +17893,23 @@ fn fn_has_no_nonfresh_mutation_f42(
   let fresh_locals : Map[String, Bool] = Map()
   let local_closures : Map[String, Bool] = Map()
   let map_locals : Map[String, Bool] = Map()
+  let non_map_lets : Map[String, Bool] = Map()
+  let map_scope : Array[(String, Int, Bool)] = []
   let reassigned : Map[String, Bool] = Map()
+  let mut bdepth = 0
   let mut p = fn_open + 1
   while p < fn_close {
     let tk = tokens[p]
+    if tk.kind == TokenKind::LBrace {
+      bdepth = bdepth + 1
+    } else if tk.kind == TokenKind::RBrace {
+      while map_scope.length() > 0 {
+        let (_, sd, _) = map_scope[map_scope.length() - 1]
+        if sd != bdepth { break }
+        let _ = map_scope.pop()
+      }
+      if bdepth > 0 { bdepth = bdepth - 1 }
+    }
     if tk.kind == TokenKind::Ident && p + 1 < fn_close &&
     (tokens[p + 1].kind == TokenKind::Eq || tokens[p + 1].kind == TokenKind::AssignOp) &&
     !(p > fn_open && tokens[p - 1].kind == TokenKind::Keyword && tokens[p - 1].raw == "let") {
@@ -17858,25 +17930,45 @@ fn fn_has_no_nonfresh_mutation_f42(
       }
       if eq_idx > p + 1 && eq_idx + 1 < fn_close {
         let rhs = eq_idx + 1
+        if fresh_locals.contains(vname) { fresh_locals[vname] = false }
+        if local_closures.contains(vname) { local_closures[vname] = false }
+        if map_locals.contains(vname) { map_locals[vname] = false }
         if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "fn" {
           local_closures[vname] = true
-        } else if let_rhs_is_fresh_alloc_f42(tokens, rhs, fn_close) {
+        } else if let_rhs_is_fresh_alloc_f42(ctx, tokens, rhs, fn_close) {
           fresh_locals[vname] = true
         }
-        let mut scan_m = rhs
-        while scan_m < fn_close && !(scan_m > rhs && tokens[scan_m].newline_before) && tokens[scan_m].kind != TokenKind::Semi {
-          if tokens[scan_m].kind == TokenKind::Ident && scan_m + 1 < fn_close && tokens[scan_m + 1].kind == TokenKind::LParen {
-            match ctx.symtab.fn_ret_types.get(tokens[scan_m].raw) {
-              Some(rt) => if str_has(rt, "Map[") || str_has(rt, "OrderedMap[") { map_locals[vname] = true }
+        // Only check top-level direct call or `if ... { Some(call(...)) } else { None }`
+        let mut is_map_rhs = false
+        if tokens[rhs].kind == TokenKind::Ident && rhs + 1 < fn_close && tokens[rhs + 1].kind == TokenKind::LParen {
+          match ctx.symtab.fn_ret_types.get(tokens[rhs].raw) {
+            Some(rt) => if is_map_ret_type_f42(rt) { is_map_rhs = true }
+            None => ()
+          }
+        } else if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "if" {
+          let mut lb_if = rhs + 1
+          while lb_if < fn_close && tokens[lb_if].kind != TokenKind::LBrace {
+            lb_if = lb_if + 1
+          }
+          if lb_if + 4 < fn_close && tokens[lb_if + 1].kind == TokenKind::UpperIdent && tokens[lb_if + 1].raw == "Some" &&
+          tokens[lb_if + 2].kind == TokenKind::LParen && tokens[lb_if + 3].kind == TokenKind::Ident &&
+          tokens[lb_if + 4].kind == TokenKind::LParen {
+            match ctx.symtab.fn_ret_types.get(tokens[lb_if + 3].raw) {
+              Some(rt) => if is_map_ret_type_f42(rt) { is_map_rhs = true }
               None => ()
             }
           }
-          scan_m = scan_m + 1
         }
+        if is_map_rhs {
+          map_locals[vname] = true
+        } else {
+          non_map_lets[vname] = true
+        }
+        map_scope.push((vname, bdepth, is_map_rhs))
       }
     }
     if tk.kind == TokenKind::Keyword && tk.raw == "match" && p + 2 < fn_close &&
-    tokens[p + 1].kind == TokenKind::Ident && map_locals.contains(tokens[p + 1].raw) &&
+    tokens[p + 1].kind == TokenKind::Ident && map_scope_lookup_f42(map_scope, tokens[p + 1].raw) &&
     tokens[p + 2].kind == TokenKind::LBrace {
       let mc = find_matching_delim(tokens, p + 2)
       let mut mp = p + 3
@@ -17884,7 +17976,10 @@ fn fn_has_no_nonfresh_mutation_f42(
         if tokens[mp].kind == TokenKind::UpperIdent && tokens[mp].raw == "Some" &&
         tokens[mp + 1].kind == TokenKind::LParen && tokens[mp + 2].kind == TokenKind::Ident &&
         tokens[mp + 3].kind == TokenKind::RParen {
-          map_locals[tokens[mp + 2].raw] = true
+          let mn = tokens[mp + 2].raw
+          if !non_map_lets.contains(mn) {
+            map_locals[mn] = true
+          }
         }
         mp = mp + 1
       }
@@ -17894,6 +17989,12 @@ fn fn_has_no_nonfresh_mutation_f42(
   for r in reassigned.keys() {
     if fresh_locals.contains(r) {
       fresh_locals[r] = false
+    }
+    if local_closures.contains(r) {
+      local_closures[r] = false
+    }
+    if map_locals.contains(r) {
+      map_locals[r] = false
     }
   }
   let mut i = fn_open + 1
@@ -17921,8 +18022,7 @@ fn fn_has_no_nonfresh_mutation_f42(
           return false
         }
         let r = tokens[i - 1].raw
-        let is_fresh = match fresh_locals.get(r) { Some(b) => b; None => false }
-        if !(is_fresh || map_locals.contains(r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+        if !(map_bool_get_f42(fresh_locals, r) || map_bool_get_f42(map_locals, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
           return false
         }
       }
@@ -17933,7 +18033,7 @@ fn fn_has_no_nonfresh_mutation_f42(
         if is_pure_ro_method_f42(ctx, m) || m == "stringify" || m == "to_string" ||
         m == "to_int" || m == "to_double" || m == "floor" {
           ()
-        } else if m == "map" {
+        } else if m == "map" && !is_method_shadowed_f42(ctx, "map") {
           if !(i + 2 < fn_close && tokens[i + 2].kind == TokenKind::Keyword && tokens[i + 2].raw == "fn") {
             return false
           }
@@ -17943,8 +18043,7 @@ fn fn_has_no_nonfresh_mutation_f42(
             return false
           }
           let r = tokens[i - 2].raw
-          let is_fresh = match fresh_locals.get(r) { Some(b) => b; None => false }
-          if !(is_fresh || map_locals.contains(r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+          if !(map_bool_get_f42(fresh_locals, r) || map_bool_get_f42(map_locals, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
             return false
           }
         }
@@ -17958,7 +18057,7 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       } else {
         let g = tk.raw
-        if g == "ignore" || g == "physical_equal" || local_closures.contains(g) || inline_closure_params.contains(g) {
+        if g == "ignore" || g == "physical_equal" || map_bool_get_f42(local_closures, g) || map_bool_get_f42(inline_closure_params, g) {
           ()
         } else if ctx.symtab.local_fn_names.contains(g) {
           let call_rp = find_matching_delim(tokens, i + 1)
@@ -17980,7 +18079,7 @@ fn fn_has_no_nonfresh_mutation_f42(
                 }
                 let is_inline_fn = (as_idx < ae && tokens[as_idx].kind == TokenKind::Keyword && tokens[as_idx].raw == "fn") ||
                 (as_idx + 1 == ae && tokens[as_idx].kind == TokenKind::Ident &&
-                  (inline_closure_params.contains(tokens[as_idx].raw) || local_closures.contains(tokens[as_idx].raw)))
+                  (map_bool_get_f42(inline_closure_params, tokens[as_idx].raw) || map_bool_get_f42(local_closures, tokens[as_idx].raw)))
                 if is_inline_fn && a_pos < g_params.length() && g_params[a_pos].length() > 0 {
                   child_inline[g_params[a_pos]] = true
                 }
