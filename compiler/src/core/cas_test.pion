@@ -1,0 +1,263 @@
+///| Unit tests for CAS key validation, batch pinning, post-run eviction,
+///  depfile parsing (incl. UTF-8 & fail-closed), MSVC /sourceDependencies,
+///  MSVC /showIncludes, and raw-bytes SHA-256.
+
+///|
+test "cas_is_safe_key_whitelist_and_index_filtering" {
+  assert_true(cas_is_safe_key("abc123_def-0.o"), "normal key")
+  assert_true(cas_is_safe_key("testbin:deadbeef.exe"), "testbin key")
+  assert_true(cas_is_safe_key("wasmbin:0123456789abcdef"), "wasmbin key")
+  assert_true(!cas_is_safe_key(""), "empty rejected")
+  assert_true(!cas_is_safe_key("."), "dot rejected")
+  assert_true(!cas_is_safe_key(".."), "dotdot rejected")
+  assert_true(!cas_is_safe_key("a..b"), "embedded dotdot rejected")
+  assert_true(!cas_is_safe_key("../evil"), "slash traversal rejected")
+  assert_true(!cas_is_safe_key("testbin:../evil"), "prefixed traversal rejected")
+  assert_true(!cas_is_safe_key("a\\b"), "backslash rejected")
+  assert_true(!cas_is_safe_key("testbin:"), "empty body after prefix rejected")
+  assert_true(!cas_is_safe_key("bad:key"), "unknown colon rejected")
+
+  // cas_parse_index drops unsafe keys silently
+  let parsed = cas_parse_index(
+    "good_key\t100\t10\n../escape\t200\t20\ntestbin:ok.exe\t300\t30\ntestbin:../x\t400\t40\n",
+  )
+  assert_eq(parsed.length(), 2)
+  assert_eq(parsed[0].key, "good_key")
+  assert_eq(parsed[1].key, "testbin:ok.exe")
+}
+
+///|
+test "cas_touch_batch_and_evict_preserves_batch_and_pinned_hits" {
+  let entries = cas_parse_index("k_old1\t400\t10\nk_old2\t400\t20\nk_hit\t300\t30\n")
+  let res = cas_touch_batch_and_evict(
+    entries,
+    ["k_new1", "k_new2"],
+    [500L, 500L],
+    500L,
+    1000L,
+    ["k_hit"],
+  )
+  assert_eq(res.evicted.length(), 2)
+  assert_eq(res.evicted[0], "k_old1")
+  assert_eq(res.evicted[1], "k_old2")
+  assert_eq(res.kept.length(), 3)
+  let mut saw_hit = false
+  let mut saw_new1 = false
+  let mut saw_new2 = false
+  let mut i = 0
+  while i < res.kept.length() {
+    let e = res.kept[i]
+    if e.key == "k_hit" {
+      saw_hit = true
+      assert_eq(e.bytes, 300L)
+      assert_eq(e.last_access_ms, 500L)
+    } else if e.key == "k_new1" {
+      saw_new1 = true
+      assert_eq(e.bytes, 500L)
+      assert_eq(e.last_access_ms, 500L)
+    } else if e.key == "k_new2" {
+      saw_new2 = true
+      assert_eq(e.bytes, 500L)
+      assert_eq(e.last_access_ms, 500L)
+    }
+    i = i + 1
+  }
+  assert_true(saw_hit, "k_hit kept")
+  assert_true(saw_new1, "k_new1 kept")
+  assert_true(saw_new2, "k_new2 kept")
+}
+
+///|
+test "cas_touch_batch_and_evict_duplicate_key_takes_last_size_and_80pct_watermark" {
+  let entries = cas_parse_index("a\t300\t10\nb\t300\t20\nc\t300\t30\n")
+  let res = cas_touch_batch_and_evict(
+    entries,
+    ["d", "d"],
+    [200L, 350L],
+    100L,
+    1000L,
+    [],
+  )
+  assert_eq(res.evicted.length(), 2)
+  assert_eq(res.evicted[0], "a")
+  assert_eq(res.evicted[1], "b")
+  assert_eq(res.kept.length(), 2)
+  let mut saw_c = false
+  let mut saw_d = false
+  let mut i = 0
+  while i < res.kept.length() {
+    if res.kept[i].key == "c" {
+      saw_c = true
+    } else if res.kept[i].key == "d" {
+      saw_d = true
+      assert_eq(res.kept[i].bytes, 350L)
+    }
+    i = i + 1
+  }
+  assert_true(saw_c, "c kept")
+  assert_true(saw_d, "d kept")
+}
+
+///|
+test "cas_evict_post_run_refreshes_lru_and_protects_peer_and_keep_keys" {
+  let entries = cas_parse_index(
+    "old_k\t400\t500\nmy_k1\t400\t600\npeer_k\t500\t100\nkeep_k\t300\t200\n",
+  )
+  // Total = 1600 > max_bytes=1000 (watermark=800).
+  // `peer_k` (active peer pin) and `keep_k` (returned output) are protected.
+  // `my_k1` is in run_keys so its timestamp refreshes to 2000L, while `old_k` stays 500L.
+  // Evict old_k -> 1200; evict my_k1 -> 800 <= 800 -> stops; peer_k & keep_k kept with ts=2000L!
+  let res = cas_evict_post_run(
+    entries,
+    2000L,
+    1000L,
+    ["my_k1"],
+    ["peer_k", "keep_k"],
+  )
+  assert_eq(res.evicted.length(), 2)
+  assert_eq(res.evicted[0], "old_k")
+  assert_eq(res.evicted[1], "my_k1")
+  assert_eq(res.kept.length(), 2)
+  let mut i = 0
+  while i < res.kept.length() {
+    assert_eq(res.kept[i].last_access_ms, 2000L)
+    i = i + 1
+  }
+}
+
+///|
+test "cas_parse_depfile_unix_utf8_crlf_continuations_escapes_and_fail_closed" {
+  // 1. Unix multiline with \\\n, escaped space, \#, $$, UTF-8 Chinese path, duplicates
+  let d1 = "/tmp/obj_0.o: /src/a.c \\\n  /inc/中文目录/foo\\#1.h \\\n  /inc/my\\ dir/cost$$2.h /inc/a.h /inc/a.h\n"
+  match cas_parse_depfile(d1) {
+    Some((targets, deps)) => {
+      assert_eq(targets.length(), 1)
+      assert_eq(targets[0], "/tmp/obj_0.o")
+      assert_eq(deps.length(), 4)
+      assert_eq(deps[0], "/inc/a.h")
+      assert_eq(deps[1], "/inc/my dir/cost$2.h")
+      assert_eq(deps[2], "/inc/中文目录/foo#1.h")
+      assert_eq(deps[3], "/src/a.c")
+    }
+    None => assert_true(false, "expected Some for Unix UTF-8 depfile")
+  }
+
+  // 2. Windows CRLF + drive colons (both C:\ and C:/)
+  let d2 = "C:\\cache\\obj_0.o: C:\\proj\\src\\main.c \\\r\n  C:/sdk/include/win\\ compat.h C:\\proj\\inc\\sub.h\r\n"
+  match cas_parse_depfile(d2) {
+    Some((targets, deps)) => {
+      assert_eq(targets.length(), 1)
+      assert_eq(targets[0], "C:\\cache\\obj_0.o")
+      assert_eq(deps.length(), 3)
+      assert_eq(deps[0], "C:/sdk/include/win compat.h")
+      assert_eq(deps[1], "C:\\proj\\inc\\sub.h")
+      assert_eq(deps[2], "C:\\proj\\src\\main.c")
+    }
+    None => assert_true(false, "expected Some for Windows depfile")
+  }
+
+  // 3. Malformed inputs fail closed -> None
+  match cas_parse_depfile("") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for empty depfile")
+  }
+  match cas_parse_depfile("no_colon_here /inc/a.h\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for depfile without colon")
+  }
+  match cas_parse_depfile("   : /inc/a.h\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for depfile with empty target")
+  }
+  match cas_parse_depfile("/tmp/obj_0.o:\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for empty prerequisite list")
+  }
+  match cas_parse_depfile("/tmp/obj_0.o: /src/a.c\nextra_rule.o: /src/b.c\n") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for extra unparsed rule line")
+  }
+}
+
+///|
+test "cas_parse_msvc_source_deps_json_and_fail_closed" {
+  let j = "{\"Version\":\"1.2\",\"Data\":{\"Source\":\"C:\\\\proj\\\\a.c\",\"ProvidedModule\":\"\",\"Includes\":[\"C:\\\\proj\\\\b.h\",\"C:\\\\proj\\\\\\u0061.h\",\"C:\\\\proj\\\\b.h\"],\"ImportedModules\":[],\"ImportedHeaderUnits\":[]}}"
+  match cas_parse_msvc_source_deps(j) {
+    Some((src, deps)) => {
+      assert_eq(src, "C:\\proj\\a.c")
+      assert_eq(deps.length(), 2)
+      assert_eq(deps[0], "C:\\proj\\a.h")
+      assert_eq(deps[1], "C:\\proj\\b.h")
+    }
+    None => assert_true(false, "expected Some for valid /sourceDependencies JSON")
+  }
+  // Valid empty Includes allowed when JSON is valid and Source is present
+  match cas_parse_msvc_source_deps("{\"Version\":\"1.2\",\"Data\":{\"Source\":\"a.c\",\"Includes\":[]}}") {
+    Some((src, deps)) => {
+      assert_eq(src, "a.c")
+      assert_eq(deps.length(), 0)
+    }
+    None => assert_true(false, "expected Some for valid empty Includes")
+  }
+  // Missing Includes -> None
+  match cas_parse_msvc_source_deps("{\"Version\":\"1.2\",\"Data\":{\"Source\":\"a.c\"}}") {
+    None => ()
+    Some(_) => assert_true(false, "expected None when Includes missing")
+  }
+  // Missing Source -> None
+  match cas_parse_msvc_source_deps("{\"Version\":\"1.2\",\"Data\":{\"Includes\":[\"a.h\"]}}") {
+    None => ()
+    Some(_) => assert_true(false, "expected None when Source missing")
+  }
+  // Trailing garbage -> None
+  match cas_parse_msvc_source_deps("{\"Version\":\"1.2\",\"Data\":{\"Source\":\"a.c\",\"Includes\":[]}} trailing") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for trailing garbage")
+  }
+  // Invalid escape -> None
+  match cas_parse_msvc_source_deps("{\"Data\":{\"Source\":\"a.c\",\"Includes\":[\"\\x\"]}}") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for invalid escape")
+  }
+  // Non-string element in Includes -> None
+  match cas_parse_msvc_source_deps("{\"Data\":{\"Source\":\"a.c\",\"Includes\":[123]}}") {
+    None => ()
+    Some(_) => assert_true(false, "expected None for non-string include")
+  }
+}
+
+///|
+test "cas_parse_msvc_show_includes_parses_trims_dedups_and_sorts" {
+  let out = "stub.c\r\nNote: including file: C:\\proj\\b.h\r\nNote: including file:   C:\\proj\\a.h  \r\nNote: including file: C:\\proj\\b.h\r\nwarning C4996: ignored\r\n"
+  let deps = cas_parse_msvc_show_includes(out)
+  assert_eq(deps.length(), 2)
+  assert_eq(deps[0], "C:\\proj\\a.h")
+  assert_eq(deps[1], "C:\\proj\\b.h")
+}
+
+///|
+test "cas_sha256_bytes_empty_ascii_and_non_utf8" {
+  assert_eq(
+    cas_sha256_bytes(Bytes::new(0)),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  )
+  let abc = Bytes::new(3)
+  abc[0] = (97).to_byte()
+  abc[1] = (98).to_byte()
+  abc[2] = (99).to_byte()
+  assert_eq(
+    cas_sha256_bytes(abc),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  )
+  let raw = Bytes::new(128)
+  let mut i = 0
+  while i < 128 {
+    raw[i] = (128 + i).to_byte()
+    i = i + 1
+  }
+  let h1 = cas_sha256_bytes(raw)
+  assert_eq(h1.length(), 64)
+  raw[64] = (0x00).to_byte()
+  let h2 = cas_sha256_bytes(raw)
+  assert_true(h1 != h2, "mutated byte changes sha256")
+}

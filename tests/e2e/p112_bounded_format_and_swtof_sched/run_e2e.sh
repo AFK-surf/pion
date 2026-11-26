@@ -118,8 +118,7 @@ fi
 # the probe passes, every compile and run below must succeed.
 if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
   && "$TMP_DIR/asan_probe"; then
-  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
   # LeakSanitizer is not available everywhere (e.g. Apple Clang on macOS ARM64).
   ASAN_RUN_OPTS=""
   if ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe" >/dev/null 2>&1; then

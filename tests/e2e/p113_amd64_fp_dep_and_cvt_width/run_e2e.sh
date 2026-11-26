@@ -90,8 +90,7 @@ fi
 # the probe passes, every compile and run below must succeed.
 if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
   && "$TMP_DIR/asan_probe"; then
-  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
   # LeakSanitizer is not available everywhere (e.g. Apple Clang on macOS ARM64).
   ASAN_RUN_OPTS=""
   if ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe" >/dev/null 2>&1; then
@@ -120,35 +119,62 @@ fi
 "$QBE" -t amd64_win -o "$TMP_DIR/win.s" "$DIR/fixture.ssa"
 
 # Test-only QBE with the slot hook (qbe_slot_hook.c), built from the same
-# vendor/qbe sources; with ASan + UBSan (first error aborts) whenever the
-# compiler can link them.
+# vendor/qbe sources; reuses prebuilt $PION_QBE_SAN_DIR/obj/*.o when available.
 QBE_DIR="$ROOT_DIR/vendor/qbe"
 HOOK_DIR="$TMP_DIR/qbe-hook"
 mkdir -p "$HOOK_DIR"
-printf '#define Deftgt T_amd64_sysv\n' > "$HOOK_DIR/config.h"
 SAN_FLAGS=""
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -o "$TMP_DIR/san_probe" 2>/dev/null && "$TMP_DIR/san_probe"; then
-  SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
-elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
-  echo "FAIL: p113 needs ASan/UBSan for QBE (PION_REQUIRE_SANITIZERS=1)" >&2
-  exit 1
-fi
-echo "p113 hook QBE sanitizers: ${SAN_FLAGS:-<none>}"
 HOOK_OBJS=""
-for S in util parse abi cfg mem ssa alias load copy fold gvn gcm simpl ifopt live spill rega emit \
-  amd64/targ amd64/sysv amd64/isel amd64/emit amd64/winabi amd64/elf \
-  arm64/targ arm64/abi arm64/isel arm64/emit arm64/macho \
-  rv64/targ rv64/abi rv64/isel rv64/emit; do
-  O="$HOOK_DIR/$(printf '%s' "$S" | tr / _).o"
-  "$CC_BIN" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_DIR" -I"$QBE_DIR" -c "$QBE_DIR/$S.c" -o "$O"
-  HOOK_OBJS="$HOOK_OBJS $O"
-done
-"$CC_BIN" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_DIR" -I"$QBE_DIR" -c "$DIR/qbe_main_hook.c" -o "$HOOK_DIR/main_hook.o"
-"$CC_BIN" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_DIR" -I"$QBE_DIR" -c "$DIR/qbe_slot_hook.c" -o "$HOOK_DIR/slot_hook.o"
-"$CC_BIN" $SAN_FLAGS $HOOK_OBJS "$HOOK_DIR/main_hook.o" "$HOOK_DIR/slot_hook.o" -o "$HOOK_DIR/qbe"
+HOOK_CC="$CC_BIN"
+if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ]; then
+  SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+  HOOK_INC="$PION_QBE_SAN_DIR"
+  [ -f "$PION_QBE_SAN_DIR/qbe.cc" ] && HOOK_CC="$(cat "$PION_QBE_SAN_DIR/qbe.cc")"
+  for O in "$PION_QBE_SAN_DIR"/obj/*.o; do
+    case "$O" in
+      */main.c.o) continue ;;
+    esac
+    HOOK_OBJS="$HOOK_OBJS $O"
+  done
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$HOOK_DIR" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+    HOOK_INC="$HOOK_DIR"
+    [ -f "$HOOK_DIR/qbe.cc" ] && HOOK_CC="$(cat "$HOOK_DIR/qbe.cc")"
+    for O in "$HOOK_DIR"/obj/*.o; do
+      case "$O" in
+        */main.c.o) continue ;;
+      esac
+      HOOK_OBJS="$HOOK_OBJS $O"
+    done
+  elif [ "$SAN_RC" -eq 77 ]; then
+    if [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
+      echo "FAIL: p113 needs ASan/UBSan for QBE (PION_REQUIRE_SANITIZERS=1)" >&2
+      exit 1
+    fi
+    HOOK_INC="$HOOK_DIR"
+    printf '#define Deftgt T_amd64_sysv\n' > "$HOOK_DIR/config.h"
+    for S in util parse abi cfg mem ssa alias load copy fold gvn gcm simpl ifopt live spill rega emit \
+      amd64/targ amd64/sysv amd64/isel amd64/emit amd64/winabi amd64/elf \
+      arm64/targ arm64/abi arm64/isel arm64/emit arm64/macho \
+      rv64/targ rv64/abi rv64/isel rv64/emit; do
+      O="$HOOK_DIR/$(printf '%s' "$S" | tr / _).o"
+      "$CC_BIN" -std=c99 -O1 -I"$HOOK_INC" -I"$QBE_DIR" -c "$QBE_DIR/$S.c" -o "$O"
+      HOOK_OBJS="$HOOK_OBJS $O"
+    done
+  else
+    echo "FAIL: p113 ASan+UBSan QBE build failed (exit $SAN_RC)" >&2
+    exit 1
+  fi
+fi
+echo "p113 hook QBE sanitizers: ${SAN_FLAGS:-<none>} (cc=$HOOK_CC)"
+"$HOOK_CC" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_main_hook.c" -o "$HOOK_DIR/main_hook.o"
+"$HOOK_CC" -std=c99 -O1 $SAN_FLAGS -I"$HOOK_INC" -I"$QBE_DIR" -c "$DIR/qbe_slot_hook.c" -o "$HOOK_DIR/slot_hook.o"
+"$HOOK_CC" $SAN_FLAGS $HOOK_OBJS "$HOOK_DIR/main_hook.o" "$HOOK_DIR/slot_hook.o" -o "$HOOK_DIR/qbe"
 HQBE="$HOOK_DIR/qbe"
-export ASAN_OPTIONS="${ASAN_OPTIONS:-}${ASAN_OPTIONS:+:}detect_leaks=0:abort_on_error=0"
+export ASAN_OPTIONS="${ASAN_OPTIONS:-}${ASAN_OPTIONS:+:}detect_leaks=0:abort_on_error=0:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 "$HQBE" -t amd64_sysv -o "$TMP_DIR/slots.s" "$DIR/slots.ssa"
 "$HQBE" -t amd64_win -o "$TMP_DIR/slots_win.s" "$DIR/slots.ssa"
 # Without slot_* functions the hook QBE is the real one: same output, and no

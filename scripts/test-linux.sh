@@ -5,6 +5,8 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/out"
 RT_DIR="$ROOT_DIR/runtime"
 CC="${CC:-cc}"
+ulimit -n 4096 2>/dev/null || true
+export PION_ASAN_FAST_OPTS="detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
 
 # Helper sub-commands invoked inside run-e2e-parallel.sh (each uses its own
 # mktemp -d + PION_CACHE_DIR and writes nothing to shared out/ or source tree).
@@ -163,9 +165,22 @@ fi
 
 mkdir -p "$OUT_DIR"
 
+MODE="full"
+E2E_SHARD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bootstrap-only) MODE="bootstrap"; shift ;;
+    --e2e-only) MODE="e2e"; shift ;;
+    --shard) E2E_SHARD="$2"; shift 2 ;;
+    --shard=*) E2E_SHARD="${1#--shard=}"; shift ;;
+    *) echo "usage: test-linux.sh [--bootstrap-only | --e2e-only [--shard i/N]]" >&2; exit 2 ;;
+  esac
+done
+
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
 }
+T_GATE_START="$(now_ms)"
 
 TMP_DIR="$(mktemp -d)"
 . "$ROOT_DIR/scripts/bg-lib.sh"
@@ -205,6 +220,7 @@ else
 fi
 MULTIARCH_LIB_DIR="/usr/lib/${UNAME_M}-linux-gnu"
 
+if [ "$MODE" != "e2e" ]; then
 echo "=== [1/6] Linux ${LINUX_ARCH_LABEL} Environment & QBE (${LINUX_TARGET}) Build ==="
 uname -a
 CC="$CC" sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
@@ -257,9 +273,15 @@ if [ "$BENCH_RC" -ne 0 ]; then
   echo "NOTE: test_rt --bench returned $BENCH_RC (paravirtualized vCPU jitter); continuing functional & MT checks"
 fi
 
-# One ASan/TSan build of the runtime for all E2E suites (see scripts/san-rt.sh),
+# One ASan/TSan build of the runtime + ASan+UBSan QBE for all E2E suites (see scripts/san-rt.sh),
 # while `as` is still reachable.
 . "$ROOT_DIR/scripts/san-rt-env.sh"
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+  _tq0="$(now_ms)"
+  ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:${PION_ASAN_FAST_OPTS}" "$PION_QBE_SAN" -h >/dev/null 2>&1 || true
+  _tq1="$(now_ms)"
+  echo "qbe-san probe (cc=$(cat "${PION_QBE_SAN}.cc" 2>/dev/null || echo unknown)): $((_tq1 - _tq0))ms"
+fi
 
 # The KV load client is plain C: build it while `as` is still reachable.
 "$CC" -O2 -pthread -o "$OUT_DIR/bench_load" "$ROOT_DIR/examples/http_kv_service/bench_load.c"
@@ -468,13 +490,15 @@ cp "$TMP_DIR/linux_stage${FP_B}.ssa" "$OUT_DIR/linux_stage.ssa"
 # [6/6] must test the compiler built from this tree, not the (possibly older) seed.
 cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
 PIONC="$OUT_DIR/pionc_linux"
-# Wave K1-A (p98) is the longest E2E suite (two >65,279-section COFF big-obj
-# assemblies when mingw-w64 is installed). It is independent of everything below
-# (own mktemp -d + CAS, nothing written to the tree), so it starts now, overlaps
-# [6/6], and is joined right after the E2E pool, before any wall-clock check.
-bg_start "$TMP_DIR/p98.log" env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
-P98_PID="$BG_PID"
-T_P98_0="$(now_ms)"
+if [ "$MODE" = "full" ]; then
+  # Wave K1-A (p98) is the longest E2E suite (two >65,279-section COFF big-obj
+  # assemblies when mingw-w64 is installed). It is independent of everything below
+  # (own mktemp -d + CAS, nothing written to the tree), so it starts now, overlaps
+  # [6/6], and is joined right after the E2E pool, before any wall-clock check.
+  bg_start "$TMP_DIR/p98.log" env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
+  P98_PID="$BG_PID"
+  T_P98_0="$(now_ms)"
+fi
 
 echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
 # One long single-threaded build: overlapped, joined after the E2E pool.
@@ -551,6 +575,62 @@ if [ "$FIXED_CHK" != '{"ok":true,"unformatted":[]}' ]; then
   exit 1
 fi
 
+if [ "$MODE" = "bootstrap" ]; then
+  if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
+    CORE_PID=""
+  else
+    CORE_PID=""
+    exit 1
+  fi
+  if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
+    FP_ASM_PID=""
+    echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+  else
+    FP_ASM_PID=""
+    echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
+    exit 1
+  fi
+  echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) BOOTSTRAP GATES PASSED!"
+  GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+  echo "test-linux.sh --bootstrap-only duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::test-linux.sh --bootstrap-only (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] test-linux.sh --bootstrap-only (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
+fi
+else
+  # --e2e-only: reuse prebuilt out/ from --bootstrap-only.
+  PIONC="$OUT_DIR/pionc_linux"
+  [ -x "$PIONC" ] || { echo "FAIL: --e2e-only requires prebuilt $PIONC" >&2; exit 1; }
+  [ -x "$OUT_DIR/qbe" ] || { echo "FAIL: --e2e-only requires prebuilt $OUT_DIR/qbe" >&2; exit 1; }
+  export PION_QBE="$OUT_DIR/qbe"
+  export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+  export PION_CACHE_DIR="$TMP_DIR/cas_linux"
+  mkdir -p "$PION_CACHE_DIR"
+  unset PION_TARGET || true
+  if [ -s "$OUT_DIR/libpionrt_asan.a" ]; then
+    export PION_ASAN_RT_LIB="$OUT_DIR/libpionrt_asan.a"
+    export PION_RT_ASAN_LIB="$OUT_DIR/libpionrt_asan.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_tsan.a" ]; then
+    export PION_TSAN_RT_LIB="$OUT_DIR/libpionrt_tsan.a"
+  fi
+  if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
+    export PION_QBE_SAN_DIR="$OUT_DIR/qbe-san"
+    export PION_QBE_SAN="$OUT_DIR/qbe-san/qbe"
+  fi
+  ORIG_PATH="$PATH"
+  if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+    mkdir -p "$TMP_DIR/noas"
+    printf '#!/bin/sh\necho "FAIL: as invoked: $*" >&2\nexit 97\n' > "$TMP_DIR/noas/as"
+    chmod +x "$TMP_DIR/noas/as"
+    export PATH="$TMP_DIR/noas:$PATH"
+  fi
+fi
+
 # Build the parallel E2E pool command list (slowest & folded [6/6] suites first).
 # Lines without PATH="$ORIG_PATH" keep the failing-`as` PATH of this gate.
 E2E_CMDS="$TMP_DIR/e2e_cmds.txt"
@@ -577,14 +657,30 @@ cat >> "$E2E_CMDS" <<'E2E'
 sh "$ROOT_DIR/scripts/test-linux.sh" --group mbt_tests
 sh "$ROOT_DIR/scripts/test-linux.sh" --group std_tests
 sh "$ROOT_DIR/scripts/test-linux.sh" --group standalone_e2e
-# Slowest suites first so the pool packs well.
+# Slowest suites first so the pool packs well (sharded giant suites spread across workers/shards).
+PION_SHARD=0/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=1/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=2/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=3/4 PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
+PION_SHARD=0/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=1/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=2/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=3/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=4/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PION_SHARD=5/6 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p119_amd64_fp_rhs_load_fold/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC"
 # P29-C: zero-toolchain WebAssembly (--target wasm32 + runtime/pion_wasm_rt.mjs + 4 V1 benchmarks in Node.js).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC"
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC"
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC"
 # P94: Wave J3 — first-class immutable Send sequence type ImmArray[T].
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC"
@@ -681,22 +777,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIO
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC"
 # P113: AMD64 movaps XMM copies + grouped-conversion xorps + cvtsi2{ss,sd}{l,q} text width (Native + Wasm32 + ASan, --obj == as, C driver).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2e.sh" "$PIONC"
-# P114: QBE loop jump-table private spill-home store sinking (rega.c sinktablehomes; -d SR structure on 3 targets, --obj / text C differential, Pion Native + Wasm32 + ASan, bytecode_vm, ASan+UBSan QBE replay).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC"
-# P117: QBE counted-loop expansion (main.c expandloops; -d G expansions on 5 targets, --obj / text C-oracle differential, --obj == as, no back edge, fannkuchredux, ASan+UBSan QBE replay).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC"
-# P119: AMD64 scalar FP right-operand load fold (amd64/isel.c foldoperandloads; objdump structure of 20 folds / 12 controls on sysv text, win text, --obj and assembled text, --obj == text, checker mutation self-test, IEEE-754 bit + flag C differential over 4 rounding modes and misaligned operands with UBSan, ASan+UBSan QBE on 5 targets, Pion source + nbody).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p119_amd64_fp_rhs_load_fold/run_e2e.sh" "$PIONC"
 # P115: cross-package struct literal type probe uses canonical package ids (method symbols, SSA + Native + Wasm32).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC"
-# P116: Opt-Track P byte-identical compile-speed changes (QBE 1-byte lexer lookahead, filllive worklist, philive projected phi liveness, rega compact snapshots next to sinktablehomes, Mach-O keep/gen GPR masks, main-thread first unit; checking QBE oracles with ASan+UBSan on 4 targets, host C differential, --jobs 1/2/4/8 parity).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC"
-# P118: Opt-Track R (amd64 jump-table selector in the dispatch scratch register, proven zero-extension indexes the table directly, widened-word interval comparison folding; text == --obj dispatch forms, -d G folds, host C differential with dirty high halves, bytecode_vm / fannkuchredux, ASan+UBSan QBE on 4 targets).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC"
-# P120: Win64 nonvolatile xmm6..xmm15 in QBE amd64_win (xmm0..xmm5-only rsave, 128-bit movups save/restore of the used xmm6..xmm14 and the xmm15 scratch; check_frames.py + mutants, x86-64 execution of the Win64 code with all 160 bytes of xmm6..xmm15 checked, ASan+UBSan QBE replay).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
-# P122: arm64_apple guarded jump-table dispatch copies (main.c replicatedispatch; br sites on 6 targets, text == Mach-O --obj, checker mutations, both-sides-table symmetry, no copy of a table shared by a rewritten edge, 24-copy limit, 8 QBE mutants of the match conditions and limit, 243712-input C reference via arm64_apple text and --obj on macOS ARM64, bytecode_vm == C with 24 run_vm sites, ASan+UBSan QBE replay).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC"
 # P125: native String slice spans + scalar Map[String, Int|Int64] entries + managed String file reads + native Channel[String].send without duplicate deep freeze (6 programs in --release and dev: exact exit status / stdout / stderr, slice-panic side-effect traces, call-mutated map fallback, 5 file kinds vs fs_read_bytes, SSA primitive presence).
@@ -737,8 +819,6 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PION
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC"
 # P95: Wasm32 nested-loop outlining writes back inner-loop-only read+write slots (Native == Wasm32, Debug + --release).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC"
-# Wave J1: 2,500-term &&+is short-circuit (Native+Wasm32), cold/hot CAS topo const-init, xpkg mono closure const.
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
 # Wave L1-A: constant patterns, unified EIs scoping + ASan/LSan, closure fail-closed, builtin arity, test --json, struct lit & impl edit.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC"
 # Unit pattern Ok(()), self-referencing generic closure callback 2-pass infer, unannotated closure early return merge & QBE ABI.
@@ -749,6 +829,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC"
 # PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC"
+# CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/cas_pin_and_cstub_deps/run_e2e.sh" "$PIONC"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
@@ -756,36 +838,58 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
 # assembly (and cc compiles their C driver) besides `--obj`.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
 E2E
+if [ "$MODE" = "e2e" ]; then
+  printf '%s\n' 'PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"' >> "$E2E_CMDS"
+fi
 export ROOT_DIR PIONC ORIG_PATH OUT_DIR STATION_LIB_PATH
-sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
-# Join p98 (started before [6/6]); reap any straggling descendants in its session.
-P98_RC=0
-wait "$P98_PID" || P98_RC=$?
-if kill -0 -"$P98_PID" 2>/dev/null; then
-  echo "[WARN] test-linux: reaping straggler process(es) in p98 pgid $P98_PID" >&2
-  bg_kill "$P98_PID"
-fi
-P98_PID=""
-if [ "$P98_RC" -eq 0 ]; then
-  echo "[PASS] tests/e2e/p98_section_gc/run_e2e.sh (overlapped, $(( $(now_ms) - T_P98_0 )) ms since start)"
+if [ -n "$E2E_SHARD" ]; then
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" --shard "$E2E_SHARD" < "$E2E_CMDS"
 else
-  cat "$TMP_DIR/p98.log"
-  echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
-  exit 1
+  sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
 fi
-if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
-  CORE_PID=""
-else
-  CORE_PID=""
-  exit 1
+if [ "$MODE" = "full" ]; then
+  # Join p98 (started before [6/6]); reap any straggling descendants in its session.
+  P98_RC=0
+  wait "$P98_PID" || P98_RC=$?
+  if kill -0 -"$P98_PID" 2>/dev/null; then
+    echo "[WARN] test-linux: reaping straggler process(es) in p98 pgid $P98_PID" >&2
+    bg_kill "$P98_PID"
+  fi
+  P98_PID=""
+  if [ "$P98_RC" -eq 0 ]; then
+    echo "[PASS] tests/e2e/p98_section_gc/run_e2e.sh (overlapped, $(( $(now_ms) - T_P98_0 )) ms since start)"
+  else
+    cat "$TMP_DIR/p98.log"
+    echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
+    exit 1
+  fi
+  if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
+    CORE_PID=""
+  else
+    CORE_PID=""
+    exit 1
+  fi
+  if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
+    FP_ASM_PID=""
+    echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+  else
+    FP_ASM_PID=""
+    echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
+    exit 1
+  fi
 fi
-if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
-  FP_ASM_PID=""
-  echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
-else
-  FP_ASM_PID=""
-  echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
-  exit 1
+# In sharded --e2e-only mode, only shard 0 runs the fast serial post-pool checks (~4s).
+if [ -n "$E2E_SHARD" ] && [ "${E2E_SHARD%%/*}" != "0" ]; then
+  echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) E2E SHARD ${E2E_SHARD} GATES PASSED!"
+  GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+  echo "test-linux.sh --e2e-only --shard ${E2E_SHARD} duration: ${GATE_ELAPSED_S}s"
+  if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      echo "::warning title=CI duration > 60s::test-linux.sh --e2e-only --shard ${E2E_SHARD} (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 180s)"
+    fi
+    echo "[WARN] test-linux.sh --e2e-only --shard ${E2E_SHARD} (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (> 60s target)"
+  fi
+  exit 0
 fi
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC"
@@ -842,3 +946,11 @@ BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_benc
 KEEP_ALIVE=1 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
 
 echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"
+GATE_ELAPSED_S=$(( ($(now_ms) - T_GATE_START) / 1000 ))
+echo "test-linux.sh total duration: ${GATE_ELAPSED_S}s"
+if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "::warning title=CI duration > 60s::test-linux.sh (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 300s)"
+  fi
+  echo "[WARN] test-linux.sh (${LINUX_ARCH_LABEL}) took ${GATE_ELAPSED_S}s (> 60s target)"
+fi

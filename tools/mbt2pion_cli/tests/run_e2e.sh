@@ -29,6 +29,17 @@ echo "[e2e] building mbt2pion CLI with $PIONC..."
 # Link directly against the real repository `tools/mbt_compat` package (no stub!).
 COMPAT_DIR="$REPO_ROOT/tools/mbt_compat"
 
+SHARD_IDX=0
+SHARD_CNT=1
+if [ -n "${PION_SHARD:-}" ]; then
+  SHARD_IDX="${PION_SHARD%%/*}"
+  SHARD_CNT="${PION_SHARD#*/}"
+fi
+shard_has() {
+  [ "$SHARD_CNT" -le 1 ] || [ $(( $1 % SHARD_CNT )) -eq "$SHARD_IDX" ]
+}
+
+if shard_has 0; then
 # -----------------------------------------------------------------------------
 # Test 1 + 2 + 3: Golden, pionc check, pionc run, idempotency, dual clean paths
 # -----------------------------------------------------------------------------
@@ -614,17 +625,17 @@ EOF
 "$PIONC" run "$XPKG_APP"
 echo "[e2e] PASS: cross-package BUG-1..BUG-7 live pionc check + run (auto-imports, .Middle, nested T?, Ref(expr), closure init, derive ignore, Ctor(..))"
 
-# -----------------------------------------------------------------------------
-# Test 7: Round 3 Astra structural acceptance tests (P0-1, P0-2, P0-4, P1-2)
-# -----------------------------------------------------------------------------
+fi
+if shard_has 1; then
 python3 - "$BIN" "$PIONC" "$COMPAT_DIR" "$WORK/r3_tests" << 'PY'
-import json, os, stat, subprocess, sys, threading
+import hashlib, json, os, shutil, stat, subprocess, sys, threading
 
 bin_path, pionc, compat_dir, root = sys.argv[1:5]
 os.makedirs(root, exist_ok=True)
 
 def run_cli(args, cwd=None):
     return subprocess.run([bin_path] + args, capture_output=True, text=True, cwd=cwd)
+
 
 # 7a. P0-1: preserve mode 0000 file, mode 0751 binary file, symlink, empty dir + reports inside --out
 s1 = os.path.join(root, "s1")
@@ -1308,6 +1319,18 @@ for label, extra, out_rel, rep_rel, rep_key in cases_10l:
         assert rep_key in json.load(open(rp)), f"10l {label} report missing key {rep_key}"
 
 print("[e2e] PASS: Final Opus P1 suite (10l: 6/6 fresh/existing --out + report combos from cd $WORK exit 0)")
+
+PY
+fi
+if shard_has 2; then
+python3 - "$BIN" "$PIONC" "$COMPAT_DIR" "$WORK/r3_tests" << 'PY'
+import hashlib, json, os, shutil, stat, subprocess, sys, threading
+
+bin_path, pionc, compat_dir, root = sys.argv[1:5]
+os.makedirs(root, exist_ok=True)
+
+def run_cli(args, cwd=None):
+    return subprocess.run([bin_path] + args, capture_output=True, text=True, cwd=cwd)
 
 # 10m. Final Astra P0-1 + P0-2 downstream runtime acceptance:
 #      #cfg(target="js") brace-less decls (tuple struct, = "%identity", extern "js" fn) followed by kept() -> 41,
@@ -2149,6 +2172,18 @@ assert "MBT2PION_UNSUPPORTED_SYNTAX" in r2_di_bad_codes, f"R2 debug_inspect(Foo)
 
 print("[e2e] PASS: Wave M2-A Round 2 regressions (Check 2 test gate, debug_inspect quoted/unquoted/struct fail-closed)")
 
+PY
+fi
+if shard_has 3; then
+python3 - "$BIN" "$PIONC" "$COMPAT_DIR" "$WORK/r3_tests" << 'PY'
+import hashlib, json, os, shutil, stat, subprocess, sys, threading
+
+bin_path, pionc, compat_dir, root = sys.argv[1:5]
+os.makedirs(root, exist_ok=True)
+
+def run_cli(args, cwd=None):
+    return subprocess.run([bin_path] + args, capture_output=True, text=True, cwd=cwd)
+
 # ---------------------------------------------------------------------------
 # Wave M2-B E2E regressions:
 # (1) Relative `--package-manifest ../pkg/pion.toml` with `path = "../dep"` canonicalized cleanly
@@ -2887,4 +2922,5 @@ if command -v moon >/dev/null 2>&1 || [ -x "$HOME/.moon/bin/moon" ]; then
   python3 "$(dirname "$0")/run_e2_oracle.py" --pionc "$PIONC"
 fi
 
+fi
 echo "[e2e] ALL E2E TESTS PASSED!"
