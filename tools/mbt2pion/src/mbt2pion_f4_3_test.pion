@@ -383,4 +383,156 @@ test "F4-3: lower_is_chain nested as on non-struct sub-patterns" {
     "{\"ok\":true,\"diagnostics\":[]}"
   })
   assert_true(bad_res.blockers > 0, "or-pattern with nested as must fail closed")
+
+  // Red-team P0-1: nested `|` or-pattern containing `as` inside branches (`Some(A(1 as y) | B(2 as y))`) MUST fail closed!
+  let bad_or_branch_as = SourceFile::{
+    rel_path: "bad_or_branch_as.mbt",
+    content: "priv enum E { A(Int); B(Int) }\npub fn h2(opt : E?) -> Int {\n  if opt is Some(A(1 as y) | B(2 as y)) { y } else { -1 }\n}\n",
+    is_test: false,
+  }
+  let bad_or_res = transpile_package([bad_or_branch_as], empty_api_map(), default_recipes(), [], [], default_options(), [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  assert_true(bad_or_res.blockers > 0, "nested or-pattern with per-branch as must fail closed")
+}
+
+test "F4-3: P1-1/P1-2/P1-3 & Red-team P1-1 regressions (qualified field types, ghost struct, dual-ns & local shadow)" {
+  // P1-1: local types in struct fields (incl. Array[Item]/Option[Item]) are qualified with `self_pkg::`,
+  // while generic type params `T` stay unqualified; malformed field without colon marks complete=false.
+  let src_q = SourceFile::{
+    rel_path: "q.mbt",
+    content: "pub(all) struct Item { n : Int }\npub(all) struct Holder[T] {\n  one : Item\n  many : Array[Item]\n  opt : Option[Item]\n  gen : T\n}\n",
+    is_test: false,
+  }
+  let opts_q = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "pkg_q",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let res_q = transpile_package([src_q], empty_api_map(), default_recipes(), [], [], opts_q, [], false, fn(_) {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  })
+  match res_q.abi.structs {
+    Some(sts) => {
+      assert_true(sts.length() == 2 && sts[0].name == "Holder", "Holder exported")
+      let h = sts[0]
+      assert_true(h.fields[0].ty == "pkg_q::Item", "bare local type qualified")
+      assert_true(h.fields[1].ty == "Array[pkg_q::Item]", "nested Array[Item] qualified")
+      assert_true(h.fields[2].ty == "Option[pkg_q::Item]", "nested Option[Item] qualified")
+      assert_true(h.fields[3].ty == "T", "generic param T stays unqualified")
+    }
+    None => assert_true(false, "expected structs")
+  }
+  // Malformed field without colon must mark complete=false without eating next line's colon
+  let bad_field_src = SourceFile::{
+    rel_path: "bf.mbt",
+    content: "pub(all) struct Broken {\n  no_colon\n  ok : Int\n}\n",
+    is_test: false,
+  }
+  let broken_sts = collect_exported_abi_structs([bad_field_src], "p", empty_symbol_table(), default_recipes(), Map(), "native")
+  assert_true(broken_sts.length() == 1 && !broken_sts[0].complete && !broken_sts[0].can_construct, "missing colon marks complete=false")
+
+  // P1-2: Ghost struct in ABI `structs` absent from generated `.pion` must fail closed!
+  let ghost_s = AbiStructSchema::{
+    pkg: "d",
+    name: "Ghost",
+    type_params: [],
+    fields: [AbiStructField::{ src_name: "x", emit_name: "x", is_mut: false, visibility: "pub", ty: "Int" }],
+    can_construct: true,
+    can_update: true,
+    complete: true,
+  }
+  let ghost_abi = PackageAbi::{ package_name: "d", enums: [], struct_val_fields: [], structs: Some([ghost_s]), companion_files: [], op_impls: [], reexports: [], publishable: true }
+  let g_sha = compute_abi_payload_sha256(ghost_abi)
+  let g_pion = "// abi-sha256: " + g_sha + "\npub fn only_fn() -> Int { 1 }\n"
+  let g_json = render_abi_json(ghost_abi, [("lib.pion", g_pion)])
+  let d_ghost : Array[Diag] = []
+  assert_true(verify_and_parse_dep_abi("d", "/d", [("lib.pion", g_pion)], Some(g_json), d_ghost) is None && d_ghost.length() > 0 && d_ghost[0].code == "MBT2PION_DEP_ABI_ERROR", "ghost struct in ABI rejected")
+
+  // P1-3: Aliased dep registers reexports under both `dep_name` and `abi.package_name`
+  let st_al = empty_symbol_table()
+  let al_abi = PackageAbi::{
+    package_name: "real_mid",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [AbiReexport::{ name: "Thing", kind: "type", target_pkg: "orig", target_name: "Thing" }],
+    publishable: true,
+  }
+  symtab_load_dep_abi(st_al, "alias_mid", al_abi)
+  match symtab_resolve_canonical_type(st_al, "real_mid", "Thing") {
+    Ok((p, n)) => assert_true(p == "orig" && n == "Thing", "canonical pkg_name alias registered in dep_reexports_type")
+    Err(_) => assert_true(false, "expected resolved type")
+  }
+
+  // Red-team P1-1: `mid` re-exports `type Tag` from `orig` AND defines local `pub const Tag = 1`!
+  // Consumer `let x = @mid.Tag + 1` must NOT be rewritten to `@orig.Tag`, while `t : @mid.Tag` IS rewritten to `@orig.Tag`!
+  let doc_o1 = "{\"packages\":[{\"name\":\"orig\",\"items\":[{\"kind\":\"struct\",\"name\":\"Tag\",\"sig\":\"pub struct Tag { x : Int }\"},{\"kind\":\"const\",\"name\":\"Tag\",\"sig\":\"pub const Tag : Int = 100\"}]}]}"
+  let doc_o2 = "{\"packages\":[{\"name\":\"orig2\",\"items\":[{\"kind\":\"fn\",\"name\":\"Foo\",\"sig\":\"pub fn Foo(x : Int) -> Int\"}]}]}"
+  let doc_mid = "{\"packages\":[{\"name\":\"mid\",\"items\":[{\"kind\":\"const\",\"name\":\"Tag\",\"sig\":\"pub const Tag : Int = 1\"}]}]}"
+  let mid_tag_abi = PackageAbi::{
+    package_name: "mid",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [AbiReexport::{ name: "Tag", kind: "type", target_pkg: "orig", target_name: "Tag" }],
+    publishable: true,
+  }
+  let d_tag : Array[Diag] = []
+  let cons_out = rewrite_dep_reexports_v2(
+    [SourceFile::{ rel_path: "c.mbt", content: "pub fn f(t : @mid.Tag) -> Int {\n  let _ = t\n  let x = @mid.Tag + 1\n  x\n}\n", is_test: false }],
+    Map(),
+    Map(),
+    [doc_o1, doc_mid],
+    [("mid", mid_tag_abi)],
+    d_tag,
+  )
+  assert_true(d_tag.length() == 0, "local value Tag + reexported type Tag disambiguates cleanly")
+  assert_true(str_has(cons_out[0].content, "t : @orig.Tag") && str_has(cons_out[0].content, "let x = @mid.Tag + 1"), "type position rewritten, local const value preserved")
+
+  // P1-3 + Red-team P1-1: 2-hop dual-namespace different origins (`mid1 -> mid2 -> orig1/orig2`)
+  // with UpperIdent + `(` (`@mid1.Foo(v)`) MUST fail closed!
+  let mid2_dual = PackageAbi::{
+    package_name: "mid2",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "Foo", kind: "type", target_pkg: "orig", target_name: "Tag" },
+      AbiReexport::{ name: "Foo", kind: "value", target_pkg: "orig2", target_name: "Foo" },
+    ],
+    publishable: true,
+  }
+  let mid1_dual = PackageAbi::{
+    package_name: "mid1",
+    enums: [],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [
+      AbiReexport::{ name: "Foo", kind: "type", target_pkg: "mid2", target_name: "Foo" },
+      AbiReexport::{ name: "Foo", kind: "value", target_pkg: "mid2", target_name: "Foo" },
+    ],
+    publishable: true,
+  }
+  let d_amb : Array[Diag] = []
+  let _ = rewrite_dep_reexports_v2(
+    [SourceFile::{ rel_path: "amb.mbt", content: "pub fn f(x : Int) -> Int { match x { @mid1.Foo(v) => v; _ => 0 } }\n", is_test: false }],
+    Map(),
+    Map(),
+    [doc_o1, doc_o2],
+    [("mid1", mid1_dual), ("mid2", mid2_dual)],
+    d_amb,
+  )
+  assert_true(d_amb.length() > 0 && d_amb[0].code == "MBT2PION_DEP_ABI_ERROR", "2-hop dual-ns UpperIdent + LParen fails closed")
 }

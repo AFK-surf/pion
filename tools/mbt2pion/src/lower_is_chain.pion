@@ -191,6 +191,16 @@ fn peel_nested_as_tokens(
   file : String,
   as_obls : Array[(String, Int, Int)],
 ) -> Array[Token] {
+  if pattern_has_top_pipe(tokens, start, end) && pattern_contains_as_kw(tokens, start, end) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[start].line,
+      tokens[start].col,
+      "or-pattern `|` combined with nested `as` binding inside `is`-chain is not supported (fail-closed)",
+    ))
+    return []
+  }
   let out : Array[Token] = []
   let mut k = start
   while k < end {
@@ -261,7 +271,15 @@ fn peel_nested_as_tokens(
           } else {
             false
           }
-          if top_as > ps && !is_direct_struct_as {
+          if pattern_has_top_pipe(tokens, ps, pe) && pattern_contains_as_kw(tokens, ps, pe) {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[ps].line,
+              tokens[ps].col,
+              "or-pattern `|` combined with nested `as` binding inside `is`-chain is not supported (fail-closed)",
+            ))
+          } else if top_as > ps && !is_direct_struct_as {
             if top_as + 2 != pe || (tokens[top_as + 1].kind != TokenKind::Ident && tokens[top_as + 1].kind != TokenKind::Underscore) {
               ctx.diags.push(diag_error(
                 "MBT2PION_UNSUPPORTED_SYNTAX",
@@ -361,7 +379,7 @@ enum IsChainCont {
 fn expand_is_chain_as_obls(
   ctx : StageAContext,
   orig_tokens : Array[Token],
-  as_obls : Array[(Array[Token], String, Int, Int)],
+  as_obls : Array[(Array[Token], String, Int, Int, String)],
   idx : Int,
   segs : Array[(Int, Int)],
   next_seg_idx : Int,
@@ -379,7 +397,7 @@ fn expand_is_chain_as_obls(
       lower_is_chain_segs_with_block(ctx, orig_tokens, segs, next_seg_idx, file, then_lb, then_rb, wrap_some, fail_expr, bound_out, bound_seen)
     }
   }
-  let (tokens, scrut_var, raw_ps, raw_pe) = as_obls[idx]
+  let (tokens, scrut_var, raw_ps, raw_pe, scrut_ty) = as_obls[idx]
   let mut ps = raw_ps
   let mut pe = raw_pe
   while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen &&
@@ -388,7 +406,7 @@ fn expand_is_chain_as_obls(
     ps = ps + 1
     pe = pe - 1
   }
-  let tail_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  let tail_as_obls : Array[(Array[Token], String, Int, Int, String)] = []
   let mut oi = idx + 1
   while oi < as_obls.length() {
     tail_as_obls.push(as_obls[oi])
@@ -413,7 +431,7 @@ fn expand_is_chain_as_obls(
       let at = tokens[top_as + 1]
       if at.kind != TokenKind::Underscore && at.raw != "_" {
         chain_alias = resolve_ident_in_scope(ctx, at.raw)
-        record_is_chain_binder(ctx, chain_alias, "", bound_out, bound_seen)
+        record_is_chain_binder(ctx, chain_alias, scrut_ty, bound_out, bound_seen)
       }
       inner_pe = top_as
     } else {
@@ -438,23 +456,38 @@ fn expand_is_chain_as_obls(
       record_is_chain_binder(ctx, cab.0, "", bound_out, bound_seen)
     }
   }
-  let next_as_obls : Array[(Array[Token], String, Int, Int)] = []
-  for cab in child_as_raw { next_as_obls.push((tokens, cab.0, cab.1, cab.2)) }
+  let next_as_obls : Array[(Array[Token], String, Int, Int, String)] = []
+  for cab in child_as_raw { next_as_obls.push((tokens, cab.0, cab.1, cab.2, "")) }
   for tab in tail_as_obls { next_as_obls.push(tab) }
   let use_peeled = child_as_raw.length() > 0
   let p_toks = if use_peeled { peeled_toks } else { tokens }
   let p_s = if use_peeled { 0 } else { ps }
   let p_e = if use_peeled { peeled_toks.length() - 1 } else { inner_pe }
   let inner_body = if pattern_contains_struct_pat(p_toks, p_s, p_e) {
+    if scrut_ty.length() > 0 {
+      push_expected_type(ctx, scrut_ty)
+    }
     let (outer_pat_raw, raw_obls) = peel_struct_patterns_in_pat(ctx, p_toks, p_s, p_e, file)
-    let outer_pat = outer_pat_raw.trim()
+    let obls : Array[(String, Int, Int, String)] = []
     for ob in raw_obls {
+      let osname = if ob.3.length() > 0 {
+        ob.3
+      } else {
+        infer_struct_name_from_ty_and_pat(ctx, scrut_ty, p_toks, p_s, p_e, ob.1)
+      }
+      obls.push((ob.0, ob.1, ob.2, osname))
+    }
+    if scrut_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    let outer_pat = outer_pat_raw.trim()
+    for ob in obls {
       if !ctx.synth_sp_temps.contains(ob.0) {
         record_is_chain_binder(ctx, ob.0, "", bound_out, bound_seen)
       }
     }
     let ob_set : Map[String, Bool] = Map()
-    for ob in raw_obls { ob_set[ob.0] = true }
+    for ob in obls { ob_set[ob.0] = true }
     let outer_toks = lex_moonbit(outer_pat)
     let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
     for rb in outer_raw_bs {
@@ -466,7 +499,7 @@ fn expand_is_chain_as_obls(
       ctx,
       p_toks,
       orig_tokens,
-      raw_obls,
+      obls,
       0,
       next_as_obls,
       segs,
@@ -535,7 +568,7 @@ fn expand_is_chain_struct_obls_with_as(
   orig_toks : Array[Token],
   obls : Array[(String, Int, Int, String)],
   idx : Int,
-  pending_as_obls : Array[(Array[Token], String, Int, Int)],
+  pending_as_obls : Array[(Array[Token], String, Int, Int, String)],
   segs : Array[(Int, Int)],
   next_seg_idx : Int,
   file : String,
@@ -568,7 +601,7 @@ fn expand_is_chain_struct_obls_with_as(
     next_obls.push(obls[oi])
     oi = oi + 1
   }
-  let combined_as : Array[(Array[Token], String, Int, Int)] = []
+  let combined_as : Array[(Array[Token], String, Int, Int, String)] = []
   let mut fi = open_b + 1
   while fi < close_b {
     if struct_toks[fi].kind == TokenKind::Comma || struct_toks[fi].kind == TokenKind::DotDot {
@@ -590,15 +623,24 @@ fn expand_is_chain_struct_obls_with_as(
     fi + 2 < fe && struct_toks[fi + 1].kind == TokenKind::Colon {
       let fexpr = bind_var + "." + access_f
       let vs = fi + 2
-      if pattern_contains_struct_pat(struct_toks, vs, fe) {
-        let field_ty = if explicit_sname.length() > 0 {
-          match ctx.symtab.struct_field_types.get(explicit_sname) {
-            Some(fm) => match fm.get(raw_f) { Some(ft) => ft, None => "" }
-            None => ""
-          }
-        } else {
-          ""
+      let has_sp = pattern_contains_struct_pat(struct_toks, vs, fe)
+      let has_as = pattern_contains_as_kw(struct_toks, vs, fe)
+      let field_ty = if explicit_sname.length() > 0 {
+        match ctx.symtab.struct_field_types.get(explicit_sname) {
+          Some(fm) => match fm.get(raw_f) { Some(ft) => ft, None => "" }
+          None => ""
         }
+      } else {
+        ""
+      }
+      if has_sp && has_as {
+        // Field contains BOTH nested struct pattern AND `as`: route through `expand_is_chain_as_obls`
+        // with `field_ty` preserved so non-struct `as` are peeled BEFORE `peel_struct_patterns_in_pat`!
+        let ftmp = fresh_temp(ctx, "fa")
+        ctx.synth_sp_temps[ftmp] = true
+        bind_fields.push((fexpr, ftmp, true))
+        combined_as.push((struct_toks, ftmp, vs, fe, field_ty))
+      } else if has_sp {
         let (peeled_pat, child_obls) = peel_struct_patterns_in_pat(ctx, struct_toks, vs, fe, file)
         for cob in child_obls {
           if !ctx.synth_sp_temps.contains(cob.0) {
@@ -613,11 +655,11 @@ fn expand_is_chain_struct_obls_with_as(
         }
         let pp = peeled_pat.trim()
         bind_fields.push((fexpr, pp, is_irrefutable_simple_pat(pp)))
-      } else if pattern_contains_as_kw(struct_toks, vs, fe) {
+      } else if has_as {
         let ftmp = fresh_temp(ctx, "fa")
         ctx.synth_sp_temps[ftmp] = true
         bind_fields.push((fexpr, ftmp, true))
-        combined_as.push((struct_toks, ftmp, vs, fe))
+        combined_as.push((struct_toks, ftmp, vs, fe, field_ty))
       } else {
         let mut has_binder = false
         let mut bi = vs
@@ -1133,7 +1175,9 @@ fn lower_is_chain_segs(
   let lhs_s = lower_expr_range(ctx, tokens, ss, is_i, file, false).trim()
   let mut pat_s = is_i + 1
   let mut pat_e = se
-  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen && find_matching_delim(tokens, pat_s) == pat_e - 1 {
+  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, pat_s) == pat_e - 1 &&
+  !range_has_top_comma(tokens, pat_s + 1, pat_e - 1) {
     pat_s = pat_s + 1
     pat_e = pat_e - 1
   }
@@ -1178,12 +1222,12 @@ fn lower_is_chain_segs(
   } else {
     []
   }
-  let seg_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  let seg_as_obls : Array[(Array[Token], String, Int, Int, String)] = []
   for aob in raw_as_obls {
     if !ctx.synth_sp_temps.contains(aob.0) {
       record_is_chain_binder(ctx, aob.0, "", bound_out, bound_seen)
     }
-    seg_as_obls.push((tokens, aob.0, aob.1, aob.2))
+    seg_as_obls.push((tokens, aob.0, aob.1, aob.2, ""))
   }
   let use_peeled_as = raw_as_obls.length() > 0
   let p_toks = if use_peeled_as { peeled_as_toks } else { tokens }
@@ -1506,7 +1550,9 @@ fn lower_is_chain_segs_with_block(
   let lhs_s = lower_expr_range(ctx, tokens, ss, is_i, file, false).trim()
   let mut pat_s = is_i + 1
   let mut pat_e = se
-  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen && find_matching_delim(tokens, pat_s) == pat_e - 1 {
+  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, pat_s) == pat_e - 1 &&
+  !range_has_top_comma(tokens, pat_s + 1, pat_e - 1) {
     pat_s = pat_s + 1
     pat_e = pat_e - 1
   }
@@ -1551,12 +1597,12 @@ fn lower_is_chain_segs_with_block(
   } else {
     []
   }
-  let seg_as_obls : Array[(Array[Token], String, Int, Int)] = []
+  let seg_as_obls : Array[(Array[Token], String, Int, Int, String)] = []
   for aob in raw_as_obls {
     if !ctx.synth_sp_temps.contains(aob.0) {
       record_is_chain_binder(ctx, aob.0, "", bound_out, bound_seen)
     }
-    seg_as_obls.push((tokens, aob.0, aob.1, aob.2))
+    seg_as_obls.push((tokens, aob.0, aob.1, aob.2, ""))
   }
   let use_peeled_as = raw_as_obls.length() > 0
   let p_toks = if use_peeled_as { peeled_as_toks } else { tokens }

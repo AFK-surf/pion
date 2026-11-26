@@ -297,6 +297,43 @@ pub fn abi_struct_is_externally_expandable(s : AbiStructSchema) -> Bool {
   true
 }
 
+///| Qualify bare identifiers in `ty` that name a local type of `pkg` (and not a generic param)
+///| as `pkg::Name`, preserving already-qualified paths (`a::B`) and type prefixes (`B::C`).
+fn qualify_abi_local_type_names(
+  ty : String,
+  pkg : String,
+  local_types : Map[String, Bool],
+  generics : Map[String, Bool],
+) -> String {
+  if pkg.length() == 0 || local_types.length() == 0 || ty.length() == 0 {
+    return ty
+  }
+  let sb = StringBuilder()
+  let n = ty.length()
+  let mut i = 0
+  while i < n {
+    let c = ty.code_unit_at(i)
+    if is_alnum(c) {
+      let s = i
+      while i < n && is_alnum(ty.code_unit_at(i)) {
+        i = i + 1
+      }
+      let word = ty.slice(s, i)
+      let qualified_before = s >= 2 && ty.code_unit_at(s - 1) == 58 && ty.code_unit_at(s - 2) == 58
+      let path_after = i + 1 < n && ty.code_unit_at(i) == 58 && ty.code_unit_at(i + 1) == 58
+      if !qualified_before && !path_after && local_types.contains(word) && !generics.contains(word) {
+        sb.write_string(pkg + "::" + word)
+      } else {
+        sb.write_string(word)
+      }
+    } else {
+      sb.write_string(ty.slice(i, i + 1))
+      i = i + 1
+    }
+  }
+  sb.to_string()
+}
+
 ///| Extract exported `pub` / `pub(all)` braced struct schemas from non-test MoonBit sources,
 ///| preserving exact field declaration order, mutability, visibility, type params, and rename map.
 pub fn collect_exported_abi_structs(
@@ -361,11 +398,13 @@ pub fn collect_exported_abi_structs(
         let sname = tokens[i + 1].raw
         let mut lb = i + 2
         let mut tparams : Array[String] = []
+        let tparam_set : Map[String, Bool] = Map()
         let added_g : Array[String] = []
         if lb < n && tokens[lb].kind == TokenKind::LBracket {
           let close_gb = find_matching_delim(tokens, lb)
           tparams = collect_generic_param_names(tokens, lb, close_gb)
           for gp in tparams {
+            tparam_set[gp] = true
             if !symtab.active_generics.contains(gp) {
               symtab.active_generics[gp] = true
               added_g.push(gp)
@@ -421,9 +460,17 @@ pub fn collect_exported_abi_structs(
               }
               let mut fc = fi + 1
               while fc < rb && tokens[fc].kind != TokenKind::Colon {
+                if tokens[fc].kind == TokenKind::Semi || tokens[fc].kind == TokenKind::Comma || tokens[fc].newline_before {
+                  break
+                }
                 fc = fc + 1
               }
-              let mut f_end = if fc < rb { fc + 1 } else { fi + 1 }
+              if fc >= rb || tokens[fc].kind != TokenKind::Colon {
+                complete = false
+                fi = if fc > fi { fc } else { fi + 1 }
+                continue
+              }
+              let mut f_end = fc + 1
               let mut fd = 0
               while f_end < rb {
                 let fk = tokens[f_end].kind
@@ -436,12 +483,13 @@ pub fn collect_exported_abi_structs(
                 }
                 f_end = f_end + 1
               }
-              let fty = if fc < rb && f_end > fc + 1 {
+              let fty_raw = if f_end > fc + 1 {
                 lower_type_tokens(tokens, fc + 1, f_end, symtab, recipes).trim()
               } else {
                 complete = false
                 ""
               }
+              let fty = qualify_abi_local_type_names(fty_raw, self_pkg, symtab.local_types, tparam_set)
               if raw_f.length() == 0 || emit_f.length() == 0 || fty.length() == 0 ||
               seen_src.contains(raw_f) || seen_emit.contains(emit_f) {
                 complete = false
@@ -1781,7 +1829,16 @@ pub fn verify_and_parse_dep_abi(
             ))
             return None
           }
-          None => ()
+          None => {
+            diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              dep_path + "/mbt2pion_abi.json",
+              1,
+              1,
+              "struct `" + st.name + "` declared in ABI `structs` does not exist in generated `.pion` files of dep `" + dep_name + "`",
+            ))
+            return None
+          }
         }
       }
     }
@@ -2220,52 +2277,75 @@ fn rewrite_reexport_snippet_v2(
       let nm = toks[i + 2].raw
       let t_opt : Option[AbiReexport] = match idx.dep_re_type.get(dep_pkg) { Some(m) => m.get(nm), None => None }
       let v_opt : Option[AbiReexport] = match idx.dep_re_value.get(dep_pkg) { Some(m) => m.get(nm), None => None }
-      let chosen_kind_opt : Option[String] = match (t_opt, v_opt) {
-        (Some(_), None) => Some("type")
-        (None, Some(_)) => Some("value")
-        (Some(tr), Some(vr)) =>
-        if tr.target_pkg == vr.target_pkg && tr.target_name == vr.target_name {
-          Some("type")
-        } else {
-          let next_is_cc_or_br = i + 3 < n && (toks[i + 3].kind == TokenKind::ColonColon || toks[i + 3].kind == TokenKind::LBracket)
-          let next_is_lp = i + 3 < n && toks[i + 3].kind == TokenKind::LParen
-          let prev_is_type_ctx = i > 0 && (toks[i - 1].kind == TokenKind::Colon || toks[i - 1].kind == TokenKind::Arrow ||
-            (toks[i - 1].kind == TokenKind::Keyword && (toks[i - 1].raw == "type" || toks[i - 1].raw == "as")))
-          if next_is_cc_or_br || prev_is_type_ctx {
-            Some("type")
-          } else if next_is_lp {
-            Some("value")
-          } else {
-            diags.push(diag_error(
-              "MBT2PION_DEP_ABI_ERROR",
-              file,
-              t.line,
-              t.col,
-              "ambiguous dual-namespace re-export `@" + raw_pkg + "." + nm + "` (both type and value re-exported from different origins)",
-            ))
-            None
-          }
+      if t_opt is Some(_) || v_opt is Some(_) {
+        let dep_has_local_type = match idx.pub_types.get(dep_pkg) { Some(m) => m.contains(nm), None => false }
+        let dep_has_local_val = match idx.pub_values.get(dep_pkg) { Some(m) => m.contains(nm), None => false }
+        let canon_type_opt : Option[(String, String)] = match t_opt {
+          Some(_) => resolve_reexport_chain_v2(dep_pkg, nm, "type", idx, file, t.line, t.col, diags)
+          None => if dep_has_local_type { Some((dep_pkg, nm)) } else { None }
         }
-        (None, None) => None
-      }
-      match chosen_kind_opt {
-        Some(ck) =>
-        match resolve_reexport_chain_v2(dep_pkg, nm, ck, idx, file, t.line, t.col, diags) {
-          Some((tpkg, tname)) =>
-          if !idx.known_pkgs.contains(tpkg) {
-            diags.push(diag_error(
-              "MBT2PION_DEP_ABI_ERROR",
-              file,
-              t.line,
-              t.col,
-              "missing transitive `--dep " + tpkg + "=...`",
-            ))
+        let canon_val_opt : Option[(String, String)] = match v_opt {
+          Some(_) => resolve_reexport_chain_v2(dep_pkg, nm, "value", idx, file, t.line, t.col, diags)
+          None => if dep_has_local_val { Some((dep_pkg, nm)) } else { None }
+        }
+        let target_opt : Option[(String, String, Bool)] = match (canon_type_opt, canon_val_opt) {
+          (Some((tp, tn)), None) => Some((tp, tn, t_opt is Some(_)))
+          (None, Some((vp, vn))) => Some((vp, vn, v_opt is Some(_)))
+          (Some((tp, tn)), Some((vp, vn))) =>
+          if tp == vp && tn == vn {
+            Some((tp, tn, t_opt is Some(_) || v_opt is Some(_)))
           } else {
-            edits.push((toks[i].start_byte, toks[i + 2].end_byte, "@" + tpkg + "." + tname))
+            let next_is_cc_or_br = i + 3 < n && (toks[i + 3].kind == TokenKind::ColonColon || toks[i + 3].kind == TokenKind::LBracket)
+            let next_is_lp = i + 3 < n && toks[i + 3].kind == TokenKind::LParen
+            let prev_is_type_ctx = i > 0 && (toks[i - 1].kind == TokenKind::Colon || toks[i - 1].kind == TokenKind::Arrow ||
+              (toks[i - 1].kind == TokenKind::Keyword && (toks[i - 1].raw == "type" || toks[i - 1].raw == "as")))
+            let prev_is_val_op = i > 0 && (toks[i - 1].kind == TokenKind::Eq || toks[i - 1].kind == TokenKind::Plus ||
+              toks[i - 1].kind == TokenKind::Minus || toks[i - 1].kind == TokenKind::Star || toks[i - 1].kind == TokenKind::Slash ||
+              toks[i - 1].kind == TokenKind::Percent || toks[i - 1].kind == TokenKind::EqEq || toks[i - 1].kind == TokenKind::BangEq ||
+              toks[i - 1].kind == TokenKind::Lt || toks[i - 1].kind == TokenKind::LtEq || toks[i - 1].kind == TokenKind::Gt ||
+              toks[i - 1].kind == TokenKind::GtEq || toks[i - 1].kind == TokenKind::AmpAmp || toks[i - 1].kind == TokenKind::PipePipe ||
+              toks[i - 1].kind == TokenKind::Bang || (toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "return"))
+            let next_is_val_op = i + 3 < n && (toks[i + 3].kind == TokenKind::Plus || toks[i + 3].kind == TokenKind::Minus ||
+              toks[i + 3].kind == TokenKind::Star || toks[i + 3].kind == TokenKind::Slash || toks[i + 3].kind == TokenKind::Percent ||
+              toks[i + 3].kind == TokenKind::EqEq || toks[i + 3].kind == TokenKind::BangEq || toks[i + 3].kind == TokenKind::Lt ||
+              toks[i + 3].kind == TokenKind::LtEq || toks[i + 3].kind == TokenKind::Gt || toks[i + 3].kind == TokenKind::GtEq ||
+              toks[i + 3].kind == TokenKind::AmpAmp || toks[i + 3].kind == TokenKind::PipePipe)
+            if next_is_cc_or_br || prev_is_type_ctx {
+              Some((tp, tn, t_opt is Some(_)))
+            } else if next_is_lp && toks[i + 2].kind == TokenKind::Ident {
+              Some((vp, vn, v_opt is Some(_)))
+            } else if !next_is_lp && (prev_is_val_op || next_is_val_op) {
+              Some((vp, vn, v_opt is Some(_)))
+            } else {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                file,
+                t.line,
+                t.col,
+                "ambiguous dual-namespace reference `@" + raw_pkg + "." + nm + "` (type `" + tp + "::" + tn + "` vs value `" + vp + "::" + vn + "`)",
+              ))
+              None
+            }
+          }
+          (None, None) => None
+        }
+        match target_opt {
+          Some((tpkg, tname, should_rewrite)) =>
+          if should_rewrite {
+            if !idx.known_pkgs.contains(tpkg) {
+              diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                file,
+                t.line,
+                t.col,
+                "missing transitive `--dep " + tpkg + "=...`",
+              ))
+            } else {
+              edits.push((toks[i].start_byte, toks[i + 2].end_byte, "@" + tpkg + "." + tname))
+            }
           }
           None => ()
         }
-        None => ()
       }
       i = i + 3
       continue
