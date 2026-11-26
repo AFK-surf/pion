@@ -801,6 +801,81 @@ pub fn f(p : Pair2) -> Int {
   s
 }
 ''', "MBT2PION_ARRAY_ITER_MUTATION", ".clear(..)"),
+    "for_in_flow_items_same_elem_param": (r'''
+struct Box { items : Array[Int] }
+fn get_items(b : Box) -> Array[Int] { b.items }
+fn mutate_other(ys : Array[Int]) -> Unit { ys.clear() }
+pub fn f(b : Box, ys : Array[Int]) -> Int {
+  let mut s = 0
+  for x in get_items(b) {
+    mutate_other(ys)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_other"),
+    "for_in_nested_stage_same_elem_param": (r'''
+struct Grid { grid : Array[Array[Int]] }
+fn mutate_other(ys : Array[Int]) -> Unit { ys.clear() }
+pub fn f(g : Grid, ti : Int, ys : Array[Int]) -> Int {
+  let mut s = 0
+  for x in g.grid[ti] {
+    mutate_other(ys)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_other"),
+    "for_in_field_alias_passed_to_helper": (r'''
+struct Box { items : Array[Int] }
+fn mutate_other(ys : Array[Int]) -> Unit { ys.clear() }
+pub fn f(b : Box) -> Int {
+  let alias = b.items
+  let mut s = 0
+  for x in b.items {
+    mutate_other(alias)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_other"),
+    "for_in_param_same_elem_passed_to_helper": (r'''
+fn mutate_other(ys : Array[Int]) -> Unit { ys.clear() }
+pub fn f(xs : Array[Int], ys : Array[Int]) -> Int {
+  let mut s = 0
+  for x in xs {
+    mutate_other(ys)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_other"),
+    "for_in_ret_field_second_owner_param_wipe": (r'''
+struct Box { items : Array[Int] }
+fn get_items_2(dummy : Int, b : Box) -> Array[Int] { let _ = dummy; b.items }
+fn wipe_items(b : Box) -> Unit { b.items.clear() }
+pub fn f(b : Box) -> Int {
+  let mut s = 0
+  for x in get_items_2(0, b) {
+    wipe_items(b)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "wipe_items"),
+    "for_in_nested_field_poisoned_by_non_nested": (r'''
+struct NestMix { mixed : Array[Array[Int]] }
+struct FlatMix { mixed : Array[Int] }
+fn mutate_str(ys : Array[String]) -> Unit { ys.clear() }
+pub fn f(nm : NestMix, ys : Array[String]) -> Int {
+  let mut s = 0
+  for x in nm.mixed[0] {
+    mutate_str(ys)
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "mutate_str"),
 }
 
 

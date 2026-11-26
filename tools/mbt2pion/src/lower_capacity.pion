@@ -2419,7 +2419,8 @@ fn name_binding_count(tokens : Array[Token], body_open : Int, name : String) -> 
           binds = before.raw == "let" || before.raw == "fn" || after == "=>" || after == "=" ||
           before.kind == TokenKind::Ident && c0 >= 65 && c0 <= 90
         }
-        if !binds && nx.kind == TokenKind::Colon {
+        if !binds && nx.kind == TokenKind::Colon &&
+        o > enclosing_open(tokens, k, f, TokenKind::LBrace) {
           binds = true
         }
         if !binds && pk.kind == TokenKind::Comma && nx.raw == "in" {
@@ -3003,6 +3004,8 @@ pub struct CapFnEffect {
   mut may_pass_param_to_dep : Bool
   // Positional parameter indices (0-based) passed directly to a cross-package `dep::f(param)` call.
   dep_escaped_params : Map[Int, Bool]
+  // Positional parameter indices (0-based) declared with a concrete built-in scalar type (cannot receive an Array/struct).
+  scalar_params : Map[Int, Bool]
   // Package-level global array names mutated (shrink/shift/shrink_to_fit) directly or transitively.
   mutated_globals : Map[String, Bool]
   // Struct field names (`.field`) mutated (shrink/shift/shrink_to_fit), grown, or written directly or transitively.
@@ -3087,8 +3090,8 @@ pub struct CapPkgSummary {
   distinct_array_fields : Map[String, Bool]
   // Package functions/methods whose every return path yields a fresh, non-escaping `Array`.
   fn_ret_fresh_array : Map[String, Bool]
-  // Package functions/methods whose every return path yields either a fresh `Array` or the same struct `Array` field `F`.
-  fn_ret_field : Map[String, String]
+  // Package functions/methods whose every return path yields either a fresh `Array` or the same struct `Array` field `(owner_param_idx, field_name)`.
+  fn_ret_field : Map[String, (Int, String)]
   // Struct closure fields `(e.f)()` proven safe: struct is non-pub or field is `priv`, and every
   // construction/assignment in the package assigns a pure closure literal.
   safe_closure_fields : Map[String, Bool]
@@ -3485,6 +3488,7 @@ fn collect_struct_field_types_from_tokens(
                 let prev_abi = match arr_bi.get(fname) { Some(v) => v, None => true }
                 arr_bi[fname] = prev_abi && is_builtin_eq_type_name(elem)
                 add_elem_set(fname, elem)
+                nested_arr_elems[fname] = ""
               } else if ts[k + 2].raw == "Array" && k + 3 < close && ts[k + 3].kind == TokenKind::LBracket {
                 arr_elems[fname] = ""
                 arr_bi[fname] = false
@@ -3501,6 +3505,7 @@ fn collect_struct_field_types_from_tokens(
                       }
                     } else {
                       arr_elem_unk[fname] = true
+                      nested_arr_elems[fname] = ""
                     }
                   } else if ts[k + 4].kind == TokenKind::LParen && find_matching_delim(ts, k + 4) == rb_arr - 1 {
                     let tup_ty = canonical_type_span(ts, k + 4, rb_arr)
@@ -3509,16 +3514,20 @@ fn collect_struct_field_types_from_tokens(
                     } else {
                       arr_elem_unk[fname] = true
                     }
+                    nested_arr_elems[fname] = ""
                   } else {
                     arr_elem_unk[fname] = true
+                    nested_arr_elems[fname] = ""
                   }
                 } else {
                   arr_elem_unk[fname] = true
+                  nested_arr_elems[fname] = ""
                 }
               } else {
                 // Any non-`Array[Plain]` declaration of `fname` (e.g. `Bag` with custom `op_get`) poisons array elem tables
                 arr_elems[fname] = ""
                 arr_bi[fname] = false
+                nested_arr_elems[fname] = ""
               }
             }
             k = k + 1
@@ -3585,7 +3594,13 @@ fn summary_fn_may_hazard_array(summary : CapPkgSummary, name : String) -> Bool {
 }
 
 ///| True iff expression slice `ts[s..e]` (inclusive) is a syntactically fresh array constructor.
-fn expr_is_fresh_array_init(ts : Array[Token], s_in : Int, e_in : Int) -> Bool {
+fn expr_is_fresh_array_init(
+  ts : Array[Token],
+  s_in : Int,
+  e_in : Int,
+  by_name : Map[String, Array[String]],
+  dep_methods : Map[String, Bool],
+) -> Bool {
   let mut s = s_in
   let mut e = e_in
   while s < e && ts[s].kind == TokenKind::LParen && find_matching_delim(ts, s) == e {
@@ -3610,7 +3625,8 @@ fn expr_is_fresh_array_init(ts : Array[Token], s_in : Int, e_in : Int) -> Bool {
         return true
       }
     }
-    if lp >= s + 2 && ts[lp - 2].kind == TokenKind::Dot && (ts[lp - 1].raw == "copy" || ts[lp - 1].raw == "to_array") {
+    if lp >= s + 2 && ts[lp - 2].kind == TokenKind::Dot && (ts[lp - 1].raw == "copy" || ts[lp - 1].raw == "to_array") &&
+    !by_name.contains(ts[lp - 1].raw) && !dep_methods.contains(ts[lp - 1].raw) {
       return true
     }
   }
@@ -3618,10 +3634,12 @@ fn expr_is_fresh_array_init(ts : Array[Token], s_in : Int, e_in : Int) -> Bool {
 }
 
 ///| Collect non-pub struct `Array` fields that are exclusively initialized with fresh arrays,
-///| never reassigned, and never escape (only accessed via `.method(..)`, `[idx]`, `for .. in`, or `mbt_compat::arr_*`).
+///| never reassigned, and never escape (only accessed via built-in `.method(..)`, `[idx]`, `for .. in`, or `mbt_compat::arr_*` arg0).
 fn collect_distinct_array_fields(
   all_tokens : Array[Array[Token]],
   array_fields : Map[String, Bool],
+  by_name : Map[String, Array[String]],
+  dep_methods : Map[String, Bool],
 ) -> Map[String, Bool] {
   let cand : Map[String, Bool] = Map()
   let disqualified : Map[String, Bool] = Map()
@@ -3672,6 +3690,67 @@ fn collect_distinct_array_fields(
   if cand.length() == 0 {
     return cand
   }
+  let is_fresh_moved_local = fn(ts : Array[Token], v_pos : Int, bo : Int) -> Bool {
+    if bo < 0 || ts[v_pos].kind != TokenKind::Ident {
+      return false
+    }
+    let vnm = ts[v_pos].raw
+    let bc = find_matching_delim(ts, bo)
+    if bc <= bo || !fresh_local_binding(ts, vnm, bo, v_pos, false) {
+      return false
+    }
+    let rhs_blk = enclosing_open(ts, v_pos, bo, TokenKind::LBrace)
+    let stmt_blk = if rhs_blk > bo { enclosing_open(ts, rhs_blk, bo, TokenKind::LBrace) } else { bo }
+    let mut let_pos = -1
+    let mut vi = bo + 1
+    while vi < bc {
+      if ts[vi].kind == TokenKind::Ident && ts[vi].raw == vnm &&
+      !(vi > bo + 1 && (ts[vi - 1].kind == TokenKind::Dot || ts[vi - 1].kind == TokenKind::ColonColon)) {
+        let is_let_decl = (vi > bo + 1 && ts[vi - 1].raw == "let") || (vi > bo + 2 && ts[vi - 1].raw == "mut" && ts[vi - 2].raw == "let")
+        let is_field_label = vi + 1 < bc && ts[vi + 1].kind == TokenKind::Colon &&
+        !(vi > bo + 1 && (ts[vi - 1].raw == "let" || ts[vi - 1].raw == "mut"))
+        if is_let_decl {
+          if let_pos >= 0 || enclosing_open(ts, vi, bo, TokenKind::LBrace) != stmt_blk {
+            return false
+          }
+          let_pos = vi
+        } else if is_field_label || vi == v_pos {
+          ()
+        } else {
+          let vn = vi + 1
+          let v_dot = vn + 2 < bc && ts[vn].kind == TokenKind::Dot &&
+          ts[vn + 1].kind == TokenKind::Ident && ts[vn + 2].kind == TokenKind::LParen &&
+          is_builtin_first_order_method(ts[vn + 1].raw) && !dep_methods.contains(ts[vn + 1].raw)
+          let v_idx = vn < bc && ts[vn].kind == TokenKind::LBracket
+          let mut v_compat = false
+          if vn < bc && (ts[vn].kind == TokenKind::Comma || ts[vn].kind == TokenKind::RParen) {
+            let vlp = enclosing_open(ts, vi, bo, TokenKind::LParen)
+            if vlp >= 3 && ts[vlp - 2].kind == TokenKind::ColonColon && ts[vlp - 3].raw == "mbt_compat" &&
+            ts[vlp - 1].raw.starts_with("arr_") && ts[vlp - 1].raw != "arr_iter" {
+              let mut has_comma = false
+              let mut vci = vlp + 1
+              let mut vcd = 0
+              while vci < vi {
+                let vck = ts[vci].kind
+                if vck == TokenKind::LParen || vck == TokenKind::LBracket || vck == TokenKind::LBrace { vcd = vcd + 1 }
+                else if vck == TokenKind::RParen || vck == TokenKind::RBracket || vck == TokenKind::RBrace { vcd = vcd - 1 }
+                else if vcd == 0 && vck == TokenKind::Comma { has_comma = true; break }
+                vci = vci + 1
+              }
+              if !has_comma {
+                v_compat = true
+              }
+            }
+          }
+          if !(v_dot || v_idx || v_compat) {
+            return false
+          }
+        }
+      }
+      vi = vi + 1
+    }
+    let_pos >= 0
+  }
   // 2-4. Audit every struct literal init, punning, reassignment, and `.f` usage across the package.
   let seen_init : Map[String, Bool] = Map()
   for ts in all_tokens {
@@ -3681,7 +3760,8 @@ fn collect_distinct_array_fields(
       let tk = ts[i]
       if tk.kind == TokenKind::Ident && cand.contains(tk.raw) {
         let bo = outermost_body_open(ts, i)
-        if bo >= 0 && !is_type_decl_brace(ts, bo) {
+        if !(bo >= 0 && is_type_decl_brace(ts, bo)) {
+          let lim_open = if bo >= 0 { bo } else { 0 }
           if i > 0 && ts[i - 1].kind == TokenKind::Dot {
             // Field access `<x>.f`: must NOT be reassigned and must NOT escape!
             let next_i = i + 1
@@ -3689,16 +3769,31 @@ fn collect_distinct_array_fields(
               cand.remove(tk.raw)
             } else {
               let safe_dot_method = next_i + 2 < n && ts[next_i].kind == TokenKind::Dot &&
-              ts[next_i + 1].kind == TokenKind::Ident && ts[next_i + 2].kind == TokenKind::LParen
+              ts[next_i + 1].kind == TokenKind::Ident && ts[next_i + 2].kind == TokenKind::LParen &&
+              is_builtin_first_order_method(ts[next_i + 1].raw) &&
+              !dep_methods.contains(ts[next_i + 1].raw)
               let safe_index = next_i < n && ts[next_i].kind == TokenKind::LBracket
-              let safe_for_in = next_i < n && ts[next_i].kind == TokenKind::LBrace &&
+              let safe_for_in = bo >= 0 && next_i < n && ts[next_i].kind == TokenKind::LBrace &&
               is_loop_body_brace(ts, next_i, bo)
               let mut safe_compat_arg = false
               if next_i < n && (ts[next_i].kind == TokenKind::Comma || ts[next_i].kind == TokenKind::RParen) {
-                let lp = enclosing_open(ts, i, bo, TokenKind::LParen)
+                let lp = enclosing_open(ts, i, lim_open, TokenKind::LParen)
                 if lp >= 3 && ts[lp - 2].kind == TokenKind::ColonColon && ts[lp - 3].raw == "mbt_compat" &&
-                ts[lp - 1].raw.starts_with("arr_") {
-                  safe_compat_arg = true
+                ts[lp - 1].raw.starts_with("arr_") && ts[lp - 1].raw != "arr_iter" {
+                  // Must be argument 0 (`arg_ord == 0`): e.g. `arr_push(grid, p.shelves)` escapes at arg 1!
+                  let mut has_comma_before = false
+                  let mut ci = lp + 1
+                  let mut cd = 0
+                  while ci < i {
+                    let ck = ts[ci].kind
+                    if ck == TokenKind::LParen || ck == TokenKind::LBracket || ck == TokenKind::LBrace { cd = cd + 1 }
+                    else if ck == TokenKind::RParen || ck == TokenKind::RBracket || ck == TokenKind::RBrace { cd = cd - 1 }
+                    else if cd == 0 && ck == TokenKind::Comma { has_comma_before = true; break }
+                    ci = ci + 1
+                  }
+                  if !has_comma_before {
+                    safe_compat_arg = true
+                  }
                 }
               }
               if !(safe_dot_method || safe_index || safe_for_in || safe_compat_arg) {
@@ -3708,7 +3803,7 @@ fn collect_distinct_array_fields(
           } else if i + 1 < n && ts[i + 1].kind == TokenKind::Colon {
             // Struct literal field init `f: <rhs>` (skip `let f : Type` and param `f : Type`!)
             let is_let_or_param = (i > 0 && (ts[i - 1].raw == "let" || ts[i - 1].raw == "mut")) ||
-            (enclosing_open(ts, i, bo, TokenKind::LParen) > enclosing_open(ts, i, bo, TokenKind::LBrace))
+            (enclosing_open(ts, i, lim_open, TokenKind::LParen) > enclosing_open(ts, i, lim_open, TokenKind::LBrace))
             if !is_let_or_param {
               seen_init[tk.raw] = true
               let rhs_s = i + 2
@@ -3725,16 +3820,21 @@ fn collect_distinct_array_fields(
                 }
                 rhs_e = rhs_e + 1
               }
-              if !expr_is_fresh_array_init(ts, rhs_s, rhs_e - 1) {
+              let fresh_rhs = expr_is_fresh_array_init(ts, rhs_s, rhs_e - 1, by_name, dep_methods) ||
+              (rhs_s == rhs_e - 1 && is_fresh_moved_local(ts, rhs_s, bo))
+              if !fresh_rhs {
                 cand.remove(tk.raw)
               }
             }
           } else if i > 0 && (ts[i - 1].kind == TokenKind::LBrace || ts[i - 1].kind == TokenKind::Comma) &&
           i + 1 < n && (ts[i + 1].kind == TokenKind::Comma || ts[i + 1].kind == TokenKind::RBrace) {
-            // Struct literal punning `{ f }` passes a variable/param -> disqualify!
-            let ob = enclosing_open(ts, i, bo, TokenKind::LBrace)
-            if ob > bo && ob > 0 && ts[ob - 1].kind == TokenKind::ColonColon {
-              cand.remove(tk.raw)
+            // Struct literal punning `{ f }`: only allowed if `f` is a single-move fresh non-escaping local!
+            let ob = enclosing_open(ts, i, lim_open, TokenKind::LBrace)
+            if ob > 0 && ts[ob - 1].kind == TokenKind::ColonColon {
+              seen_init[tk.raw] = true
+              if !is_fresh_moved_local(ts, i, bo) {
+                cand.remove(tk.raw)
+              }
             }
           }
         }
@@ -3943,7 +4043,7 @@ fn local_or_param_never_escapes(
       if i + 3 < body_close && ts[i + 1].kind == TokenKind::Dot && ts[i + 2].kind == TokenKind::Ident &&
       ts[i + 3].kind == TokenKind::LParen {
         let m = ts[i + 2].raw
-        if is_builtin_first_order_method(m) {
+        if is_builtin_first_order_method(m) && !dep_methods.contains(m) {
           i = i + 1
           continue
         }
@@ -3995,8 +4095,8 @@ fn local_or_param_never_escapes(
             else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
             ai = ai + 1
           }
-          if lp >= 3 && ts[lp - 2].kind == TokenKind::ColonColon && ts[lp - 3].raw == "mbt_compat" &&
-          ts[lp - 1].raw.starts_with("arr_") {
+          if arg_ord == 0 && lp >= 3 && ts[lp - 2].kind == TokenKind::ColonColon && ts[lp - 3].raw == "mbt_compat" &&
+          ts[lp - 1].raw.starts_with("arr_") && ts[lp - 1].raw != "arr_iter" {
             i = i + 1
             continue
           }
@@ -4049,27 +4149,38 @@ fn local_or_param_never_escapes(
   true
 }
 
-///| Extract root identifier of the first argument inside `lp+1 .. rp`.
-fn first_arg_root(tokens : Array[Token], as_ : Int, ae_ : Int) -> String {
-  if as_ >= ae_ {
+///| Extract root identifier of the 0-based `target_idx`-th argument inside `as_..ae_`.
+fn nth_arg_root(tokens : Array[Token], as_ : Int, ae_ : Int, target_idx : Int) -> String {
+  if target_idx < 0 || as_ >= ae_ {
     return ""
   }
-  let mut a0_end = as_
+  let mut cur_idx = 0
+  let mut seg_s = as_
+  let mut i = as_
   let mut ad = 0
-  while a0_end < ae_ {
-    let ak = tokens[a0_end].kind
-    if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
-    else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
-    else if ad == 0 && ak == TokenKind::Comma { break }
-    a0_end = a0_end + 1
+  while i <= ae_ {
+    let at_end = i == ae_
+    let is_comma = !at_end && ad == 0 && tokens[i].kind == TokenKind::Comma
+    if at_end || is_comma {
+      if cur_idx == target_idx {
+        let mut s = seg_s
+        let mut e = i - 1
+        while s < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e {
+          s = s + 1
+          e = e - 1
+        }
+        return if e >= s { receiver_root(tokens, e) } else { "" }
+      }
+      cur_idx = cur_idx + 1
+      seg_s = i + 1
+    } else {
+      let ak = tokens[i].kind
+      if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+      else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+    }
+    i = i + 1
   }
-  let mut s = as_
-  let mut e = a0_end - 1
-  while s < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e {
-    s = s + 1
-    e = e - 1
-  }
-  if e >= s { receiver_root(tokens, e) } else { "" }
+  ""
 }
 
 ///| Build declaration-bound `CapPkgSummary` from pre-lexed package tokens (zero re-lexing).
@@ -4108,6 +4219,7 @@ pub fn collect_cap_pkg_summary(
   let decl_open_map : Map[String, Int] = Map()
   let decl_close_map : Map[String, Int] = Map()
   let decl_params_map : Map[String, Array[(Int, String)]] = Map()
+  let decl_param_idx_map : Map[String, Map[String, Int]] = Map()
   let decl_is_known : Map[String, Bool] = Map()
 
   let register_decl = fn(
@@ -4129,6 +4241,7 @@ pub fn collect_cap_pkg_summary(
       may_call_opaque: false,
       may_pass_param_to_dep: false,
       dep_escaped_params: Map(),
+      scalar_params: Map(),
       mutated_globals: Map(),
       mutated_fields: Map(),
       grew_fields: Map(),
@@ -4153,8 +4266,14 @@ pub fn collect_cap_pkg_summary(
         else if pkk == TokenKind::RBracket { brack_d = brack_d - 1 }
         else if paren_d == 1 && brack_d == 0 && (pkk == TokenKind::Ident || ts[pk].raw == "self") && ts[pk + 1].kind == TokenKind::Colon {
           fn_param_idx[ts[pk].raw] = p_ord
-          if pk + 2 < body_open && ts[pk + 2].raw == "Array" {
-            fn_arr_params[ts[pk].raw] = p_ord
+          if pk + 2 < body_open {
+            let pty = ts[pk + 2].raw
+            if pty == "Array" {
+              fn_arr_params[ts[pk].raw] = p_ord
+            } else if (is_builtin_eq_type_name(pty) || pty == "Bytes") &&
+            !(pk + 3 < body_open && (ts[pk + 3].kind == TokenKind::LBracket || ts[pk + 3].kind == TokenKind::ColonColon || ts[pk + 3].raw == "?")) {
+              ef.scalar_params[p_ord] = true
+            }
           }
           p_ord = p_ord + 1
         }
@@ -4349,6 +4468,7 @@ pub fn collect_cap_pkg_summary(
       }
     }
     decl_params_map[decl_key] = plist
+    decl_param_idx_map[decl_key] = fn_param_idx
     decl_is_known[decl_key] = true
   }
 
@@ -4762,7 +4882,7 @@ pub fn collect_cap_pkg_summary(
   }
 
   let (field_types, field_all_builtin, array_elem_types, array_elem_all_builtin, array_elem_type_sets, array_elem_unknown, nested_array_elem_types) = collect_struct_field_types_from_tokens(all_tokens)
-  let distinct_array_fields = collect_distinct_array_fields(all_tokens, array_fields)
+  let distinct_array_fields = collect_distinct_array_fields(all_tokens, array_fields, by_name, dep_methods)
   // Pass 4: Non-escaping parameter fixpoint + package function return provenance (`fn_ret_fresh_array` / `fn_ret_field`).
   let param_safe : Map[String, Map[Int, Bool]] = Map()
   for dk in decl_params_map.keys() {
@@ -4780,7 +4900,7 @@ pub fn collect_cap_pkg_summary(
   let empty_allowed : Map[Int, Bool] = Map()
   let mut ps_iter = 0
   let mut ps_changed = true
-  while ps_changed && ps_iter < 6 {
+  while ps_changed && ps_iter < 64 {
     ps_changed = false
     ps_iter = ps_iter + 1
     for dk in decl_params_map.keys() {
@@ -4799,11 +4919,15 @@ pub fn collect_cap_pkg_summary(
       }
     }
   }
+  if ps_changed {
+    // Unconverged optimistic fixpoint -> fail closed!
+    param_safe.clear()
+  }
   let fn_ret_fresh_array : Map[String, Bool] = Map()
-  let fn_ret_field : Map[String, String] = Map()
+  let fn_ret_field : Map[String, (Int, String)] = Map()
   let mut ret_iter = 0
   let mut ret_changed = true
-  while ret_changed && ret_iter < 6 {
+  while ret_changed && ret_iter < 8 {
     ret_changed = false
     ret_iter = ret_iter + 1
     for dk in decl_tokens_map.keys() {
@@ -4812,6 +4936,7 @@ pub fn collect_cap_pkg_summary(
       }
       match (decl_tokens_map.get(dk), decl_open_map.get(dk), decl_close_map.get(dk)) {
         (Some(ts_d), Some(bo_d), Some(bc_d)) => {
+          let caller_pidx = match decl_param_idx_map.get(dk) { Some(m) => m, None => Map() }
           let spans = collect_fn_return_spans(ts_d, bo_d, bc_d)
           if spans.length() == 0 {
             continue
@@ -4831,6 +4956,7 @@ pub fn collect_cap_pkg_summary(
           }
           let mut all_fresh = true
           let mut common_field = ""
+          let mut common_owner = -2
           let mut all_fresh_or_same_field = true
           for sp in spans {
             let mut rs = sp.0
@@ -4846,7 +4972,8 @@ pub fn collect_cap_pkg_summary(
             }
             let mut sp_fresh = false
             let mut sp_field = ""
-            if expr_is_fresh_array_init(ts_d, rs, re) {
+            let mut sp_owner = -1
+            if expr_is_fresh_array_init(ts_d, rs, re, by_name, dep_methods) {
               sp_fresh = true
             } else if rs == re && ts_d[rs].kind == TokenKind::Ident {
               let vnm = ts_d[rs].raw
@@ -4866,20 +4993,35 @@ pub fn collect_cap_pkg_summary(
                     if ckeys.length() > 0 {
                       let mut cf = true
                       let mut cfield = ""
+                      let mut cowner = -2
                       let mut cfield_ok = true
                       for cdk in ckeys {
                         if !fn_ret_fresh_array.contains(cdk) {
                           cf = false
                           match fn_ret_field.get(cdk) {
-                            Some(fnm) =>
-                            if cfield.length() == 0 { cfield = fnm }
-                            else if cfield != fnm { cfield_ok = false }
+                            Some(fp) => {
+                              if cfield.length() == 0 { cfield = fp.1 }
+                              else if cfield != fp.1 { cfield_ok = false }
+                              let mapped_r = if fp.0 == 0 {
+                                receiver_root(ts_d, lp - 3)
+                              } else if fp.0 > 0 {
+                                nth_arg_root(ts_d, lp + 1, re, fp.0 - 1)
+                              } else {
+                                ""
+                              }
+                              let mapped_idx = match caller_pidx.get(mapped_r) { Some(pi) => pi, None => -1 }
+                              if cowner == -2 { cowner = mapped_idx }
+                              else if cowner != mapped_idx { cowner = -1 }
+                            }
                             None => cfield_ok = false
                           }
                         }
                       }
                       if cf { sp_fresh = true }
-                      else if cfield_ok && cfield.length() > 0 { sp_field = cfield }
+                      else if cfield_ok && cfield.length() > 0 {
+                        sp_field = cfield
+                        sp_owner = if cowner >= 0 { cowner } else { -1 }
+                      }
                     }
                     None => ()
                   }
@@ -4890,7 +5032,11 @@ pub fn collect_cap_pkg_summary(
                 if fn_ret_fresh_array.contains(cdk) { sp_fresh = true }
                 else {
                   match fn_ret_field.get(cdk) {
-                    Some(fnm) => sp_field = fnm
+                    Some(fp) => {
+                      sp_field = fp.1
+                      let mapped_r = if fp.0 >= 0 { nth_arg_root(ts_d, lp + 1, re, fp.0) } else { "" }
+                      sp_owner = match caller_pidx.get(mapped_r) { Some(pi) => pi, None => -1 }
+                    }
                     None => ()
                   }
                 }
@@ -4899,7 +5045,11 @@ pub fn collect_cap_pkg_summary(
                 if fn_ret_fresh_array.contains(cdk) { sp_fresh = true }
                 else {
                   match fn_ret_field.get(cdk) {
-                    Some(fnm) => sp_field = fnm
+                    Some(fp) => {
+                      sp_field = fp.1
+                      let mapped_r = if fp.0 >= 0 { nth_arg_root(ts_d, lp + 1, re, fp.0) } else { "" }
+                      sp_owner = match caller_pidx.get(mapped_r) { Some(pi) => pi, None => -1 }
+                    }
                     None => ()
                   }
                 }
@@ -4908,6 +5058,8 @@ pub fn collect_cap_pkg_summary(
               let fnm = ts_d[re].raw
               if array_fields.get(fnm) == Some(true) {
                 sp_field = fnm
+                let r_root = receiver_root(ts_d, re)
+                sp_owner = match caller_pidx.get(r_root) { Some(pi) => pi, None => -1 }
               }
             }
             if sp_fresh {
@@ -4916,9 +5068,12 @@ pub fn collect_cap_pkg_summary(
               all_fresh = false
               if common_field.length() == 0 {
                 common_field = sp_field
+                common_owner = sp_owner
               } else if common_field != sp_field {
                 all_fresh_or_same_field = false
                 break
+              } else if common_owner != sp_owner {
+                common_owner = -1
               }
             } else {
               all_fresh = false
@@ -4931,8 +5086,13 @@ pub fn collect_cap_pkg_summary(
             fn_ret_field.remove(dk)
             ret_changed = true
           } else if all_fresh_or_same_field && common_field.length() > 0 {
-            if fn_ret_field.get(dk) != Some(common_field) {
-              fn_ret_field[dk] = common_field
+            let final_owner = if common_owner >= 0 { common_owner } else { -1 }
+            let changed_entry = match fn_ret_field.get(dk) {
+              Some(prev) => prev.0 != final_owner || prev.1 != common_field
+              None => true
+            }
+            if changed_entry {
+              fn_ret_field[dk] = (final_owner, common_field)
               ret_changed = true
             }
           }
@@ -5181,9 +5341,17 @@ fn resolve_local_type_name(
         if ni < cur_pos && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == nm &&
         (ni + 1 >= cur_pos || tokens[ni + 1].kind == TokenKind::Colon || tokens[ni + 1].kind == TokenKind::Eq) {
           if ni + 2 < cur_pos && tokens[ni + 1].kind == TokenKind::Colon {
-            if tokens[ni + 2].raw == "Array" && ni + 5 < cur_pos && tokens[ni + 3].kind == TokenKind::LBracket &&
-            is_type_ident_tok(tokens[ni + 4].kind) && tokens[ni + 5].kind == TokenKind::RBracket {
-              return "Array:" + tokens[ni + 4].raw
+            if tokens[ni + 2].raw == "Array" && ni + 3 < cur_pos && tokens[ni + 3].kind == TokenKind::LBracket {
+              let rb_a = find_matching_delim(tokens, ni + 3)
+              if rb_a > ni + 4 && rb_a < cur_pos {
+                if rb_a == ni + 5 && is_type_ident_tok(tokens[ni + 4].kind) {
+                  return "Array:" + tokens[ni + 4].raw
+                }
+                let inner_c = canonical_type_span(tokens, ni + 4, rb_a)
+                if inner_c.length() > 0 {
+                  return "Array:" + inner_c
+                }
+              }
             }
             if is_type_ident_tok(tokens[ni + 2].kind) &&
             !(ni + 3 < cur_pos && (tokens[ni + 3].kind == TokenKind::LBracket || tokens[ni + 3].kind == TokenKind::ColonColon)) {
@@ -6534,14 +6702,22 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
         if cand_keys.length() > 0 {
           let mut all_fresh = true
           let mut common_f = ""
+          let mut common_owner = -2
           let mut all_same_f = true
           for dk in cand_keys {
             if !summary.fn_ret_fresh_array.contains(dk) {
               all_fresh = false
               match summary.fn_ret_field.get(dk) {
-                Some(fnm) =>
-                if common_f.length() == 0 { common_f = fnm }
-                else if common_f != fnm { all_same_f = false }
+                Some(fp) => {
+                  if common_f.length() == 0 {
+                    common_f = fp.1
+                    common_owner = fp.0
+                  } else if common_f != fp.1 {
+                    all_same_f = false
+                  } else if common_owner != fp.0 {
+                    common_owner = -1
+                  }
+                }
                 None => all_same_f = false
               }
             }
@@ -6553,7 +6729,13 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
             is_field_iter = true
             is_computed_iter = false
             tail = common_f
-            root = receiver_root(tokens, lp_it - 3)
+            root = if common_owner == 0 {
+              receiver_root(tokens, lp_it - 3)
+            } else if common_owner > 0 {
+              nth_arg_root(tokens, lp_it + 1, iter_e, common_owner - 1)
+            } else {
+              ""
+            }
           }
         }
       }
@@ -6564,11 +6746,11 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
         return ""
       }
       match summary.fn_ret_field.get(dk) {
-        Some(fnm) => {
+        Some(fp) => {
           is_field_iter = true
           is_computed_iter = false
-          tail = fnm
-          root = first_arg_root(tokens, lp_it + 1, iter_e)
+          tail = fp.1
+          root = if fp.0 >= 0 { nth_arg_root(tokens, lp_it + 1, iter_e, fp.0) } else { "" }
         }
         None => ()
       }
@@ -6578,11 +6760,11 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
         return ""
       }
       match summary.fn_ret_field.get(dk) {
-        Some(fnm) => {
+        Some(fp) => {
           is_field_iter = true
           is_computed_iter = false
-          tail = fnm
-          root = first_arg_root(tokens, lp_it + 1, iter_e)
+          tail = fp.1
+          root = if fp.0 >= 0 { nth_arg_root(tokens, lp_it + 1, iter_e, fp.0) } else { "" }
         }
         None => ()
       }
@@ -6592,7 +6774,11 @@ pub fn for_in_array_hazard(tokens : Array[Token], for_i : Int, summary : CapPkgS
     let lb_it = find_open_before(tokens, iter_e, iter_s)
     if lb_it >= iter_s + 2 && tokens[lb_it - 1].kind == TokenKind::Ident && tokens[lb_it - 2].kind == TokenKind::Dot {
       let fnm = tokens[lb_it - 1].raw
-      if summary.nested_array_elem_types.contains(fnm) {
+      let has_nested = match summary.nested_array_elem_types.get(fnm) {
+        Some(nt) => nt.length() > 0
+        None => false
+      }
+      if has_nested {
         is_field_iter = true
         is_computed_iter = false
         is_nested_field_iter = true
@@ -6820,8 +7006,19 @@ fn for_in_body_hazard(
       }
       (r_is_field && other_field_can_alias(r_tail)) || (!r_is_field && names.contains(r)) || param_can_alias
     } else {
+      let param_can_alias = if !r_is_field && arr_params.contains(r) && !fresh_before.contains(r) {
+        let rty = if body_open >= 0 { resolve_local_type_name(tokens, r, body_open, pos, summary) } else { "" }
+        let re = if rty.starts_with("Array:") { rty.slice(6, rty.length()) } else { "" }
+        if re.length() > 0 && !iter_elem_unk && iter_elem_set.length() > 0 {
+          iter_elem_set.contains(re)
+        } else {
+          true
+        }
+      } else {
+        false
+      }
       let field_can_alias = r_is_field && other_field_can_alias(r_tail)
-      (!r_is_field && (names.contains(r) || (arr_params.contains(r) && !fresh_before.contains(r)))) || field_can_alias
+      (!r_is_field && (names.contains(r) || param_can_alias)) || field_can_alias
     }
   }
   let check_pkg_effect = fn(ef : CapFnEffect, pass_kind : Int, arg_open : Int, arg_close : Int, is_method_call : Bool, recv_is_root : Bool, pos : Int, label : String) -> String {
@@ -6834,10 +7031,10 @@ fn for_in_body_hazard(
       if ef.may_write { flags[1] = true }
     } else if pass_kind == 1 {
       if is_field_iter && tail.length() > 0 {
-        // Check if `root` is passed at a parameter position that `ef` passes to a cross-package `dep::f(param)`.
+        // Check if `root` (or any non-fresh arg when `root == ""`) is passed at a parameter position that `ef` passes to a cross-package `dep::f(param)`.
         let mut root_escapes_to_dep = false
         if ef.may_pass_param_to_dep {
-          if is_method_call && recv_is_root && ef.dep_escaped_params.contains(0) {
+          if is_method_call && (recv_is_root || root.length() == 0) && ef.dep_escaped_params.contains(0) {
             root_escapes_to_dep = true
           }
           if !root_escapes_to_dep && arg_open >= 0 && arg_close > arg_open {
@@ -6849,10 +7046,15 @@ fn for_in_body_hazard(
               if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
               else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
               else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
-              else if ad == 0 && ak == TokenKind::Ident && tokens[ai].raw == root &&
+              else if ad == 0 && (ak == TokenKind::Ident || tokens[ai].raw == "self") &&
               !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
               !(ai + 1 < arg_close && tokens[ai + 1].kind == TokenKind::Dot) {
-                if ef.dep_escaped_params.contains(arg_ord) {
+                let matches_owner = if root.length() > 0 {
+                  tokens[ai].raw == root
+                } else {
+                  !is_local_fresh_recv(tokens[ai].raw, false, ai)
+                }
+                if matches_owner && ef.dep_escaped_params.contains(arg_ord) {
                   root_escapes_to_dep = true
                   break
                 }
@@ -6877,33 +7079,142 @@ fn for_in_body_hazard(
         }
         if ef.grew_fields.contains(tail) { flags[0] = true }
         if ef.wrote_fields.contains(tail) { flags[1] = true }
+        if root.length() == 0 && ef.may_pass_param_to_dep && !can_exit(pos) {
+          let mut unknown_owner_escapes = false
+          if is_method_call && ef.dep_escaped_params.contains(0) {
+            unknown_owner_escapes = true
+          }
+          if !unknown_owner_escapes && arg_open >= 0 && arg_close > arg_open {
+            let mut ai = arg_open + 1
+            let mut ad = 0
+            let mut arg_ord = if is_method_call { 1 } else { 0 }
+            while ai < arg_close {
+              let ak = tokens[ai].kind
+              if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+              else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+              else if ad == 0 && ak == TokenKind::Comma { arg_ord = arg_ord + 1 }
+              else if ad == 0 && (ak == TokenKind::Ident || tokens[ai].raw == "self") &&
+              !(ai > 0 && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) &&
+              !is_local_fresh_recv(tokens[ai].raw, false, ai) && ef.dep_escaped_params.contains(arg_ord) {
+                unknown_owner_escapes = true
+                break
+              }
+              ai = ai + 1
+            }
+          }
+          if unknown_owner_escapes {
+            return label + " may mutate field `." + tail + "` during `for .. in`"
+          }
+        }
       }
     }
     ""
   }
-  let args_pass_kind = fn(as_ : Int, ae_ : Int) -> Int {
+  let empty_scalars : Map[Int, Bool] = Map()
+  let args_pass_kind_ex = fn(as_ : Int, ae_ : Int, scalar_params : Map[Int, Bool], arg_base : Int) -> Int {
     if ae_ <= as_ {
       return 0
     }
     if is_computed_iter {
-      // Computed iterable (`ident(xs)` / `bag[0]`): any non-literal argument may pass the array or its owner.
+      // Computed iterable (`ident(xs)` / `bag[0]`): any non-literal argument at a non-scalar param may pass the array or its owner.
       let mut ai = as_
+      let mut ad = 0
+      let mut aord = arg_base
       while ai < ae_ {
         let ak = tokens[ai].kind
-        if (ak == TokenKind::Ident || tokens[ai].raw == "self") && !is_local_fresh_recv(tokens[ai].raw, false, ai) {
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+        else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
+        else if !scalar_params.contains(aord) && (ak == TokenKind::Ident || tokens[ai].raw == "self") && !is_local_fresh_recv(tokens[ai].raw, false, ai) {
           return 2
         }
         ai = ai + 1
       }
       return 0
     }
+    if !fresh_root {
+      // Unified alias check via `may_alias_target` across both `is_field_iter` and `!is_field_iter`:
+      // catches field aliases (`names`), compatible `arr_params`, and compatible sibling/nested fields!
+      let mut ai = as_
+      let mut ad = 0
+      let mut aord = arg_base
+      while ai < ae_ {
+        let ak = tokens[ai].kind
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+        else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
+        else if !scalar_params.contains(aord) {
+          let next_is_lp = ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::LParen
+          let next_is_lb = ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::LBracket
+          if ak == TokenKind::Ident && !next_is_lp && !(ai > as_ && tokens[ai - 1].kind == TokenKind::ColonColon) {
+            if ai > as_ && tokens[ai - 1].kind == TokenKind::Dot {
+              let fname = tokens[ai].raw
+              let is_known_local = summary.field_all_builtin.contains(fname)
+              let is_known_arr = summary.array_fields.contains(fname)
+              let may_yield_arr = if next_is_lb {
+                if is_known_local {
+                  if !is_known_arr {
+                    false
+                  } else if summary.array_elem_unknown.contains(fname) {
+                    true
+                  } else {
+                    match summary.nested_array_elem_types.get(fname) { Some(nt) => nt.length() > 0, None => false }
+                  }
+                } else {
+                  true
+                }
+              } else {
+                !is_known_local || is_known_arr || fname == tail
+              }
+              if may_yield_arr && may_alias_target(receiver_root(tokens, ai), fname, true, ai) {
+                return 2
+              }
+            } else if !(ai + 1 < ae_ && tokens[ai + 1].kind == TokenKind::Dot) {
+              let rname = tokens[ai].raw
+              let elem_non_arr = if next_is_lb && body_open >= 0 {
+                let rty = resolve_local_type_name(tokens, rname, body_open, ai, summary)
+                rty.starts_with("Array:") && !rty.starts_with("Array:Array")
+              } else {
+                false
+              }
+              if !elem_non_arr && may_alias_target(rname, "", false, ai) {
+                return 2
+              }
+            }
+          }
+        }
+        ai = ai + 1
+      }
+    }
+    if span_mentions(tokens, as_, ae_, names) {
+      // Only treat `names` as passed if it appears in a non-scalar argument position
+      let mut ai = as_
+      let mut ad = 0
+      let mut aord = arg_base
+      while ai < ae_ {
+        let ak = tokens[ai].kind
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+        else if ad == 0 && ak == TokenKind::Comma { aord = aord + 1 }
+        else if !scalar_params.contains(aord) && ak == TokenKind::Ident && names.contains(tokens[ai].raw) &&
+        !(ai > as_ && (tokens[ai - 1].kind == TokenKind::Dot || tokens[ai - 1].kind == TokenKind::ColonColon)) {
+          return 2
+        }
+        ai = ai + 1
+      }
+    }
     if is_field_iter {
-      span_passes_owner_or_field(tokens, as_, ae_, root, tail)
-    } else if span_mentions(tokens, as_, ae_, names) {
-      2
+      if root.length() > 0 {
+        span_passes_owner_or_field(tokens, as_, ae_, root, tail)
+      } else {
+        0
+      }
     } else {
       0
     }
+  }
+  let args_pass_kind = fn(as_ : Int, ae_ : Int) -> Int {
+    args_pass_kind_ex(as_, ae_, empty_scalars, 0)
   }
   let mut k = s
   while k < e {
@@ -6989,7 +7300,15 @@ fn for_in_body_hazard(
             for dk in keys {
               match summary.effects.get(dk) {
                 Some(ef) => {
-                  let why = check_pkg_effect(ef, pass_kind, k + 2, cp_m, true, recv_is_root, k, "`." + m + "(..)`")
+                  let apk_ef = args_pass_kind_ex(k + 3, cp_m, ef.scalar_params, 1)
+                  let pk_ef = if may_alias || apk_ef == 2 {
+                    2
+                  } else if (is_field_iter && recv_is_root) || apk_ef == 1 {
+                    1
+                  } else {
+                    0
+                  }
+                  let why = check_pkg_effect(ef, pk_ef, k + 2, cp_m, true, recv_is_root, k, "`." + m + "(..)`")
                   if why.length() > 0 { return why }
                 }
                 None => ()
@@ -7065,7 +7384,8 @@ fn for_in_body_hazard(
         } else {
           match summary.effects.get(q + "::" + tk.raw) {
             Some(ef) => {
-              let why = check_pkg_effect(ef, pk, k + 1, cp, false, false, k, "call to `" + q + "::" + tk.raw + "(..)`")
+              let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, 0)
+              let why = check_pkg_effect(ef, pk_ef, k + 1, cp, false, false, k, "call to `" + q + "::" + tk.raw + "(..)`")
               if why.length() > 0 { return why }
             }
             None =>
@@ -7097,7 +7417,8 @@ fn for_in_body_hazard(
       } else {
         match summary.effects.get("::" + tk.raw) {
           Some(ef) => {
-            let why = check_pkg_effect(ef, pk, k + 1, cp, false, false, k, "call to `" + tk.raw + "(..)`")
+            let pk_ef = args_pass_kind_ex(k + 2, cp, ef.scalar_params, 0)
+            let why = check_pkg_effect(ef, pk_ef, k + 1, cp, false, false, k, "call to `" + tk.raw + "(..)`")
             if why.length() > 0 { return why }
           }
           None =>
