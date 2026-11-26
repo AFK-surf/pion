@@ -478,6 +478,14 @@ try:
     # Crashed peer's stale lock & data files MUST be auto-cleaned!
     assert not os.path.exists(stale_lock), "stale pin lock was not cleaned"
     assert not os.path.exists(stale_data), "stale pin data was not cleaned"
+    # Explicit `pionc cache prune` under PION_CACHE_MAX_KB=1 MUST also respect active peer pins!
+    prune_proc = subprocess.run(
+        [pionc, "cache", "prune", "--json"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    pd = json.loads(prune_proc.stdout)
+    assert pd["ok"] is True and pd["action"] == "prune", pd
+    assert os.path.isfile(peer_obj), f"cache prune evicted active peer pinned object: {peer_obj}"
 finally:
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
@@ -494,9 +502,29 @@ d2 = json.loads(proc2.stdout)
 assert d2["ok"] is True and d2["passed"] == 2 and d2["failed"] == 0, d2
 assert not os.path.exists(live_lock), "released peer pin lock was not cleaned"
 assert not os.path.exists(live_data), "released peer pin data was not cleaned"
+
+# Two real concurrent `pionc` processes sharing the same CAS_D under PION_CACHE_MAX_KB=1
+out_p1 = os.path.join(os.path.dirname(cas_dir), "conc_bin_1")
+out_p2 = os.path.join(os.path.dirname(cas_dir), "conc_bin_2")
+p1 = subprocess.Popen(
+    [pionc, "build", "-o", out_p1, os.path.join(ws_c, "app")],
+    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+p2 = subprocess.Popen(
+    [pionc, "test", "--jobs", "2", "--json", ws_c],
+    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+)
+o1, e1 = p1.communicate(timeout=120)
+o2, e2 = p2.communicate(timeout=120)
+assert p1.returncode == 0, f"concurrent build failed: {o1}\n{e1}"
+assert p2.returncode == 0, f"concurrent test failed: {o2}\n{e2}"
+d_conc = json.loads(o2)
+assert d_conc["ok"] is True and d_conc["passed"] == 2 and d_conc["failed"] == 0, d_conc
+r1 = subprocess.run([out_p1], capture_output=True, text=True, check=True)
+assert r1.stdout.strip() == "mtime_sum=57", r1.stdout
 PYEOF
 
-echo "(D) cross-process kernel-locked CAS pin + stale crash cleanup -> OK"
+echo "(D) cross-process kernel-locked CAS pin + cache prune + real concurrent pionc -> OK"
 
 # ============================================================================
 # Scenario E (Round 2 #2): Wasm32 build without `-o` under PION_CACHE_MAX_KB=1
@@ -543,9 +571,12 @@ fi
 echo "(E) Wasm32 build/run without -o under PION_CACHE_MAX_KB=1 (keep_keys + HIT) -> OK"
 
 # ============================================================================
-# Scenario F (Round 2 #3): Same-size + same-mtime external .a edit invalidates
+# Scenario F (Round 2 #3 + Round 3): Same-size + same-mtime external .a edit
 # ============================================================================
 cp -p "$WS_C/app/libext_mtime.a" "$TMP_DIR/libext_mtime.ref"
+# Ensure hot default build & hot testbin exist in CAS_C before rewriting .a
+PION_CACHE_DIR="$CAS_C" "$PIONC" build "$WS_C/app"
+PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > /dev/null
 cat > "$WS_C/ext_obj.c" <<'EOF'
 #include <stdint.h>
 int64_t mtime_ext_lib_val(void) { return 99; }
@@ -554,10 +585,27 @@ EOF
 rm -f "$WS_C/app/libext_mtime.a"
 ar rcs "$WS_C/app/libext_mtime.a" "$WS_C/ext_obj.o"
 touch -r "$TMP_DIR/libext_mtime.ref" "$WS_C/app/libext_mtime.a"
-PION_CACHE_DIR="$CAS_C" "$PIONC" build -o "$TMP_DIR/f_bin" "$WS_C/app"
-OUT_F="$("$TMP_DIR/f_bin")"
-[ "$OUT_F" = "mtime_sum=114" ] || fail "Scenario F expected mtime_sum=114 after same-size/same-mtime .a edit, got $OUT_F"
-echo "(F) external .a content edit with identical size & mtime -> MISS & relink OK"
+# Explicitly verify BOTH byte size and mtime are strictly identical!
+python3 - "$TMP_DIR/libext_mtime.ref" "$WS_C/app/libext_mtime.a" <<'PYEOF'
+import os, sys
+s1, s2 = os.stat(sys.argv[1]), os.stat(sys.argv[2])
+assert s1.st_size == s2.st_size, f"expected identical .a size: {s1.st_size} vs {s2.st_size}"
+assert int(s1.st_mtime) == int(s2.st_mtime), f"expected identical .a mtime: {s1.st_mtime} vs {s2.st_mtime}"
+PYEOF
+# Hot `pionc run` (uses default CAS bin key, not `-o`) MUST relink and print 114
+OUT_F="$(PION_CACHE_DIR="$CAS_C" "$PIONC" run "$WS_C/app")"
+[ "$OUT_F" = "mtime_sum=114" ] || fail "Scenario F expected mtime_sum=114 from default CAS bin after same-size/same-mtime .a edit, got $OUT_F"
+# Hot `pionc test` MUST also relink testbin (app_mtime_ok expects 57, so it must FAIL now with 114!)
+cat > "$WS_C/app/src/app_test.pion" <<'EOF'
+test "app_mtime_ok" { debug_assert(combined() == 114L, "app_mtime_ok_114") }
+EOF
+PION_CACHE_DIR="$CAS_C" "$PIONC" test --jobs 2 --json "$WS_C" > "$TMP_DIR/f_test.json"
+python3 - "$TMP_DIR/f_test.json" <<'PYEOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["ok"] is True and d["passed"] == 2 and d["failed"] == 0, d
+PYEOF
+echo "(F) external .a content edit with verified identical size & mtime -> default run & testbin relink OK"
 
 # ============================================================================
 # Scenario G (Round 2 #5): -I shadowing, UTF-8 Chinese path, racy compile edit
@@ -692,4 +740,146 @@ grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/racy2.trace" || fail "Scenario G3 
 [ "$("$TMP_DIR/racy_bin2")" = "20" ] || fail "Scenario G3 expected 20 after racy compile self-healed"
 
 echo "(G) -I shadowing + UTF-8 Chinese path + racy compile-time edit self-heal -> OK"
+
+# ============================================================================
+# Scenario H (Round 3): Nested `-I dir -I dir/sub` header shadowing
+# ============================================================================
+WS_H="$TMP_DIR/ws_nested_shadow"
+mkdir -p "$WS_H/pkg/src" "$WS_H/inc/sub"
+cat > "$WS_H/inc/sub/nested.h" <<'EOF'
+#define NESTED_VAL 11
+EOF
+cat > "$WS_H/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "nested.h"
+int64_t nested_val(void) { return NESTED_VAL; }
+EOF
+cat > "$WS_H/pkg/pion.toml" <<'EOF'
+[package]
+name = "nested_shadow_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../inc", "-I../inc/sub"]
+EOF
+cat > "$WS_H/pkg/src/main.pion" <<'EOF'
+extern "C" fn nested_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, nested_val().to_string()) }
+EOF
+CAS_H="$TMP_DIR/cas_h"
+mkdir -p "$CAS_H"
+PION_CACHE_DIR="$CAS_H" "$PIONC" build -o "$TMP_DIR/h_bin1" "$WS_H/pkg"
+[ "$("$TMP_DIR/h_bin1")" = "11" ] || fail "Scenario H cold expected 11"
+# Introduce shadowing header at higher-priority parent `-I../inc/nested.h`
+cat > "$WS_H/inc/nested.h" <<'EOF'
+#define NESTED_VAL 88
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_H" "$PIONC" build -o "$TMP_DIR/h_bin2" "$WS_H/pkg" 2>"$TMP_DIR/h_shadow.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/h_shadow.trace" || fail "Scenario H expected MISS on nested -I shadowing"
+[ "$("$TMP_DIR/h_bin2")" = "88" ] || fail "Scenario H expected 88 after nested -I shadowing"
+echo "(H) nested -I dir -I dir/sub header shadowing -> OK"
+
+# ============================================================================
+# Scenario I (Round 3): Header symlink retargeting (inc/h.h -> v1.h => v2.h)
+# ============================================================================
+WS_I="$TMP_DIR/ws_sym_hdr"
+mkdir -p "$WS_I/pkg/src" "$WS_I/inc" "$WS_I/vers"
+cat > "$WS_I/vers/v1.h" <<'EOF'
+#define SYM_VAL 31
+EOF
+cat > "$WS_I/vers/v2.h" <<'EOF'
+#define SYM_VAL 62
+EOF
+ln -s "$WS_I/vers/v1.h" "$WS_I/inc/h.h"
+cat > "$WS_I/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "h.h"
+int64_t sym_val(void) { return SYM_VAL; }
+EOF
+cat > "$WS_I/pkg/pion.toml" <<'EOF'
+[package]
+name = "sym_hdr_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I../inc"]
+EOF
+cat > "$WS_I/pkg/src/main.pion" <<'EOF'
+extern "C" fn sym_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, sym_val().to_string()) }
+EOF
+CAS_I="$TMP_DIR/cas_i"
+mkdir -p "$CAS_I"
+PION_CACHE_DIR="$CAS_I" "$PIONC" build -o "$TMP_DIR/i_bin1" "$WS_I/pkg"
+[ "$("$TMP_DIR/i_bin1")" = "31" ] || fail "Scenario I cold expected 31"
+# Retarget symlink inc/h.h -> v2.h while keeping v1.h completely untouched
+ln -sfn "$WS_I/vers/v2.h" "$WS_I/inc/h.h"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_I" "$PIONC" build -o "$TMP_DIR/i_bin2" "$WS_I/pkg" 2>"$TMP_DIR/i_sym.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/i_sym.trace" || fail "Scenario I expected MISS after header symlink retarget"
+[ "$("$TMP_DIR/i_bin2")" = "62" ] || fail "Scenario I expected 62 after header symlink retarget"
+echo "(I) header symlink retargeting (v1.h intact) -> OK"
+
+# ============================================================================
+# Scenario J (Round 3): Preserved-mtime atomic rename of header during compile
+# ============================================================================
+WS_J="$TMP_DIR/ws_racy_rename"
+mkdir -p "$WS_J/pkg/src"
+cat > "$WS_J/pkg/hdr.h" <<'EOF'
+#define RENAME_VAL 100
+EOF
+touch -t 202001010000 "$WS_J/pkg/hdr.h"
+cat > "$WS_J/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "hdr.h"
+int64_t rename_val(void) { return RENAME_VAL; }
+EOF
+cat > "$WS_J/pkg/pion.toml" <<'EOF'
+[package]
+name = "racy_rename_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_J/pkg/src/main.pion" <<'EOF'
+extern "C" fn rename_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, rename_val().to_string()) }
+EOF
+
+RACY_RENAME_CC="$TMP_DIR/racy_rename_cc.sh"
+cat > "$RACY_RENAME_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+"${REAL_CC_BIN}" "$@"
+RC=$?
+if [ "$RC" = "0" ] && [ "${INJECT_RENAME:-0}" = "1" ]; then
+  case "$*" in
+    *-c*stub.c*)
+      TMP_H="${RENAME_HDR}.new"
+      printf '#define RENAME_VAL 200\n' > "$TMP_H"
+      touch -r "${RENAME_HDR}" "$TMP_H"
+      mv -f "$TMP_H" "${RENAME_HDR}"
+      ;;
+  esac
+fi
+exit "$RC"
+EOF
+chmod +x "$RACY_RENAME_CC"
+
+CAS_J="$TMP_DIR/cas_j"
+mkdir -p "$CAS_J"
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_RENAME=1 RENAME_HDR="$WS_J/pkg/hdr.h" CC="$RACY_RENAME_CC" \
+  PION_CACHE_DIR="$CAS_J" "$PIONC" build -o "$TMP_DIR/j_bin1" "$WS_J/pkg"
+[ "$("$TMP_DIR/j_bin1")" = "100" ] || fail "Scenario J run 1 expected 100"
+# Next run (no race) MUST MISS and pick up 200 because ctime + parent dir changed!
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_RENAME=0 RENAME_HDR="$WS_J/pkg/hdr.h" CC="$RACY_RENAME_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_J" "$PIONC" build -o "$TMP_DIR/j_bin2" "$WS_J/pkg" 2>"$TMP_DIR/j2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/j2.trace" || fail "Scenario J expected MISS after preserved-mtime atomic rename"
+[ "$("$TMP_DIR/j_bin2")" = "200" ] || fail "Scenario J expected 200 after preserved-mtime atomic rename"
+echo "(J) preserved-mtime atomic header rename during compile -> ctime/dir guard self-heal OK"
+
 echo "PASS: cas_pin_and_cstub_deps"

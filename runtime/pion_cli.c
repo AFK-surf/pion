@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifndef WC_ERR_INVALID_CHARS
 #define WC_ERR_INVALID_CHARS 0x80
@@ -568,6 +569,23 @@ int32_t pion_fs_lstat_kind(const char *path) {
     if (a & FILE_ATTRIBUTE_REPARSE_POINT) return 3;
     if (a & FILE_ATTRIBUTE_DIRECTORY) return 2;
     return 1;
+}
+
+int64_t pion_cli_path_change_ms(const char *path) {
+    if (!path || !*path) return -1;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return -1;
+    struct _stat64 st;
+    int rc = _wstat64(wp, &st);
+    free(wp);
+    if (rc != 0) return -1;
+    int64_t m = (int64_t)st.st_mtime * 1000LL;
+    int64_t c = (int64_t)st.st_ctime * 1000LL;
+    return m >= c ? m : c;
+}
+
+int64_t pion_cli_lpath_change_ms(const char *path) {
+    return pion_cli_path_change_ms(path);
 }
 
 #else /* POSIX */
@@ -1240,6 +1258,35 @@ int32_t pion_fs_lstat_kind(const char *path) {
     if (S_ISDIR(st.st_mode)) return 2;
     if (S_ISLNK(st.st_mode)) return 3;
     return 4;
+}
+
+static int64_t pion_cli_stat_change_ms(const struct stat *st) {
+#ifdef __APPLE__
+    int64_t m = (int64_t)st->st_mtimespec.tv_sec * 1000LL +
+                (int64_t)(st->st_mtimespec.tv_nsec / 1000000L);
+    int64_t c = (int64_t)st->st_ctimespec.tv_sec * 1000LL +
+                (int64_t)(st->st_ctimespec.tv_nsec / 1000000L);
+#else
+    int64_t m = (int64_t)st->st_mtim.tv_sec * 1000LL +
+                (int64_t)(st->st_mtim.tv_nsec / 1000000L);
+    int64_t c = (int64_t)st->st_ctim.tv_sec * 1000LL +
+                (int64_t)(st->st_ctim.tv_nsec / 1000000L);
+#endif
+    return m >= c ? m : c;
+}
+
+int64_t pion_cli_path_change_ms(const char *path) {
+    if (!path || !*path) return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return pion_cli_stat_change_ms(&st);
+}
+
+int64_t pion_cli_lpath_change_ms(const char *path) {
+    if (!path || !*path) return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return -1;
+    return pion_cli_stat_change_ms(&st);
 }
 
 #endif /* _WIN32 */

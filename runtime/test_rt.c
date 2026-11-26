@@ -3538,9 +3538,52 @@ static void test_fs_lstat_kind(void) {
     char *h_raw = pion_cli_sha256_file(file);
     assert(h_raw && strlen(h_raw) == 64);
     free(h_raw);
+    /* Boundary lengths (SHA-256 block & 64 KiB read buffer edges) */
+    static const struct { size_t len; const char *hex; } sha_cases[] = {
+        { 0,     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+        { 1,     "ca358758f6d27e6cf45272937977a748fd88391db679ceda7dc7bf1f005ee879" },
+        { 55,    "8aa994584139d128848eeebc4e815639ba5ab6e6e39574195a63ac4f14f7c43b" },
+        { 56,    "ad574708f75c044c9b85de64cb568ee7711ff4f36448c6242f053ba8f6cc2b63" },
+        { 63,    "280ed3e8ff1df845b2e7dfe6ac6cee817bef20e783cc65abc41b818b4d2fe076" },
+        { 64,    "c6ab9724ade5b6a7a1edfffb12f3aa9181351355af8fd08c919952ad211339dd" },
+        { 65,    "788367c73c7ddf4c53f65e68cc0d943e6227ab55b0e78ba63ace822b1c6301c0" },
+        { 65537, "74f3260f4a9adaf7271c910ba2d111dbae7a176afb487e1b7f655897eadf1093" }
+    };
+    unsigned char *pat = (unsigned char *)malloc(65537);
+    assert(pat != NULL);
+    for (size_t pi = 0; pi < 65537; pi++) pat[pi] = (unsigned char)((pi * 31 + 7) & 0xff);
+    for (size_t ci = 0; ci < sizeof(sha_cases) / sizeof(sha_cases[0]); ci++) {
+        f = fopen(file, "wb");
+        assert(f);
+        if (sha_cases[ci].len > 0) {
+            assert(fwrite(pat, 1, sha_cases[ci].len, f) == sha_cases[ci].len);
+        }
+        fclose(f);
+        char *got = pion_cli_sha256_file(file);
+        assert(got && strcmp(got, sha_cases[ci].hex) == 0);
+        free(got);
+    }
+    free(pat);
+    /* pion_cli_path_change_ms / pion_cli_lpath_change_ms */
+    assert(pion_cli_path_change_ms(NULL) == -1);
+    assert(pion_cli_path_change_ms("") == -1);
+    assert(pion_cli_path_change_ms(missing) == -1);
+    assert(pion_cli_lpath_change_ms(missing) == -1);
+    int64_t f_chg = pion_cli_path_change_ms(file);
+    int64_t f_lchg = pion_cli_lpath_change_ms(file);
+    int64_t d_chg = pion_cli_path_change_ms(base);
+    assert(f_chg > 0 && f_lchg > 0 && d_chg > 0);
+#ifndef _WIN32
+    char sym_chg[640];
+    snprintf(sym_chg, sizeof(sym_chg), "%s/sym_chg", base);
+    assert(symlink(file, sym_chg) == 0);
+    assert(pion_cli_path_change_ms(sym_chg) >= f_chg);
+    assert(pion_cli_lpath_change_ms(sym_chg) > 0);
+    assert(remove(sym_chg) == 0);
+#endif
     assert(remove(file) == 0);
     assert(pion_fs_rmdir(base) == 0);
-    printf("[PASS] pion_cli_sha256_file (empty / abc / non-UTF-8 / missing / dir)\n");
+    printf("[PASS] pion_cli_sha256_file (boundaries 0..65537) + path_change_ms\n");
 }
 
 static const char *g_lock_path;
