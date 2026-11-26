@@ -1032,4 +1032,302 @@ if [ "$OUT_QMONO_REL" != "$EXP_QMONO" ]; then
   exit 1
 fi
 
+# =====================================================================
+# Part 4 (Wave AA3): canonical drop functions across units and packages.
+#   - Non-generic structs and niche enums drop through file-local
+#     `$pion_drop_slots_<key>` helpers (no `$pion_drop_struct_*` symbol).
+#   - An all-non-RC payload tagged enum (`Shape`) allocates with drop_fn 0.
+#   - A tagged enum with exactly one RC variant (`Msg`) keeps its exported
+#     `$pion_drop_enum_Msg`, which a sibling unit references.
+#   - Cold producer / hot consumer (unit mode: a manifest-less multi-file
+#     package compiles one object per file): editing only `b_use.pion` reuses
+#     the cached `a_types.pion` unit object, and the recompiled consumer links
+#     against the `$pion_drop_enum_Msg` that object exports.
+#   - Cross-package (`aa3app -> aa3lib`) whole-package build, release, ASan
+#     and Wasm32.
+# =====================================================================
+mkdir -p "$TMP_DIR/aa3/lib/src" "$TMP_DIR/aa3/app/src" "$TMP_DIR/aa3/units"
+cat > "$TMP_DIR/aa3/lib/pion.toml" <<'EOF'
+[package]
+name = "aa3lib"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/aa3/lib/src/lib.pion" <<'EOF'
+pub struct LPair {
+  a : String
+  b : String
+}
+
+pub enum LMsg {
+  LPing(Int)
+  LText(String)
+  LQuit
+}
+
+pub enum LShape {
+  LCircle(Int)
+  LRect(Int, Int)
+  LEmpty
+}
+
+pub enum LTree {
+  LLeaf
+  LNode(LTree, LTree)
+}
+
+pub fn mk_ltree(d : Int) -> LTree {
+  if d == 0 { LTree::LLeaf } else { LTree::LNode(mk_ltree(d - 1), mk_ltree(d - 1)) }
+}
+
+pub fn lcount(t : LTree) -> Int {
+  match t {
+    LTree::LLeaf => 1
+    LTree::LNode(l, r) => lcount(l) + lcount(r)
+  }
+}
+
+pub fn lpair_len(p : LPair) -> Int {
+  p.a.length() + p.b.length()
+}
+
+pub fn lmsg_len(m : LMsg) -> Int {
+  match m {
+    LMsg::LPing(n) => n
+    LMsg::LText(s) => s.length()
+    LMsg::LQuit => -1
+  }
+}
+
+pub fn lshape_area(s : LShape) -> Int {
+  match s {
+    LShape::LCircle(r) => 3 * r * r
+    LShape::LRect(w, h) => w * h
+    LShape::LEmpty => 0
+  }
+}
+EOF
+cat > "$TMP_DIR/aa3/app/pion.toml" <<'EOF'
+[package]
+name = "aa3app"
+version = "0.1.0"
+
+[dependencies]
+aa3lib = { path = "../lib" }
+EOF
+cat > "$TMP_DIR/aa3/units/a_types.pion" <<'EOF'
+pub struct Pair {
+  a : String
+  b : String
+}
+
+pub struct Flat {
+  x : Int
+  y : Int
+}
+
+pub enum Shape {
+  Circle(Int)
+  Rect(Int, Int)
+  Empty
+}
+
+pub enum Msg {
+  Ping(Int)
+  Text(String)
+  Quit
+}
+
+pub enum Tree {
+  Leaf
+  Node(Tree, Tree)
+}
+
+pub fn mk_tree(d : Int) -> Tree {
+  if d == 0 { Leaf } else { Node(mk_tree(d - 1), mk_tree(d - 1)) }
+}
+
+pub fn count(t : Tree) -> Int {
+  match t {
+    Leaf => 1
+    Node(l, r) => count(l) + count(r)
+  }
+}
+
+pub fn area(s : Shape) -> Int {
+  match s {
+    Circle(r) => 3 * r * r
+    Rect(w, h) => w * h
+    Empty => 0
+  }
+}
+
+pub fn msg_len(m : Msg) -> Int {
+  match m {
+    Ping(n) => n
+    Text(s) => s.length()
+    Quit => -1
+  }
+}
+EOF
+aa3_write_consumer() {
+  cat > "$TMP_DIR/aa3/units/b_use.pion" <<EOF
+pub fn hot_k() -> Int {
+  $1
+}
+
+pub fn use_local() -> Int {
+  let shared = mk_tree(4)
+  let mut acc = 0
+  let mut i = 0
+  while i < 50 {
+    let both = Node(shared, shared)
+    acc = acc + count(both)
+    let p = Pair::{ a: "p" + i.to_string(), b: "q" }
+    let p2 = Pair::{ a: p.a, b: p.a }
+    acc = acc + p2.a.length() + p2.b.length()
+    acc = acc + area(Rect(i, hot_k())) + msg_len(Text("t" + i.to_string())) + msg_len(Ping(i))
+    let f = Flat::{ x: i, y: hot_k() }
+    acc = acc + f.x * f.y
+    i = i + 1
+  }
+  acc + area(Empty) + msg_len(Quit) + 1
+}
+EOF
+}
+aa3_write_consumer 1
+cat > "$TMP_DIR/aa3/units/main.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  io_println(world, "aa3 ok local=" + use_local().to_string())
+  0
+}
+EOF
+cat > "$TMP_DIR/aa3/app/src/main.pion" <<'EOF'
+import "aa3lib"
+
+pub struct Pair {
+  a : String
+  b : String
+}
+
+pub enum Shape {
+  Rect(Int, Int)
+  Empty
+  Unit2
+}
+
+pub fn main(world : World) -> Int {
+  let p = Pair::{ a: "pq", b: "r" }
+  let local = p.a.length() + p.b.length() + match Rect(2, 5) {
+    Rect(w, h) => w * h
+    _ => 0
+  }
+  let lp = aa3lib::LPair::{ a: "x", b: "yy" }
+  let lm = aa3lib::LMsg::LText("zzz")
+  let ls = aa3lib::LShape::LRect(3, 4)
+  let lt = aa3lib::LTree::LNode(aa3lib::LTree::LLeaf, aa3lib::mk_ltree(2))
+  let x = aa3lib::lpair_len(lp) + aa3lib::lmsg_len(lm) + aa3lib::lshape_area(ls) + aa3lib::lcount(lt)
+  io_println(world, "aa3x ok local=" + local.to_string() + " xpkg=" + x.to_string())
+  0
+}
+EOF
+# local = 50 * 32 (Node(shared, shared), 16 leaves each) + 3 * sum(1 + digits(i))
+#       + sum(i) * (2 * k + 1)
+EXP_AA3_K1="aa3 ok local=5695"
+EXP_AA3_K2="aa3 ok local=8145"
+AA3_CAS="$CAS_DIR/aa3"
+OUT_AA3=$(PION_CACHE_DIR="$AA3_CAS" "$PIONC" run "$TMP_DIR/aa3/units")
+echo "p89 aa3 cold dev -> $OUT_AA3"
+[ "$OUT_AA3" = "$EXP_AA3_K1" ] || { echo "FAIL: aa3 cold dev mismatch (expected '$EXP_AA3_K1')" >&2; exit 1; }
+aa3_objs() {
+  find "$AA3_CAS" -type f -name '*.o' | sort
+}
+aa3_objs > "$TMP_DIR/aa3_objs_cold.txt"
+[ -s "$TMP_DIR/aa3_objs_cold.txt" ] || { echo "FAIL: aa3 found no unit objects in CAS" >&2; exit 1; }
+# Symbol audit over every cached unit object: exactly the RC-carrying tagged
+# enums keep a per-type drop, and no per-type struct / niche / RC-free drop exists.
+NM_ALL=$(aa3_objs | while read -r o; do nm "$o" 2>/dev/null || true; done)
+aa3_nm_dump() {
+  cat "$TMP_DIR/aa3_objs_cold.txt" >&2
+  printf '%s\n' "$NM_ALL" | grep 'pion_drop_' >&2 || true
+}
+printf '%s\n' "$NM_ALL" | grep -q 'pion_drop_slots_3$' || { aa3_nm_dump; echo "FAIL: aa3 missing \$pion_drop_slots_3" >&2; exit 1; }
+printf '%s\n' "$NM_ALL" | grep -Eq ' T _?pion_drop_enum_Msg$' || { aa3_nm_dump; echo "FAIL: aa3 producer unit must export \$pion_drop_enum_Msg" >&2; exit 1; }
+printf '%s\n' "$NM_ALL" | grep -Eq ' U _?pion_drop_enum_Msg$' || { aa3_nm_dump; echo "FAIL: aa3 consumer unit must reference \$pion_drop_enum_Msg" >&2; exit 1; }
+if printf '%s\n' "$NM_ALL" | grep -Eq 'pion_drop_struct_|pion_drop_enum_.*(Shape|Tree)'; then
+  printf '%s\n' "$NM_ALL" | grep -E 'pion_drop_struct_|pion_drop_enum_.*(Shape|Tree)' >&2
+  echo "FAIL: aa3 unexpected per-type struct / niche / RC-free enum drop symbol" >&2
+  exit 1
+fi
+# Hot consumer: only b_use.pion changes; the producer unit object is reused.
+aa3_write_consumer 2
+OUT_AA3_HOT=$(PION_CACHE_DIR="$AA3_CAS" "$PIONC" run "$TMP_DIR/aa3/units")
+echo "p89 aa3 hot consumer dev -> $OUT_AA3_HOT"
+[ "$OUT_AA3_HOT" = "$EXP_AA3_K2" ] || { echo "FAIL: aa3 hot consumer mismatch (expected '$EXP_AA3_K2')" >&2; exit 1; }
+aa3_objs > "$TMP_DIR/aa3_objs_hot.txt"
+comm -13 "$TMP_DIR/aa3_objs_cold.txt" "$TMP_DIR/aa3_objs_hot.txt" > "$TMP_DIR/aa3_objs_new.txt"
+[ -s "$TMP_DIR/aa3_objs_new.txt" ] || { echo "FAIL: aa3 hot edit produced no new unit object" >&2; exit 1; }
+NM_NEW=$(while read -r o; do nm "$o" 2>/dev/null || true; done < "$TMP_DIR/aa3_objs_new.txt")
+if printf '%s\n' "$NM_NEW" | grep -Eq ' T _?pion_drop_enum_Msg$'; then
+  echo "FAIL: aa3 hot build recompiled the producer unit (expected cached a_types object)" >&2
+  exit 1
+fi
+printf '%s\n' "$NM_NEW" | grep -Eq ' U _?pion_drop_enum_Msg$' || { echo "FAIL: aa3 hot consumer must reference the cached producer's \$pion_drop_enum_Msg" >&2; exit 1; }
+OUT_AA3_REL=$(PION_CACHE_DIR="$AA3_CAS" "$PIONC" run --release "$TMP_DIR/aa3/units")
+echo "p89 aa3 hot consumer release -> $OUT_AA3_REL"
+[ "$OUT_AA3_REL" = "$EXP_AA3_K2" ] || { echo "FAIL: aa3 release mismatch" >&2; exit 1; }
+# Whole-package SSA of the same files: RC-free Shape passes a null drop, Msg keeps its drop.
+"$PIONC" build --release --emit-ssa "$TMP_DIR/aa3_units.ssa" "$TMP_DIR/aa3/units"
+python3 - "$TMP_DIR/aa3_units.ssa" <<'SSA_EOF'
+import re, sys
+ssa = open(sys.argv[1]).read()
+assert "$pion_drop_struct_" not in ssa, "unexpected $pion_drop_struct_*"
+assert not re.search(r"\$pion_drop_enum_\w*(Shape|Tree)\b", ssa), "unexpected Shape / Tree per-type drop"
+assert ssa.count("function $pion_drop_slots_3(") == 1, "Pair and Tree must share one $pion_drop_slots_3"
+assert re.search(r"function \$pion_drop_enum_\w*Msg\(", ssa), "Msg must keep its per-type drop"
+assert re.search(r"\$pion_alloc_uninit\(w 24, w 5, l 0\)", ssa), "Rect(i, k) must allocate with drop_fn 0"
+assert re.search(r"\$pion_alloc_uninit\(w 16, w 4, l \$pion_drop_slots_3\)", ssa), "Pair must use $pion_drop_slots_3"
+assert re.search(r"\$pion_alloc_uninit\(w 16, w 5, l \$pion_drop_slots_3\)", ssa), "Node must use $pion_drop_slots_3"
+SSA_EOF
+echo "p89 aa3 SSA audit -> OK"
+# Cross-package: app-local Pair / RC-free Shape next to aa3lib's LPair, LMsg
+# (one RC variant), RC-free LShape and niche LTree.
+EXP_AA3_X="aa3x ok local=13 xpkg=23"
+OUT_AA3_X=$(PION_CACHE_DIR="$CAS_DIR/aa3x" "$PIONC" run "$TMP_DIR/aa3/app")
+echo "p89 aa3 xpkg dev -> $OUT_AA3_X"
+[ "$OUT_AA3_X" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 xpkg dev mismatch (expected '$EXP_AA3_X')" >&2; exit 1; }
+OUT_AA3_XR=$("$PIONC" run --release "$TMP_DIR/aa3/app")
+echo "p89 aa3 xpkg release -> $OUT_AA3_XR"
+[ "$OUT_AA3_XR" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 xpkg release mismatch" >&2; exit 1; }
+# Manifest builds compile one object per package: audit their symbols.
+NM_X=$(find "$CAS_DIR/aa3x" -type f -name '*.o' | while read -r o; do nm "$o" 2>/dev/null || true; done)
+printf '%s\n' "$NM_X" | grep -q 'pion_drop_slots_3$' || { echo "FAIL: aa3 xpkg missing \$pion_drop_slots_3" >&2; exit 1; }
+printf '%s\n' "$NM_X" | grep -Eq 'pion_drop_enum_[A-Za-z0-9_]*LMsg$' || { echo "FAIL: aa3 xpkg LMsg must keep a per-type drop" >&2; exit 1; }
+if printf '%s\n' "$NM_X" | grep -Eq 'pion_drop_struct_|pion_drop_enum_[A-Za-z0-9_]*(Shape|LTree)$'; then
+  printf '%s\n' "$NM_X" | grep 'pion_drop_' >&2
+  echo "FAIL: aa3 xpkg unexpected per-type struct / niche / RC-free enum drop symbol" >&2
+  exit 1
+fi
+echo "p89 aa3 xpkg symbol audit -> OK"
+PION_CACHE_DIR="$CAS_DIR/asan_aa3" "$PIONC" build --release --emit-staticlib "$TMP_DIR/libp89_aa3.a" "$TMP_DIR/aa3/app"
+"$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libp89_aa3.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p89_aa3_asan" 2>/dev/null \
+  || "$CC_BIN" -fsanitize=address -Wl,-force_load,"$TMP_DIR/libp89_aa3.a" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p89_aa3_asan"
+OUT_AA3_ASAN=$(ASAN_OPTIONS="$ASAN_OPTS" "$TMP_DIR/p89_aa3_asan")
+echo "p89 aa3 ASan -> $OUT_AA3_ASAN"
+[ "$OUT_AA3_ASAN" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 ASan mismatch" >&2; exit 1; }
+PION_CACHE_DIR="$CAS_DIR/asan_aa3u" "$PIONC" build --release --emit-obj "$TMP_DIR/aa3_units.o" "$TMP_DIR/aa3/units"
+"$CC_BIN" -fsanitize=address "$TMP_DIR/aa3_units.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/aa3_units_asan"
+OUT_AA3_UASAN=$(ASAN_OPTIONS="$ASAN_OPTS" "$TMP_DIR/aa3_units_asan")
+echo "p89 aa3 units ASan -> $OUT_AA3_UASAN"
+[ "$OUT_AA3_UASAN" = "$EXP_AA3_K2" ] || { echo "FAIL: aa3 units ASan mismatch" >&2; exit 1; }
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/aa3u.wasm" "$TMP_DIR/aa3/units"
+  OUT_AA3_WASM="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/aa3u.wasm")"
+  echo "p89 aa3 units Wasm32 -> $OUT_AA3_WASM"
+  [ "$OUT_AA3_WASM" = "$EXP_AA3_K2" ] || { echo "FAIL: aa3 units Wasm32 mismatch" >&2; exit 1; }
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/aa3x.wasm" "$TMP_DIR/aa3/app"
+  OUT_AA3_XWASM="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/aa3x.wasm")"
+  echo "p89 aa3 xpkg Wasm32 -> $OUT_AA3_XWASM"
+  [ "$OUT_AA3_XWASM" = "$EXP_AA3_X" ] || { echo "FAIL: aa3 xpkg Wasm32 mismatch" >&2; exit 1; }
+fi
+
 echo "p89_unit_enum: ALL PASSED"

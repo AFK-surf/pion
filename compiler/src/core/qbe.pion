@@ -184,7 +184,6 @@ pub struct QbeGen {
   target_name : String
   mut export_internals : Bool
   pkg_prefix : String
-  struct_order : Array[String]
   enum_order : Array[String]
   const_order : Array[String]
   const_int_vals : Map[String, Int]
@@ -22531,7 +22530,6 @@ fn qbe_new_for_target_name(
     target_name: target_name,
     export_internals: false,
     pkg_prefix: qbe_pkg_prefix_for(tc.pkg_name, tc.multi_pkg),
-    struct_order: [],
     enum_order: [],
     const_order: [],
     const_int_vals: Map([]),
@@ -31589,27 +31587,27 @@ fn qbe_emit_variant_ctor(
       }
       let payload_sz = layout.payload_offset + arg_vals.length() * 8
       let drop_sym = if einfo.decl.type_params.length() == 0 {
-        if has_qual_sep(resolved_enum) && !str_arr_contains(g.enum_order, resolved_enum) {
-          g.enum_order.push(resolved_enum)
-        }
         if layout.is_niche {
+          // A niche enum's payload object holds only the payload variant's
+          // fields: drop it through the canonical slot helper.
           let pv = einfo.variants[layout.payload_tag]
-          let mut has_obj = false
+          let obj_slots : Array[Int] = []
           let mut pfi = 0
           while pfi < pv.field_tys.length() {
             if qbe_is_obj_ty(g, pv.field_tys[pfi]) {
-              has_obj = true
-              break
+              obj_slots.push(layout.payload_offset / 8 + pfi)
             }
             pfi = pfi + 1
           }
-          if has_obj {
-            "$pion_drop_enum_" + qbe_mangle_qual_sym(resolved_enum)
-          } else {
-            "0"
+          qbe_register_slot_drop(g, obj_slots)
+        } else if qbe_tagged_enum_has_obj(g, einfo) {
+          if has_qual_sep(resolved_enum) && !str_arr_contains(g.enum_order, resolved_enum) {
+            g.enum_order.push(resolved_enum)
           }
-        } else {
           "$pion_drop_enum_" + qbe_mangle_qual_sym(resolved_enum)
+        } else {
+          // No variant carries an RC field: the drop would only read the tag.
+          "0"
         }
       } else {
         let obj_slots : Array[Int] = []
@@ -46066,23 +46064,19 @@ fn qbe_emit_expr_inner(
           let drop_sym = if all_obj_fields_static_null {
             "0"
           } else if sinfo.decl.type_params.length() == 0 {
-            let mut has_obj = false
+            // Non-generic structs share the canonical per-unit
+            // `$pion_drop_slots_<key>` helper keyed by their RC slot set
+            // (`SPEC.md` §6 drop functions): structs with the same object
+            // slots reuse one body, and no per-type export exists.
+            let obj_slots : Array[Int] = []
             let mut k = 0
-            while k < n_fields {
+            while k < sinfo.field_tys.length() {
               if qbe_is_obj_ty(g, sinfo.field_tys[k]) {
-                has_obj = true
-                break
+                obj_slots.push(k)
               }
               k = k + 1
             }
-            if has_obj {
-              if has_qual_sep(resolved_name) && !str_arr_contains(g.struct_order, resolved_name) {
-                g.struct_order.push(resolved_name)
-              }
-              "$pion_drop_struct_" + qbe_mangle_qual_sym(resolved_name)
-            } else {
-              "0"
-            }
+            qbe_register_slot_drop(g, obj_slots)
           } else {
             let obj_slots : Array[Int] = []
             let tp_names : Array[String] = []
@@ -60266,66 +60260,21 @@ fn qbe_drain_mono_queue(g : QbeGen, out : StringBuilder) -> Unit {
 }
 
 ///|
-fn qbe_emit_struct_drops(g : QbeGen, out : StringBuilder) -> Unit {
-  let mut i = 0
-  while i < g.struct_order.length() {
-    let sname = g.struct_order[i]
-    match qbe_lookup_struct_info(g, sname) {
-      Some(sinfo) =>
-        if sinfo.decl.type_params.length() == 0 {
-          let obj_slots : Array[Int] = []
-          let mut fi = 0
-          while fi < sinfo.field_tys.length() {
-            if qbe_is_obj_ty(g, sinfo.field_tys[fi]) {
-              obj_slots.push(fi)
-            }
-            fi = fi + 1
-          }
-          if obj_slots.length() > 0 {
-            if g.unit_mode && !has_qual_sep(sname) {
-              out.write_string("export ")
-            }
-            out.write_string("function $pion_drop_struct_")
-            out.write_string(qbe_mangle_qual_sym(sname))
-            out.write_string("(l %p) {\n@start\n")
-            let mut j = 0
-            while j < obj_slots.length() {
-              let off = obj_slots[j] * 8
-              let js = j.to_string()
-              out.write_string("    %a")
-              out.write_string(js)
-              out.write_string(" =l add %p, ")
-              out.write_string(off.to_string())
-              out.write_string("\n    %v")
-              out.write_string(js)
-              out.write_string(" =l loadl %a")
-              out.write_string(js)
-              out.write_string("\n    %vnz")
-              out.write_string(js)
-              out.write_string(" =w cnel %v")
-              out.write_string(js)
-              out.write_string(", 0\n    jnz %vnz")
-              out.write_string(js)
-              out.write_string(", @d")
-              out.write_string(js)
-              out.write_string(", @n")
-              out.write_string(js)
-              out.write_string("\n@d")
-              out.write_string(js)
-              out.write_string("\n    call $pion_rc_dec(l %v")
-              out.write_string(js)
-              out.write_string(")\n@n")
-              out.write_string(js)
-              out.write_string("\n")
-              j = j + 1
-            }
-            out.write_string("    ret\n}\n\n")
-          }
-        }
-      None => ()
+/// Whether any variant of a non-generic tagged enum has an RC object field.
+fn qbe_tagged_enum_has_obj(g : QbeGen, einfo : EnumInfo) -> Bool {
+  let mut vi = 0
+  while vi < einfo.variants.length() {
+    let v = einfo.variants[vi]
+    let mut fi = 0
+    while fi < v.field_tys.length() {
+      if qbe_is_obj_ty(g, v.field_tys[fi]) {
+        return true
+      }
+      fi = fi + 1
     }
-    i = i + 1
+    vi = vi + 1
   }
+  false
 }
 
 ///|
@@ -60337,49 +60286,10 @@ fn qbe_emit_enum_drops(g : QbeGen, out : StringBuilder) -> Unit {
       Some(einfo) => {
         let layout = qbe_enum_layout_for_info(einfo)
         if einfo.decl.type_params.length() == 0 && !layout.is_unit_only {
-          if layout.is_niche {
-            let pv = einfo.variants[layout.payload_tag]
-            let obj_slots : Array[Int] = []
-            let mut fi = 0
-            while fi < pv.field_tys.length() {
-              if qbe_is_obj_ty(g, pv.field_tys[fi]) {
-                obj_slots.push(fi)
-              }
-              fi = fi + 1
-            }
-            if obj_slots.length() > 0 {
-              if g.unit_mode && !has_qual_sep(ename) {
-                out.write_string("export ")
-              }
-              out.write_string("function $pion_drop_enum_")
-              out.write_string(qbe_mangle_qual_sym(ename))
-              out.write_string("(l %p) {\n@start\n")
-              let mut j = 0
-              while j < obj_slots.length() {
-                let off = layout.payload_offset + obj_slots[j] * 8
-                if off == 0 {
-                  out.write_string("    %v_")
-                  out.write_string(j.to_string())
-                  out.write_string(" =l loadl %p\n")
-                } else {
-                  out.write_string("    %a_")
-                  out.write_string(j.to_string())
-                  out.write_string(" =l add %p, ")
-                  out.write_string(off.to_string())
-                  out.write_string("\n    %v_")
-                  out.write_string(j.to_string())
-                  out.write_string(" =l loadl %a_")
-                  out.write_string(j.to_string())
-                  out.write_string("\n")
-                }
-                out.write_string("    call $pion_rc_dec(l %v_")
-                out.write_string(j.to_string())
-                out.write_string(")\n")
-                j = j + 1
-              }
-              out.write_string("    ret\n}\n\n")
-            }
-          } else {
+          // Niche enums drop through `$pion_drop_slots_<key>` and tagged
+          // enums without RC fields allocate with a null drop: only tagged
+          // enums with at least one RC field keep a per-type drop.
+          if !layout.is_niche && qbe_tagged_enum_has_obj(g, einfo) {
             if g.unit_mode && !has_qual_sep(ename) {
               out.write_string("export ")
             }
@@ -61019,7 +60929,7 @@ pub fn emit_qbe_package_multi_entry_target_opts(
     let mut di = 0
     while di < f.decls.length() {
       match f.decls[di] {
-        DStruct(sd) => g.struct_order.push(sd.name)
+        DStruct(_) => ()
         DEnum(ed) => g.enum_order.push(ed.name)
         DConst(cd) => {
           g.const_order.push(cd.name)
@@ -61240,7 +61150,6 @@ pub fn emit_qbe_package_multi_entry_target_opts(
   }
   out.write_string("\n")
 
-  qbe_emit_struct_drops(g, out)
   qbe_emit_enum_drops(g, out)
   qbe_emit_helper_drops(g, out)
   qbe_emit_fn_wrappers(g, out)
@@ -61570,7 +61479,7 @@ pub fn emit_qbe_unit_entry_target_opts(
   let mut di = 0
   while di < f.decls.length() {
     match f.decls[di] {
-      DStruct(sd) => g.struct_order.push(sd.name)
+      DStruct(_) => ()
       DEnum(ed) => g.enum_order.push(ed.name)
       DConst(cd) => {
         g.const_order.push(cd.name)
@@ -61762,7 +61671,6 @@ pub fn emit_qbe_unit_entry_target_opts(
   }
   out.write_string("\n")
 
-  qbe_emit_struct_drops(g, out)
   qbe_emit_enum_drops(g, out)
   qbe_emit_helper_drops(g, out)
   qbe_emit_fn_wrappers(g, out)
@@ -61967,7 +61875,7 @@ pub fn emit_qbe_test_package_target(
     let mut di = 0
     while di < f.decls.length() {
       match f.decls[di] {
-        DStruct(sd) => g.struct_order.push(sd.name)
+        DStruct(_) => ()
         DEnum(ed) => g.enum_order.push(ed.name)
         DConst(cd) => {
           g.const_order.push(cd.name)
@@ -62256,7 +62164,6 @@ pub fn emit_qbe_test_package_target(
   }
   out.write_string("\n")
 
-  qbe_emit_struct_drops(g, out)
   qbe_emit_enum_drops(g, out)
   qbe_emit_helper_drops(g, out)
   qbe_emit_fn_wrappers(g, out)
