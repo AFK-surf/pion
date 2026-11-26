@@ -104,58 +104,120 @@ rejects obj-br "guarded has 4 br words, text has 5" "$F/expect.txt" arm64_apple 
 rejects other-target "guarded has 5 indirect branches, want 1" "$F/expect.txt" arm64 "$TMP_DIR/d_arm64_apple.s"
 echo "p122 site checker rejects 4 mutations"
 
-# Sanitized QBE objects (2 and 5); plain ones when the toolchain has none.
+# Sanitized QBE objects (2 and 5); reuse prebuilt $PION_QBE_SAN_DIR when available.
 SAN=""
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -o "$TMP_DIR/san_probe" 2>/dev/null && "$TMP_DIR/san_probe"; then
-  SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
-elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
-  fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
-else
-  echo "NOTE: $CC_BIN -fsanitize=address,undefined unavailable; mutants unsanitized, no sanitized replay"
-fi
+Q="$TMP_DIR/sanq"
+mkdir -p "$Q"
 export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
-Q="$TMP_DIR/sanq"
-mkdir -p "$Q/obj"
-# Every run passes -t, so any default target will do.
-printf '#define Deftgt T_amd64_sysv\n' > "$Q/config.h"
-(
-  cd "$ROOT_DIR/vendor/qbe"
-  PIDS=""
-  for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-    [ "$f" = main.c ] && continue
-    "$CC_BIN" -std=c99 -O1 -g -w $SAN -fno-omit-frame-pointer -I "$Q" -I . \
-      -c "$f" -o "$Q/obj/$(printf '%s' "$f" | tr / _).o" &
-    PIDS="$PIDS $!"
-  done
-  CC_FAIL=0
-  for pid in $PIDS; do
-    wait "$pid" || CC_FAIL=1
-  done
-  [ "$CC_FAIL" -eq 0 ] || fail "sanitized QBE: compiling an object failed"
-)
-qbe_with() { # $1 main.c source, $2 output binary
-  "$CC_BIN" -std=c99 -O1 -g -w $SAN -fno-omit-frame-pointer -I "$Q" -I "$ROOT_DIR/vendor/qbe" -c "$1" -o "$2.o"
-  "$CC_BIN" $SAN "$Q"/obj/*.o "$2.o" -o "$2"
-}
-qbe_with "$ROOT_DIR/vendor/qbe/main.c" "$Q/qbe"
-[ "$(ls "$Q"/obj/*.o | wc -l | tr -d ' ')" -ge 20 ] || fail "sanitized QBE: objects missing"
-
-# 2. Mutants: each control is rejected by its own condition only.
-MUTS=$(python3 -E "$DIR/mk_mutants.py" "$ROOT_DIR/vendor/qbe/main.c" "$Q")
-NM=0
-for M in $MUTS; do
-  qbe_with "$Q/main_$M.c" "$Q/qbe_$M"
-  "$Q/qbe_$M" -t arm64_apple -o "$TMP_DIR/m_$M.s" "$F/dispatch.ssa" 2> "$TMP_DIR/m.err" || { cat "$TMP_DIR/m.err" >&2; fail "mutant $M"; }
-  [ ! -s "$TMP_DIR/m.err" ] || { cat "$TMP_DIR/m.err" >&2; fail "mutant $M wrote diagnostics"; }
-  python3 -E "$DIR/check_sites.py" "$F/expect_$M.txt" arm64_apple "$TMP_DIR/m_$M.s" > /dev/null
-  if python3 -E "$DIR/check_sites.py" "$F/expect.txt" arm64_apple "$TMP_DIR/m_$M.s" > /dev/null 2>&1; then
-    fail "mutant $M changes no control"
+if [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -x "$PION_QBE_SAN_DIR/qbe" ] && [ -d "$PION_QBE_SAN_DIR/obj" ] \
+  && { [ ! -f "$PION_QBE_SAN_DIR/qbe.cc" ] || [ "$(cat "$PION_QBE_SAN_DIR/qbe.cc")" = "$CC_BIN" ]; }; then
+  SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+  Q_OBJ_DIR="$PION_QBE_SAN_DIR/obj"
+  Q_INC_DIR="$PION_QBE_SAN_DIR"
+  Q_BIN="$PION_QBE_SAN_DIR/qbe"
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$Q" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+    Q_OBJ_DIR="$Q/obj"
+    Q_INC_DIR="$Q"
+    Q_BIN="$Q/qbe"
+  elif [ "$SAN_RC" -eq 77 ]; then
+    if [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
+      fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
+    fi
+    echo "NOTE: $CC_BIN -fsanitize=address,undefined unavailable; mutants unsanitized, no sanitized replay"
+    mkdir -p "$Q/obj"
+    printf '#define Deftgt T_amd64_sysv\n' > "$Q/config.h"
+    python3 -E - "$CC_BIN" "$ROOT_DIR/vendor/qbe" "$Q" <<'PYEOF'
+import glob, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+cc, qbe_dir, out_dir = sys.argv[1:4]
+obj_dir = os.path.join(out_dir, "obj")
+srcs = sorted(glob.glob("*.c", root_dir=qbe_dir) + glob.glob("amd64/*.c", root_dir=qbe_dir)
+              + glob.glob("arm64/*.c", root_dir=qbe_dir) + glob.glob("rv64/*.c", root_dir=qbe_dir))
+srcs = [s for s in srcs if s != "main.c"]
+jobs = min(os.cpu_count() or 1, 8)
+def build(s):
+    o = os.path.join(obj_dir, s.replace("/", "_") + ".o")
+    r = subprocess.run([cc, "-std=c99", "-O1", "-g", "-w", "-fno-omit-frame-pointer",
+                        "-I", out_dir, "-I", qbe_dir, "-c", os.path.join(qbe_dir, s), "-o", o])
+    if r.returncode != 0:
+        raise SystemExit(1)
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(build, srcs))
+PYEOF
+    Q_OBJ_DIR="$Q/obj"
+    Q_INC_DIR="$Q"
+    Q_BIN="$Q/qbe"
+  else
+    fail "sanitized QBE build failed (exit $SAN_RC)"
   fi
-  NM=$((NM + 1))
+fi
+Q_BASE_OBJS=""
+for o in "$Q_OBJ_DIR"/*.o; do
+  case "$o" in
+    */main.c.o) continue ;;
+  esac
+  Q_BASE_OBJS="$Q_BASE_OBJS $o"
 done
-[ "$NM" -eq 8 ] || fail "$NM mutants, want 8"
+qbe_with() { # $1 main.c source, $2 output binary
+  "$CC_BIN" -std=c99 -O1 -g -w $SAN -fno-omit-frame-pointer -I "$Q_INC_DIR" -I "$ROOT_DIR/vendor/qbe" -c "$1" -o "$2.o"
+  "$CC_BIN" $SAN $Q_BASE_OBJS "$2.o" -o "$2"
+}
+if [ ! -x "$Q_BIN" ]; then
+  qbe_with "$ROOT_DIR/vendor/qbe/main.c" "$Q_BIN"
+fi
+[ "$(ls "$Q_OBJ_DIR"/*.o | wc -l | tr -d ' ')" -ge 20 ] || fail "sanitized QBE: objects missing"
+
+# 2. Mutants: each control is rejected by its own condition only (bounded parallel compile + run).
+MUTS=$(python3 -E "$DIR/mk_mutants.py" "$ROOT_DIR/vendor/qbe/main.c" "$Q")
+python3 -E - "$CC_BIN" "$SAN" "$Q_INC_DIR" "$ROOT_DIR/vendor/qbe" "$Q_OBJ_DIR" "$Q" "$TMP_DIR" "$F" "$DIR/check_sites.py" $MUTS <<'PYEOF'
+import glob, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+cc, san_str, q_inc, qbe_dir, q_obj_dir, q_dir, tmp_dir, f_dir, checker = sys.argv[1:10]
+muts = sys.argv[10:]
+if len(muts) != 8:
+    raise SystemExit(f"FAIL: p122 {len(muts)} mutants, want 8")
+san = san_str.split() if san_str else []
+base_objs = sorted(o for o in glob.glob(os.path.join(q_obj_dir, "*.o")) if os.path.basename(o) != "main.c.o")
+jobs = min(os.cpu_count() or 1, 4)
+
+def run_mutant(m):
+    src = os.path.join(q_dir, f"main_{m}.c")
+    obj = os.path.join(q_dir, f"qbe_{m}.o")
+    exe = os.path.join(q_dir, f"qbe_{m}")
+    r = subprocess.run([cc, "-std=c99", "-O1", "-g", "-w", *san, "-fno-omit-frame-pointer",
+                        "-I", q_inc, "-I", qbe_dir, "-c", src, "-o", obj])
+    if r.returncode != 0:
+        raise SystemExit(f"FAIL: p122 mutant {m} compile")
+    r = subprocess.run([cc, *san, *base_objs, obj, "-o", exe])
+    if r.returncode != 0:
+        raise SystemExit(f"FAIL: p122 mutant {m} link")
+    out_s = os.path.join(tmp_dir, f"m_{m}.s")
+    r = subprocess.run([exe, "-t", "arm64_apple", "-o", out_s, os.path.join(f_dir, "dispatch.ssa")],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        raise SystemExit(f"FAIL: p122 mutant {m}")
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+        raise SystemExit(f"FAIL: p122 mutant {m} wrote diagnostics")
+    r = subprocess.run([sys.executable, "-E", checker, os.path.join(f_dir, f"expect_{m}.txt"), "arm64_apple", out_s],
+                       stdout=subprocess.DEVNULL)
+    if r.returncode != 0:
+        raise SystemExit(f"FAIL: p122 mutant {m} expect check")
+    r = subprocess.run([sys.executable, "-E", checker, os.path.join(f_dir, "expect.txt"), "arm64_apple", out_s],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode == 0:
+        raise SystemExit(f"FAIL: p122 mutant {m} changes no control")
+
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(run_mutant, muts))
+PYEOF
 echo "p122 mutants: each of $MUTS changes exactly its control"
 
 # 3. Host execution against the C reference.
@@ -227,7 +289,7 @@ if [ -n "$SAN" ]; then
     in=$1
     shift
     "$QBE" "$@" -o "$TMP_DIR/ref.out" "$in"
-    "$Q/qbe" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
+    "$Q_BIN" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
     [ ! -s "$TMP_DIR/san.err" ] || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in wrote diagnostics"; }
     cmp "$TMP_DIR/ref.out" "$TMP_DIR/san.out" || fail "sanitized QBE $* $in: output differs from out/qbe"
     N=$((N + 1))

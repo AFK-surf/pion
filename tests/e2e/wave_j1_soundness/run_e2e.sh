@@ -7662,9 +7662,7 @@ test "$("$TMP_DIR/r52_rc_b")" = "6"
 PION_CACHE_DIR="$TMP_DIR/cas_r52_rc_rel" "$PIONC" build --release -o "$TMP_DIR/r52_rc_rel_b" "$TMP_DIR/r52_rc/main.pion"
 test "$("$TMP_DIR/r52_rc_rel_b")" = "6"
 CC_BIN="${CC:-cc}"
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/r52_asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/r52_pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/r52_libpionrt_asan.a" "$TMP_DIR/r52_pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/r52_libpionrt_asan.a"; then
   for R52_MODE in "" --release; do
     "$PIONC" build $R52_MODE --emit-obj "$TMP_DIR/r52_rc.o" "$TMP_DIR/r52_rc/main.pion"
     "$CC_BIN" -fsanitize=address "$TMP_DIR/r52_rc.o" "$TMP_DIR/r52_libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/r52_rc_asan"

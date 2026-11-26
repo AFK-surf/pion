@@ -130,8 +130,7 @@ if [ "$ASAN" = 1 ] && (ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe") >/dev/
 fi
 if [ "$ASAN" = 1 ]; then
   echo "p114 ASan options: ${ASAN_RUN_OPTS:-<none, no LeakSanitizer>}"
-  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
   for MODE in "" --release; do
     "$PIONC" build $MODE --emit-obj "$TMP_DIR/p114.o" "$SRC"
     "$CC_BIN" -fsanitize=address "$TMP_DIR/p114.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p114_asan"
@@ -225,26 +224,28 @@ for MODE in dev release; do
 done
 
 # 6. ASan + UBSan QBE over every QBE input above.
-if [ "$ASAN" = 1 ] && printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -o "$TMP_DIR/ubsan_probe" 2>/dev/null \
-  && "$TMP_DIR/ubsan_probe"; then
-  mkdir -p "$TMP_DIR/sanq"
-  # Every replay passes -t, so any default target will do.
-  printf '#define Deftgt T_amd64_sysv\n' > "$TMP_DIR/sanq/config.h"
-  (
-    cd "$ROOT_DIR/vendor/qbe"
-    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-      o="$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
-      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$o"
-    done
-  )
-  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
+SAN_QBE=""
+mkdir -p "$TMP_DIR/sanq"
+if [ "$ASAN" = 1 ] && [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ] \
+  && { [ ! -f "${PION_QBE_SAN}.cc" ] || [ "$(cat "${PION_QBE_SAN}.cc")" = "$CC_BIN" ]; }; then
+  SAN_QBE="$PION_QBE_SAN"
+elif [ "$ASAN" = 1 ]; then
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$TMP_DIR/sanq" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_QBE="$TMP_DIR/sanq/qbe"
+  elif [ "$SAN_RC" -ne 77 ]; then
+    echo "FAIL: p114 ASan+UBSan QBE build failed (exit $SAN_RC)" >&2
+    exit 1
+  fi
+fi
+if [ -n "$SAN_QBE" ]; then
   for IN in "$TMP_DIR/dev.ssa" "$TMP_DIR/release.ssa" "$TMP_DIR/cfg/cfg.ssa" "$TMP_DIR/vm_dev.ssa" "$TMP_DIR/vm_release.ssa"; do
     for T in amd64_sysv arm64_apple; do
       ASAN_OPTIONS="${ASAN_RUN_OPTS:+$ASAN_RUN_OPTS:}halt_on_error=1" UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-        "$TMP_DIR/sanq/qbe" -t "$T" -o "$TMP_DIR/sanq/out.s" "$IN"
+        "$SAN_QBE" -t "$T" -o "$TMP_DIR/sanq/out.s" "$IN"
       ASAN_OPTIONS="${ASAN_RUN_OPTS:+$ASAN_RUN_OPTS:}halt_on_error=1" UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-        "$TMP_DIR/sanq/qbe" -t "$T" --obj -o "$TMP_DIR/sanq/out.o" "$IN"
+        "$SAN_QBE" -t "$T" --obj -o "$TMP_DIR/sanq/out.o" "$IN"
     done
   done
   echo "p114 ASan+UBSan QBE: 5 inputs x {amd64_sysv, arm64_apple} x {text, --obj} clean"

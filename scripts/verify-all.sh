@@ -247,6 +247,7 @@ if [ "${1:-}" = "--group" ]; then
 fi
 
 . "$ROOT_DIR/scripts/bg-lib.sh"
+T_GATE_START=$(python3 -c 'import time; print(int(time.time()))')
 RT_LOG_DIR=$(mktemp -d)
 TSAN_PID=""
 ASAN_PID=""
@@ -341,6 +342,15 @@ sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" <<'E2E'
 PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC
 # Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
 sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p119_amd64_fp_rhs_load_fold/run_e2e.sh" "$PIONC2"
 # Wave H-2 Track H5: ARM64 far conditional branches (> +-1MB) + QBE rega cold-call seeding + cold-block layout.
 sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC2"
@@ -348,7 +358,6 @@ sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC2"
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
 # Wave J4b: Cargo-style package aliases, canonical package IDs, lockfile compat & C-export collision guard.
 sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC2"
 # Folded [4/6] std/* + text_stats + regex 9/9 ReDoS + init + doc, mbt*, dogfood release apps, [5/6] standalone e2e, and [6/6] TLS/flagship.
@@ -437,26 +446,12 @@ sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC2"
 # P113: AMD64 movaps XMM copies + grouped-conversion xorps + cvtsi2{ss,sd}{l,q} text width (Native + Wasm32 + ASan, --obj == as, C driver).
 sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2e.sh" "$PIONC2"
-# P114: QBE loop jump-table private spill-home store sinking (rega.c sinktablehomes; -d SR structure on 3 targets, --obj / text C differential, Pion Native + Wasm32 + ASan, bytecode_vm, ASan+UBSan QBE replay).
-sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC2"
-# P117: QBE counted-loop expansion (main.c expandloops; -d G expansions on 5 targets, --obj / text C-oracle differential, --obj == as, no back edge, fannkuchredux, ASan+UBSan QBE replay).
-sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC2"
-# P119: AMD64 scalar FP right-operand load fold (amd64/isel.c foldoperandloads; objdump structure of 20 folds / 12 controls on sysv text, win text, --obj and assembled text, --obj == text, checker mutation self-test, IEEE-754 bit + flag C differential over 4 rounding modes and misaligned operands with UBSan, ASan+UBSan QBE on 5 targets, Pion source + nbody).
-sh "$ROOT_DIR/tests/e2e/p119_amd64_fp_rhs_load_fold/run_e2e.sh" "$PIONC2"
 # P115: cross-package struct literal type probe uses canonical package ids (method symbols, SSA + Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC2"
-# P116: Opt-Track P byte-identical compile-speed changes (QBE 1-byte lexer lookahead, filllive worklist, philive projected phi liveness, rega compact snapshots next to sinktablehomes, Mach-O keep/gen GPR masks, main-thread first unit; checking QBE oracles with ASan+UBSan on 4 targets, host C differential, --jobs 1/2/4/8 parity).
-sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC2"
-# P118: Opt-Track R (amd64 jump-table selector in the dispatch scratch register, proven zero-extension indexes the table directly, widened-word interval comparison folding; text == --obj dispatch forms, -d G folds, host C differential with dirty high halves, bytecode_vm / fannkuchredux, ASan+UBSan QBE on 4 targets).
-sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
-# P120: Win64 nonvolatile xmm6..xmm15 in QBE amd64_win (xmm0..xmm5-only rsave, 128-bit movups save/restore of the used xmm6..xmm14 and the xmm15 scratch; check_frames.py + mutants, x86-64 execution of the Win64 code with all 160 bytes of xmm6..xmm15 checked, ASan+UBSan QBE replay).
-sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
 # Generic arithmetic operator instantiation checks & QBE monomorphization (dev, --release, wasm32, ASan).
 sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC2"
 # Round 232: untyped tuple array literal -> generic Array[(K, V)] monomorphization (dev, --release, wasm32, ASan).
 sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC2"
-# P122: arm64_apple guarded jump-table dispatch copies (main.c replicatedispatch; br sites on 6 targets, text == Mach-O --obj, checker mutations, both-sides-table symmetry, no copy of a table shared by a rewritten edge, 24-copy limit, 8 QBE mutants of the match conditions and limit, 243712-input C reference via arm64_apple text and --obj on macOS ARM64, bytecode_vm == C with 24 run_vm sites, ASan+UBSan QBE replay).
-sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC2"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC2"
 # P125: native String slice spans + scalar Map[String, Int|Int64] entries + managed String file reads + native Channel[String].send without duplicate deep freeze (6 programs in --release and dev: exact exit status / stdout / stderr, slice-panic side-effect traces, call-mutated map fallback, 5 file kinds vs fs_read_bytes, SSA primitive presence).
@@ -522,8 +517,6 @@ sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC2"
 # P95: Wasm32 nested-loop outlining writes back inner-loop-only read+write slots (Native == Wasm32, Debug + --release).
 sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC2"
-# Wave J1: 2,500-term &&+is short-circuit (Native+Wasm32), cold/hot CAS topo const-init, xpkg mono closure const.
-sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC2"
 # Wave L1-A: constant patterns, unified EIs scoping + ASan/LSan, closure fail-closed, builtin arity, test --json, struct lit & impl edit.
 sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC2"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
@@ -536,3 +529,11 @@ E2E
 sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="
+GATE_ELAPSED_S=$(( $(python3 -c 'import time; print(int(time.time()))') - T_GATE_START ))
+echo "verify-all.sh total duration: ${GATE_ELAPSED_S}s"
+if [ "$GATE_ELAPSED_S" -gt 60 ]; then
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "::warning title=CI duration > 60s::verify-all.sh took ${GATE_ELAPSED_S}s (target <= 60s, hard timeout 300s)"
+  fi
+  echo "[WARN] verify-all.sh took ${GATE_ELAPSED_S}s (> 60s target)"
+fi

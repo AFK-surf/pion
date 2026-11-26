@@ -562,18 +562,20 @@ fi
 echo "p120 benchmarks + seed: amd64_win frames OK; amd64_sysv without xmm saves; xmm0..xmm5-only code saves nothing; mixed alloc4+alloc8(+alloc16) aligned across all 6 targets"
 
 # 4. ASan + UBSan QBE.
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -o "$TMP_DIR/san_probe" 2>/dev/null && "$TMP_DIR/san_probe"; then
-  mkdir -p "$TMP_DIR/sanq"
-  printf '#define Deftgt T_amd64_sysv\n' > "$TMP_DIR/sanq/config.h"
-  (
-    cd "$ROOT_DIR/vendor/qbe"
-    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=all \
-        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
-    done
-  )
-  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
+SAN_QBE=""
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ] \
+  && { [ ! -f "${PION_QBE_SAN}.cc" ] || [ "$(cat "${PION_QBE_SAN}.cc")" = "$CC_BIN" ]; }; then
+  SAN_QBE="$PION_QBE_SAN"
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$TMP_DIR/sanq" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_QBE="$TMP_DIR/sanq/qbe"
+  elif [ "$SAN_RC" -ne 77 ]; then
+    fail "ASan+UBSan QBE build failed (exit $SAN_RC)"
+  fi
+fi
+if [ -n "$SAN_QBE" ]; then
   export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
   export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
   N=0
@@ -581,7 +583,7 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,un
     in=$1
     shift
     "$QBE" "$@" -o "$TMP_DIR/ref.out" "$in"
-    "$TMP_DIR/sanq/qbe" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
+    "$SAN_QBE" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
     [ ! -s "$TMP_DIR/san.err" ] || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in wrote diagnostics"; }
     cmp "$TMP_DIR/ref.out" "$TMP_DIR/san.out" || fail "sanitized QBE $* $in: output differs from out/qbe"
     N=$((N + 1))

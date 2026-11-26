@@ -240,8 +240,7 @@ elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
 fi
 if [ "$ASAN" = 1 ]; then
-  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
   for MODE in "" --release; do
     "$PIONC" build $MODE --emit-obj "$TMP_DIR/prog.o" "$PROG"
     "$CC_BIN" -fsanitize=address "$TMP_DIR/prog.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/prog_asan"
@@ -261,13 +260,45 @@ INPUTS="lex.ssa flow.ssa jtbl_cfg.ssa prog_dev.ssa prog_release.ssa"
 python3 -E "$DIR/mkcheck.py" "$ROOT_DIR/vendor/qbe" "$TMP_DIR/cq"
 printf '#define Deftgt T_amd64_sysv\n' > "$TMP_DIR/cq/config.h"
 echo "p116 checking QBE sanitizers: ${SAN_FLAGS:-<none>}"
-(
-  cd "$TMP_DIR/cq"
-  for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-    "$CC_BIN" -std=c99 -O1 -g -w $SAN_FLAGS -I . -c "$f" -o "$(printf '%s' "$f" | tr / _).o"
+if [ -n "$SAN_FLAGS" ] && [ -n "${PION_QBE_SAN_DIR:-}" ] && [ -d "$PION_QBE_SAN_DIR/obj" ] \
+  && { [ ! -f "$PION_QBE_SAN_DIR/qbe.cc" ] || [ "$(cat "$PION_QBE_SAN_DIR/qbe.cc")" = "$CC_BIN" ]; }; then
+  # mkcheck.py modifies only live.c, ssa.c and arm64/macho.c: compile those 3
+  # and link with the prebuilt ASan+UBSan QBE objects for all other units.
+  CQ_OBJS=""
+  for O in "$PION_QBE_SAN_DIR"/obj/*.o; do
+    case "$O" in
+      */live.c.o|*/ssa.c.o|*/arm64_macho.c.o) continue ;;
+    esac
+    CQ_OBJS="$CQ_OBJS $O"
   done
-  "$CC_BIN" $SAN_FLAGS ./*.o -o qbe
-)
+  for f in live.c ssa.c arm64/macho.c; do
+    O="$TMP_DIR/cq/$(printf '%s' "$f" | tr / _).o"
+    "$CC_BIN" -std=c99 -O1 -g -w $SAN_FLAGS -I "$PION_QBE_SAN_DIR" -I "$TMP_DIR/cq" -c "$TMP_DIR/cq/$f" -o "$O"
+    CQ_OBJS="$CQ_OBJS $O"
+  done
+  "$CC_BIN" $SAN_FLAGS $CQ_OBJS -o "$TMP_DIR/cq/qbe"
+else
+  python3 -E - "$CC_BIN" "$SAN_FLAGS" "$TMP_DIR/cq" <<'PYEOF'
+import glob, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+cc, san_str, cq = sys.argv[1:4]
+san = san_str.split() if san_str else []
+srcs = sorted(glob.glob("*.c", root_dir=cq) + glob.glob("amd64/*.c", root_dir=cq)
+              + glob.glob("arm64/*.c", root_dir=cq) + glob.glob("rv64/*.c", root_dir=cq))
+jobs = min(os.cpu_count() or 1, 8)
+def build(f):
+    o = os.path.join(cq, f.replace("/", "_") + ".o")
+    r = subprocess.run([cc, "-std=c99", "-O1", "-g", "-w", *san, "-I", cq, "-c", os.path.join(cq, f), "-o", o])
+    if r.returncode != 0:
+        raise SystemExit(1)
+    return o
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    objs = list(pool.map(build, srcs))
+r = subprocess.run([cc, *san, *objs, "-o", os.path.join(cq, "qbe")])
+if r.returncode != 0:
+    raise SystemExit(1)
+PYEOF
+fi
 CQ="$TMP_DIR/cq/qbe"
 export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
