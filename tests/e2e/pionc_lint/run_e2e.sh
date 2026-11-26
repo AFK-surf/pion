@@ -841,6 +841,137 @@ if [ -e "$GIT_APP/pion.lock" ]; then
   exit 1
 fi
 
+# R5 P1 (Astra): Nested manifest ownership transition + deterministic lock-synchronized
+# concurrent ownership change during `pionc lint --fix`.
+# (a) Two-state ownership comparison: without `outer/src/pion.toml` -> L_UNUSED_MUT + 1 edit;
+#     with `outer/src/pion.toml` added (zero source or `.pion` list change) -> ok:true, diagnostics:[].
+NEST_SYNC_PKG="$TMP_DIR/nest_sync_pkg"
+mkdir -p "$NEST_SYNC_PKG/src"
+cat > "$NEST_SYNC_PKG/pion.toml" <<'EOF'
+[package]
+name = "nest_sync_pkg"
+version = "0.1.0"
+EOF
+cat > "$NEST_SYNC_PKG/lib.pion" <<'EOF'
+pub fn call_f() -> Int {
+  nested_f()
+}
+EOF
+cat > "$NEST_SYNC_PKG/src/f.pion" <<'EOF'
+pub fn nested_f() -> Int {
+  let mut x = 1
+  x
+}
+EOF
+set +e
+NEST_BEFORE_OUT="$("$PIONC" lint --json "$NEST_SYNC_PKG")"
+NEST_BEFORE_RC=$?
+set -e
+[ "$NEST_BEFORE_RC" -eq 1 ] || { echo "FAIL: expected L_UNUSED_MUT before src/pion.toml: $NEST_BEFORE_OUT" >&2; exit 1; }
+printf '%s' "$NEST_BEFORE_OUT" | grep -q '"code":"L_UNUSED_MUT"' || { echo "FAIL: missing L_UNUSED_MUT: $NEST_BEFORE_OUT" >&2; exit 1; }
+printf '%s' "$NEST_BEFORE_OUT" | grep -q '"edits":\[{' || { echo "FAIL: missing edit before src/pion.toml: $NEST_BEFORE_OUT" >&2; exit 1; }
+
+cat > "$NEST_SYNC_PKG/src/pion.toml" <<'EOF'
+[package]
+name = "nested_sub"
+version = "0.1.0"
+EOF
+NEST_AFTER_OUT="$("$PIONC" lint --json "$NEST_SYNC_PKG")"
+[ "$NEST_AFTER_OUT" = '{"ok":true,"diagnostics":[]}' ] || { echo "FAIL: expected clean outer lint after src/pion.toml: $NEST_AFTER_OUT" >&2; exit 1; }
+rm -f "$NEST_SYNC_PKG/src/pion.toml"
+
+# (b) Deterministic lock-synchronized concurrent `src/pion.toml` creation (zero sleep race):
+#     hold LOCK_EX on an isolated `PION_CACHE_DIR/lint-fix.lock`, wait until `pionc` opens
+#     `lint-fix.lock` (meaning all eval rounds & final_ev finished and it is blocked on flock),
+#     then create `src/pion.toml` (leaving `.pion` files untouched) and release LOCK_EX.
+NEST_LOCK_CACHE="$TMP_DIR/nest_lock_cache"
+mkdir -p "$NEST_LOCK_CACHE"
+python3 - "$PIONC" "$NEST_SYNC_PKG" "$NEST_LOCK_CACHE" <<'PYEOF'
+import fcntl, json, os, subprocess, sys, time
+
+pionc, pkg_dir, cache_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+lock_path = os.path.join(cache_dir, "lint-fix.lock")
+src_f = os.path.join(pkg_dir, "src", "f.pion")
+orig_f = open(src_f, "r", encoding="utf-8").read()
+
+def proc_has_lock_open(pid, target_path):
+    real_target = os.path.realpath(target_path)
+    fd_dir = f"/proc/{pid}/fd"
+    if os.path.isdir(fd_dir):
+        try:
+            for name in os.listdir(fd_dir):
+                try:
+                    if os.path.realpath(os.readlink(os.path.join(fd_dir, name))) == real_target:
+                        return True
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return False
+    # macOS fallback via lsof
+    try:
+        res = subprocess.run(
+            ["lsof", "-Fn", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        return os.path.basename(target_path) in res.stdout
+    except Exception:
+        return False
+
+lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+proc = None
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    env = os.environ.copy()
+    env["PION_CACHE_DIR"] = cache_dir
+    proc = subprocess.Popen(
+        [pionc, "lint", "--fix", "--json", pkg_dir],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    deadline = time.monotonic() + 30.0
+    opened = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            out, err = proc.communicate()
+            raise AssertionError(f"pionc exited early before waiting on lock: rc={proc.returncode} out={out} err={err}")
+        if proc_has_lock_open(proc.pid, lock_path):
+            opened = True
+            break
+        time.sleep(0.01)
+    assert opened, "timed out waiting for pionc to block on lint-fix.lock"
+
+    # Mutate ONLY ownership by creating nested `src/pion.toml` (zero `.pion` changes).
+    with open(os.path.join(pkg_dir, "src", "pion.toml"), "w", encoding="utf-8") as mf:
+        mf.write('[package]\nname = "nested_sub"\nversion = "0.1.0"\n')
+
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 1, f"expected exit 1 on concurrent ownership change, got {proc.returncode}: out={out} err={err}"
+    d = json.loads(out)
+    assert d.get("ok") is False, f"expected ok:false, got {d}"
+    assert d.get("fixed") == 0, f"expected fixed:0, got {d}"
+    assert d.get("files") == [], f"expected files:[], got {d}"
+    assert d.get("diagnostics") == [], f"expected diagnostics:[], got {d}"
+    assert isinstance(d.get("error"), str) and len(d["error"]) > 0, f"expected non-empty error, got {d}"
+    after_f = open(src_f, "r", encoding="utf-8").read()
+    assert after_f == orig_f, f"src/f.pion was modified despite concurrent ownership change!\nBEFORE:\n{orig_f}\nAFTER:\n{after_f}"
+finally:
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+        proc.wait()
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(lock_fd)
+PYEOF
+
 # 12. Real examples/ packages lint clean, and strict dynamic dogfood check explicitly
 #     including all `compiler/src/core/*.pion` (including `lint*_test.pion`).
 for EX in examples/text_stats examples/http_loopback; do

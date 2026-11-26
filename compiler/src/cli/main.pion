@@ -254,6 +254,70 @@ fn drv_append_test_sources_for(
 }
 
 ///|
+/// Same as `drv_append_test_sources_for`, but snapshots each enumerated directory
+/// (`dir`, `dir/src`, `dir/tests`) from the exact `fs_list_dir` result (or
+/// `"<absent>"` when missing) so `pionc lint` has zero post-load re-list gap.
+fn drv_append_test_sources_for_snap(
+  world : World,
+  dir : String,
+  target_rules : Map[String, Array[String]],
+  active_target : String,
+  paths : Array[String],
+  sources : Array[String],
+  scanned_dirs : Array[String],
+  dir_snapshots : Map[String, String],
+) -> Result[Unit, String] {
+  let check_dirs : Array[String] = [
+    dir,
+    drv_join_path(dir, "src"),
+    drv_join_path(dir, "tests"),
+  ]
+  let rel_prefixes : Array[String] = ["", "src/", "tests/"]
+  let mut di = 0
+  while di < check_dirs.length() {
+    let cur_dir = check_dirs[di]
+    if di > 0 && !fs_is_dir(world, cur_dir) {
+      match drv_lint_record_dir_snap_value(scanned_dirs, dir_snapshots, cur_dir, "<absent>") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      di = di + 1
+      continue
+    }
+    let entries = fs_list_dir(world, cur_dir)
+    let snap = drv_lint_snapshot_entries(entries)
+    match drv_lint_record_dir_snap_value(scanned_dirs, dir_snapshots, cur_dir, snap) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    // Skip nested `tests/pion.toml` sub-package using the exact same `entries`.
+    if di == 2 && drv_str_arr_contains(entries, "pion.toml") {
+      di = di + 1
+      continue
+    }
+    let mut i = 0
+    while i < entries.length() {
+      if drv_is_test_source_file(entries[i]) {
+        let rel = rel_prefixes[di] + entries[i]
+        if manifest_target_file_active(target_rules, rel, active_target) {
+          let fpath = drv_join_path(cur_dir, entries[i])
+          match fs_read(world, fpath) {
+            Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+            Ok(content) => {
+              paths.push(fpath)
+              sources.push(content)
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+    di = di + 1
+  }
+  Ok(())
+}
+
+///|
 fn drv_append_test_sources(
   world : World,
   dir : String,
@@ -1889,6 +1953,67 @@ fn drv_load_targets(
 }
 
 ///|
+/// Same as `drv_load_targets`, but records each enumerated directory's snapshot
+/// directly from its `fs_list_dir` entries (used by `pionc lint`).
+fn drv_load_targets_with_snaps(
+  world : World,
+  targets : Array[String],
+  scanned_dirs : Array[String],
+  dir_snapshots : Map[String, String],
+) -> Result[DrvLoaded, String] {
+  if targets.length() == 0 {
+    return Err("no input files specified")
+  }
+  let pkg_name = drv_basename_pkg(targets[0])
+  let paths : Array[String] = []
+  let sources : Array[String] = []
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    if !fs_exists(world, target) {
+      return Err("path does not exist: " + target)
+    }
+    if fs_is_dir(world, target) {
+      let entries = fs_list_dir(world, target)
+      match drv_lint_record_dir_snap_value(
+        scanned_dirs,
+        dir_snapshots,
+        target,
+        drv_lint_snapshot_entries(entries),
+      ) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let mut i = 0
+      while i < entries.length() {
+        let name = entries[i]
+        if drv_is_source_file(name) {
+          let fpath = drv_join_path(target, name)
+          match fs_read(world, fpath) {
+            Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+            Ok(content) => {
+              paths.push(fpath)
+              sources.push(content)
+            }
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      match fs_read(world, target) {
+        Err(msg) => return Err("failed to read " + target + ": " + msg)
+        Ok(content) => {
+          paths.push(target)
+          sources.push(content)
+        }
+      }
+    }
+    t = t + 1
+  }
+  Ok(DrvLoaded::{ pkg_name: pkg_name, paths: paths, sources: sources })
+}
+
+///|
 /// Parallel per-file SHA-256 pre-hash using Pion native OS threads (scope + spawn + Channel + AtomicInt).
 /// Results are always reassembled in deterministic input index order.
 fn drv_parallel_prehash(
@@ -2337,6 +2462,8 @@ fn drv_detect_manifest_dir(world : World, target : String) -> Option[String] {
 struct DrvSrcPair {
   paths : Array[String]
   sources : Array[String]
+  root_dir_snap : String
+  src_dir_snap : String
 }
 
 ///|
@@ -2370,6 +2497,7 @@ fn drv_load_pkg_dir_sources_for(
   let paths : Array[String] = []
   let sources : Array[String] = []
   let entries = fs_list_dir(world, pkg_dir)
+  let root_dir_snap = drv_lint_snapshot_entries(entries)
   let mut i = 0
   while i < entries.length() {
     let name = entries[i]
@@ -2387,8 +2515,10 @@ fn drv_load_pkg_dir_sources_for(
     i = i + 1
   }
   let src_dir = drv_join_path(pkg_dir, "src")
+  let mut src_dir_snap = "<absent>"
   if fs_is_dir(world, src_dir) {
     let sentries = fs_list_dir(world, src_dir)
+    src_dir_snap = drv_lint_snapshot_entries(sentries)
     let mut j = 0
     while j < sentries.length() {
       let name = sentries[j]
@@ -2406,7 +2536,12 @@ fn drv_load_pkg_dir_sources_for(
       j = j + 1
     }
   }
-  Ok(DrvSrcPair::{ paths: paths, sources: sources })
+  Ok(DrvSrcPair::{
+    paths: paths,
+    sources: sources,
+    root_dir_snap: root_dir_snap,
+    src_dir_snap: src_dir_snap,
+  })
 }
 
 ///|
@@ -3322,6 +3457,8 @@ fn drv_load_workspace_dfs(
   out : Array[PkgNodeInput],
   manifest_paths : Array[String],
   manifest_texts : Map[String, String],
+  scanned_dirs : Array[String],
+  dir_snapshots : Map[String, String],
 ) -> Result[String, String] {
   let display_dir = drv_normalize_path(drv_abs_path(world, pkg_dir))
   let norm_dir = drv_canon_dir(world, pkg_dir)
@@ -3486,6 +3623,8 @@ fn drv_load_workspace_dfs(
       out,
       manifest_paths,
       manifest_texts,
+      scanned_dirs,
+      dir_snapshots,
     ) {
       Err(e) => return Err(e)
       Ok(cid) => cid
@@ -3506,6 +3645,24 @@ fn drv_load_workspace_dfs(
   ) {
     Err(e) => return Err(e)
     Ok(v) => v
+  }
+  match drv_lint_record_dir_snap_value(
+    scanned_dirs,
+    dir_snapshots,
+    display_dir,
+    loaded_src.root_dir_snap,
+  ) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  match drv_lint_record_dir_snap_value(
+    scanned_dirs,
+    dir_snapshots,
+    drv_join_path(display_dir, "src"),
+    loaded_src.src_dir_snap,
+  ) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
   }
   out.push(PkgNodeInput::{
     name: canon_id,
@@ -3540,6 +3697,8 @@ struct DrvWsLoad {
   git_root : String
   manifest_paths : Array[String]
   manifest_texts : Map[String, String]
+  scanned_dirs : Array[String]
+  dir_snapshots : Map[String, String]
 }
 
 ///|
@@ -3675,6 +3834,8 @@ fn drv_load_workspace_core(
   }
   let manifest_paths : Array[String] = [root_mf_path]
   let manifest_texts : Map[String, String] = Map([])
+  let scanned_dirs : Array[String] = []
+  let dir_snapshots : Map[String, String] = Map([])
   manifest_texts.set(root_mf_path, root_mf_txt)
   match enclosing_ws {
     Some(ws) => {
@@ -3889,6 +4050,8 @@ fn drv_load_workspace_core(
         out,
         manifest_paths,
         manifest_texts,
+        scanned_dirs,
+        dir_snapshots,
       ) {
         Err(e) => return Err(e)
         Ok(_) => ()
@@ -3920,6 +4083,8 @@ fn drv_load_workspace_core(
       out,
       manifest_paths,
       manifest_texts,
+      scanned_dirs,
+      dir_snapshots,
     ) {
       Err(e) => return Err(e)
       Ok(_) => ()
@@ -4023,6 +4188,8 @@ fn drv_load_workspace_core(
     git_root: ctx.git_root,
     manifest_paths: manifest_paths,
     manifest_texts: manifest_texts,
+    scanned_dirs: scanned_dirs,
+    dir_snapshots: dir_snapshots,
   })
 }
 
@@ -14353,14 +14520,19 @@ struct DrvLintEval {
   /// Exact source file paths eligible for `--fix` (non-symlink regular files
   /// physically owned by a selected package or explicit standalone target).
   allowed_files : Map[String, Bool]
+  /// Package directory and canonical directory recorded when each owned file
+  /// was admitted, re-verified under `lint-fix.lock` before commit.
+  owned_pkg_dir : Map[String, String]
+  owned_pkg_canon : Map[String, String]
+  all_pkg_canon_dirs : Array[String]
   /// On-disk snapshots of every existing file in the read set.
   disk_snapshots : Map[String, String]
   /// Ordered list of every existing file path in the read set.
   read_paths : Array[String]
-  /// Files confirmed absent during load (e.g. missing `pion.lock`), verified
-  /// still absent before commit.
+  /// Files confirmed absent during load (e.g. missing `pion.lock` or nested
+  /// `src/pion.toml` / `tests/pion.toml`), verified still absent before commit.
   absent_paths : Array[String]
-  /// Snapshot of sorted `.pion` filenames in each scanned source directory.
+  /// Snapshot of sorted `.pion` / `pion.toml` filenames in each scanned directory.
   dir_snapshots : Map[String, String]
   /// Ordered list of scanned source directories.
   scanned_dirs : Array[String]
@@ -14414,16 +14586,12 @@ fn drv_lint_record_read(
 }
 
 ///|
-fn drv_lint_snapshot_pion_dir(world : World, dir : String) -> String {
-  if !fs_is_dir(world, dir) {
-    return "<absent>"
-  }
-  let entries = fs_list_dir(world, dir)
+fn drv_lint_snapshot_entries(entries : Array[String]) -> String {
   let names : Array[String] = []
   let mut i = 0
   while i < entries.length() {
     let n = entries[i]
-    if drv_is_source_file(n) || drv_is_test_source_file(n) {
+    if drv_is_source_file(n) || drv_is_test_source_file(n) || n == "pion.toml" {
       names.push(n)
     }
     i = i + 1
@@ -14442,28 +14610,38 @@ fn drv_lint_snapshot_pion_dir(world : World, dir : String) -> String {
 }
 
 ///|
-fn drv_lint_record_dir_snapshot(
-  world : World,
-  scanned_dirs : Array[String],
-  dir_snapshots : Map[String, String],
-  dir : String,
-) -> Unit {
-  if !dir_snapshots.contains(dir) {
-    scanned_dirs.push(dir)
-    dir_snapshots.set(dir, drv_lint_snapshot_pion_dir(world, dir))
+fn drv_lint_snapshot_pion_dir(world : World, dir : String) -> String {
+  if !fs_is_dir(world, dir) {
+    return "<absent>"
   }
+  drv_lint_snapshot_entries(fs_list_dir(world, dir))
 }
 
 ///|
-fn drv_lint_record_pkg_dirs(
-  world : World,
+fn drv_lint_record_dir_snap_value(
   scanned_dirs : Array[String],
   dir_snapshots : Map[String, String],
-  pkg_dir : String,
-) -> Unit {
-  drv_lint_record_dir_snapshot(world, scanned_dirs, dir_snapshots, pkg_dir)
-  drv_lint_record_dir_snapshot(world, scanned_dirs, dir_snapshots, drv_join_path(pkg_dir, "src"))
-  drv_lint_record_dir_snapshot(world, scanned_dirs, dir_snapshots, drv_join_path(pkg_dir, "tests"))
+  dir : String,
+  snap : String,
+) -> Result[Unit, String] {
+  match dir_snapshots.get(dir) {
+    Some(prev) =>
+      if prev != snap {
+        return Err("directory contents changed during `pionc lint`: " + dir)
+      }
+    None => {
+      scanned_dirs.push(dir)
+      dir_snapshots.set(dir, snap)
+    }
+  }
+  Ok(())
+}
+
+///|
+fn drv_lint_record_absent(absent_paths : Array[String], path : String) -> Unit {
+  if !drv_str_arr_contains(absent_paths, path) {
+    absent_paths.push(path)
+  }
 }
 
 ///|
@@ -14651,29 +14829,44 @@ fn drv_lint_collect_extra_import_files(
   disk_snapshots : Map[String, String],
   scanned_dirs : Array[String],
   dir_snapshots : Map[String, String],
-) -> DrvLintExtraFiles {
+) -> Result[DrvLintExtraFiles, String] {
   let out : Array[SourceFile] = []
   let mut incomplete = false
-  let dirs : Array[String] = [pkg_dir]
-  let src_dir = drv_join_path(pkg_dir, "src")
-  if fs_is_dir(world, src_dir) &&
-    !fs_exists(world, drv_join_path(src_dir, "pion.toml")) {
-    dirs.push(src_dir)
-  }
-  let tests_dir = drv_join_path(pkg_dir, "tests")
-  if fs_is_dir(world, tests_dir) &&
-    !fs_exists(world, drv_join_path(tests_dir, "pion.toml")) {
-    dirs.push(tests_dir)
-  }
+  let check_dirs : Array[String] = [
+    pkg_dir,
+    drv_join_path(pkg_dir, "src"),
+    drv_join_path(pkg_dir, "tests"),
+  ]
   let mut di = 0
-  while di < dirs.length() {
-    drv_lint_record_dir_snapshot(world, scanned_dirs, dir_snapshots, dirs[di])
-    let entries = fs_list_dir(world, dirs[di])
+  while di < check_dirs.length() {
+    let cur_dir = check_dirs[di]
+    if di > 0 && !fs_is_dir(world, cur_dir) {
+      match drv_lint_record_dir_snap_value(scanned_dirs, dir_snapshots, cur_dir, "<absent>") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      di = di + 1
+      continue
+    }
+    let entries = fs_list_dir(world, cur_dir)
+    match drv_lint_record_dir_snap_value(
+      scanned_dirs,
+      dir_snapshots,
+      cur_dir,
+      drv_lint_snapshot_entries(entries),
+    ) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    if di > 0 && drv_str_arr_contains(entries, "pion.toml") {
+      di = di + 1
+      continue
+    }
     let mut i = 0
     while i < entries.length() {
       let name = entries[i]
       if drv_is_source_file(name) || drv_is_test_source_file(name) {
-        let fpath = drv_join_path(dirs[di], name)
+        let fpath = drv_join_path(cur_dir, name)
         if !active_paths.contains(fpath) &&
           drv_lint_file_owned_by_pkg(world, fpath, pkg_dir, node_canon_dir, all_pkg_canon_dirs) {
           match fs_read(world, fpath) {
@@ -14698,7 +14891,7 @@ fn drv_lint_collect_extra_import_files(
     }
     di = di + 1
   }
-  DrvLintExtraFiles::{ files: out, incomplete: incomplete }
+  Ok(DrvLintExtraFiles::{ files: out, incomplete: incomplete })
 }
 
 ///|
@@ -14711,6 +14904,9 @@ fn drv_lint_eval(
   overrides : Map[String, String],
 ) -> Result[DrvLintEval, String] {
   let allowed_files : Map[String, Bool] = Map([])
+  let owned_pkg_dir : Map[String, String] = Map([])
+  let owned_pkg_canon : Map[String, String] = Map([])
+  let mut all_pkg_canon_dirs_out : Array[String] = []
   let disk_snapshots : Map[String, String] = Map([])
   let read_paths : Array[String] = []
   let absent_paths : Array[String] = []
@@ -14766,9 +14962,23 @@ fn drv_lint_eval(
           drv_join_path(root_dir, "pion.lock")
         }
         if !ws.lock_existed {
-          absent_paths.push(lock_p)
+          drv_lint_record_absent(absent_paths, lock_p)
         } else {
           drv_lint_record_read(read_paths, disk_snapshots, lock_p, ws.lock_text)
+        }
+        // Merge directory snapshots captured during workspace load (zero post-load re-list gap).
+        let mut sdi = 0
+        while sdi < ws.scanned_dirs.length() {
+          let sd = ws.scanned_dirs[sdi]
+          match ws.dir_snapshots.get(sd) {
+            Some(snap) =>
+              match drv_lint_record_dir_snap_value(scanned_dirs, dir_snapshots, sd, snap) {
+                Err(e) => return Err(e)
+                Ok(_) => ()
+              }
+            None => ()
+          }
+          sdi = sdi + 1
         }
 
         let nodes = ws.nodes
@@ -14782,6 +14992,7 @@ fn drv_lint_eval(
           dep_lists.push(nodes[ni].deps)
           ni = ni + 1
         }
+        all_pkg_canon_dirs_out = all_pkg_canon_dirs
         let topo = topo_sort_packages(names, dep_lists)
         if topo.diagnostics.length() > 0 {
           return Ok(DrvLintEval::{
@@ -14791,6 +15002,9 @@ fn drv_lint_eval(
               allowed_files,
             ),
             allowed_files: allowed_files,
+            owned_pkg_dir: owned_pkg_dir,
+            owned_pkg_canon: owned_pkg_canon,
+            all_pkg_canon_dirs: all_pkg_canon_dirs_out,
             disk_snapshots: disk_snapshots,
             read_paths: read_paths,
             absent_paths: absent_paths,
@@ -14828,7 +15042,6 @@ fn drv_lint_eval(
           let node = nodes[topo.order[k]]
           let node_canon_dir = drv_canon_dir(world, node.dir)
           let is_selected = selected_dirs.contains(node_canon_dir)
-          drv_lint_record_pkg_dirs(world, scanned_dirs, dir_snapshots, node.dir)
           let deps_k = trans_dep_topo[k]
           let mut any_dep_err = false
           let mut di = 0
@@ -14961,8 +15174,22 @@ fn drv_lint_eval(
                 all_pkg_canon_dirs,
               ) {
                 owned_files.set(fpath, true)
+                let rel_own = drv_lint_rel_to_pkg(fpath, node.dir)
+                if drv_starts_with(rel_own, "src/") {
+                  drv_lint_record_absent(
+                    absent_paths,
+                    drv_join_path(drv_join_path(node.dir, "src"), "pion.toml"),
+                  )
+                } else if drv_starts_with(rel_own, "tests/") {
+                  drv_lint_record_absent(
+                    absent_paths,
+                    drv_join_path(drv_join_path(node.dir, "tests"), "pion.toml"),
+                  )
+                }
                 if drv_lstat_kind(fpath) == 1 {
                   allowed_files.set(fpath, true)
+                  owned_pkg_dir.set(fpath, node.dir)
+                  owned_pkg_canon.set(fpath, node_canon_dir)
                 }
               }
               let mem_txt = match overrides.get(fpath) {
@@ -14998,13 +15225,15 @@ fn drv_lint_eval(
               sig_hashes.set(node.name, drv_effective_sig_hash(pionsig, node, sig_hashes))
               let raw_test_paths : Array[String] = []
               let raw_test_disk_sources : Array[String] = []
-              match drv_append_test_sources_for(
+              match drv_append_test_sources_for_snap(
                 world,
                 node.dir,
                 node.target_rules,
                 active_target,
                 raw_test_paths,
                 raw_test_disk_sources,
+                scanned_dirs,
+                dir_snapshots,
               ) {
                 Err(msg) => return Err(msg)
                 Ok(_) => ()
@@ -15040,8 +15269,22 @@ fn drv_lint_eval(
                   all_pkg_canon_dirs,
                 ) {
                   owned_files.set(fp, true)
+                  let rel_own = drv_lint_rel_to_pkg(fp, node.dir)
+                  if drv_starts_with(rel_own, "src/") {
+                    drv_lint_record_absent(
+                      absent_paths,
+                      drv_join_path(drv_join_path(node.dir, "src"), "pion.toml"),
+                    )
+                  } else if drv_starts_with(rel_own, "tests/") {
+                    drv_lint_record_absent(
+                      absent_paths,
+                      drv_join_path(drv_join_path(node.dir, "tests"), "pion.toml"),
+                    )
+                  }
                   if drv_lstat_kind(fp) == 1 {
                     allowed_files.set(fp, true)
+                    owned_pkg_dir.set(fp, node.dir)
+                    owned_pkg_canon.set(fp, node_canon_dir)
                   }
                 }
                 let mem_txt = match overrides.get(fp) {
@@ -15081,7 +15324,7 @@ fn drv_lint_eval(
                 }
                 pkg_has_err[k] = true
               } else {
-                let extra = drv_lint_collect_extra_import_files(
+                let extra = match drv_lint_collect_extra_import_files(
                   world,
                   node.dir,
                   node_canon_dir,
@@ -15093,7 +15336,10 @@ fn drv_lint_eval(
                   disk_snapshots,
                   scanned_dirs,
                   dir_snapshots,
-                )
+                ) {
+                  Err(msg) => return Err(msg)
+                  Ok(v) => v
+                }
                 let mut efi = 0
                 while efi < extra.files.length() {
                   owned_files.set(extra.files[efi].path, true)
@@ -15137,6 +15383,9 @@ fn drv_lint_eval(
               allowed_files,
             ),
             allowed_files: allowed_files,
+            owned_pkg_dir: owned_pkg_dir,
+            owned_pkg_canon: owned_pkg_canon,
+            all_pkg_canon_dirs: all_pkg_canon_dirs_out,
             disk_snapshots: disk_snapshots,
             read_paths: read_paths,
             absent_paths: absent_paths,
@@ -15219,6 +15468,9 @@ fn drv_lint_eval(
             allowed_files,
           ),
           allowed_files: allowed_files,
+          owned_pkg_dir: owned_pkg_dir,
+          owned_pkg_canon: owned_pkg_canon,
+          all_pkg_canon_dirs: all_pkg_canon_dirs_out,
           disk_snapshots: disk_snapshots,
           read_paths: read_paths,
           absent_paths: absent_paths,
@@ -15230,19 +15482,17 @@ fn drv_lint_eval(
     }
   }
   // Standalone file(s) or directory without pion.toml.
-  let loaded = match drv_load_targets(world, targets) {
+  let loaded = match drv_load_targets_with_snaps(
+    world,
+    targets,
+    scanned_dirs,
+    dir_snapshots,
+  ) {
     Err(msg) => return Err(msg)
     Ok(v) => v
   }
   if loaded.paths.length() == 0 {
     return Err("no .pion source files found")
-  }
-  let mut ti = 0
-  while ti < targets.length() {
-    if fs_is_dir(world, targets[ti]) {
-      drv_lint_record_dir_snapshot(world, scanned_dirs, dir_snapshots, targets[ti])
-    }
-    ti = ti + 1
   }
   let mem_sources : Array[String] = []
   let raw_map : Map[String, String] = Map([])
@@ -15280,6 +15530,9 @@ fn drv_lint_eval(
         allowed_files,
       ),
       allowed_files: allowed_files,
+      owned_pkg_dir: owned_pkg_dir,
+      owned_pkg_canon: owned_pkg_canon,
+      all_pkg_canon_dirs: all_pkg_canon_dirs_out,
       disk_snapshots: disk_snapshots,
       read_paths: read_paths,
       absent_paths: absent_paths,
@@ -15295,6 +15548,9 @@ fn drv_lint_eval(
     has_errors: false,
     diagnostics: lds,
     allowed_files: allowed_files,
+    owned_pkg_dir: owned_pkg_dir,
+    owned_pkg_canon: owned_pkg_canon,
+    all_pkg_canon_dirs: all_pkg_canon_dirs_out,
     disk_snapshots: disk_snapshots,
     read_paths: read_paths,
     absent_paths: absent_paths,
@@ -15391,19 +15647,27 @@ fn drv_lint_merge_read_set(
   initial_absent : Array[String],
   initial_dirs : Array[String],
   initial_dir_snaps : Map[String, String],
-) -> Unit {
+  initial_owned_pkg_dir : Map[String, String],
+  initial_owned_pkg_canon : Map[String, String],
+  initial_all_pkg_canon_dirs : Array[String],
+) -> Result[Unit, String] {
   let mut i = 0
   while i < ev.read_paths.length() {
     let rp = ev.read_paths[i]
-    if !initial_snapshots.contains(rp) {
-      match ev.disk_snapshots.get(rp) {
-        Some(t) => {
-          initial_read_paths.push(rp)
-          initial_snapshots.set(rp, t)
-          initial_lstat.set(rp, drv_lstat_kind(rp))
+    match ev.disk_snapshots.get(rp) {
+      Some(t) =>
+        match initial_snapshots.get(rp) {
+          Some(prev) =>
+            if prev != t {
+              return Err("file changed on disk during `pionc lint --fix`: " + rp)
+            }
+          None => {
+            initial_read_paths.push(rp)
+            initial_snapshots.set(rp, t)
+            initial_lstat.set(rp, drv_lstat_kind(rp))
+          }
         }
-        None => ()
-      }
+      None => ()
     }
     i = i + 1
   }
@@ -15418,17 +15682,47 @@ fn drv_lint_merge_read_set(
   i = 0
   while i < ev.scanned_dirs.length() {
     let sd = ev.scanned_dirs[i]
-    if !initial_dir_snaps.contains(sd) {
-      match ev.dir_snapshots.get(sd) {
-        Some(ds) => {
-          initial_dirs.push(sd)
-          initial_dir_snaps.set(sd, ds)
+    match ev.dir_snapshots.get(sd) {
+      Some(ds) =>
+        match initial_dir_snaps.get(sd) {
+          Some(prev) =>
+            if prev != ds {
+              return Err("directory contents changed during `pionc lint --fix`: " + sd)
+            }
+          None => {
+            initial_dirs.push(sd)
+            initial_dir_snaps.set(sd, ds)
+          }
         }
+      None => ()
+    }
+    i = i + 1
+  }
+  let op_keys = ev.owned_pkg_dir.keys()
+  i = 0
+  while i < op_keys.length() {
+    let fp = op_keys[i]
+    if !initial_owned_pkg_dir.contains(fp) {
+      match ev.owned_pkg_dir.get(fp) {
+        Some(pd) => initial_owned_pkg_dir.set(fp, pd)
+        None => ()
+      }
+      match ev.owned_pkg_canon.get(fp) {
+        Some(pc) => initial_owned_pkg_canon.set(fp, pc)
         None => ()
       }
     }
     i = i + 1
   }
+  i = 0
+  while i < ev.all_pkg_canon_dirs.length() {
+    let cd = ev.all_pkg_canon_dirs[i]
+    if !drv_str_arr_contains(initial_all_pkg_canon_dirs, cd) {
+      initial_all_pkg_canon_dirs.push(cd)
+    }
+    i = i + 1
+  }
+  Ok(())
 }
 
 ///|
@@ -15448,6 +15742,9 @@ fn drv_run_lint_fix_cmd(
   let initial_absent : Array[String] = []
   let initial_dirs : Array[String] = []
   let initial_dir_snaps : Map[String, String] = Map([])
+  let initial_owned_pkg_dir : Map[String, String] = Map([])
+  let initial_owned_pkg_canon : Map[String, String] = Map([])
+  let initial_all_pkg_canon_dirs : Array[String] = []
   let mut total_applied = 0
   let mut round = 0
   while round < 3 {
@@ -15462,7 +15759,7 @@ fn drv_run_lint_fix_cmd(
       Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
       Ok(v) => v
     }
-    drv_lint_merge_read_set(
+    match drv_lint_merge_read_set(
       ev,
       initial_read_paths,
       initial_snapshots,
@@ -15470,7 +15767,13 @@ fn drv_run_lint_fix_cmd(
       initial_absent,
       initial_dirs,
       initial_dir_snaps,
-    )
+      initial_owned_pkg_dir,
+      initial_owned_pkg_canon,
+      initial_all_pkg_canon_dirs,
+    ) {
+      Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
+      Ok(_) => ()
+    }
     if ev.has_errors {
       return drv_lint_print_fix_result(world, false, 0, [], ev.diagnostics)
     }
@@ -15598,7 +15901,7 @@ fn drv_run_lint_fix_cmd(
     Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
     Ok(v) => v
   }
-  drv_lint_merge_read_set(
+  match drv_lint_merge_read_set(
     final_ev,
     initial_read_paths,
     initial_snapshots,
@@ -15606,7 +15909,13 @@ fn drv_run_lint_fix_cmd(
     initial_absent,
     initial_dirs,
     initial_dir_snaps,
-  )
+    initial_owned_pkg_dir,
+    initial_owned_pkg_canon,
+    initial_all_pkg_canon_dirs,
+  ) {
+    Err(msg) => return drv_lint_fix_fail(world, as_json, msg)
+    Ok(_) => ()
+  }
   if final_ev.has_errors {
     return drv_lint_print_fix_result(world, false, 0, [], final_ev.diagnostics)
   }
@@ -15688,6 +15997,42 @@ fn drv_run_lint_fix_cmd(
           as_json,
           "directory contents changed during `pionc lint --fix`: " + sd,
         )
+      }
+      ri = ri + 1
+    }
+    // 3.5. Re-verify per-file regular-file kind and package ownership under lock before writing.
+    ri = 0
+    while ri < modified_files.length() {
+      let path = modified_files[ri]
+      if drv_lstat_kind(path) != 1 {
+        drv_lint_fix_unlock(lock_h)
+        return drv_lint_fix_fail(
+          world,
+          as_json,
+          "file identity changed on disk during `pionc lint --fix`: " + path,
+        )
+      }
+      match initial_owned_pkg_dir.get(path) {
+        Some(pdir) =>
+          match initial_owned_pkg_canon.get(path) {
+            Some(pcanon) =>
+              if !drv_lint_file_owned_by_pkg(
+                world,
+                path,
+                pdir,
+                pcanon,
+                initial_all_pkg_canon_dirs,
+              ) {
+                drv_lint_fix_unlock(lock_h)
+                return drv_lint_fix_fail(
+                  world,
+                  as_json,
+                  "file package ownership changed during `pionc lint --fix`: " + path,
+                )
+              }
+            None => ()
+          }
+        None => ()
       }
       ri = ri + 1
     }
