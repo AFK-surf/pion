@@ -639,6 +639,92 @@ fn pick_r20_shadow_lifted() -> Int {
   a + b + walk(0)
 }
 
+fn r21_val_not(not~ : Int) -> Int {
+  not
+}
+
+fn pick_r21_shadow_cap_let(x : Int) -> Int {
+  fn rec(n : Int) -> Int {
+    if n == 0 { x } else if n == 1 { let x = 9; x } else { rec(n - 1) }
+  }
+  rec(2)
+}
+
+fn pick_r21_shadow_cap_clo(x : Int) -> Int {
+  fn rec(n : Int) -> Int {
+    if n == 0 { x } else if n == 1 { (fn(x : Int) { x })(9) } else { rec(n - 1) }
+  }
+  rec(2)
+}
+
+fn pick_r21_esc_val_(val : (Int) -> Int) -> Int {
+  fn val_(n : Int) -> Int {
+    if n == 0 { 1 } else { val_(n - 1) }
+  }
+  let cb = val_
+  val(0) * 10 + cb(1)
+}
+
+fn pick_r21_esc_val(val_ : (Int) -> Int) -> Int {
+  fn val(n : Int) -> Int {
+    if n == 0 { 1 } else { val(n - 1) }
+  }
+  let cb = val
+  val_(0) * 10 + cb(1)
+}
+
+fn pick_r21_nonrec_val_(val : (Int) -> Int) -> Int {
+  fn val_() -> Int {
+    1
+  }
+  val(0) * 10 + val_()
+}
+
+fn pick_r21_is_and_expr(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  let b = (Some(cb) is Some(walk)) && walk(0) == 9
+  if b { 9 } else { 0 }
+}
+
+fn pick_r21_is_and_if(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  let a = if (Some(cb) is Some(walk)) && walk(0) == 9 { walk(0) } else { 0 }
+  a * 10 + walk(1)
+}
+
+fn pick_r21_is_and_guard(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  guard (Some(cb) is Some(walk)) && walk(0) == 9 else { return 0 }
+  walk(0)
+}
+
+fn pick_r21_is_and_while(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  let mut opt : ((Int) -> Int)? = Some(cb)
+  let mut acc = 0
+  while (opt is Some(walk)) && walk(0) == 9 {
+    acc = acc + walk(0)
+    opt = None
+  }
+  acc * 10 + walk(1)
+}
+
+fn pick_r21_named_not_cap() -> Int {
+  let not : Int = 42
+  fn rec(n : Int) -> Int {
+    if n == 0 { r21_val_not(not~) + r21_val_not(not=not) } else { rec(n - 1) }
+  }
+  rec(1)
+}
+
 fn pick_r19_ascribe_rec() -> Int {
   let r17_g = true
   fn walk(n : Int) -> Int {
@@ -1004,7 +1090,18 @@ fn case_r5_paren_and_guard() -> String {
   let p75 = pick_r20_arm_eq_nl()
   let p76 = pick_r20_same_line_semi()
   let p77 = pick_r20_shadow_lifted()
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string()
+  // R21: cap_renames inner shadowing, escaping/non-rec local fn collision avoidance, paren is-&& / while shadowing, named not~/not=
+  let p78 = pick_r21_shadow_cap_let(42)
+  let p79 = pick_r21_shadow_cap_clo(42)
+  let p80 = pick_r21_esc_val_(fn(_x) { 9 })
+  let p81 = pick_r21_esc_val(fn(_x) { 9 })
+  let p82 = pick_r21_nonrec_val_(fn(_x) { 9 })
+  let p83 = pick_r21_is_and_expr(fn(_x) { 9 })
+  let p84 = pick_r21_is_and_if(fn(_x) { 9 })
+  let p85 = pick_r21_is_and_guard(fn(_x) { 9 })
+  let p86 = pick_r21_is_and_while(fn(_x) { 9 })
+  let p87 = pick_r21_named_not_cap()
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string() + "," + p78.to_string() + "," + p79.to_string() + "," + p80.to_string() + "," + p81.to_string() + "," + p82.to_string() + "," + p83.to_string() + "," + p84.to_string() + "," + p85.to_string() + "," + p86.to_string() + "," + p87.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -1227,7 +1324,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31,9,9,91,91,91,9,91,9,91,84"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"

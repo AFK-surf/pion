@@ -109,6 +109,8 @@ fn compute_scoped_binder_renames(ctx : StageAContext, raw_names : Array[String])
       if cand != rn + "_" || (lookup_ident_rename(ctx, rn) is Some(_)) {
         out[rn] = cand
       }
+    } else if rn != "_" && (lookup_ident_rename(ctx, rn) is Some(_)) {
+      out[rn] = rn
     }
   }
   out
@@ -3329,9 +3331,107 @@ fn push_scope_binders(ctx : StageAContext, names : Array[String]) -> Unit {
   }
 }
 
+///| Push `is <Pat>` binders from a single boolean condition segment `[seg_s, seg_e)` into
+///| `ctx.ident_renames`, `ctx.scope_vars`, and `ctx.lifted_local_fns` (shadowing outer bindings).
+///| Strips balanced outer parens, recurses into parenthesized `&&` chains, and ignores negated /
+///| `||` / `|>` / comparison-wrapped expressions.
+fn push_is_seg_binders(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  seg_s : Int,
+  seg_e : Int,
+) -> Unit {
+  let mut cs = seg_s
+  let mut ce = seg_e
+  while cs + 1 < ce && tokens[cs].kind == TokenKind::LParen && find_matching_delim(tokens, cs) == ce - 1 {
+    cs = cs + 1
+    ce = ce - 1
+  }
+  if cs >= ce || tokens[cs].kind == TokenKind::Bang {
+    return
+  }
+  let mut has_ampamp = false
+  let mut is_idx = -1
+  let mut has_cmp = false
+  let mut k = cs
+  let mut d = 0
+  while k < ce {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 {
+      if kk == TokenKind::PipePipe || kk == TokenKind::PipeGt {
+        return
+      }
+      if kk == TokenKind::AmpAmp {
+        has_ampamp = true
+      } else if kk == TokenKind::EqEq || kk == TokenKind::BangEq ||
+      kk == TokenKind::Lt || kk == TokenKind::LtEq || kk == TokenKind::Gt || kk == TokenKind::GtEq {
+        has_cmp = true
+      } else if kk == TokenKind::Keyword && tokens[k].raw == "is" && is_idx < 0 {
+        is_idx = k
+      }
+    }
+    k = k + 1
+  }
+  if has_ampamp {
+    let mut sub_s = cs
+    let mut j = cs
+    let mut jd = 0
+    while j < ce {
+      let jk = tokens[j].kind
+      if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { jd = jd + 1 }
+      else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if jd > 0 { jd = jd - 1 } }
+      else if jd == 0 && jk == TokenKind::AmpAmp {
+        push_is_seg_binders(ctx, tokens, sub_s, j)
+        sub_s = j + 1
+      }
+      j = j + 1
+    }
+    if sub_s < ce {
+      push_is_seg_binders(ctx, tokens, sub_s, ce)
+    }
+    return
+  }
+  if is_idx > cs && is_idx + 1 < ce && !has_cmp {
+    let raw_is_b = collect_raw_pattern_binders(tokens, is_idx + 1, ce)
+    let is_rn = compute_scoped_binder_renames(ctx, raw_is_b)
+    if is_rn.length() > 0 {
+      ctx.ident_renames.push(is_rn)
+    }
+    let lhs_ty = infer_simple_expr_type(ctx, tokens, cs, is_idx).trim()
+    if lhs_ty.starts_with("Option[") && lhs_ty.ends_with("]") &&
+    is_idx + 4 < ce && tokens[is_idx + 1].kind == TokenKind::UpperIdent && tokens[is_idx + 1].raw == "Some" &&
+    tokens[is_idx + 2].kind == TokenKind::LParen && find_matching_delim(tokens, is_idx + 2) == ce - 1 &&
+    is_idx + 4 == ce - 1 && f3d2_is_value_ident_tok(tokens[is_idx + 3]) && tokens[is_idx + 3].raw != "_" {
+      let inner_t = lhs_ty.slice(7, lhs_ty.length() - 1).trim()
+      ctx.scope_vars.push(ScopeVar::{
+        name: resolve_ident_in_scope(ctx, tokens[is_idx + 3].raw),
+        ty: inner_t,
+        is_mut: false,
+        is_boxed: false,
+      })
+    } else {
+      for rb in raw_is_b {
+        if rb != "_" {
+          ctx.scope_vars.push(ScopeVar::{
+            name: resolve_ident_in_scope(ctx, rb),
+            ty: "",
+            is_mut: false,
+            is_boxed: false,
+          })
+        }
+      }
+    }
+    shadow_lifted_local_fns(ctx, raw_is_b)
+  }
+}
+
 ///| Lower a boolean condition `[start, end)` segment-by-segment across depth-0 `&&`,
-///| pushing any `is <Pat>` binders onto `ctx.scope_vars` so subsequent `&&` segments
-///| and the guarded body observe lexical shadowing.
+///| pushing any `is <Pat>` binders onto `ctx.scope_vars`, `ctx.ident_renames`, and `ctx.lifted_local_fns`
+///| so subsequent `&&` segments and the guarded body observe lexical shadowing.
 fn lower_cond_with_is_binders(
   ctx : StageAContext,
   tokens : Array[Token],
@@ -3352,50 +3452,7 @@ fn lower_cond_with_is_binders(
       seg_e = seg_e + 1
     }
     sb.write_string(lower_expr_range(ctx, tokens, seg_s, seg_e, file, false))
-    // Scan this segment for depth-0 `is <Pat>` and push its binders for subsequent `&&` and body
-    let mut k = seg_s
-    let mut kd = 0
-    while k < seg_e {
-      let kk = tokens[k].kind
-      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { kd = kd + 1 }
-      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if kd > 0 { kd = kd - 1 } }
-      else if kd == 0 && kk == TokenKind::Keyword && tokens[k].raw == "is" && k + 1 < seg_e {
-        let mut pe = k + 1
-        let mut pd = 0
-        while pe < seg_e {
-          let pk = tokens[pe].kind
-          if pd == 0 && pe > k + 1 && tokens[pe].newline_before { break }
-          if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
-          else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace {
-            if pd == 0 { break }
-            pd = pd - 1
-          } else if pd == 0 && (pk == TokenKind::PipePipe || pk == TokenKind::EqEq || pk == TokenKind::BangEq) {
-            break
-          }
-          pe = pe + 1
-        }
-        let lhs_ty = infer_simple_expr_type(ctx, tokens, seg_s, k).trim()
-        let raw_is_b = collect_raw_pattern_binders(tokens, k + 1, pe)
-        if lhs_ty.starts_with("Option[") && lhs_ty.ends_with("]") &&
-        k + 4 < pe && tokens[k + 1].kind == TokenKind::UpperIdent && tokens[k + 1].raw == "Some" &&
-        tokens[k + 2].kind == TokenKind::LParen && find_matching_delim(tokens, k + 2) == pe - 1 &&
-        k + 4 == pe - 1 && f3d2_is_value_ident_tok(tokens[k + 3]) && tokens[k + 3].raw != "_" {
-          let inner_t = lhs_ty.slice(7, lhs_ty.length() - 1).trim()
-          ctx.scope_vars.push(ScopeVar::{
-            name: resolve_ident_in_scope(ctx, tokens[k + 3].raw),
-            ty: inner_t,
-            is_mut: false,
-            is_boxed: false,
-          })
-        } else {
-          push_scope_binders(ctx, collect_pattern_binders(tokens, k + 1, pe))
-        }
-        shadow_lifted_local_fns(ctx, raw_is_b)
-        k = pe
-        continue
-      }
-      k = k + 1
-    }
+    push_is_seg_binders(ctx, tokens, seg_s, seg_e)
     if seg_e < end && tokens[seg_e].kind == TokenKind::AmpAmp {
       sb.write_string(tokens[seg_e].leading_trivia + "&&")
       seg_s = seg_e + 1
@@ -4856,15 +4913,37 @@ fn lower_stmts_range(
           restore_scope_vars(ctx, saved_sc)
           restore_ident_renames(ctx, saved_rn)
           restore_lifted_local_fns(ctx, saved_lf)
+          let occ_lfn : Map[String, Bool] = Map()
+          for cur_sv in ctx.scope_vars {
+            occ_lfn[cur_sv.name] = true
+          }
+          let local_fn_pion_name = if occ_lfn.contains(g.name) {
+            ctx.lift_counter = ctx.lift_counter + 1
+            let base_lfn = "__mbt_lfn_" + ctx.lift_counter.to_string() + "_" + g.name
+            let mut lfn_cand = base_lfn
+            let mut lfn_sfx = 1
+            while occ_lfn.contains(lfn_cand) {
+              lfn_cand = base_lfn + "_" + lfn_sfx.to_string()
+              lfn_sfx = lfn_sfx + 1
+            }
+            lfn_cand
+          } else {
+            g.name
+          }
+          if local_fn_pion_name != g.name || (lookup_ident_rename(ctx, raw_g_name) is Some(_)) {
+            let lfn_rn : Map[String, String] = Map()
+            lfn_rn[raw_g_name] = local_fn_pion_name
+            ctx.ident_renames.push(lfn_rn)
+          }
           sb.write_string(tokens[g.start_tok].leading_trivia)
-          sb.write_string("let " + g.name + " = fn(" + p_str + ")" + ret_str + " " + body)
+          sb.write_string("let " + local_fn_pion_name + " = fn(" + p_str + ")" + ret_str + " " + body)
           // Register this local fn in scope for subsequent statements/local fns (declaration order!)
           let fn_ty = if all_typed && g.ret_start >= 0 && g.ret_end > g.ret_start {
             "(" + join_comma(p_tys) + ") -> " + lower_type_tokens_checked(ctx, tokens, g.ret_start, g.ret_end, file)
           } else {
             ""
           }
-          ctx.scope_vars.push(ScopeVar::{ name: g.name, ty: fn_ty, is_mut: false, is_boxed: false })
+          ctx.scope_vars.push(ScopeVar::{ name: local_fn_pion_name, ty: fn_ty, is_mut: false, is_boxed: false })
           shadow_lifted_local_fns(ctx, [raw_g_name])
           i = next_after
           continue
@@ -5121,11 +5200,30 @@ fn lower_stmts_range(
           sb.write_string(cap_decls_s)
         }
         if escapes_outer && can_lift && all_typed {
-          let esc_rn = compute_scoped_binder_renames(ctx, [raw_g_name])
-          if esc_rn.length() > 0 {
+          let esc_occ : Map[String, Bool] = Map()
+          for cur_sv in ctx.scope_vars {
+            esc_occ[cur_sv.name] = true
+          }
+          let esc_name = if esc_occ.contains(g.name) || is_pion_reserved_ident(raw_g_name) {
+            let base_esc = "__mbt_esc_" + lift_id + "_" + g.name
+            let mut ecand = base_esc
+            let mut esfx = 1
+            while esc_occ.contains(ecand) || used_idents.contains(ecand) {
+              ecand = base_esc + "_" + esfx.to_string()
+              esfx = esfx + 1
+            }
+            used_idents[ecand] = true
+            ecand
+          } else {
+            g.name
+          }
+          if esc_name != g.name || (lookup_ident_rename(ctx, raw_g_name) is Some(_)) {
+            let esc_rn : Map[String, String] = Map()
+            esc_rn[raw_g_name] = esc_name
             ctx.ident_renames.push(esc_rn)
           }
-          let esc_name = resolve_ident_in_scope(ctx, raw_g_name)
+          let esc_fn_ty = "(" + join_comma(p_tys) + ")" + ret_str
+          ctx.scope_vars.push(ScopeVar::{ name: esc_name, ty: esc_fn_ty, is_mut: false, is_boxed: false })
           let esc_params : Array[String] = []
           let esc_args : Array[String] = []
           for ea in env_args { esc_args.push(ea) }
@@ -5356,7 +5454,7 @@ fn lower_call_args(
   while ai < raw_args.length() {
     let (s, e) = raw_args[ai]
     let exp_ty_ai = if ai < arg_exp_tys.length() { arg_exp_tys[ai] } else { "" }
-    if e - s == 2 && tokens[s].kind == TokenKind::Ident && tokens[s + 1].kind == TokenKind::Tilde {
+    if e - s == 2 && f3d2_is_value_ident_tok(tokens[s]) && tokens[s + 1].kind == TokenKind::Tilde {
       let lbl = callee_param_rename(callee_renames, tokens[s].raw)
       let val_nm = resolve_ident_in_scope(ctx, tokens[s].raw)
       if tokens[s].raw == "loc" {
@@ -5366,7 +5464,7 @@ fn lower_call_args(
       arg_labels.push(lbl)
       arg_vals.push(val_nm)
       arg_is_ext_opt.push(false)
-    } else if e - s == 2 && tokens[s].kind == TokenKind::Ident && tokens[s + 1].kind == TokenKind::Question {
+    } else if e - s == 2 && f3d2_is_value_ident_tok(tokens[s]) && tokens[s + 1].kind == TokenKind::Question {
       let lbl = callee_param_rename(callee_renames, tokens[s].raw)
       let val_nm = resolve_ident_in_scope(ctx, tokens[s].raw)
       if tokens[s].raw == "loc" {
@@ -5376,7 +5474,7 @@ fn lower_call_args(
       arg_labels.push(lbl)
       arg_vals.push(val_nm)
       arg_is_ext_opt.push(is_external_tilde)
-    } else if e - s >= 3 && tokens[s].kind == TokenKind::Ident && tokens[s + 1].kind == TokenKind::QuestionEq {
+    } else if e - s >= 3 && f3d2_is_value_ident_tok(tokens[s]) && tokens[s + 1].kind == TokenKind::QuestionEq {
       let lbl = callee_param_rename(callee_renames, tokens[s].raw)
       if tokens[s].raw == "loc" {
         has_explicit_loc = true
@@ -5389,7 +5487,7 @@ fn lower_call_args(
       arg_labels.push(lbl)
       arg_vals.push(val_s)
       arg_is_ext_opt.push(is_external_tilde)
-    } else if e - s >= 3 && tokens[s].kind == TokenKind::Ident && tokens[s + 1].kind == TokenKind::Eq {
+    } else if e - s >= 3 && f3d2_is_value_ident_tok(tokens[s]) && tokens[s + 1].kind == TokenKind::Eq {
       let lbl = callee_param_rename(callee_renames, tokens[s].raw)
       if tokens[s].raw == "loc" {
         has_explicit_loc = true
@@ -6159,6 +6257,100 @@ pub fn lower_expr_range(
       }
       None => ()
     }
+    // Expression-level `&&` with `is` binders (including parenthesized `(e is Pat) && ...`):
+    // zero-cost fast-path unless both depth-0 `&&` and an `is` keyword are present.
+    let mut has_top_ampamp = false
+    let mut has_any_is = false
+    let mut has_top_sep = false
+    let mut sk = start
+    let mut sd = 0
+    while sk < end {
+      let tk = tokens[sk].kind
+      if tk == TokenKind::Keyword && tokens[sk].raw == "is" {
+        has_any_is = true
+      }
+      if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+        sd = sd + 1
+      } else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+        if sd > 0 { sd = sd - 1 }
+      } else if sd == 0 {
+        if tk == TokenKind::AmpAmp {
+          has_top_ampamp = true
+        } else if tk == TokenKind::Comma || tk == TokenKind::Semi || tk == TokenKind::FatArrow || tk == TokenKind::Eq ||
+        (tk == TokenKind::Keyword && (tokens[sk].raw == "let" || tokens[sk].raw == "fn" || tokens[sk].raw == "if" || tokens[sk].raw == "while" || tokens[sk].raw == "for" || tokens[sk].raw == "match" || tokens[sk].raw == "guard")) {
+          has_top_sep = true
+        }
+      }
+      sk = sk + 1
+    }
+    if has_top_ampamp && has_any_is && !has_top_sep {
+      let sb_and = StringBuilder()
+      let mut os = start
+      while os < end {
+        let mut oe = os
+        let mut od = 0
+        while oe < end {
+          let ok = tokens[oe].kind
+          if ok == TokenKind::LParen || ok == TokenKind::LBracket || ok == TokenKind::LBrace { od = od + 1 }
+          else if ok == TokenKind::RParen || ok == TokenKind::RBracket || ok == TokenKind::RBrace { if od > 0 { od = od - 1 } }
+          else if od == 0 && (ok == TokenKind::PipePipe || ok == TokenKind::PipeGt) { break }
+          oe = oe + 1
+        }
+        let saved_sc = ctx.scope_vars.length()
+        let saved_rn = ctx.ident_renames.length()
+        let saved_lf = save_lifted_local_fns(ctx)
+        let mut as_i = os
+        while as_i < oe {
+          let mut ae_i = as_i
+          let mut ad = 0
+          while ae_i < oe {
+            let ak = tokens[ae_i].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+            else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+            else if ad == 0 && ak == TokenKind::AmpAmp { break }
+            ae_i = ae_i + 1
+          }
+          sb_and.write_string(lower_expr_range(ctx, tokens, as_i, ae_i, file, false))
+          if ae_i < oe && tokens[ae_i].kind == TokenKind::AmpAmp {
+            push_is_seg_binders(ctx, tokens, as_i, ae_i)
+            sb_and.write_string(tokens[ae_i].leading_trivia + "&&")
+            as_i = ae_i + 1
+          } else {
+            break
+          }
+        }
+        restore_scope_vars(ctx, saved_sc)
+        restore_ident_renames(ctx, saved_rn)
+        restore_lifted_local_fns(ctx, saved_lf)
+        if oe < end && (tokens[oe].kind == TokenKind::PipePipe || tokens[oe].kind == TokenKind::PipeGt) {
+          sb_and.write_string(tokens[oe].leading_trivia + tokens[oe].raw)
+          os = oe + 1
+        } else {
+          break
+        }
+      }
+      return sb_and.to_string()
+    }
+    if has_any_is && start + 2 < end && tokens[start].kind == TokenKind::LParen &&
+    find_matching_delim(tokens, start) == end - 1 {
+      let mut has_inner_amp = false
+      let mut has_inner_sep = false
+      let mut ik = start + 1
+      let mut id = 0
+      while ik < end - 1 {
+        let itk = tokens[ik].kind
+        if itk == TokenKind::LParen || itk == TokenKind::LBracket || itk == TokenKind::LBrace { id = id + 1 }
+        else if itk == TokenKind::RParen || itk == TokenKind::RBracket || itk == TokenKind::RBrace { if id > 0 { id = id - 1 } }
+        else if id == 0 {
+          if itk == TokenKind::AmpAmp { has_inner_amp = true }
+          else if itk == TokenKind::Comma || itk == TokenKind::Colon || itk == TokenKind::Semi || itk == TokenKind::FatArrow { has_inner_sep = true }
+        }
+        ik = ik + 1
+      }
+      if has_inner_amp && !has_inner_sep {
+        return tokens[start].leading_trivia + "(" + lower_expr_range(ctx, tokens, start + 1, end - 1, file, false) + tokens[end - 1].leading_trivia + ")"
+      }
+    }
   }
   let sb = StringBuilder()
   let mut i = start
@@ -6763,6 +6955,11 @@ fn lower_one_token_or_form(
     if cb + 1 < end && tokens[cb + 1].kind == TokenKind::Eq {
       let rhs_end = find_expr_end(tokens, cb + 2, end)
       let rhs_s = lower_expr_range(ctx, tokens, cb + 2, rhs_end, file, false).trim()
+      let raw_ds_b = collect_raw_pattern_binders(tokens, i + 1, cb + 1)
+      let ds_rn = compute_scoped_binder_renames(ctx, raw_ds_b)
+      if ds_rn.length() > 0 {
+        ctx.ident_renames.push(ds_rn)
+      }
       let tmp_s = fresh_temp(ctx, "ds")
       let sb = StringBuilder()
       sb.write_string(trivia + "let " + tmp_s + " = " + rhs_s)
@@ -6789,13 +6986,18 @@ fn lower_one_token_or_form(
               sb.write_string("; let " + pat_s + " = " + tmp_s + "." + fname)
             }
           } else {
-            sb.write_string("; let " + fname + " = " + tmp_s + "." + fname)
+            let local_b = resolve_ident_in_scope(ctx, tokens[fi].raw)
+            sb.write_string("; let " + local_b + " = " + tmp_s + "." + fname)
           }
         }
         fi = fe + 1
       }
-      push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cb + 1))
-      shadow_lifted_local_fns(ctx, collect_raw_pattern_binders(tokens, i + 1, cb + 1))
+      for rb in raw_ds_b {
+        if rb != "_" {
+          ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+        }
+      }
+      shadow_lifted_local_fns(ctx, raw_ds_b)
       return (sb.to_string(), rhs_end)
     }
   }
@@ -6808,6 +7010,11 @@ fn lower_one_token_or_form(
     if cp + 1 < end && tokens[cp + 1].kind == TokenKind::Eq {
       let rhs_end = find_expr_end(tokens, cp + 2, end)
       let rhs_s = lower_expr_range(ctx, tokens, cp + 2, rhs_end, file, false).trim()
+      let raw_ts_b = collect_raw_pattern_binders(tokens, i + 2, cp + 1)
+      let ts_rn = compute_scoped_binder_renames(ctx, raw_ts_b)
+      if ts_rn.length() > 0 {
+        ctx.ident_renames.push(ts_rn)
+      }
       let tmp_s = fresh_temp(ctx, "ts")
       let sb = StringBuilder()
       sb.write_string(trivia + "let " + tmp_s + " = " + rhs_s)
@@ -6834,8 +7041,12 @@ fn lower_one_token_or_form(
         fidx = fidx + 1
         pi = pe + 1
       }
-      push_scope_binders(ctx, collect_pattern_binders(tokens, i + 2, cp + 1))
-      shadow_lifted_local_fns(ctx, collect_raw_pattern_binders(tokens, i + 2, cp + 1))
+      for rb in raw_ts_b {
+        if rb != "_" {
+          ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+        }
+      }
+      shadow_lifted_local_fns(ctx, raw_ts_b)
       return (sb.to_string(), rhs_end)
     }
   }
@@ -7003,6 +7214,7 @@ fn lower_one_token_or_form(
         None => ()
       }
       let saved_if_sc = ctx.scope_vars.length()
+      let saved_if_rn = ctx.ident_renames.length()
       let saved_if_lf = save_lifted_local_fns(ctx)
       let saved_if_exp = ctx.expected_type_stack.length()
       let mut pushed_if_sib = false
@@ -7019,6 +7231,7 @@ fn lower_one_token_or_form(
       pop_expected_type(ctx)
       let then_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
       restore_scope_vars(ctx, saved_if_sc)
+      restore_ident_renames(ctx, saved_if_rn)
       restore_lifted_local_fns(ctx, saved_if_lf)
       if (pushed_if_sib || current_expected_type(ctx).starts_with("__qual__::")) && close_b + 2 < end &&
       tokens[close_b + 1].kind == TokenKind::Keyword && tokens[close_b + 1].raw == "else" {
@@ -7062,6 +7275,25 @@ fn lower_one_token_or_form(
         }
       }
       return (trivia + "if" + cond_s + tokens[lb].leading_trivia + then_s, close_b + 1)
+    }
+  }
+
+  // 1b4b. `while <cond> { ... }`: scope `is <Pat>` binders into subsequent `&&` and the loop body only!
+  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "while" {
+    let lb = le_find_header_body_lbrace(tokens, i, end)
+    if lb > i + 1 && lb < end && tokens[lb].kind == TokenKind::LBrace {
+      let close_b = find_matching_delim(tokens, lb)
+      let saved_w_sc = ctx.scope_vars.length()
+      let saved_w_rn = ctx.ident_renames.length()
+      let saved_w_lf = save_lifted_local_fns(ctx)
+      push_expected_type(ctx, "Bool")
+      let cond_s = lower_cond_with_is_binders(ctx, tokens, i + 1, lb, file)
+      pop_expected_type(ctx)
+      let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+      restore_scope_vars(ctx, saved_w_sc)
+      restore_ident_renames(ctx, saved_w_rn)
+      restore_lifted_local_fns(ctx, saved_w_lf)
+      return (trivia + "while" + cond_s + tokens[lb].leading_trivia + body_s, close_b + 1)
     }
   }
 
@@ -7241,15 +7473,36 @@ fn lower_one_token_or_form(
         }
       } else if semi1 > i + 1 {
         // C-style `for v1 = init1, v2 = init2; cond; step { body }`
-        let loop_vars : Array[String] = []
         let raw_loop_vars : Array[String] = []
+        let mut rvi = i + 1
+        while rvi < semi1 {
+          if f3d2_is_value_ident_tok(tokens[rvi]) && rvi + 1 < semi1 && tokens[rvi + 1].kind == TokenKind::Eq {
+            raw_loop_vars.push(tokens[rvi].raw)
+            let mut rve = rvi + 2
+            let mut rvd = 0
+            while rve < semi1 {
+              let vk = tokens[rve].kind
+              if vk == TokenKind::LParen || vk == TokenKind::LBracket || vk == TokenKind::LBrace { rvd = rvd + 1 }
+              else if vk == TokenKind::RParen || vk == TokenKind::RBracket || vk == TokenKind::RBrace { if rvd > 0 { rvd = rvd - 1 } }
+              else if rvd == 0 && vk == TokenKind::Comma { break }
+              rve = rve + 1
+            }
+            rvi = if rve < semi1 && tokens[rve].kind == TokenKind::Comma { rve + 1 } else { rve }
+          } else {
+            rvi = rvi + 1
+          }
+        }
+        let cfor_rn = compute_scoped_binder_renames(ctx, raw_loop_vars)
+        let loop_vars : Array[String] = []
         let init_sb = StringBuilder()
         let mut vi = i + 1
         while vi < semi1 {
           if f3d2_is_value_ident_tok(tokens[vi]) && vi + 1 < semi1 && tokens[vi + 1].kind == TokenKind::Eq {
-            let vname = rename_keyword_ident(tokens[vi].raw)
+            let vname = match cfor_rn.get(tokens[vi].raw) {
+              Some(v) => v
+              None => rename_keyword_ident(tokens[vi].raw)
+            }
             loop_vars.push(vname)
-            raw_loop_vars.push(tokens[vi].raw)
             init_sb.write_string(tokens[vi].leading_trivia + vname + tokens[vi + 1].leading_trivia + "=")
             let mut ve = vi + 2
             let mut vd = 0
@@ -7274,12 +7527,17 @@ fn lower_one_token_or_form(
           }
         }
         let saved_for_sc = ctx.scope_vars.length()
+        let saved_for_rn = ctx.ident_renames.length()
         let saved_for_lf = save_lifted_local_fns(ctx)
+        if cfor_rn.length() > 0 {
+          ctx.ident_renames.push(cfor_rn)
+        }
         push_scope_binders(ctx, loop_vars)
         shadow_lifted_local_fns(ctx, raw_loop_vars)
         let rest_hdr = lower_expr_range(ctx, tokens, semi1, lb, file, false)
         let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
         restore_scope_vars(ctx, saved_for_sc)
+        restore_ident_renames(ctx, saved_for_rn)
         restore_lifted_local_fns(ctx, saved_for_lf)
         return (trivia + "for" + init_sb.to_string() + rest_hdr + tokens[lb].leading_trivia + body_s, close_b + 1)
       }
