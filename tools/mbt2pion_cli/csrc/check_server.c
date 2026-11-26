@@ -179,10 +179,10 @@ int mbt_check_server_start(const char *pionc_bin, const char *scratch_dir) {
             (void)dup2(devnull, STDERR_FILENO);
             if (devnull > STDERR_FILENO) close(devnull);
         }
-        close(p_in[0]);
-        close(p_in[1]);
-        close(p_out[0]);
-        close(p_out[1]);
+        if (p_in[0] > STDERR_FILENO) close(p_in[0]);
+        if (p_in[1] > STDERR_FILENO) close(p_in[1]);
+        if (p_out[0] > STDERR_FILENO) close(p_out[0]);
+        if (p_out[1] > STDERR_FILENO) close(p_out[1]);
 
         char *const argv[] = {
             (char *)pionc_bin,
