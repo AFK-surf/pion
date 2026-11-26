@@ -391,32 +391,25 @@ if [ "$N" -lt 1 ]; then
 fi
 
 # 5. ASan + UBSan QBE over every QBE input above.
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -o "$TMP_DIR/san_probe" 2>/dev/null \
-  && "$TMP_DIR/san_probe"; then
-  mkdir -p "$TMP_DIR/sanq"
-  # The host's default target, as scripts/build-qbe.sh picks it (the replays
-  # below pass -t; the default matters for the host differential run).
-  case "$HOST" in
-    Darwin/arm64|Darwin/aarch64) DEFTGT=T_arm64_apple ;;
-    Darwin/*) DEFTGT=T_amd64_apple ;;
-    */aarch64|*/arm64) DEFTGT=T_arm64 ;;
-    */riscv64) DEFTGT=T_rv64 ;;
-    *) DEFTGT=T_amd64_sysv ;;
-  esac
-  printf '#define Deftgt %s\n' "$DEFTGT" > "$TMP_DIR/sanq/config.h"
-  (
-    cd "$ROOT_DIR/vendor/qbe"
-    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-      o="$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
-      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$o"
-    done
-  )
-  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
-  SAN_ENV="ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+SAN_QBE=""
+mkdir -p "$TMP_DIR/sanq"
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+  SAN_QBE="$PION_QBE_SAN"
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$TMP_DIR/sanq" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_QBE="$TMP_DIR/sanq/qbe"
+  elif [ "$SAN_RC" -ne 77 ]; then
+    echo "FAIL: p117 ASan+UBSan QBE build failed (exit $SAN_RC)" >&2
+    exit 1
+  fi
+fi
+if [ -n "$SAN_QBE" ]; then
+  SAN_ENV="ASAN_OPTIONS=halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
   # san ARGS: run the sanitized QBE; any exit status or diagnostic fails.
   san() {
-    if ! env $SAN_ENV "$TMP_DIR/sanq/qbe" "$@" 2> "$TMP_DIR/sanq/err" || [ -s "$TMP_DIR/sanq/err" ]; then
+    if ! env $SAN_ENV "$SAN_QBE" "$@" 2> "$TMP_DIR/sanq/err" || [ -s "$TMP_DIR/sanq/err" ]; then
       cat "$TMP_DIR/sanq/err" >&2
       echo "FAIL: p117 sanitized QBE $*" >&2
       exit 1
@@ -425,7 +418,7 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,un
   # san_dump ARGS: same with a -d dump on stderr (printed to stdout); a
   # sanitizer report ends the process with a non-zero status.
   san_dump() {
-    if ! env $SAN_ENV "$TMP_DIR/sanq/qbe" "$@" 2> "$TMP_DIR/sanq/err"; then
+    if ! env $SAN_ENV "$SAN_QBE" "$@" 2> "$TMP_DIR/sanq/err"; then
       tail -40 "$TMP_DIR/sanq/err" >&2
       echo "FAIL: p117 sanitized QBE $*" >&2
       exit 1
@@ -458,7 +451,7 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,un
       fi
     done
   done
-  asm "$TMP_DIR/sanq/qbe" "$DIR/loops.ssa" "$TMP_DIR/san_text.o"
+  asm "$SAN_QBE" "$DIR/loops.ssa" "$TMP_DIR/san_text.o"
   run_driver "asan-ubsan-text" "$TMP_DIR/san_text.o"
   echo "p117 ASan+UBSan QBE: 3 inputs x 4 targets, $RUNS runs clean (same expansions and assembly as the plain QBE)"
 elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then

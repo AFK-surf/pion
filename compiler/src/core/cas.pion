@@ -151,8 +151,7 @@ pub fn cas_linked_exe_name(windows : Bool, path : String) -> String {
 }
 
 ///|
-pub fn cas_sha256_hex(s : String) -> String {
-  let bytes = str_to_utf8_ints(s)
+fn cas_sha256_ints(bytes : Array[Int]) -> String {
   let msg_len = bytes.length()
   let bit_len = msg_len.to_int64() * 8L
   bytes.push(0x80)
@@ -257,6 +256,23 @@ pub fn cas_sha256_hex(s : String) -> String {
     si = si + 1
   }
   sb.to_string()
+}
+
+///|
+pub fn cas_sha256_hex(s : String) -> String {
+  cas_sha256_ints(str_to_utf8_ints(s))
+}
+
+///|
+pub fn cas_sha256_bytes(data : Bytes) -> String {
+  let bytes : Array[Int] = []
+  let n = data.length()
+  let mut i = 0
+  while i < n {
+    bytes.push(data[i].to_int() & 0xFF)
+    i = i + 1
+  }
+  cas_sha256_ints(bytes)
 }
 
 ///|
@@ -424,6 +440,49 @@ fn parse_int64_dec(s : String) -> Int64 {
 }
 
 ///|
+/// Whitelist validation for CAS index keys: rejects empty strings, `..`,
+/// path separators (`/`, `\`), NUL, control characters, and whitespace.
+/// After stripping an optional `testbin:` or `wasmbin:` prefix, every byte
+/// must be in `[A-Za-z0-9_.-]`.
+pub fn cas_is_safe_key(ek : String) -> Bool {
+  let n = ek.length()
+  if n == 0 {
+    return false
+  }
+  let start = if n >= 8 &&
+    (slice_str(ek, 0, 8) == "testbin:" || slice_str(ek, 0, 8) == "wasmbin:") {
+    8
+  } else {
+    0
+  }
+  let body_len = n - start
+  if body_len == 0 {
+    return false
+  }
+  if body_len == 1 && str_code_at(ek, start) == 46 {
+    return false
+  }
+  let mut i = start
+  while i < n {
+    let c = str_code_at(ek, i)
+    let ok = (c >= 48 && c <= 57) ||
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      c == 95 ||
+      c == 46 ||
+      c == 45
+    if !ok {
+      return false
+    }
+    if c == 46 && i + 1 < n && str_code_at(ek, i + 1) == 46 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 pub fn cas_parse_index(text : String) -> Array[CasEntry] {
   let out : Array[CasEntry] = []
   let lines = split_lines(text)
@@ -450,13 +509,15 @@ pub fn cas_parse_index(text : String) -> Array[CasEntry] {
     }
     if tab1 > 0 && tab2 > tab1 {
       let key = slice_str(line, 0, tab1)
-      let bytes_s = slice_str(line, tab1 + 1, tab2)
-      let ts_s = slice_str(line, tab2 + 1, line.length())
-      out.push(CasEntry::{
-        key: key,
-        bytes: parse_int64_dec(bytes_s),
-        last_access_ms: parse_int64_dec(ts_s),
-      })
+      if cas_is_safe_key(key) {
+        let bytes_s = slice_str(line, tab1 + 1, tab2)
+        let ts_s = slice_str(line, tab2 + 1, line.length())
+        out.push(CasEntry::{
+          key: key,
+          bytes: parse_int64_dec(bytes_s),
+          last_access_ms: parse_int64_dec(ts_s),
+        })
+      }
     }
     i = i + 1
   }
@@ -571,4 +632,909 @@ pub fn cas_touch_and_evict(
     i = i + 1
   }
   CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+pub fn cas_touch_batch_and_evict(
+  entries : Array[CasEntry],
+  keys : Array[String],
+  sizes : Array[Int64],
+  now_ms : Int64,
+  max_bytes : Int64,
+  pinned_keys : Array[String],
+) -> CasEvictResult {
+  let pinned : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < pinned_keys.length() {
+    pinned.set(pinned_keys[i], true)
+    i = i + 1
+  }
+  let key_sizes : Map[String, Int64] = Map([])
+  let key_order : Array[String] = []
+  let nk = if keys.length() < sizes.length() {
+    keys.length()
+  } else {
+    sizes.length()
+  }
+  i = 0
+  while i < nk {
+    let k = keys[i]
+    pinned.set(k, true)
+    if !key_sizes.contains(k) {
+      key_order.push(k)
+    }
+    key_sizes.set(k, sizes[i])
+    i = i + 1
+  }
+
+  let updated : Array[CasEntry] = []
+  let seen : Map[String, Bool] = Map([])
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if seen.contains(e.key) {
+      i = i + 1
+      continue
+    }
+    seen.set(e.key, true)
+    match key_sizes.get(e.key) {
+      Some(sz) =>
+        updated.push(CasEntry::{
+          key: e.key,
+          bytes: sz,
+          last_access_ms: now_ms,
+        })
+      None =>
+        if pinned.contains(e.key) {
+          updated.push(CasEntry::{
+            key: e.key,
+            bytes: e.bytes,
+            last_access_ms: now_ms,
+          })
+        } else {
+          updated.push(e)
+        }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < key_order.length() {
+    let k = key_order[i]
+    if !seen.contains(k) {
+      let sz = match key_sizes.get(k) {
+        Some(v) => v
+        None => 0L
+      }
+      updated.push(CasEntry::{
+        key: k,
+        bytes: sz,
+        last_access_ms: now_ms,
+      })
+    }
+    i = i + 1
+  }
+
+  let mut total = 0L
+  i = 0
+  while i < updated.length() {
+    total = total + updated[i].bytes
+    i = i + 1
+  }
+
+  let evicted : Array[String] = []
+  if max_bytes <= 0L || total <= max_bytes {
+    return CasEvictResult::{ kept: updated, evicted: evicted }
+  }
+
+  sort_cas_entries_lru(updated)
+  let watermark = (max_bytes * 80L) / 100L
+  let kept : Array[CasEntry] = []
+  i = 0
+  while i < updated.length() {
+    let e = updated[i]
+    if total > watermark && !pinned.contains(e.key) {
+      total = total - e.bytes
+      evicted.push(e.key)
+    } else {
+      kept.push(e)
+    }
+    i = i + 1
+  }
+  CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+pub fn cas_touch_and_evict_pinned(
+  entries : Array[CasEntry],
+  key : String,
+  bytes : Int64,
+  now_ms : Int64,
+  max_bytes : Int64,
+  pinned_keys : Array[String],
+) -> CasEvictResult {
+  cas_touch_batch_and_evict(
+    entries,
+    [key],
+    [bytes],
+    now_ms,
+    max_bytes,
+    pinned_keys,
+  )
+}
+
+///|
+/// Post-run CAS budget trim: refreshes `last_access_ms = now_ms` on all entries
+/// in `run_keys ∪ protected_keys`, then if total bytes exceed `max_bytes` evicts
+/// least-recently-used entries NOT in `protected_keys` (active peer process pins
+/// plus returned output `keep_keys`) down to the 80% watermark.
+pub fn cas_evict_post_run(
+  entries : Array[CasEntry],
+  now_ms : Int64,
+  max_bytes : Int64,
+  run_keys : Array[String],
+  protected_keys : Array[String],
+) -> CasEvictResult {
+  let touch_set : Map[String, Bool] = Map([])
+  let prot_set : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < run_keys.length() {
+    touch_set.set(run_keys[i], true)
+    i = i + 1
+  }
+  i = 0
+  while i < protected_keys.length() {
+    let k = protected_keys[i]
+    touch_set.set(k, true)
+    prot_set.set(k, true)
+    i = i + 1
+  }
+  let sorted : Array[CasEntry] = []
+  let mut total = 0L
+  i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    let updated_e = if touch_set.contains(e.key) {
+      CasEntry::{
+        key: e.key,
+        bytes: e.bytes,
+        last_access_ms: now_ms,
+      }
+    } else {
+      e
+    }
+    sorted.push(updated_e)
+    total = total + updated_e.bytes
+    i = i + 1
+  }
+  let evicted : Array[String] = []
+  if max_bytes <= 0L || total <= max_bytes {
+    return CasEvictResult::{ kept: sorted, evicted: evicted }
+  }
+  sort_cas_entries_lru(sorted)
+  let watermark = (max_bytes * 80L) / 100L
+  let kept : Array[CasEntry] = []
+  i = 0
+  while i < sorted.length() {
+    let e = sorted[i]
+    if total > watermark && !prot_set.contains(e.key) {
+      total = total - e.bytes
+      evicted.push(e.key)
+    } else {
+      kept.push(e)
+    }
+    i = i + 1
+  }
+  CasEvictResult::{ kept: kept, evicted: evicted }
+}
+
+///|
+fn cas_sort_strings(arr : Array[String]) -> Unit {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let cur = arr[i]
+    let mut j = i - 1
+    while j >= 0 && cur < arr[j] {
+      arr[j + 1] = arr[j]
+      j = j - 1
+    }
+    arr[j + 1] = cur
+    i = i + 1
+  }
+}
+
+///|
+/// Parses a slice `[start, end)` of a normalized Makefile depfile line into
+/// unescaped tokens (handling `\ `, `\#`, `\t`, `\:`, `$$` with contiguous
+/// slice copies so UTF-8 paths stay intact).
+fn cas_parse_depfile_tokens(
+  norm : String,
+  start : Int,
+  end : Int,
+) -> Array[String] {
+  let out : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  let mut i = start
+  while i < end {
+    let ch0 = str_code_at(norm, i)
+    if ch0 == 32 || ch0 == 9 || ch0 == 10 {
+      i = i + 1
+      continue
+    }
+    let tok = StringBuilder()
+    let mut seg_start = i
+    while i < end {
+      let ch = str_code_at(norm, i)
+      if ch == 32 || ch == 9 || ch == 10 {
+        break
+      }
+      if ch == 92 && i + 1 < end {
+        let nxt = str_code_at(norm, i + 1)
+        if nxt == 32 || nxt == 35 || nxt == 9 || nxt == 58 {
+          if i > seg_start {
+            tok.write_string(slice_str(norm, seg_start, i))
+          }
+          if nxt == 32 {
+            tok.write_char(' ')
+          } else if nxt == 35 {
+            tok.write_char('#')
+          } else if nxt == 9 {
+            tok.write_char('\t')
+          } else {
+            tok.write_char(':')
+          }
+          i = i + 2
+          seg_start = i
+          continue
+        }
+      }
+      if ch == 36 && i + 1 < end && str_code_at(norm, i + 1) == 36 {
+        if i > seg_start {
+          tok.write_string(slice_str(norm, seg_start, i))
+        }
+        tok.write_char('$')
+        i = i + 2
+        seg_start = i
+        continue
+      }
+      i = i + 1
+    }
+    if i > seg_start {
+      tok.write_string(slice_str(norm, seg_start, i))
+    }
+    let dep = tok.to_string()
+    if dep.length() > 0 && !seen.contains(dep) {
+      seen.set(dep, true)
+      out.push(dep)
+    }
+  }
+  out
+}
+
+///|
+/// Parses a GCC/Clang Makefile depfile (`-MD -MF`) into `(targets, deps)` where
+/// both lists are deduplicated (and `deps` sorted). Uses contiguous slices to
+/// preserve multi-byte UTF-8 paths intact. Fails closed (`None`) on missing
+/// target/separator, empty target or prerequisite list, or unexpected extra
+/// non-comment lines after the rule.
+pub fn cas_parse_depfile(txt : String) -> Option[(Array[String], Array[String])] {
+  // 1. Normalize CRLF -> LF using contiguous slice copies (UTF-8 safe).
+  let crlf_sb = StringBuilder()
+  let raw_n = txt.length()
+  let mut run_start = 0
+  let mut ri = 0
+  while ri < raw_n {
+    if str_code_at(txt, ri) == 13 &&
+      ri + 1 < raw_n &&
+      str_code_at(txt, ri + 1) == 10 {
+      if ri > run_start {
+        crlf_sb.write_string(slice_str(txt, run_start, ri))
+      }
+      crlf_sb.write_char('\n')
+      ri = ri + 2
+      run_start = ri
+    } else {
+      ri = ri + 1
+    }
+  }
+  if raw_n > run_start {
+    crlf_sb.write_string(slice_str(txt, run_start, raw_n))
+  }
+  let lf_txt = crlf_sb.to_string()
+
+  // 2. Collapse backslash-newline continuations into a single space.
+  let cont_sb = StringBuilder()
+  let lf_n = lf_txt.length()
+  run_start = 0
+  let mut ci = 0
+  while ci < lf_n {
+    if str_code_at(lf_txt, ci) == 92 &&
+      ci + 1 < lf_n &&
+      str_code_at(lf_txt, ci + 1) == 10 {
+      if ci > run_start {
+        cont_sb.write_string(slice_str(lf_txt, run_start, ci))
+      }
+      cont_sb.write_char(' ')
+      ci = ci + 2
+      run_start = ci
+    } else {
+      ci = ci + 1
+    }
+  }
+  if lf_n > run_start {
+    cont_sb.write_string(slice_str(lf_txt, run_start, lf_n))
+  }
+  let norm = cont_sb.to_string()
+  let n = norm.length()
+
+  // 3. Locate the rule line start and true `:` target separator (skipping `\:`
+  //    and Windows drive colons like `C:\` / `C:/`).
+  let mut rule_start = 0
+  let mut colon_pos = -1
+  let mut has_target = false
+  let mut i = 0
+  while i < n {
+    let ch = str_code_at(norm, i)
+    if ch == 10 {
+      if has_target {
+        return None
+      }
+      i = i + 1
+      rule_start = i
+      continue
+    }
+    if !has_target && ch == 35 {
+      // Skip leading comment line
+      while i < n && str_code_at(norm, i) != 10 {
+        i = i + 1
+      }
+      continue
+    }
+    if ch == 92 && i + 1 < n {
+      let nxt = str_code_at(norm, i + 1)
+      if nxt == 58 || nxt == 32 || nxt == 9 || nxt == 35 {
+        has_target = true
+        i = i + 2
+        continue
+      }
+    }
+    if ch == 58 {
+      let at_sep = i + 1 == n ||
+        str_code_at(norm, i + 1) == 32 ||
+        str_code_at(norm, i + 1) == 9 ||
+        str_code_at(norm, i + 1) == 10
+      if at_sep {
+        colon_pos = i
+        break
+      }
+      has_target = true
+      i = i + 1
+      continue
+    }
+    if ch != 32 && ch != 9 {
+      has_target = true
+    }
+    i = i + 1
+  }
+  if colon_pos < 0 || !has_target {
+    return None
+  }
+
+  let targets = cas_parse_depfile_tokens(norm, rule_start, colon_pos)
+  if targets.length() == 0 {
+    return None
+  }
+
+  // 4. Find end of rule line and parse prerequisite paths.
+  let mut line_end = colon_pos + 1
+  while line_end < n && str_code_at(norm, line_end) != 10 {
+    line_end = line_end + 1
+  }
+  let deps = cas_parse_depfile_tokens(norm, colon_pos + 1, line_end)
+  if deps.length() == 0 {
+    return None
+  }
+
+  // 5. Reject any unparsed non-blank, non-comment lines after the rule (fail-closed).
+  i = if line_end < n { line_end + 1 } else { n }
+  while i < n {
+    let ch = str_code_at(norm, i)
+    if ch == 32 || ch == 9 || ch == 10 {
+      i = i + 1
+      continue
+    }
+    if ch == 35 {
+      while i < n && str_code_at(norm, i) != 10 {
+        i = i + 1
+      }
+      continue
+    }
+    return None
+  }
+
+  cas_sort_strings(deps)
+  Some((targets, deps))
+}
+
+///|
+fn cas_json_skip_ws(txt : String, pos : Array[Int], n : Int) -> Unit {
+  let mut p = pos[0]
+  while p < n {
+    let c = str_code_at(txt, p)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p = p + 1
+    } else {
+      break
+    }
+  }
+  pos[0] = p
+}
+
+///|
+fn cas_json_hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+///|
+fn cas_json_parse_hex4(txt : String, start : Int, n : Int) -> Int {
+  if start + 4 > n {
+    return -1
+  }
+  let h0 = cas_json_hex_val(str_code_at(txt, start))
+  let h1 = cas_json_hex_val(str_code_at(txt, start + 1))
+  let h2 = cas_json_hex_val(str_code_at(txt, start + 2))
+  let h3 = cas_json_hex_val(str_code_at(txt, start + 3))
+  if h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0 {
+    return -1
+  }
+  (h0 << 12) | (h1 << 8) | (h2 << 4) | h3
+}
+
+///|
+fn cas_json_write_utf8_cp(sb : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    sb.write_byte(cp.to_byte())
+  } else if cp < 0x800 {
+    sb.write_byte((0xC0 | (cp >> 6)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else if cp < 0x10000 {
+    sb.write_byte((0xE0 | (cp >> 12)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  } else {
+    sb.write_byte((0xF0 | (cp >> 18)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 12) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)).to_byte())
+    sb.write_byte((0x80 | (cp & 0x3F)).to_byte())
+  }
+}
+
+///|
+fn cas_json_parse_string(txt : String, pos : Array[Int], n : Int) -> Option[String] {
+  let mut p = pos[0]
+  if p >= n || str_code_at(txt, p) != 34 {
+    return None
+  }
+  p = p + 1
+  let sb = StringBuilder()
+  let mut seg = p
+  while p < n {
+    let c = str_code_at(txt, p)
+    if c == 34 {
+      if p > seg {
+        sb.write_string(slice_str(txt, seg, p))
+      }
+      pos[0] = p + 1
+      return Some(sb.to_string())
+    }
+    if c < 32 {
+      return None
+    }
+    if c == 92 {
+      if p > seg {
+        sb.write_string(slice_str(txt, seg, p))
+      }
+      if p + 1 >= n {
+        return None
+      }
+      let esc = str_code_at(txt, p + 1)
+      if esc == 34 {
+        sb.write_char('"')
+        p = p + 2
+      } else if esc == 92 {
+        sb.write_char('\\')
+        p = p + 2
+      } else if esc == 47 {
+        sb.write_char('/')
+        p = p + 2
+      } else if esc == 98 {
+        sb.write_byte((8).to_byte())
+        p = p + 2
+      } else if esc == 102 {
+        sb.write_byte((12).to_byte())
+        p = p + 2
+      } else if esc == 110 {
+        sb.write_char('\n')
+        p = p + 2
+      } else if esc == 114 {
+        sb.write_char('\r')
+        p = p + 2
+      } else if esc == 116 {
+        sb.write_char('\t')
+        p = p + 2
+      } else if esc == 117 {
+        let u1 = cas_json_parse_hex4(txt, p + 2, n)
+        if u1 < 0 {
+          return None
+        }
+        p = p + 6
+        if u1 >= 0xD800 && u1 <= 0xDBFF {
+          if p + 6 > n ||
+            str_code_at(txt, p) != 92 ||
+            str_code_at(txt, p + 1) != 117 {
+            return None
+          }
+          let u2 = cas_json_parse_hex4(txt, p + 2, n)
+          if u2 < 0xDC00 || u2 > 0xDFFF {
+            return None
+          }
+          p = p + 6
+          let cp = 0x10000 + ((u1 - 0xD800) << 10) + (u2 - 0xDC00)
+          cas_json_write_utf8_cp(sb, cp)
+        } else if u1 >= 0xDC00 && u1 <= 0xDFFF {
+          return None
+        } else {
+          cas_json_write_utf8_cp(sb, u1)
+        }
+      } else {
+        return None
+      }
+      seg = p
+      continue
+    }
+    p = p + 1
+  }
+  None
+}
+
+///|
+fn cas_json_skip_value(txt : String, pos : Array[Int], n : Int, depth : Int) -> Bool {
+  if depth > 64 {
+    return false
+  }
+  cas_json_skip_ws(txt, pos, n)
+  let p = pos[0]
+  if p >= n {
+    return false
+  }
+  let c = str_code_at(txt, p)
+  if c == 34 {
+    match cas_json_parse_string(txt, pos, n) {
+      Some(_) => true
+      None => false
+    }
+  } else if c == 123 {
+    pos[0] = p + 1
+    cas_json_skip_ws(txt, pos, n)
+    if pos[0] < n && str_code_at(txt, pos[0]) == 125 {
+      pos[0] = pos[0] + 1
+      return true
+    }
+    while true {
+      cas_json_skip_ws(txt, pos, n)
+      match cas_json_parse_string(txt, pos, n) {
+        Some(_) => ()
+        None => return false
+      }
+      cas_json_skip_ws(txt, pos, n)
+      if pos[0] >= n || str_code_at(txt, pos[0]) != 58 {
+        return false
+      }
+      pos[0] = pos[0] + 1
+      if !cas_json_skip_value(txt, pos, n, depth + 1) {
+        return false
+      }
+      cas_json_skip_ws(txt, pos, n)
+      if pos[0] >= n {
+        return false
+      }
+      let sep = str_code_at(txt, pos[0])
+      if sep == 125 {
+        pos[0] = pos[0] + 1
+        return true
+      } else if sep == 44 {
+        pos[0] = pos[0] + 1
+      } else {
+        return false
+      }
+    }
+    false
+  } else if c == 91 {
+    pos[0] = p + 1
+    cas_json_skip_ws(txt, pos, n)
+    if pos[0] < n && str_code_at(txt, pos[0]) == 93 {
+      pos[0] = pos[0] + 1
+      return true
+    }
+    while true {
+      if !cas_json_skip_value(txt, pos, n, depth + 1) {
+        return false
+      }
+      cas_json_skip_ws(txt, pos, n)
+      if pos[0] >= n {
+        return false
+      }
+      let sep = str_code_at(txt, pos[0])
+      if sep == 93 {
+        pos[0] = pos[0] + 1
+        return true
+      } else if sep == 44 {
+        pos[0] = pos[0] + 1
+      } else {
+        return false
+      }
+    }
+    false
+  } else if c == 116 {
+    if p + 4 <= n && slice_str(txt, p, p + 4) == "true" {
+      pos[0] = p + 4
+      true
+    } else {
+      false
+    }
+  } else if c == 102 {
+    if p + 5 <= n && slice_str(txt, p, p + 5) == "false" {
+      pos[0] = p + 5
+      true
+    } else {
+      false
+    }
+  } else if c == 110 {
+    if p + 4 <= n && slice_str(txt, p, p + 4) == "null" {
+      pos[0] = p + 4
+      true
+    } else {
+      false
+    }
+  } else if c == 45 || (c >= 48 && c <= 57) {
+    let mut q = p
+    if str_code_at(txt, q) == 45 {
+      q = q + 1
+      if q >= n {
+        return false
+      }
+    }
+    let d0 = str_code_at(txt, q)
+    if d0 == 48 {
+      q = q + 1
+    } else if d0 >= 49 && d0 <= 57 {
+      q = q + 1
+      while q < n && str_code_at(txt, q) >= 48 && str_code_at(txt, q) <= 57 {
+        q = q + 1
+      }
+    } else {
+      return false
+    }
+    if q < n && str_code_at(txt, q) == 46 {
+      q = q + 1
+      if q >= n || str_code_at(txt, q) < 48 || str_code_at(txt, q) > 57 {
+        return false
+      }
+      while q < n && str_code_at(txt, q) >= 48 && str_code_at(txt, q) <= 57 {
+        q = q + 1
+      }
+    }
+    if q < n && (str_code_at(txt, q) == 101 || str_code_at(txt, q) == 69) {
+      q = q + 1
+      if q < n && (str_code_at(txt, q) == 43 || str_code_at(txt, q) == 45) {
+        q = q + 1
+      }
+      if q >= n || str_code_at(txt, q) < 48 || str_code_at(txt, q) > 57 {
+        return false
+      }
+      while q < n && str_code_at(txt, q) >= 48 && str_code_at(txt, q) <= 57 {
+        q = q + 1
+      }
+    }
+    pos[0] = q
+    true
+  } else {
+    false
+  }
+}
+
+///|
+/// Parses MSVC `/sourceDependencies <file>` JSON output with a full strict
+/// recursive-descent JSON parser to EOF, extracting `(Data.Source, Data.Includes)`
+/// (deduplicated and sorted). Fails closed (`None`) on invalid JSON, trailing
+/// tokens, missing/empty `Data.Source`, or missing/non-string `Data.Includes`.
+pub fn cas_parse_msvc_source_deps(
+  txt : String,
+) -> Option[(String, Array[String])] {
+  let n = txt.length()
+  let pos : Array[Int] = [0]
+  cas_json_skip_ws(txt, pos, n)
+  if pos[0] >= n || str_code_at(txt, pos[0]) != 123 {
+    return None
+  }
+  pos[0] = pos[0] + 1
+  cas_json_skip_ws(txt, pos, n)
+  let mut saw_data = false
+  let mut source = ""
+  let mut saw_includes = false
+  let includes : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  if pos[0] < n && str_code_at(txt, pos[0]) == 125 {
+    return None
+  }
+  while true {
+    cas_json_skip_ws(txt, pos, n)
+    let key = match cas_json_parse_string(txt, pos, n) {
+      Some(k) => k
+      None => return None
+    }
+    cas_json_skip_ws(txt, pos, n)
+    if pos[0] >= n || str_code_at(txt, pos[0]) != 58 {
+      return None
+    }
+    pos[0] = pos[0] + 1
+    if key == "Data" {
+      if saw_data {
+        return None
+      }
+      saw_data = true
+      cas_json_skip_ws(txt, pos, n)
+      if pos[0] >= n || str_code_at(txt, pos[0]) != 123 {
+        return None
+      }
+      pos[0] = pos[0] + 1
+      cas_json_skip_ws(txt, pos, n)
+      if pos[0] < n && str_code_at(txt, pos[0]) == 125 {
+        pos[0] = pos[0] + 1
+      } else {
+        while true {
+          cas_json_skip_ws(txt, pos, n)
+          let dkey = match cas_json_parse_string(txt, pos, n) {
+            Some(k) => k
+            None => return None
+          }
+          cas_json_skip_ws(txt, pos, n)
+          if pos[0] >= n || str_code_at(txt, pos[0]) != 58 {
+            return None
+          }
+          pos[0] = pos[0] + 1
+          if dkey == "Source" {
+            cas_json_skip_ws(txt, pos, n)
+            match cas_json_parse_string(txt, pos, n) {
+              Some(sv) => source = sv
+              None => return None
+            }
+          } else if dkey == "Includes" {
+            if saw_includes {
+              return None
+            }
+            saw_includes = true
+            cas_json_skip_ws(txt, pos, n)
+            if pos[0] >= n || str_code_at(txt, pos[0]) != 91 {
+              return None
+            }
+            pos[0] = pos[0] + 1
+            cas_json_skip_ws(txt, pos, n)
+            if pos[0] < n && str_code_at(txt, pos[0]) == 93 {
+              pos[0] = pos[0] + 1
+            } else {
+              while true {
+                cas_json_skip_ws(txt, pos, n)
+                let inc = match cas_json_parse_string(txt, pos, n) {
+                  Some(v) => v
+                  None => return None
+                }
+                if inc.length() > 0 && !seen.contains(inc) {
+                  seen.set(inc, true)
+                  includes.push(inc)
+                }
+                cas_json_skip_ws(txt, pos, n)
+                if pos[0] >= n {
+                  return None
+                }
+                let asep = str_code_at(txt, pos[0])
+                if asep == 93 {
+                  pos[0] = pos[0] + 1
+                  break
+                } else if asep == 44 {
+                  pos[0] = pos[0] + 1
+                } else {
+                  return None
+                }
+              }
+            }
+          } else if !cas_json_skip_value(txt, pos, n, 1) {
+            return None
+          }
+          cas_json_skip_ws(txt, pos, n)
+          if pos[0] >= n {
+            return None
+          }
+          let dsep = str_code_at(txt, pos[0])
+          if dsep == 125 {
+            pos[0] = pos[0] + 1
+            break
+          } else if dsep == 44 {
+            pos[0] = pos[0] + 1
+          } else {
+            return None
+          }
+        }
+      }
+    } else if !cas_json_skip_value(txt, pos, n, 1) {
+      return None
+    }
+    cas_json_skip_ws(txt, pos, n)
+    if pos[0] >= n {
+      return None
+    }
+    let sep = str_code_at(txt, pos[0])
+    if sep == 125 {
+      pos[0] = pos[0] + 1
+      break
+    } else if sep == 44 {
+      pos[0] = pos[0] + 1
+    } else {
+      return None
+    }
+  }
+  cas_json_skip_ws(txt, pos, n)
+  if pos[0] != n {
+    return None
+  }
+  if !saw_data || source.length() == 0 || !saw_includes {
+    return None
+  }
+  cas_sort_strings(includes)
+  Some((source, includes))
+}
+
+///|
+pub fn cas_parse_msvc_show_includes(txt : String) -> Array[String] {
+  let prefix = "Note: including file:"
+  let plen = prefix.length()
+  let lines = split_lines(txt)
+  let out : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < lines.length() {
+    let mut line = lines[i]
+    let ln = line.length()
+    if ln > 0 && str_code_at(line, ln - 1) == 13 {
+      line = slice_str(line, 0, ln - 1)
+    }
+    if line.length() >= plen && slice_str(line, 0, plen) == prefix {
+      let mut s = plen
+      let mut e = line.length()
+      while s < e && (str_code_at(line, s) == 32 || str_code_at(line, s) == 9) {
+        s = s + 1
+      }
+      while e > s && (str_code_at(line, e - 1) == 32 || str_code_at(line, e - 1) == 9) {
+        e = e - 1
+      }
+      if e > s {
+        let path = slice_str(line, s, e)
+        if !seen.contains(path) {
+          seen.set(path, true)
+          out.push(path)
+        }
+      }
+    }
+    i = i + 1
+  }
+  cas_sort_strings(out)
+  out
 }

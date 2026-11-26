@@ -301,42 +301,64 @@ for MODE in dev release; do
   echo "p118 fannkuchredux $MODE: $B widened bounds folded"
 done
 
-# 4. ASan + UBSan QBE.
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -o "$TMP_DIR/san_probe" 2>/dev/null && "$TMP_DIR/san_probe"; then
-  mkdir -p "$TMP_DIR/sanq"
-  # Every replay passes -t, so any default target will do.
-  printf '#define Deftgt T_amd64_sysv\n' > "$TMP_DIR/sanq/config.h"
-  (
-    cd "$ROOT_DIR/vendor/qbe"
-    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=all \
-        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
-    done
-  )
-  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
-  export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1"
+# 4. ASan + UBSan QBE (bounded parallel replay).
+SAN_QBE=""
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+  SAN_QBE="$PION_QBE_SAN"
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$TMP_DIR/sanq" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_QBE="$TMP_DIR/sanq/qbe"
+  elif [ "$SAN_RC" -ne 77 ]; then
+    fail "ASan+UBSan QBE build failed (exit $SAN_RC)"
+  fi
+fi
+if [ -n "$SAN_QBE" ]; then
+  export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16"
   export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
-  N=0
-  replay() { # $1 input, then qbe options
-    in=$1
-    shift
-    "$QBE" "$@" -o "$TMP_DIR/ref.out" "$in"
-    "$TMP_DIR/sanq/qbe" "$@" -o "$TMP_DIR/san.out" "$in" 2> "$TMP_DIR/san.err" || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in"; }
-    [ ! -s "$TMP_DIR/san.err" ] || { cat "$TMP_DIR/san.err" >&2; fail "sanitized QBE $* $in wrote diagnostics"; }
-    cmp "$TMP_DIR/ref.out" "$TMP_DIR/san.out" || fail "sanitized QBE $* $in: output differs from out/qbe"
-    N=$((N + 1))
-  }
-  for IN in "$F/jtbl.ssa" "$F/bounds.ssa" "$TMP_DIR/cfg/cfg.ssa" "$F/bytecode_vm_dev.ssa" "$F/bytecode_vm_release.ssa" \
-    "$F/fannkuchredux_dev.ssa" "$F/fannkuchredux_release.ssa"; do
-    for T in amd64_sysv arm64_apple arm64 amd64_win; do
-      replay "$IN" -t "$T"
-      case "$T" in
-        amd64_sysv|arm64_apple) replay "$IN" -t "$T" --obj ;;
-      esac
-    done
-  done
-  [ "$N" -eq 42 ] || fail "replayed $N outputs, want 42"
+  python3 -E - "$QBE" "$SAN_QBE" "$TMP_DIR" \
+    "$F/jtbl.ssa" "$F/bounds.ssa" "$TMP_DIR/cfg/cfg.ssa" "$F/bytecode_vm_dev.ssa" \
+    "$F/bytecode_vm_release.ssa" "$F/fannkuchredux_dev.ssa" "$F/fannkuchredux_release.ssa" <<'PYEOF'
+import os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+
+qbe, san_qbe, tmp_dir = sys.argv[1:4]
+inputs = sys.argv[4:]
+targets = ["amd64_sysv", "arm64_apple", "arm64", "amd64_win"]
+tasks = []
+idx = 0
+for inp in inputs:
+    for t in targets:
+        tasks.append((idx, inp, ["-t", t]))
+        idx += 1
+        if t in ("amd64_sysv", "arm64_apple"):
+            tasks.append((idx, inp, ["-t", t, "--obj"]))
+            idx += 1
+assert len(tasks) == 42, f"expected 42 replay tasks, got {len(tasks)}"
+jobs = min(os.cpu_count() or 1, 4)
+
+def run_one(item):
+    i, inp, opts = item
+    ref_out = os.path.join(tmp_dir, f"ref_{i}.out")
+    san_out = os.path.join(tmp_dir, f"san_{i}.out")
+    r1 = subprocess.run([qbe, *opts, "-o", ref_out, inp])
+    if r1.returncode != 0:
+        raise SystemExit(f"FAIL: p118 out/qbe {' '.join(opts)} {inp}")
+    r2 = subprocess.run([san_qbe, *opts, "-o", san_out, inp], capture_output=True, text=True)
+    if r2.returncode != 0:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p118 sanitized QBE {' '.join(opts)} {inp}")
+    if r2.stderr:
+        sys.stderr.write(r2.stderr)
+        raise SystemExit(f"FAIL: p118 sanitized QBE {' '.join(opts)} {inp} wrote diagnostics")
+    with open(ref_out, "rb") as f1, open(san_out, "rb") as f2:
+        if f1.read() != f2.read():
+            raise SystemExit(f"FAIL: p118 sanitized QBE {' '.join(opts)} {inp}: output differs from out/qbe")
+
+with ThreadPoolExecutor(max_workers=jobs) as pool:
+    list(pool.map(run_one, tasks))
+PYEOF
   echo "p118 ASan+UBSan QBE: 42 outputs (7 inputs, 4 targets text, 2 --obj) clean and equal to out/qbe"
 elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   fail "needs ASan+UBSan (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"

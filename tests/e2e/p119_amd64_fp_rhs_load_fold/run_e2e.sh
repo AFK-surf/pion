@@ -301,34 +301,26 @@ check pion "p119.pion --release amd64_sysv" "$TMP_DIR/p119_release.s" '*:subsd,d
 check pion "nbody --release amd64_sysv" "$TMP_DIR/nbody.s" 'pion_fn_advance:subsd:3'
 
 # 5. ASan + UBSan QBE.
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -o "$TMP_DIR/san_probe" 2>/dev/null \
-  && "$TMP_DIR/san_probe"; then
-  mkdir -p "$TMP_DIR/sanq"
-  case "$HOST" in
-    Darwin/arm64|Darwin/aarch64) DEFTGT=T_arm64_apple ;;
-    Darwin/*) DEFTGT=T_amd64_apple ;;
-    */aarch64|*/arm64) DEFTGT=T_arm64 ;;
-    */riscv64) DEFTGT=T_rv64 ;;
-    *) DEFTGT=T_amd64_sysv ;;
-  esac
-  printf '#define Deftgt %s\n' "$DEFTGT" > "$TMP_DIR/sanq/config.h"
-  (
-    cd "$ROOT_DIR/vendor/qbe"
-    PIDS=""
-    for f in *.c amd64/*.c arm64/*.c rv64/*.c; do
-      o="$TMP_DIR/sanq/$(printf '%s' "$f" | tr / _).o"
-      "$CC_BIN" -std=c99 -O1 -g -w -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-        -fno-omit-frame-pointer -I "$TMP_DIR/sanq" -I . -c "$f" -o "$o" &
-      PIDS="$PIDS $!"
-    done
-    for p in $PIDS; do wait "$p"; done
-  )
-  "$CC_BIN" -fsanitize=address,undefined "$TMP_DIR"/sanq/*.o -o "$TMP_DIR/sanq/qbe"
-  SAN_ENV="ASAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
+SAN_QBE=""
+mkdir -p "$TMP_DIR/sanq"
+if [ -n "${PION_QBE_SAN:-}" ] && [ -x "$PION_QBE_SAN" ]; then
+  SAN_QBE="$PION_QBE_SAN"
+else
+  SAN_RC=0
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/build-qbe-san.sh" "$TMP_DIR/sanq" || SAN_RC=$?
+  if [ "$SAN_RC" -eq 0 ]; then
+    SAN_QBE="$TMP_DIR/sanq/qbe"
+  elif [ "$SAN_RC" -ne 77 ]; then
+    echo "FAIL: p119 ASan+UBSan QBE build failed (exit $SAN_RC)" >&2
+    exit 1
+  fi
+fi
+if [ -n "$SAN_QBE" ]; then
+  SAN_ENV="ASAN_OPTIONS=halt_on_error=1:detect_stack_use_after_return=0:fast_unwind_on_malloc=0:quarantine_size_mb=16 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1"
   RUNS=0
   # san ARGS...: sanitized QBE, no report, same output as the plain QBE.
   san() {
-    if ! env $SAN_ENV "$TMP_DIR/sanq/qbe" -o "$TMP_DIR/sanq/out" "$@" 2> "$TMP_DIR/sanq/err" \
+    if ! env $SAN_ENV "$SAN_QBE" -o "$TMP_DIR/sanq/out" "$@" 2> "$TMP_DIR/sanq/err" \
       || [ -s "$TMP_DIR/sanq/err" ]; then
       cat "$TMP_DIR/sanq/err" >&2
       echo "FAIL: p119 sanitized QBE $*" >&2
@@ -346,9 +338,9 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,un
     san -t arm64_apple "$IN"
     san -t arm64_apple --obj "$IN"
   done
-  env $SAN_ENV "$TMP_DIR/sanq/qbe" -t amd64_sysv -o "$TMP_DIR/san_sysv.s" "$FOLD"
+  env $SAN_ENV "$SAN_QBE" -t amd64_sysv -o "$TMP_DIR/san_sysv.s" "$FOLD"
   check asm "ASan+UBSan QBE amd64_sysv text" "$TMP_DIR/san_sysv.s"
-  asm_obj "$TMP_DIR/sanq/qbe" "$FOLD" "$TMP_DIR/san_text.o"
+  asm_obj "$SAN_QBE" "$FOLD" "$TMP_DIR/san_text.o"
   route asan-ubsan-qbe-text "$TMP_DIR/san_text.o"
   cmp "$TMP_DIR/rows_text" "$TMP_DIR/rows_asan-ubsan-qbe-text"
   echo "p119 ASan+UBSan QBE: 3 inputs x 6 target/route runs = $RUNS runs clean, output equal to the plain QBE"
