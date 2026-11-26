@@ -10180,7 +10180,9 @@ fn classify_slice_consumer(
         !(enclosing_lp >= 2 && tokens[enclosing_lp - 2].kind == TokenKind::Dot) &&
         (close_br + 1 == end || (close_br + 1 < end && (tokens[close_br + 1].kind == TokenKind::RParen || tokens[close_br + 1].kind == TokenKind::Comma))) {
           let call_rp = find_matching_delim(tokens, enclosing_lp)
-          // Reject if `recv_root` is also referenced in any OTHER argument of the same call
+          // Reject if `recv_root` is also referenced in any OTHER argument of the same call,
+          // OR if any argument AFTER the slice argument is not strictly side-effect-free
+          // (blocks `read(xs[0:3], { ys[1] = 9 })` where `ys` aliases `xs`).
           let mut other_arg_refs_recv = false
           let mut ak = enclosing_lp + 1
           while ak < call_rp {
@@ -10195,12 +10197,31 @@ fn classify_slice_consumer(
             }
             ak = ak + 1
           }
-          if !other_arg_refs_recv {
+          let mut trailing_args_pure = true
+          let mut tk_after = close_br + 1
+          while tk_after < call_rp {
+            let tk = tokens[tk_after]
+            let kk = tk.kind
+            let ok_tok = kk == TokenKind::Comma || kk == TokenKind::Dot ||
+            kk == TokenKind::RParen || kk == TokenKind::Ident || kk == TokenKind::UpperIdent ||
+            kk == TokenKind::IntLit || kk == TokenKind::FloatLit || kk == TokenKind::StringLit ||
+            kk == TokenKind::CharLit ||
+            (kk == TokenKind::Keyword && (tk.raw == "true" || tk.raw == "false")) ||
+            (kk == TokenKind::LParen &&
+              !(tk_after > close_br + 1 &&
+                (tokens[tk_after - 1].kind == TokenKind::Ident || tokens[tk_after - 1].kind == TokenKind::UpperIdent)))
+            if !ok_tok {
+              trailing_args_pure = false
+              break
+            }
+            tk_after = tk_after + 1
+          }
+          if !other_arg_refs_recv && trailing_args_pure {
             let callee_name = tokens[enclosing_lp - 1].raw
             let target_elem_ty = extract_array_view_elem_f42(exp_t)
             match ctx.symtab.fn_ret_types.get(callee_name) {
               Some(ret_ty) =>
-              if !str_has(ret_ty, "ArrayView") &&
+              if !str_has(ret_ty, "ArrayView") && !str_has(ret_ty, "->") && !str_has(ret_ty, "Iter") &&
               callee_param_is_ro_non_escaping_f42(ctx, tokens, callee_name, arg_pos, target_elem_ty, 0) {
                 return ("mbt_compat::__mbt_slice_owned", close_br + 1, "\"__RO_VIEW__\"")
               }
@@ -17751,10 +17772,28 @@ fn find_top_level_fn_f42(tokens : Array[Token], fn_name : String) -> Option[(Arr
   Some((param_names, fn_open, fn_close))
 }
 
+///| True iff `t` is a known built-in primitive/Json type name or a non-aliased local nominal type.
+fn is_known_nominal_or_prim_f42(ctx : StageAContext, t : String) -> Bool {
+  if ctx.symtab.type_aliases.contains(t) {
+    return false
+  }
+  let is_prim = t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" ||
+  t == "Double" || t == "Float" || t == "Bool" || t == "Char" ||
+  t == "Byte" || t == "String" || t == "Json"
+  if is_prim {
+    return !ctx.symtab.local_types.contains(t)
+  }
+  ctx.symtab.local_types.contains(t)
+}
+
 ///| True iff `name` is a module-level `let` of type `Array[E]` whose element type `E` is provably
-///| disjoint from `target_elem_ty` (e.g. `keyed_ats : Array[KeyedAt]` vs `Json`).
+///| disjoint from `target_elem_ty` (e.g. `keyed_ats : Array[KeyedAt]` vs `Json`), rejecting type aliases.
 fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_ty : String) -> Bool {
   if target_elem_ty.length() == 0 {
+    return false
+  }
+  let norm_target = if target_elem_ty == "mbt_compat::MbtJson" || target_elem_ty == "MbtJson" { "Json" } else { target_elem_ty.trim() }
+  if !is_known_nominal_or_prim_f42(ctx, norm_target) {
     return false
   }
   match ctx.symtab.val_types.get(name) {
@@ -17763,7 +17802,8 @@ fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_
       if t.starts_with("Array[") && t.ends_with("]") {
         let e = t.slice(6, t.length() - 1).trim()
         let norm_e = if e == "mbt_compat::MbtJson" || e == "MbtJson" { "Json" } else { e }
-        return norm_e.length() > 0 && norm_e != target_elem_ty && !str_has(norm_e, "Array")
+        return norm_e.length() > 0 && norm_e != norm_target && !str_has(norm_e, "Array") &&
+        is_known_nominal_or_prim_f42(ctx, norm_e)
       }
       false
     }
@@ -17771,10 +17811,12 @@ fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_
   }
 }
 
-///| True iff `idx` is at a statement boundary inside `fn_close`.
+///| True iff `idx` is at a statement boundary inside `fn_close` (newline followed by `.` continues the expr).
 fn is_stmt_end_f42(tokens : Array[Token], idx : Int, fn_close : Int) -> Bool {
-  idx >= fn_close || tokens[idx].newline_before ||
-  tokens[idx].kind == TokenKind::Semi || tokens[idx].kind == TokenKind::RBrace
+  if idx >= fn_close || tokens[idx].kind == TokenKind::Semi || tokens[idx].kind == TokenKind::RBrace {
+    return true
+  }
+  tokens[idx].newline_before && tokens[idx].kind != TokenKind::Dot
 }
 
 ///| True iff the RHS of `let <x> [: Ty] = <rhs>` allocates a provably fresh local collection.
@@ -17817,7 +17859,7 @@ fn let_rhs_is_fresh_alloc_f42(ctx : StageAContext, tokens : Array[Token], rhs_st
   let mut k = rhs_start
   let mut d = 0
   while k < fn_close {
-    if k > rhs_start && d == 0 && (tokens[k].newline_before || tokens[k].kind == TokenKind::Semi || tokens[k].kind == TokenKind::RBrace) {
+    if k > rhs_start && d == 0 && is_stmt_end_f42(tokens, k, fn_close) {
       break
     }
     let kk = tokens[k].kind
@@ -17827,8 +17869,7 @@ fn let_rhs_is_fresh_alloc_f42(ctx : StageAContext, tokens : Array[Token], rhs_st
     tokens[k + 1].kind == TokenKind::Ident && tokens[k + 1].raw == "copy" &&
     !is_method_shadowed_f42(ctx, "copy") &&
     tokens[k + 2].kind == TokenKind::LParen && tokens[k + 3].kind == TokenKind::RParen {
-      let after = k + 4
-      if after >= fn_close || tokens[after].newline_before || tokens[after].kind == TokenKind::Semi || tokens[after].kind == TokenKind::RBrace {
+      if is_stmt_end_f42(tokens, k + 4, fn_close) {
         return true
       }
     }
@@ -17852,7 +17893,83 @@ fn is_map_ret_type_f42(rt : String) -> Bool {
   t.starts_with("Option[Map[") || t.starts_with("Option[OrderedMap[") || t.starts_with("Option[mbt_compat::OrderedMap[")
 }
 
-///| Lexical lookup in `mscope` stack `(name, depth, is_map)`.
+///| True iff RHS at `rhs` is a provably Map/Option[Map]-returning direct call or `if ... { Some(call(...)) } else { None }` at statement boundary.
+fn is_map_rhs_f42(ctx : StageAContext, tokens : Array[Token], rhs : Int, fn_close : Int) -> Bool {
+  if rhs >= fn_close {
+    return false
+  }
+  if tokens[rhs].kind == TokenKind::Ident && rhs + 1 < fn_close && tokens[rhs + 1].kind == TokenKind::LParen {
+    let rp = find_matching_delim(tokens, rhs + 1)
+    if rp > rhs + 1 && rp < fn_close && is_stmt_end_f42(tokens, rp + 1, fn_close) {
+      match ctx.symtab.fn_ret_types.get(tokens[rhs].raw) {
+        Some(rt) => return is_map_ret_type_f42(rt)
+        None => return false
+      }
+    }
+    return false
+  }
+  if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "if" {
+    let mut lb_if = rhs + 1
+    while lb_if < fn_close && tokens[lb_if].kind != TokenKind::LBrace {
+      lb_if = lb_if + 1
+    }
+    if lb_if >= fn_close {
+      return false
+    }
+    let rb_if = find_matching_delim(tokens, lb_if)
+    if rb_if <= lb_if || rb_if + 4 >= fn_close {
+      return false
+    }
+    if !(tokens[lb_if + 1].kind == TokenKind::UpperIdent && tokens[lb_if + 1].raw == "Some" &&
+      tokens[lb_if + 2].kind == TokenKind::LParen && tokens[lb_if + 3].kind == TokenKind::Ident &&
+      tokens[lb_if + 4].kind == TokenKind::LParen) {
+      return false
+    }
+    let call_rp = find_matching_delim(tokens, lb_if + 4)
+    let some_rp = find_matching_delim(tokens, lb_if + 2)
+    if call_rp + 1 != some_rp || some_rp + 1 != rb_if {
+      return false
+    }
+    // Strictly require `else { None }` ending at statement boundary
+    if !(tokens[rb_if + 1].kind == TokenKind::Keyword && tokens[rb_if + 1].raw == "else" &&
+      tokens[rb_if + 2].kind == TokenKind::LBrace &&
+      tokens[rb_if + 3].kind == TokenKind::UpperIdent && tokens[rb_if + 3].raw == "None" &&
+      tokens[rb_if + 4].kind == TokenKind::RBrace &&
+      is_stmt_end_f42(tokens, rb_if + 5, fn_close)) {
+      return false
+    }
+    match ctx.symtab.fn_ret_types.get(tokens[lb_if + 3].raw) {
+      Some(rt) => return is_map_ret_type_f42(rt)
+      None => return false
+    }
+  }
+  false
+}
+
+///| True iff this file or package defines a custom `impl Eq` (or `equal`/`op_equal`/`not_equal` method).
+fn has_custom_eq_impl_f42(ctx : StageAContext, tokens : Array[Token]) -> Bool {
+  if is_method_shadowed_f42(ctx, "equal") || is_method_shadowed_f42(ctx, "op_equal") || is_method_shadowed_f42(ctx, "not_equal") {
+    return true
+  }
+  let n = tokens.length()
+  let mut k = 0
+  while k < n {
+    if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "impl" {
+      let mut j = k + 1
+      let lim = if k + 16 < n { k + 16 } else { n }
+      while j < lim && tokens[j].kind != TokenKind::LBrace {
+        if tokens[j].kind == TokenKind::UpperIdent && tokens[j].raw == "Eq" {
+          return true
+        }
+        j = j + 1
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Lexical lookup in `mscope` stack `(name, depth, flag)`.
 fn map_scope_lookup_f42(mscope : Array[(String, Int, Bool)], name : String) -> Bool {
   let mut idx = mscope.length() - 1
   while idx >= 0 {
@@ -17863,6 +17980,17 @@ fn map_scope_lookup_f42(mscope : Array[(String, Int, Bool)], name : String) -> B
     idx = idx - 1
   }
   false
+}
+
+///| Pop all entries at `depth` from `mscope`.
+fn pop_scope_depth_f42(mscope : Array[(String, Int, Bool)], depth : Int) -> Unit {
+  while mscope.length() > 0 {
+    let (_, sd, _) = mscope[mscope.length() - 1]
+    if sd != depth {
+      break
+    }
+    let _ = mscope.pop()
+  }
 }
 
 ///| True iff `fn_name` and every same-file function transitively reachable from it performs NO
@@ -17890,116 +18018,149 @@ fn fn_has_no_nonfresh_mutation_f42(
     None => return false
   }
   let _ = param_names
-  let fresh_locals : Map[String, Bool] = Map()
-  let local_closures : Map[String, Bool] = Map()
-  let map_locals : Map[String, Bool] = Map()
-  let non_map_lets : Map[String, Bool] = Map()
-  let map_scope : Array[(String, Int, Bool)] = []
+  let has_custom_eq = has_custom_eq_impl_f42(ctx, tokens)
+  // Pass 1: collect all reassigned variable names anywhere in the function body.
   let reassigned : Map[String, Bool] = Map()
-  let mut bdepth = 0
   let mut p = fn_open + 1
   while p < fn_close {
     let tk = tokens[p]
-    if tk.kind == TokenKind::LBrace {
-      bdepth = bdepth + 1
-    } else if tk.kind == TokenKind::RBrace {
-      while map_scope.length() > 0 {
-        let (_, sd, _) = map_scope[map_scope.length() - 1]
-        if sd != bdepth { break }
-        let _ = map_scope.pop()
-      }
-      if bdepth > 0 { bdepth = bdepth - 1 }
-    }
     if tk.kind == TokenKind::Ident && p + 1 < fn_close &&
     (tokens[p + 1].kind == TokenKind::Eq || tokens[p + 1].kind == TokenKind::AssignOp) &&
-    !(p > fn_open && tokens[p - 1].kind == TokenKind::Keyword && tokens[p - 1].raw == "let") {
+    !(p > fn_open && tokens[p - 1].kind == TokenKind::Keyword && (tokens[p - 1].raw == "let" || tokens[p - 1].raw == "mut")) {
       reassigned[tk.raw] = true
-    }
-    if tk.kind == TokenKind::Keyword && tk.raw == "let" && p + 2 < fn_close &&
-    tokens[p + 1].kind == TokenKind::Ident {
-      let vname = tokens[p + 1].raw
-      let mut eq_idx = p + 2
-      let mut ld = 0
-      while eq_idx < fn_close {
-        let ek = tokens[eq_idx].kind
-        if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { ld = ld + 1 }
-        else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if ld > 0 { ld = ld - 1 } }
-        else if ld == 0 && ek == TokenKind::Eq { break }
-        else if ld == 0 && (tokens[eq_idx].newline_before || ek == TokenKind::Semi) { eq_idx = -1; break }
-        eq_idx = eq_idx + 1
-      }
-      if eq_idx > p + 1 && eq_idx + 1 < fn_close {
-        let rhs = eq_idx + 1
-        if fresh_locals.contains(vname) { fresh_locals[vname] = false }
-        if local_closures.contains(vname) { local_closures[vname] = false }
-        if map_locals.contains(vname) { map_locals[vname] = false }
-        if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "fn" {
-          local_closures[vname] = true
-        } else if let_rhs_is_fresh_alloc_f42(ctx, tokens, rhs, fn_close) {
-          fresh_locals[vname] = true
-        }
-        // Only check top-level direct call or `if ... { Some(call(...)) } else { None }`
-        let mut is_map_rhs = false
-        if tokens[rhs].kind == TokenKind::Ident && rhs + 1 < fn_close && tokens[rhs + 1].kind == TokenKind::LParen {
-          match ctx.symtab.fn_ret_types.get(tokens[rhs].raw) {
-            Some(rt) => if is_map_ret_type_f42(rt) { is_map_rhs = true }
-            None => ()
-          }
-        } else if tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "if" {
-          let mut lb_if = rhs + 1
-          while lb_if < fn_close && tokens[lb_if].kind != TokenKind::LBrace {
-            lb_if = lb_if + 1
-          }
-          if lb_if + 4 < fn_close && tokens[lb_if + 1].kind == TokenKind::UpperIdent && tokens[lb_if + 1].raw == "Some" &&
-          tokens[lb_if + 2].kind == TokenKind::LParen && tokens[lb_if + 3].kind == TokenKind::Ident &&
-          tokens[lb_if + 4].kind == TokenKind::LParen {
-            match ctx.symtab.fn_ret_types.get(tokens[lb_if + 3].raw) {
-              Some(rt) => if is_map_ret_type_f42(rt) { is_map_rhs = true }
-              None => ()
-            }
-          }
-        }
-        if is_map_rhs {
-          map_locals[vname] = true
-        } else {
-          non_map_lets[vname] = true
-        }
-        map_scope.push((vname, bdepth, is_map_rhs))
-      }
-    }
-    if tk.kind == TokenKind::Keyword && tk.raw == "match" && p + 2 < fn_close &&
-    tokens[p + 1].kind == TokenKind::Ident && map_scope_lookup_f42(map_scope, tokens[p + 1].raw) &&
-    tokens[p + 2].kind == TokenKind::LBrace {
-      let mc = find_matching_delim(tokens, p + 2)
-      let mut mp = p + 3
-      while mp + 3 < mc {
-        if tokens[mp].kind == TokenKind::UpperIdent && tokens[mp].raw == "Some" &&
-        tokens[mp + 1].kind == TokenKind::LParen && tokens[mp + 2].kind == TokenKind::Ident &&
-        tokens[mp + 3].kind == TokenKind::RParen {
-          let mn = tokens[mp + 2].raw
-          if !non_map_lets.contains(mn) {
-            map_locals[mn] = true
-          }
-        }
-        mp = mp + 1
-      }
     }
     p = p + 1
   }
-  for r in reassigned.keys() {
-    if fresh_locals.contains(r) {
-      fresh_locals[r] = false
-    }
-    if local_closures.contains(r) {
-      local_closures[r] = false
-    }
-    if map_locals.contains(r) {
-      map_locals[r] = false
-    }
-  }
+  // Pass 2: single lexical walk with depth-tracked stacks for fresh locals, closures, and maps.
+  let fresh_scope : Array[(String, Int, Bool)] = []
+  let closure_scope : Array[(String, Int, Bool)] = []
+  let map_scope : Array[(String, Int, Bool)] = []
+  let mut bdepth = 0
   let mut i = fn_open + 1
   while i < fn_close {
     let tk = tokens[i]
+    if tk.kind == TokenKind::LBrace {
+      bdepth = bdepth + 1
+    } else if tk.kind == TokenKind::RBrace {
+      pop_scope_depth_f42(fresh_scope, bdepth)
+      pop_scope_depth_f42(closure_scope, bdepth)
+      pop_scope_depth_f42(map_scope, bdepth)
+      if bdepth > 0 { bdepth = bdepth - 1 }
+    }
+    // `let [mut] <v> [: Ty] = <rhs>`: push lexical entries at current `bdepth`
+    if tk.kind == TokenKind::Keyword && tk.raw == "let" && i + 2 < fn_close {
+      let is_mut = tokens[i + 1].kind == TokenKind::Keyword && tokens[i + 1].raw == "mut"
+      let v_idx = if is_mut { i + 2 } else { i + 1 }
+      if v_idx + 1 < fn_close && tokens[v_idx].kind == TokenKind::Ident {
+        let vname = tokens[v_idx].raw
+        let mut eq_idx = v_idx + 1
+        let mut ld = 0
+        while eq_idx < fn_close {
+          let ek = tokens[eq_idx].kind
+          if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { ld = ld + 1 }
+          else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if ld > 0 { ld = ld - 1 } }
+          else if ld == 0 && ek == TokenKind::Eq { break }
+          else if ld == 0 && (tokens[eq_idx].newline_before || ek == TokenKind::Semi) { eq_idx = -1; break }
+          eq_idx = eq_idx + 1
+        }
+        if eq_idx > v_idx && eq_idx + 1 < fn_close {
+          let rhs = eq_idx + 1
+          let can_trust = !is_mut && !reassigned.contains(vname)
+          let is_fn_rhs = tokens[rhs].kind == TokenKind::Keyword && tokens[rhs].raw == "fn"
+          let is_fresh_rhs = !is_fn_rhs && let_rhs_is_fresh_alloc_f42(ctx, tokens, rhs, fn_close)
+          let is_map_rhs = is_map_rhs_f42(ctx, tokens, rhs, fn_close)
+          fresh_scope.push((vname, bdepth, can_trust && is_fresh_rhs))
+          closure_scope.push((vname, bdepth, can_trust && is_fn_rhs))
+          map_scope.push((vname, bdepth, can_trust && is_map_rhs))
+        }
+      }
+    }
+    // `for <v1> [, <v2>] in ... {`: shadow loop binders at `bdepth + 1`
+    if tk.kind == TokenKind::Keyword && tk.raw == "for" {
+      let mut fk = i + 1
+      while fk < fn_close && !(tokens[fk].kind == TokenKind::Keyword && tokens[fk].raw == "in") &&
+      tokens[fk].kind != TokenKind::LBrace && tokens[fk].kind != TokenKind::Semi {
+        if tokens[fk].kind == TokenKind::Ident {
+          let bn = tokens[fk].raw
+          fresh_scope.push((bn, bdepth + 1, false))
+          closure_scope.push((bn, bdepth + 1, false))
+          map_scope.push((bn, bdepth + 1, false))
+        }
+        fk = fk + 1
+      }
+    }
+    // Inline closure `fn ( <params> )`: shadow closure param names at `bdepth + 1`
+    if tk.kind == TokenKind::Keyword && tk.raw == "fn" && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i + 1)
+      if cp > i + 1 && cp < fn_close {
+        let mut ps = i + 2
+        while ps < cp {
+          if tokens[ps].kind == TokenKind::Comma { ps = ps + 1; continue }
+          let mut pe = ps
+          let mut pd = 0
+          while pe < cp {
+            let pk = tokens[pe].kind
+            if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+            else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+            else if pd == 0 && pk == TokenKind::Comma { break }
+            pe = pe + 1
+          }
+          if ps < pe && tokens[ps].kind == TokenKind::Ident {
+            let pn = tokens[ps].raw
+            fresh_scope.push((pn, bdepth + 1, false))
+            closure_scope.push((pn, bdepth + 1, false))
+            map_scope.push((pn, bdepth + 1, false))
+          }
+          ps = pe + 1
+        }
+      }
+    }
+    // `match <scrut> { ... }`: bind pattern variables at `bdepth + 1` (only `Some(m)` on a map_scope scrutinee gets map=true)
+    if tk.kind == TokenKind::Keyword && tk.raw == "match" && i + 2 < fn_close {
+      let mut mb_open = i + 1
+      while mb_open < fn_close && tokens[mb_open].kind != TokenKind::LBrace {
+        mb_open = mb_open + 1
+      }
+      if mb_open < fn_close {
+        let scrut_is_map = i + 2 == mb_open && tokens[i + 1].kind == TokenKind::Ident && map_scope_lookup_f42(map_scope, tokens[i + 1].raw)
+        let mc = find_matching_delim(tokens, mb_open)
+        let mut mp = mb_open + 1
+        let mut md = 0
+        let mut in_pat = true
+        while mp < mc {
+          let mk = tokens[mp].kind
+          if md == 0 && mk == TokenKind::FatArrow {
+            in_pat = false
+          } else if md == 0 && !in_pat && (tokens[mp].newline_before || mk == TokenKind::Semi) {
+            in_pat = true
+          }
+          if in_pat {
+            if scrut_is_map && mk == TokenKind::UpperIdent && tokens[mp].raw == "Some" &&
+            mp + 3 < mc && tokens[mp + 1].kind == TokenKind::LParen &&
+            tokens[mp + 2].kind == TokenKind::Ident && tokens[mp + 3].kind == TokenKind::RParen {
+              let mn = tokens[mp + 2].raw
+              fresh_scope.push((mn, bdepth + 1, false))
+              closure_scope.push((mn, bdepth + 1, false))
+              map_scope.push((mn, bdepth + 1, !reassigned.contains(mn)))
+              mp = mp + 4
+              continue
+            } else if mk == TokenKind::Ident &&
+            !(mp > mb_open && (tokens[mp - 1].kind == TokenKind::Dot || tokens[mp - 1].kind == TokenKind::ColonColon)) {
+              let bn = tokens[mp].raw
+              fresh_scope.push((bn, bdepth + 1, false))
+              closure_scope.push((bn, bdepth + 1, false))
+              map_scope.push((bn, bdepth + 1, false))
+            }
+          }
+          if mk == TokenKind::LParen || mk == TokenKind::LBracket || mk == TokenKind::LBrace { md = md + 1 }
+          else if mk == TokenKind::RParen || mk == TokenKind::RBracket || mk == TokenKind::RBrace { if md > 0 { md = md - 1 } }
+          mp = mp + 1
+        }
+      }
+    }
+    if (tk.kind == TokenKind::EqEq || tk.kind == TokenKind::BangEq) && has_custom_eq {
+      return false
+    }
     if (tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket) &&
     i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
       return false
@@ -18022,7 +18183,7 @@ fn fn_has_no_nonfresh_mutation_f42(
           return false
         }
         let r = tokens[i - 1].raw
-        if !(map_bool_get_f42(fresh_locals, r) || map_bool_get_f42(map_locals, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+        if !(map_scope_lookup_f42(fresh_scope, r) || map_scope_lookup_f42(map_scope, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
           return false
         }
       }
@@ -18030,8 +18191,9 @@ fn fn_has_no_nonfresh_mutation_f42(
     if tk.kind == TokenKind::Ident && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
       if i > fn_open && tokens[i - 1].kind == TokenKind::Dot {
         let m = tk.raw
-        if is_pure_ro_method_f42(ctx, m) || m == "stringify" || m == "to_string" ||
-        m == "to_int" || m == "to_double" || m == "floor" {
+        if is_pure_ro_method_f42(ctx, m) ||
+        ((m == "stringify" || m == "to_string" || m == "to_int" || m == "to_double" || m == "floor") &&
+          !is_method_shadowed_f42(ctx, m)) {
           ()
         } else if m == "map" && !is_method_shadowed_f42(ctx, "map") {
           if !(i + 2 < fn_close && tokens[i + 2].kind == TokenKind::Keyword && tokens[i + 2].raw == "fn") {
@@ -18043,7 +18205,7 @@ fn fn_has_no_nonfresh_mutation_f42(
             return false
           }
           let r = tokens[i - 2].raw
-          if !(map_bool_get_f42(fresh_locals, r) || map_bool_get_f42(map_locals, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
+          if !(map_scope_lookup_f42(fresh_scope, r) || map_scope_lookup_f42(map_scope, r) || is_disjoint_global_array_f42(ctx, r, target_elem_ty)) {
             return false
           }
         }
@@ -18057,7 +18219,7 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       } else {
         let g = tk.raw
-        if g == "ignore" || g == "physical_equal" || map_bool_get_f42(local_closures, g) || map_bool_get_f42(inline_closure_params, g) {
+        if g == "ignore" || g == "physical_equal" || map_scope_lookup_f42(closure_scope, g) || map_bool_get_f42(inline_closure_params, g) {
           ()
         } else if ctx.symtab.local_fn_names.contains(g) {
           let call_rp = find_matching_delim(tokens, i + 1)
@@ -18079,7 +18241,7 @@ fn fn_has_no_nonfresh_mutation_f42(
                 }
                 let is_inline_fn = (as_idx < ae && tokens[as_idx].kind == TokenKind::Keyword && tokens[as_idx].raw == "fn") ||
                 (as_idx + 1 == ae && tokens[as_idx].kind == TokenKind::Ident &&
-                  (map_bool_get_f42(inline_closure_params, tokens[as_idx].raw) || map_bool_get_f42(local_closures, tokens[as_idx].raw)))
+                  (map_bool_get_f42(inline_closure_params, tokens[as_idx].raw) || map_scope_lookup_f42(closure_scope, tokens[as_idx].raw)))
                 if is_inline_fn && a_pos < g_params.length() && g_params[a_pos].length() > 0 {
                   child_inline[g_params[a_pos]] = true
                 }
@@ -18124,11 +18286,66 @@ fn callee_param_is_ro_non_escaping_f42(
     return false
   }
   let target_param = param_names[arg_pos]
+  // Track closure body spans (`fn(...) { ... }` and non-match arrow closures `=> ...`) so that
+  // capturing `target_param` inside any closure immediately fails closed (prevents lifetime escape).
+  let match_brace_depths : Array[Int] = []
+  let mut bdepth = 0
+  let mut closure_end = -1
   let mut i = fn_open + 1
   while i < fn_close {
     let tk = tokens[i]
+    if tk.kind == TokenKind::Keyword && tk.raw == "match" {
+      let mut mb = i + 1
+      while mb < fn_close && tokens[mb].kind != TokenKind::LBrace { mb = mb + 1 }
+      if mb < fn_close { match_brace_depths.push(bdepth + 1) }
+    }
+    if tk.kind == TokenKind::LBrace {
+      bdepth = bdepth + 1
+    } else if tk.kind == TokenKind::RBrace {
+      if match_brace_depths.length() > 0 && match_brace_depths[match_brace_depths.length() - 1] == bdepth {
+        let _ = match_brace_depths.pop()
+      }
+      if bdepth > 0 { bdepth = bdepth - 1 }
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "fn" && i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i + 1)
+      if cp > i + 1 && cp < fn_close {
+        let mut cb_open = cp + 1
+        while cb_open < fn_close && tokens[cb_open].kind != TokenKind::LBrace { cb_open = cb_open + 1 }
+        if cb_open < fn_close {
+          let cb_close = find_matching_delim(tokens, cb_open)
+          if cb_close > closure_end { closure_end = cb_close }
+        }
+      }
+    } else if tk.kind == TokenKind::FatArrow {
+      let in_match_arm = match_brace_depths.length() > 0 && match_brace_depths[match_brace_depths.length() - 1] == bdepth
+      if !in_match_arm && i + 1 < fn_close {
+        if tokens[i + 1].kind == TokenKind::LBrace {
+          let cb_close = find_matching_delim(tokens, i + 1)
+          if cb_close > closure_end { closure_end = cb_close }
+        } else {
+          let mut ae = i + 1
+          let mut ad = 0
+          while ae < fn_close {
+            let ak = tokens[ae].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+            else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace {
+              if ad == 0 { break }
+              ad = ad - 1
+            } else if ad == 0 && (ak == TokenKind::Comma || ak == TokenKind::Semi || tokens[ae].newline_before) {
+              break
+            }
+            ae = ae + 1
+          }
+          if ae - 1 > closure_end { closure_end = ae - 1 }
+        }
+      }
+    }
     if tk.kind == TokenKind::Ident && tk.raw == target_param &&
     !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      if i <= closure_end {
+        return false
+      }
       if !ident_occ_is_strictly_ro_f42(ctx, tokens, i, fn_open, fn_close, false, -1, depth) {
         return false
       }

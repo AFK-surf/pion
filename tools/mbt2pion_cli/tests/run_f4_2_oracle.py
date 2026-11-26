@@ -98,11 +98,20 @@ fn run_json_show() -> String {
   ].join("|")
 }
 
+fn mark_unit(xs : Array[Int]) -> Unit {
+  xs.push(7)
+}
+
 fn run_repr_and_iter() -> String {
   let opt_d : Double? = Some(1.5)
   let opt_n : Double? = None
   let s_hi = "hi"
-  let r_str = "\{Repr(opt_d)}|\{Repr(opt_n)}|\{Repr(s_hi)}"
+  let b0 : Byte = b'\x00'
+  let ba : Byte = b'\x0a'
+  let bff : Byte = b'\xff'
+  let side_xs : Array[Int] = []
+  let r_unit = "\{Repr(mark_unit(side_xs))}"
+  let r_str = "\{Repr(opt_d)}|\{Repr(opt_n)}|\{Repr(s_hi)}|\{Repr(b0)},\{Repr(ba)},\{Repr(bff)}|\{r_unit}:\{side_xs.length()}"
   let arr = [10, 20, 30]
   let it = arr.iter()
   let h1 = it.head().unwrap_or(-1)
@@ -113,8 +122,23 @@ fn run_repr_and_iter() -> String {
   let kh = m.keys().head().unwrap_or("none")
   let kn = m.keys().next().unwrap_or("none")
   let ka = m.keys().any(fn(k) { k == "beta" })
+  // Astra P1-3: deleting an unvisited key during Map::keys().any(...) must match MoonBit callback count
+  let m2 : Map[String, Int] = { "a": 1, "b": 2 }
+  let mut n2 = 0
+  let _ = m2.keys().any(fn(k) {
+    n2 = n2 + 1
+    if k == "a" { m2.remove("b") }
+    false
+  })
+  let m3 : Map[String, Int] = { "a": 1, "b": 2 }
+  let mut n3 = 0
+  let _ = m3.keys().any(fn(k) {
+    n3 = n3 + 1
+    if k == "a" { m3.remove("a") }
+    false
+  })
   let c_alias : Color = { r: 7 }
-  r_str + "|" + h1.to_string() + "," + h2.to_string() + "," + h3.to_string() + "," + h4.to_string() + "|" + kh + "|" + kn + "|" + ka.to_string() + "|" + c_alias.r.to_string()
+  r_str + "|" + h1.to_string() + "," + h2.to_string() + "," + h3.to_string() + "," + h4.to_string() + "|" + kh + "|" + kn + "|" + ka.to_string() + "|" + n2.to_string() + "," + n3.to_string() + "|" + c_alias.r.to_string()
 }
 
 fn run_map_kv_and_json_index() -> String {
@@ -443,6 +467,14 @@ def main():
             ("struct_lit_mut", "priv struct Hook { a : Array[Int] }\nfn Hook::wipe(self : Hook) -> Unit { self.a[0] = 99 }\nfn slm(a : Array[Int], v : ArrayView[Int]) -> Int { let h : Hook = { a: a }; h.wipe(); v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { slm(a, ops[0:2]) }\n"),
             ("visited_inline_cb", "fn run_cb(cb : () -> Unit) -> Unit { cb() }\nfn two_c(ext : () -> Unit, v : ArrayView[Int]) -> Int { run_cb(fn() { () }); run_cb(ext); v[0] }\npub fn f(ext : () -> Unit, ops : Array[Int]) -> Int { two_c(ext, ops[0:2]) }\n"),
             ("nested_map_arg_mut", "fn get_m() -> Map[String, Int] { Map([]) }\nfn pick(m : Map[String, Int], a : Array[Int]) -> Array[Int] { let _ = m; a }\nfn nma(a : Array[Int], v : ArrayView[Int]) -> Int { let x = pick(get_m(), a); x[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { nma(a, ops[0:2]) }\n"),
+            ("trailing_arg_mut", "fn rd(v : ArrayView[Int], _u : Unit) -> Int { v[1] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { rd(xs[0:3], { ys[1] = 9 }) }\n"),
+            ("custom_eq_mut", "priv struct H { xs : Array[Int] }\nimpl Eq for H with equal(self, other) { let _ = other; self.xs[1] = 9; true }\nfn ce(a : H, b : H, v : ArrayView[Int]) -> Int { if a == b { v[1] } else { 0 } }\npub fn f(a : H, b : H, ops : Array[Int]) -> Int { ce(a, b, ops[0:2]) }\n"),
+            ("shadow_to_int_mut", "priv struct H { xs : Array[Int] }\nfn H::to_int(self : H) -> Int { self.xs[1] = 9; 0 }\nfn ct(h : H, v : ArrayView[Int]) -> Int { let _ = h.to_int(); v[1] }\npub fn f(h : H, ops : Array[Int]) -> Int { ct(h, ops[0:2]) }\n"),
+            ("block_scope_leak", "fn bl(a : Array[Int], v : ArrayView[Int]) -> Int { { let a : Array[Int] = []; a.push(1) }; a[0] = 99; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { bl(a, ops[0:2]) }\n"),
+            ("fwd_shadow_mut", "fn fs(a : Array[Int], v : ArrayView[Int]) -> Int { let out = a; out[0] = 99; let out : Array[Int] = []; let _ = out; v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { fs(a, ops[0:2]) }\n"),
+            ("nl_dot_pop_mut", "fn ndp(a : Array[Int], v : ArrayView[Int]) -> Int { let al = [a]\n  .unsafe_pop()\n  al[0] = 99\n  v[0] }\npub fn f(a : Array[Int], ops : Array[Int]) -> Int { ndp(a, ops[0:2]) }\n"),
+            ("v1escape", "fn mk(p : ArrayView[Int]) -> () -> Int { fn() { p[0] } }\npub fn f(xs : Array[Int]) -> () -> Int { mk(xs[0:2]) }\n"),
+            ("v2shadowfresh", "fn patch(p : ArrayView[Int], ys : Array[Int]) -> Int { let a = ys; if p.length() > 0 { let a = [0]; a[0] = 1 }; a[0] = 99; p[0] }\npub fn f(xs : Array[Int], zs : Array[Int]) -> Int { patch(xs[0:2], zs) }\n"),
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
 

@@ -1806,14 +1806,17 @@ fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String]
   if t == "Char" {
     return Some("mbt_compat::debug_char(" + expr + ")")
   }
-  if t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" || t == "Bool" || t == "Float" || t == "Byte" {
+  if t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" || t == "Bool" || t == "Float" {
     return Some("(" + expr + ").to_string()")
+  }
+  if t == "Byte" {
+    return Some("mbt_compat::debug_byte(" + expr + ")")
   }
   if t == "Double" {
     return Some("mbt_compat::double_to_string(" + expr + ")")
   }
   if t == "Unit" {
-    return Some("\"()\"")
+    return Some("({ let _ = " + expr + "; \"()\" })")
   }
   if t.starts_with("Option[") && t.ends_with("]") {
     let inner = t.slice(7, t.length() - 1).trim()
@@ -3715,7 +3718,7 @@ pub fn run_stage_a5_with_val_sites(
   probe_dispositions : Array[ProbeDisposition],
   max_rounds : Int,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
-  run_stage_a5_with_val_sites_and_origins(
+  run_stage_a5_core(
     files,
     recipes,
     api_map,
@@ -3727,6 +3730,7 @@ pub fn run_stage_a5_with_val_sites(
     drift_ledger,
     probe_dispositions,
     max_rounds,
+    true,
   )
 }
 
@@ -3742,6 +3746,36 @@ pub fn run_stage_a5_with_val_sites_and_origins(
   drift_ledger : Array[DriftEntry],
   probe_dispositions : Array[ProbeDisposition],
   max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_core(
+    files,
+    recipes,
+    api_map,
+    struct_val_fields,
+    val_probe_sites,
+    init_origins_in,
+    check_fn,
+    diags,
+    drift_ledger,
+    probe_dispositions,
+    max_rounds,
+    false,
+  )
+}
+
+fn run_stage_a5_core(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  init_origins_in : Map[String, Array[InitOriginRecord]],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+  allow_untagged : Bool,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
   // P0-1(b): bucket registered `.val` placeholders by owning file `vps.file` so a placeholder
   // allocated in file A can NEVER match a legitimate user field of the same name in file B.
@@ -4010,21 +4044,27 @@ pub fn run_stage_a5_with_val_sites_and_origins(
               tagged_cursor[tkey] = cur
               if cur < bucket.length() {
                 let first_idx = bucket[cur]
-                let first_ty = probe_results[first_idx].resolved_type.trim()
+                let first_pr = probe_results[first_idx]
+                let first_ty = first_pr.resolved_type.trim()
                 // Reject untrusted/error placeholder receiver types (outer `Array[<error>]` is valid for len/idx!)
                 let trusted_ty = first_ty.length() > 0 &&
                 first_ty != "?" &&
                 first_ty != "<error>" &&
                 first_ty != "<unknown>" &&
                 first_ty != "TError"
-                // Check for duplicate diagnostics on the same unique probe_id
+                // Check for duplicate diagnostics on the same unique probe_id:
+                // Reject any differing type OR differing source span (file/line/col);
+                // allow exact-span identical-type duplicates because `pionc` itself checks
+                // or-pattern arm bodies (`A(n) | B(n) => body`) once per branch.
                 let mut dup_conflict = false
-                let mut dup_count = 0
                 let mut bi = cur
                 while bi < bucket.length() {
                   if !consumed[bucket[bi]] {
-                    dup_count = dup_count + 1
-                    if probe_results[bucket[bi]].resolved_type.trim() != first_ty {
+                    let bpr = probe_results[bucket[bi]]
+                    if bpr.resolved_type.trim() != first_ty ||
+                    bpr.file != first_pr.file ||
+                    bpr.line != first_pr.line ||
+                    bpr.col != first_pr.col {
                       dup_conflict = true
                     }
                   }
@@ -4040,7 +4080,7 @@ pub fn run_stage_a5_with_val_sites_and_origins(
                   }
                 } else {
                   matched_idx = first_idx
-                  // Consume any identical-type duplicate entries for the same unique probe_id
+                  // Consume exact-span identical-type duplicates (e.g. pionc or-pattern arms)
                   let mut ci2 = cur + 1
                   while ci2 < bucket.length() {
                     consumed[bucket[ci2]] = true
@@ -4052,9 +4092,10 @@ pub fn run_stage_a5_with_val_sites_and_origins(
             None => ()
           }
         }
-        // Pass 2: fallback for untagged diagnostics (unit-test mocks ONLY — never when tagged diags exist
-        // or when Pass 1 detected a conflict; fail-closed on same-col / tied-distance ambiguity!)
-        if matched_idx < 0 && !match_conflict && tagged_index.length() == 0 {
+        // Pass 2: fallback for untagged diagnostics (legacy unit-test mocks ONLY — strictly disabled
+        // in CLI/publish entry `run_stage_a5_with_val_sites_and_origins`, and never when tagged diags
+        // exist or Pass 1 detected a conflict).
+        if allow_untagged && matched_idx < 0 && !match_conflict && tagged_index.length() == 0 {
           match untagged_index.get(site.line.to_string() + "|" + site.probe_kind) {
             Some(bucket) => {
               let mut best_col_dist = 1000000
