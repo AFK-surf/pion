@@ -1,0 +1,133 @@
+///| Unit tests: Stage B content-versioned cache equivalence & explicit dep_methods isolation.
+
+test "stage_b_cache: stage_b cache ON vs OFF produces byte-identical output and reduces lex/build counts" {
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{
+      rel_path: "a.pion",
+      content: "fn helper(xs : Array[Int]) -> Unit {\n  xs.shrink_to_fit()\n  xs.shrink_to_fit()\n}\n",
+      source_file: "a.mbt",
+      anchors: [],
+    },
+    GeneratedFile::{
+      rel_path: "b.pion",
+      content: "fn keep_sorted(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x })\n  xs.sort_by_key(fn(x) { x })\n}\n",
+      source_file: "b.mbt",
+      anchors: [],
+    },
+    GeneratedFile::{
+      rel_path: "c.pion",
+      content: "fn untouched(x : Int) -> Int {\n  x + 1\n}\n",
+      source_file: "c.mbt",
+      anchors: [],
+    },
+  ]
+  let make_mock_check = fn() -> (Array[(String, String)]) -> String {
+    let round = [0]
+    fn(batch : Array[(String, String)]) -> String {
+      round[0] = round[0] + 1
+      let sb = StringBuilder()
+      sb.write_string("{\"ok\":false,\"diagnostics\":[")
+      let mut first = true
+      for item in batch {
+        let lines = item.1.split("\n")
+        let mut li = 0
+        while li < lines.length() {
+          let ln = lines[li]
+          if str_has(ln, ".shrink_to_fit()") {
+            if !first { sb.write_string(",") }
+            first = false
+            sb.write_string("{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"")
+            sb.write_string(item.0)
+            sb.write_string("\",\"line\":")
+            sb.write_string((li + 1).to_string())
+            sb.write_string(",\"col\":6,\"message\":\"unknown method `shrink_to_fit` on type `Array[Int]`\"}")
+          } else if str_has(ln, ".sort_by_key(") {
+            if !first { sb.write_string(",") }
+            first = false
+            sb.write_string("{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"")
+            sb.write_string(item.0)
+            sb.write_string("\",\"line\":")
+            sb.write_string((li + 1).to_string())
+            sb.write_string(",\"col\":6,\"message\":\"unknown method `sort_by_key` on type `Array[Int]`\"}")
+          }
+          li = li + 1
+        }
+      }
+      sb.write_string("]}")
+      if first { "{\"ok\":true,\"diagnostics\":[]}" } else { sb.to_string() }
+    }
+  }
+
+  let empty_api = ApiMap::{ symbols: [], pkg_aliases: Map() }
+  let diags_on : Array[Diag] = []
+  let drift_on : Array[DriftEntry] = []
+  stage_b_set_cache_enabled(true)
+  stage_b_reset_perf_counters()
+  let (out_on, it_on, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_on,
+    drift_on,
+  )
+  let stats_on = stage_b_get_perf_counters()
+
+  let diags_off : Array[Diag] = []
+  let drift_off : Array[DriftEntry] = []
+  stage_b_set_cache_enabled(false)
+  stage_b_reset_perf_counters()
+  let (out_off, it_off, _) = run_stage_b_with_ops_and_deps(
+    files,
+    empty_api,
+    Map(),
+    Map(),
+    make_mock_check(),
+    diags_off,
+    drift_off,
+  )
+  let stats_off = stage_b_get_perf_counters()
+  stage_b_set_cache_enabled(true)
+
+  assert_eq(it_on, it_off)
+  assert_eq(out_on.length(), out_off.length())
+  assert_eq(diags_on.length(), diags_off.length())
+  let mut idx = 0
+  while idx < out_on.length() {
+    assert_true(out_on[idx].rel_path == out_off[idx].rel_path, "rel_path mismatch")
+    assert_true(out_on[idx].content == out_off[idx].content, "content mismatch")
+    idx = idx + 1
+  }
+  // Cache ON must lex fewer times and build ShrinkPkg/SortKeyEnv once per round instead of once per site.
+  assert_true(stats_on.0 < stats_off.0, "expected fewer lex calls with cache ON")
+  assert_true(stats_on.1 < stats_off.1, "expected fewer ShrinkPkg builds with cache ON")
+  assert_true(stats_on.2 < stats_off.2, "expected fewer SortKeyEnv builds with cache ON")
+}
+
+test "stage_b_cache: explicit dep_methods does not leak across consecutive runs" {
+  let src = "fn run(xs : Array[Int]) -> Unit {\n  xs.sort_by_key(fn(x) { x.custom_key() })\n}\n"
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{ rel_path: "k.pion", content: src, source_file: "k.mbt", anchors: [] },
+  ]
+  let mock_check = fn(batch : Array[(String, String)]) -> String {
+    if str_has(batch[0].1, ".sort_by_key(") {
+      "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"k.pion\",\"line\":2,\"col\":6,\"message\":\"unknown method `sort_by_key` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let empty_api = ApiMap::{ symbols: [], pkg_aliases: Map() }
+  // Run 1: `custom_key` is in `dep_methods` -> blocked with MBT2PION_ARRAY_ITER_MUTATION
+  let deps1 : Map[String, Bool] = Map()
+  deps1["custom_key"] = true
+  let d1 : Array[Diag] = []
+  let (_, _, _) = run_stage_b_with_ops_and_deps(files, empty_api, Map(), deps1, mock_check, d1, [])
+  assert_true(d1.length() > 0, "expected dep_methods to block custom_key in run 1")
+
+  // Run 2: empty `dep_methods` -> must NOT inherit `custom_key` from Run 1
+  let d2 : Array[Diag] = []
+  let (out2, _, _) = run_stage_b_with_ops_and_deps(files, empty_api, Map(), Map(), mock_check, d2, [])
+  assert_eq(d2.length(), 0)
+  assert_true(str_has(out2[0].content, "mbt_compat::arr_sort_by_key"), "expected run 2 to lower sort_by_key")
+}
