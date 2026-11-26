@@ -9,22 +9,24 @@
 #      divisors are `b'\xNN'` literals, which take the general `%` path); the
 #      operand of the test (a call with side effects, also returning Int8 /
 #      Byte) is evaluated exactly once.
-#   2. loops.pion: `break` / `continue` in the condition of a nested `while`
-#      and C-style `for` leave / continue the enclosing loop, with an owned
-#      String operand in the condition. edge.pion: an operand of the test that
-#      leaves the function inside a value-context comparison (right side `||`
-#      / `if`), and `continue` / `break` in the step of a C-style `for` nested
-#      in `for ... in` range / array and `while` loops.
-#   divzero.pion: Int8 `% 256 == 0` (256 narrows to 0) is not folded: it
-#   panics with "division by zero" under `#verify` (native and Wasm32) and
-#   traps without it.
-#   For both, dev and --release (each build in its own empty PION_CACHE_DIR):
-#   exact stdout, exit 0 and empty stderr natively, with an AddressSanitizer
-#   runtime (LeakSanitizer on Linux) and on Wasm32.
-#   3. `pionc check --json` rejects `break` / `continue` outside every loop
-#      body (function body, outermost `while` / `for` condition, closure
-#      inside a loop) with "cannot use `break` outside a loop"
-#      (E_TYPE_MISMATCH), and accepts them in a nested loop's condition.
+#   2. loops.pion: `break` / `continue` in a nested C-style `for` `init`, in
+#      `for ... in` range bounds and in a `for x in` iterable leave / continue
+#      the enclosing loop (with owned String temporaries there), and a loop
+#      nested in a `while` condition breaks itself. edge.pion: an operand of
+#      the test that leaves the function inside a value-context comparison
+#      (right side `||` / `if`), and `continue` / `break` in a nested `for`
+#      `init` under range / array / `while` outer loops.
+#   For these three, dev and --release (each build in its own empty
+#   PION_CACHE_DIR): exact stdout, exit 0 and empty stderr natively, with an
+#   AddressSanitizer runtime (LeakSanitizer on Linux) and on Wasm32.
+#   divzero.pion: divisors the operand's width narrows to 0 (Int8 `% 256`,
+#   UInt `% 4294967296U`) are not folded: `#verify` panics with "division by
+#   zero" (native and Wasm32); plain code behaves exactly like the same `%`
+#   through a variable divisor on the same target (ARM64 does not trap).
+#   3. `pionc check --json` rejects `break` / `continue` outside a loop body:
+#      a function body, a `while` condition and a C-style `for` condition /
+#      step (outermost and nested), and a closure inside a loop, with "cannot
+#      use `break` outside a loop" (E_TYPE_MISMATCH); loops.pion is accepted.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -122,45 +124,59 @@ for PROG in modpow loops edge; do
 done
 [ "$N" -eq 3 ]
 
-# Int8 `% 256 == 0`: a division by zero in both modes, never folded.
+# Divisors narrowed to 0 are a division by zero, never folded: `#verify`
+# panics; plain code matches a variable divisor on the same target.
+run_mode() {
+  set +e
+  ( exec "$1" "$2" > "$3.out" 2> "$3.err" ) 2> /dev/null
+  echo $? > "$3.rc"
+  set -e
+}
+run_wasm_mode() {
+  set +e
+  node "$WASM_RT" "$1" "$2" > "$3.out" 2> "$3.err"
+  echo $? > "$3.rc"
+  set -e
+}
 for MODE in dev release; do
   FLAG=""
   [ "$MODE" = "release" ] && FLAG="--release"
   BASE="$TMP_DIR/divzero_$MODE"
   fresh_cas
   "$PIONC" build $FLAG -o "$BASE" "$DIR/divzero.pion"
-  set +e
-  "$BASE" > "$BASE.out" 2> "$BASE.err"
-  RC=$?
-  set -e
-  if [ "$RC" -eq 0 ] || [ -s "$BASE.out" ] || ! grep -q "pion panic at divzero.pion:8: division by zero" "$BASE.err"; then
-    cat "$BASE.out" "$BASE.err" >&2
-    echo "FAIL: p132 divzero $MODE #verify: exit $RC, want the division-by-zero panic" >&2
-    exit 1
-  fi
-  set +e
-  ( exec "$BASE" plain > "$BASE.pout" 2> "$BASE.perr" ) 2> /dev/null
-  RC=$?
-  set -e
-  if [ "$RC" -eq 0 ] || [ -s "$BASE.pout" ]; then
-    cat "$BASE.pout" "$BASE.perr" >&2
-    echo "FAIL: p132 divzero $MODE plain: exit $RC, want an integer division trap" >&2
-    exit 1
-  fi
+  LEGS="native"
   if [ "$HAVE_NODE" -eq 1 ]; then
     fresh_cas
     "$PIONC" build $FLAG --target wasm32 -o "$BASE.wasm" "$DIR/divzero.pion"
-    set +e
-    node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
-    RC=$?
-    set -e
-    if [ "$RC" -eq 0 ] || [ -s "$BASE.wout" ] || ! grep -q "division by zero" "$BASE.werr"; then
-      cat "$BASE.wout" "$BASE.werr" >&2
-      echo "FAIL: p132 divzero $MODE Wasm32 #verify: exit $RC, want the division-by-zero panic" >&2
+    LEGS="native wasm"
+  fi
+  for LEG in $LEGS; do
+    for V in verify8 verify32 folded unfolded; do
+      if [ "$LEG" = "native" ]; then
+        run_mode "$BASE" "$V" "$BASE.$LEG.$V"
+      else
+        run_wasm_mode "$BASE.wasm" "$V" "$BASE.$LEG.$V"
+      fi
+    done
+    for V in verify8 verify32; do
+      R="$BASE.$LEG.$V"
+      LINE=9
+      [ "$V" = "verify32" ] && LINE=14
+      if [ "$(cat "$R.rc")" -eq 0 ] || [ -s "$R.out" ] || ! grep -q "pion panic at divzero.pion:$LINE: division by zero" "$R.err"; then
+        cat "$R.out" "$R.err" >&2
+        echo "FAIL: p132 divzero $MODE $LEG $V: exit $(cat "$R.rc"), want the division-by-zero panic" >&2
+        exit 1
+      fi
+    done
+    F="$BASE.$LEG.folded"
+    U="$BASE.$LEG.unfolded"
+    if [ "$(cat "$F.rc")" != "$(cat "$U.rc")" ] || ! cmp -s "$F.out" "$U.out"; then
+      echo "folded: exit $(cat "$F.rc"), stdout '$(cat "$F.out")'; unfolded: exit $(cat "$U.rc"), stdout '$(cat "$U.out")'" >&2
+      echo "FAIL: p132 divzero $MODE $LEG: folded Int8 % 256 == 0 differs from a variable divisor" >&2
       exit 1
     fi
-  fi
-  echo "p132 divzero $MODE: Int8 % 256 == 0 panics under #verify and traps otherwise (not folded)"
+    echo "p132 divzero $MODE $LEG: #verify Int8 % 256 / UInt % 2^32 panic; plain == variable divisor (exit $(cat "$F.rc"))"
+  done
 done
 
 # 3. `break` / `continue` outside every loop body are rejected.
@@ -213,7 +229,51 @@ pub fn f(n : Int) -> Int {
   i
 }
 P
-for NAME in body_break body_continue while_cond_break for_cond_continue closure_break; do
+cat > "$TMP_DIR/neg/for_step_break.pion" <<'P'
+pub fn f(n : Int) -> Int {
+  let mut s = 0
+  for i = 0; i < 10; (if i > n { break } else { i = i + 1 }) {
+    s = s + i
+  }
+  s
+}
+P
+cat > "$TMP_DIR/neg/nested_while_cond_break.pion" <<'P'
+pub fn f(n : Int) -> Int {
+  let mut i = 0
+  while i < n {
+    i = i + 1
+    let mut j = 0
+    while j != (if j > i { break } else { 9 }) {
+      j = j + 1
+    }
+  }
+  i
+}
+P
+cat > "$TMP_DIR/neg/nested_for_cond_continue.pion" <<'P'
+pub fn f(n : Int) -> Int {
+  let mut s = 0
+  for k in 0..<n {
+    for i = 0; (if i > k { continue } else { i < 3 }); i = i + 1 {
+      s = s + i
+    }
+  }
+  s
+}
+P
+cat > "$TMP_DIR/neg/nested_for_step_continue.pion" <<'P'
+pub fn f(n : Int) -> Int {
+  let mut s = 0
+  for k in 0..<n {
+    for i = 0; i < 3; (if i > k { continue } else { i = i + 1 }) {
+      s = s + i
+    }
+  }
+  s
+}
+P
+for NAME in body_break body_continue while_cond_break for_cond_continue closure_break for_step_break nested_while_cond_break nested_for_cond_continue nested_for_step_continue; do
   case "$NAME" in
     *continue*) KW=continue ;;
     *) KW=break ;;
@@ -232,7 +292,7 @@ for NAME in body_break body_continue while_cond_break for_cond_continue closure_
   fi
 done
 fresh_cas
-"$PIONC" check --json "$TMP_DIR/loops.pion" > "$TMP_DIR/loops.json" || { cat "$TMP_DIR/loops.json" >&2; echo "FAIL: p132 nested loop conditions rejected" >&2; exit 1; }
-echo "p132 check: break / continue outside every loop body rejected (5 forms), nested loop conditions accepted"
+"$PIONC" check --json "$TMP_DIR/loops.pion" > "$TMP_DIR/loops.json" || { cat "$TMP_DIR/loops.json" >&2; echo "FAIL: p132 nested loop init / bounds / iterables rejected" >&2; exit 1; }
+echo "p132 check: break / continue outside a loop body rejected (9 forms incl. nested while / for conditions and steps), init / bounds / iterables of nested loops accepted"
 
 echo "PASS: p132_mod_pow2_loop_break"
