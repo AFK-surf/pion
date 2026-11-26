@@ -23,6 +23,8 @@ here, independently of the compiler) into OUT_DIR:
                 next to two 1,024+ element literals;
   edges.pion    the same edge literals through a 1,023 element (stores) and a
                 1,024 element (word table) literal;
+  twopkg/       an app package whose dependency `words` holds a 1,024 element
+                literal (for --entry-symbol cache determinism);
 
 Also writes sparse.table / sparsecap.table (the little-endian images of
 those tables) and strings.base64 (the Base64 literal) for check.py.
@@ -518,3 +520,32 @@ fn main(world : World) -> Int {
 write('edges.pion', src)
 vals = ' '.join(str(wrap32(t)) for t in EDGE) + ' '
 write('edges.expected', 'small %s\nbig %s\nsame 1023 of 1023 1024\n' % (vals, vals))
+
+# ---------------------------------------------------------------- twopkg
+TW = int_values(1024, 6)
+for d in ('twopkg/app/src', 'twopkg/words/src'):
+    os.makedirs(os.path.join(OUT, d), exist_ok=True)
+write('twopkg/words/pion.toml', '[package]\nname = "words"\nversion = "0.1.0"\n')
+write('twopkg/app/pion.toml', '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nwords = { path = "../words" }\n')
+write('twopkg/words/src/lib.pion', '''pub fn table() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+''' % lit(TW))
+write('twopkg/app/src/main.pion', '''import "words"
+
+fn main(world : World) -> Int {
+  let t = words::table()
+  let mut h = 0L
+  let mut i = 0
+  while i < t.length() {
+    h = (h * 31L + t[i].to_int64()) % 1000000007L
+    i = i + 1
+  }
+  io_println(world, "twopkg " + t.length().to_string() + " " + h.to_string())
+  0
+}
+''')
+write('twopkg.expected', 'twopkg 1024 %d\n' % checksum([v for v, _ in TW]))

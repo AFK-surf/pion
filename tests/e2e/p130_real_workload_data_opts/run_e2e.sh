@@ -25,7 +25,9 @@
 #      a 1,024 element word table;
 #   6. ints as a static library whose `--entry-symbol` is
 #      `pion_i32_literal_0` / `pion_i32_literal_0_words` (dev, --release),
-#      linked into a C host: same output.
+#      linked into a C host: same output; twopkg: an `--entry-symbol` equal
+#      to a dependency's first word table name gives byte-identical warm
+#      (dependency cached) and cold static libraries that run correctly.
 # Each program: check.py on the dev and --release SSA, exact stdout natively
 # (dev, --release) and on Wasm32 (Node, dev and --release); ints and records
 # (and collide, edges) also under ASan/LSan; sparse and sparsecap also
@@ -148,5 +150,34 @@ for SYM in pion_i32_literal_0 pion_i32_literal_0_words; do
   done
   echo "p130 --entry-symbol $SYM: static library links, output equals the reference"
 done
+
+# The entry symbol is keyed only into the entry package: an entry symbol equal
+# to the dependency's first word table name leaves the dependency's object
+# unchanged, so a warm build (dependency cached from a default build) and a
+# cold build produce the same library.
+APP="$GEN/twopkg/app"
+TP="$TMP_DIR/twopkg"
+mkdir -p "$TP"
+WARM_CAS=$(mktemp -d "$TMP_DIR/cas.XXXXXX")
+PION_CACHE_DIR="$WARM_CAS" "$PIONC" build --release --emit-staticlib "$TP/default.a" "$APP"
+# The dependency's first word table descriptor (a local data symbol).
+DEP_SYM=$(nm "$TP/default.a" | sed -n 's/.* [dDsS] _\{0,1\}\(pion_[A-Za-z0-9_]*i32_literal_0\)$/\1/p' | head -n 1)
+case "$DEP_SYM" in
+  pion_?*i32_literal_0) ;;
+  *) echo "FAIL: p130 twopkg: no dependency word table in the library (got '$DEP_SYM')" >&2; exit 1 ;;
+esac
+PION_CACHE_DIR="$WARM_CAS" "$PIONC" build --release --entry-symbol "$DEP_SYM" --emit-staticlib "$TP/warm.a" "$APP"
+build --release --entry-symbol "$DEP_SYM" --emit-staticlib "$TP/cold.a" "$APP"
+if [ ! -s "$TP/cold.a" ] || ! cmp -s "$TP/warm.a" "$TP/cold.a"; then
+  echo "FAIL: p130 twopkg: warm and cold --entry-symbol $DEP_SYM libraries differ" >&2
+  exit 1
+fi
+printf 'int %s(int argc, char **argv);\nint main(int argc, char **argv) { return %s(argc, argv); }\n' \
+  "$DEP_SYM" "$DEP_SYM" > "$TP/host.c"
+"$CC_BIN" -O1 "$TP/host.c" "$TP/cold.a" "$RT_LIB" -lm -lpthread -o "$TP/host"
+"$TP/host" > "$TP/host.out" 2> "$TP/host.err"
+same_output "twopkg --entry-symbol $DEP_SYM" "$GEN/twopkg.expected" "$TP/host.out"
+no_stderr "twopkg --entry-symbol $DEP_SYM" "$TP/host.err"
+echo "p130 twopkg: --entry-symbol $DEP_SYM warm == cold library, output equals the reference"
 
 echo "PASS: p130_real_workload_data_opts"
