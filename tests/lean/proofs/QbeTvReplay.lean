@@ -303,15 +303,15 @@ theorem vids_ok_sound {vg : ValGraph} {vids : Pion.Array Std.I32} {n : Std.I32}
   · cases ok_inj' h
   rename_i hln
   have hln' : l.val = n.val := by simpa using hln
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
-  have key := scan_loop (fun i => vids_ok_loop0.body vids vg i) vids.val.length
+  have key := scan_loop (fun i => vids_ok_loop0.body t vids vg i) vids.val.length
     (fun k => ∀ hk : k < vids.val.length, vids.val[k] = (-1)#i32 ∨ Valid vg vids.val[k])
     (fun _ b => b = false) (fun _ => True)
     (by
       intro i c hi hc
       unfold vids_ok_loop0.body at hc
-      obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-      obtain ⟨ht1, ht2⟩ := arr_length_ok ht
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, ht1] at hlt
@@ -646,16 +646,16 @@ theorem atom_known_true {vids : Pion.Array Std.I32} {a : Atom} (h : atom_known v
 theorem facts_contradict_true {fs : Pion.Array Fact} (h : facts_contradict fs = ok true) :
     ∃ fa ∈ fs.val, fa.zero = true ∧ ∃ fb ∈ fs.val, fb.vid = fa.vid ∧ fb.zero = false := by
   unfold facts_contradict at h
+  obtain ⟨t, ht, h⟩ := bind_eq_ok h
+  obtain ⟨ht1, ht2⟩ := arr_length_ok ht
   obtain ⟨r, hr, h⟩ := bind_eq_ok h
-  have key := scan_loop (fun i => facts_contradict_loop0.body fs i) fs.val.length
+  have key := scan_loop (fun i => facts_contradict_loop0.body t fs i) fs.val.length
     (fun _ => True)
     (fun _ b => b = true → ∃ fa ∈ fs.val, fa.zero = true ∧ ∃ fb ∈ fs.val, fb.vid = fa.vid ∧ fb.zero = false)
     (fun _ => True)
     (by
       intro i c hi hc
       unfold facts_contradict_loop0.body at hc
-      obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-      obtain ⟨ht1, ht2⟩ := arr_length_ok ht
       split at hc
       · rename_i hlt
         simp only [i32_lt_iff, ht1] at hlt

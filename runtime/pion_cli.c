@@ -613,3 +613,158 @@ int32_t pion_fs_lstat_kind(const char *path) {
 }
 
 #endif /* _WIN32 */
+
+#include <stdio.h>
+
+#ifdef _WIN32
+#define PION_CLI_GETC(fp) fgetc(fp)
+#else
+#define PION_CLI_GETC(fp) getc_unlocked(fp)
+#endif
+
+/* Compiler-only bounded line reader (used by `pionc check --server`).
+ * Reads one line from `fp` up to `max_bytes` payload bytes (strictly capping
+ * heap allocation at `max_bytes + 1` for NUL termination). Strips trailing
+ * '\n' or "\r\n" and handles a final line without trailing '\n'.
+ * When a line exceeds `max_bytes`, stops buffering immediately, frees the
+ * buffer, and drains remaining bytes through '\n' or EOF so the next frame
+ * stays cleanly framed.
+ * Returns:
+ *   0 = OK (*out_buf_slot = heap NUL-terminated buffer or NULL if len==0,
+ *           *out_len_slot = payload byte length)
+ *   1 = clean EOF (0 bytes read, !ferror(fp))
+ *   2 = line exceeded `max_bytes`
+ *   3 = I/O read error (ferror(fp)) or allocation failure */
+int32_t pion_cli_read_line_bounded_fp(FILE *fp, int64_t max_bytes,
+                                      void *out_buf_slot, void *out_len_slot) {
+    char **buf_out = (char **)out_buf_slot;
+    int64_t *len_out = (int64_t *)out_len_slot;
+    if (buf_out) *buf_out = NULL;
+    if (len_out) *len_out = 0;
+    if (!fp || max_bytes < 0) return 3;
+
+    size_t limit = (size_t)max_bytes;
+    char *buf = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+    int saw_any = 0;
+    int exceeded = 0;
+    int pending_cr = 0;
+    int oom = 0;
+
+    for (;;) {
+        int c = PION_CLI_GETC(fp);
+        if (c == EOF) {
+            if (ferror(fp) || oom) {
+                free(buf);
+                return 3;
+            }
+            if (exceeded || pending_cr) {
+                free(buf);
+                return 2;
+            }
+            if (!saw_any) {
+                free(buf);
+                return 1;
+            }
+            if (buf) buf[len] = '\0';
+            if (buf_out) *buf_out = buf;
+            else free(buf);
+            if (len_out) *len_out = (int64_t)len;
+            return 0;
+        }
+        saw_any = 1;
+        if (c == '\n') {
+            if (oom) {
+                free(buf);
+                return 3;
+            }
+            if (exceeded) {
+                free(buf);
+                return 2;
+            }
+            if (!pending_cr && len > 0 && buf[len - 1] == '\r') {
+                len--;
+            }
+            if (len == 0) {
+                free(buf);
+                buf = NULL;
+            } else if (buf) {
+                buf[len] = '\0';
+            }
+            if (buf_out) *buf_out = buf;
+            else free(buf);
+            if (len_out) *len_out = (int64_t)len;
+            return 0;
+        }
+        if (exceeded || oom) {
+            continue;
+        }
+        if (pending_cr) {
+            free(buf);
+            buf = NULL;
+            cap = 0;
+            len = 0;
+            pending_cr = 0;
+            exceeded = 1;
+            continue;
+        }
+        if (len == limit) {
+            if (c == '\r') {
+                pending_cr = 1;
+            } else {
+                free(buf);
+                buf = NULL;
+                cap = 0;
+                len = 0;
+                exceeded = 1;
+            }
+            continue;
+        }
+        /* Buffer holds up to `limit` payload bytes plus 1 byte for trailing NUL
+         * (total allocation <= limit + 1). */
+        if (len == cap) {
+            size_t new_cap = cap ? cap * 2 : 4096;
+            if (new_cap < len + 1) new_cap = len + 1;
+            if (new_cap > limit) new_cap = limit;
+            char *nb = (char *)realloc(buf, new_cap + 1);
+            if (!nb) {
+                free(buf);
+                buf = NULL;
+                cap = 0;
+                len = 0;
+                oom = 1;
+                continue;
+            }
+            buf = nb;
+            cap = new_cap;
+        }
+        buf[len++] = (char)c;
+    }
+}
+
+int32_t pion_cli_read_line_bounded(int64_t max_bytes,
+                                   void *out_buf_slot, void *out_len_slot) {
+    return pion_cli_read_line_bounded_fp(stdin, max_bytes, out_buf_slot, out_len_slot);
+}
+
+void pion_cli_free_buf(void *buf) {
+    free(buf);
+}
+
+/* Writes a single complete JSON-lines frame with one fwrite + '\n' + one fflush.
+ * Returns 0 on success, -1 on I/O error. */
+int32_t pion_cli_write_line_fp(FILE *fp, const char *data, int64_t len) {
+    if (!fp || len < 0) return -1;
+    if (len > 0) {
+        if (!data) return -1;
+        if (fwrite(data, 1, (size_t)len, fp) != (size_t)len) return -1;
+    }
+    if (fputc('\n', fp) == EOF) return -1;
+    if (fflush(fp) != 0) return -1;
+    return 0;
+}
+
+int32_t pion_cli_write_line(const char *data, int64_t len) {
+    return pion_cli_write_line_fp(stdout, data, len);
+}

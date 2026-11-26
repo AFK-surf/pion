@@ -1,0 +1,1568 @@
+///| Query-types exporter: exact UTF-8 byte spans, parenthesis expansion,
+///| binding identifier resolution, per-file alias rendering, and JSON output.
+
+///|
+struct QtFileTokens {
+  path : String
+  source : String
+  tokens : Array[Token]
+  starts : Array[Int]
+  ends : Array[Int]
+  line_offsets : Array[Int]
+  tok_by_start : Map[Int, Int]
+  match_close : Array[Int]
+}
+
+///|
+struct QtRenderCache {
+  tc : TypeChecker
+  file : String
+  ty_disp : Map[String, String]
+}
+
+///|
+struct QtExprOut {
+  start_byte : Int
+  end_byte : Int
+  op_byte : Int
+  role : String
+  rec : QtExprRec
+}
+
+///|
+struct QtCallOut {
+  start_byte : Int
+  end_byte : Int
+  op_byte : Int
+  rec : QtCallRec
+}
+
+///|
+struct QtBindOut {
+  start_byte : Int
+  end_byte : Int
+  rec : QtBindRec
+}
+
+///|
+struct QtFileCollector {
+  ft : QtFileTokens
+  tc : TypeChecker
+  exprs : Array[QtExprOut]
+  calls : Array[QtCallOut]
+  binds : Array[QtBindOut]
+  seen_exprs : Map[String, Bool]
+  seen_calls : Map[String, Bool]
+  seen_binds : Map[String, Bool]
+}
+
+///|
+fn qt_build_line_offsets(src : String) -> Array[Int] {
+  let out : Array[Int] = [0]
+  let n = src.length()
+  let mut i = 0
+  while i < n {
+    if str_code_at(src, i) == 10 {
+      out.push(i + 1)
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qt_span_to_byte(ft : QtFileTokens, sp : Span) -> Int {
+  if sp.line <= 0 || sp.line > ft.line_offsets.length() {
+    return -1
+  }
+  let off = ft.line_offsets[sp.line - 1] + (sp.col - 1)
+  if off < 0 || off > ft.source.length() {
+    -1
+  } else {
+    off
+  }
+}
+
+///|
+fn qt_build_file_tokens(path : String, src : String) -> QtFileTokens {
+  let ls = lex_with_spans(path, src)
+  let toks = ls.tokens
+  let starts = ls.starts
+  let ends = ls.ends
+  let n = toks.length()
+  let tok_by_start : Map[Int, Int] = Map([])
+  let match_close : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    match_close.push(-1)
+    i = i + 1
+  }
+  let paren_stack : Array[Int] = []
+  let brace_stack : Array[Int] = []
+  let bracket_stack : Array[Int] = []
+  let interp_stack : Array[Int] = []
+  i = 0
+  while i < n {
+    match toks[i].kind {
+      Eof => ()
+      _ =>
+      if !tok_by_start.contains(starts[i]) {
+        tok_by_start.set(starts[i], i)
+      }
+    }
+    match toks[i].kind {
+      LParen => paren_stack.push(i)
+      RParen =>
+      if paren_stack.length() > 0 {
+        match paren_stack.pop() {
+          Some(oi) => match_close[oi] = i
+          None => ()
+        }
+      }
+      LBrace => brace_stack.push(i)
+      RBrace =>
+      if brace_stack.length() > 0 {
+        match brace_stack.pop() {
+          Some(oi) => match_close[oi] = i
+          None => ()
+        }
+      }
+      LBracket => bracket_stack.push(i)
+      RBracket =>
+      if bracket_stack.length() > 0 {
+        match bracket_stack.pop() {
+          Some(oi) => match_close[oi] = i
+          None => ()
+        }
+      }
+      InterpStart(_) => interp_stack.push(i)
+      InterpEnd(_) =>
+      if interp_stack.length() > 0 {
+        match interp_stack.pop() {
+          Some(oi) => match_close[oi] = i
+          None => ()
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  QtFileTokens::{
+    path: path,
+    source: src,
+    tokens: toks,
+    starts: starts,
+    ends: ends,
+    line_offsets: qt_build_line_offsets(src),
+    tok_by_start: tok_by_start,
+    match_close: match_close,
+  }
+}
+
+///|
+fn qt_tok_at_span(ft : QtFileTokens, sp : Span) -> Int {
+  let b = qt_span_to_byte(ft, sp)
+  if b < 0 {
+    return -1
+  }
+  match ft.tok_by_start.get(b) {
+    Some(ti) => ti
+    None => -1
+  }
+}
+
+///|
+fn qt_last_real_tok(ft : QtFileTokens) -> Int {
+  if ft.tokens.length() >= 2 {
+    ft.tokens.length() - 2
+  } else {
+    0
+  }
+}
+
+///|
+fn qt_wrap_parens(ft : QtFileTokens, s_ti0 : Int, e_ti0 : Int) -> (Int, Int) {
+  let mut s_ti = s_ti0
+  let mut e_ti = e_ti0
+  let max_real = ft.tokens.length() - 2
+  if s_ti < 0 || e_ti < 0 || s_ti > max_real || e_ti > max_real {
+    return (s_ti, e_ti)
+  }
+  while s_ti > 0 && e_ti < max_real {
+    let prev = s_ti - 1
+    let is_lp = match ft.tokens[prev].kind {
+      LParen => true
+      _ => false
+    }
+    if is_lp && ft.match_close[prev] == e_ti + 1 {
+      s_ti = prev
+      e_ti = e_ti + 1
+    } else {
+      break
+    }
+  }
+  (s_ti, e_ti)
+}
+
+///|
+fn qt_find_matching_jsx_end(ft : QtFileTokens, open_lt : Int) -> Int {
+  let max_real = qt_last_real_tok(ft)
+  if open_lt < 0 || open_lt > max_real {
+    return max_real
+  }
+  let mut depth = 0
+  let mut i = open_lt
+  while i <= max_real {
+    match ft.tokens[i].kind {
+      Lt => {
+        if i + 1 <= max_real {
+          let is_close_tag = match ft.tokens[i + 1].kind {
+            Slash => true
+            _ => false
+          }
+          if is_close_tag {
+            depth = depth - 1
+            let mut j = i + 2
+            while j <= max_real {
+              let is_gt = match ft.tokens[j].kind {
+                Gt => true
+                _ => false
+              }
+              if is_gt {
+                if depth <= 0 {
+                  return j
+                }
+                i = j
+                break
+              }
+              j = j + 1
+            }
+          } else {
+            depth = depth + 1
+            // Scan attributes of opening tag until `>` or `/>`, skipping `{...}`
+            let mut j = i + 1
+            while j <= max_real {
+              match ft.tokens[j].kind {
+                LBrace =>
+                if ft.match_close[j] > j {
+                  j = ft.match_close[j]
+                }
+                Slash =>
+                if j + 1 <= max_real {
+                  let next_gt = match ft.tokens[j + 1].kind {
+                    Gt => true
+                    _ => false
+                  }
+                  if next_gt {
+                    depth = depth - 1
+                    if depth <= 0 {
+                      return j + 1
+                    }
+                    i = j + 1
+                    break
+                  }
+                }
+                Gt => {
+                  i = j
+                  break
+                }
+                _ => ()
+              }
+              j = j + 1
+            }
+          }
+        }
+      }
+      LBrace =>
+      if ft.match_close[i] > i {
+        i = ft.match_close[i]
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  max_real
+}
+
+///|
+fn qt_type_expr_end_ti(ft : QtFileTokens, te : TypeExpr) -> Int {
+  let max_real = qt_last_real_tok(ft)
+  match te {
+    TyMissing(sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 { ti } else { max_real }
+    }
+    TyDynTrait(_, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti < 0 {
+        return max_real
+      }
+      // `dyn Name` or `dyn pkg::Name`
+      let mut e = ti + 1
+      if e + 2 <= max_real {
+        let is_cc = match ft.tokens[e + 1].kind {
+          ColonColon => true
+          _ => false
+        }
+        if is_cc {
+          e = e + 2
+        }
+      }
+      if e <= max_real { e } else { max_real }
+    }
+    TyTuple(_, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 && ft.match_close[ti] >= 0 {
+        ft.match_close[ti]
+      } else if ti >= 0 {
+        ti
+      } else {
+        max_real
+      }
+    }
+    TyFn(_, ret, sp) => {
+      let _ = sp
+      qt_type_expr_end_ti(ft, ret)
+    }
+    TyName(_, args, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti < 0 {
+        return max_real
+      }
+      let mut e = ti
+      if e + 2 <= max_real {
+        let is_cc = match ft.tokens[e + 1].kind {
+          ColonColon => true
+          _ => false
+        }
+        if is_cc {
+          e = e + 2
+        }
+      }
+      if args.length() > 0 && e + 1 <= max_real {
+        let is_lb = match ft.tokens[e + 1].kind {
+          LBracket => true
+          _ => false
+        }
+        if is_lb && ft.match_close[e + 1] >= 0 {
+          return ft.match_close[e + 1]
+        }
+      }
+      e
+    }
+  }
+}
+
+///|
+fn qt_pat_end_ti(ft : QtFileTokens, pat : Pattern) -> Int {
+  let max_real = qt_last_real_tok(ft)
+  match pat {
+    PWild(sp) | PIdent(_, sp) | PBool(_, sp) | PInt(_, sp) | PString(_, sp) | PChar(_, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 { ti } else { max_real }
+    }
+    PTuple(_, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 && ft.match_close[ti] >= 0 {
+        ft.match_close[ti]
+      } else if ti >= 0 {
+        ti
+      } else {
+        max_real
+      }
+    }
+    PVariant(_, _, sub, _, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti < 0 {
+        return max_real
+      }
+      let mut e = ti
+      // Could be `.V`, `Enum::V`, `pkg::Enum::V`, `V`
+      let mut steps = 0
+      while steps < 4 && e + 1 <= max_real {
+        match ft.tokens[e].kind {
+          Dot => e = e + 1
+          _ =>
+          match ft.tokens[e + 1].kind {
+            ColonColon =>
+            if e + 2 <= max_real {
+              e = e + 2
+            } else {
+              break
+            }
+            _ => break
+          }
+        }
+        steps = steps + 1
+      }
+      if (sub.length() > 0 || (e + 1 <= max_real && match ft.tokens[e + 1].kind { LParen => true; _ => false })) &&
+      e + 1 <= max_real {
+        let is_lp = match ft.tokens[e + 1].kind {
+          LParen => true
+          _ => false
+        }
+        if is_lp && ft.match_close[e + 1] >= 0 {
+          return ft.match_close[e + 1]
+        }
+      }
+      e
+    }
+  }
+}
+
+///|
+fn qt_find_next_lbrace(ft : QtFileTokens, from_ti : Int) -> Int {
+  let max_real = qt_last_real_tok(ft)
+  let mut i = if from_ti < 0 { 0 } else { from_ti }
+  while i <= max_real {
+    match ft.tokens[i].kind {
+      LBrace => return i
+      LParen | LBracket =>
+      if ft.match_close[i] > i {
+        i = ft.match_close[i]
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+/// Computes `(start_ti, end_ti, op_ti)` for any `Expr` variant.
+/// `op_ti == -1` when the expression has no distinct operator byte.
+fn qt_expr_tok_range(ft : QtFileTokens, e : Expr) -> (Int, Int, Int) {
+  let max_real = qt_last_real_tok(ft)
+  match e {
+    EInt(_, sp) | EInt64(_, sp) | EUInt(_, sp) | EUInt64(_, sp) | EDouble(_, sp) | EFloat(_, sp) | EBool(_, sp) | EByte(_, sp) | EChar(_, sp) | EString(_, sp) | EIdent(_, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      (ti, ti, -1)
+    }
+    EUnit(sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 {
+        let is_lp = match ft.tokens[ti].kind {
+          LParen => true
+          _ => false
+        }
+        if is_lp && ft.match_close[ti] >= 0 {
+          return (ti, ft.match_close[ti], -1)
+        }
+      }
+      (ti, ti, -1)
+    }
+    EPath(_, _, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti >= 0 {
+        let mut end_ti = ti
+        while end_ti + 2 <= max_real {
+          let is_cc = match ft.tokens[end_ti + 1].kind {
+            ColonColon => true
+            _ => false
+          }
+          if is_cc {
+            end_ti = end_ti + 2
+          } else {
+            break
+          }
+        }
+        return (ti, end_ti, -1)
+      }
+      (ti, ti, -1)
+    }
+    EDotVariant(_, _, sp) => {
+      let ti = qt_tok_at_span(ft, sp)
+      if ti < 0 {
+        return (-1, -1, -1)
+      }
+      let ident_ti = if ti + 1 <= max_real { ti + 1 } else { ti }
+      if ident_ti + 1 <= max_real {
+        let is_lp = match ft.tokens[ident_ti + 1].kind {
+          LParen => true
+          _ => false
+        }
+        if is_lp {
+          let close = ft.match_close[ident_ti + 1]
+          let end_ti = if close >= 0 { close } else { max_real }
+          return (ti, end_ti, -1)
+        }
+      }
+      (ti, ident_ti, -1)
+    }
+    EUnary(_, inner, sp) | EMove(inner, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, inner)
+      let (_, we_ti) = qt_wrap_parens(ft, is_ti, ie_ti)
+      let end_ti = if we_ti >= 0 { we_ti } else { sp_ti }
+      (sp_ti, end_ti, sp_ti)
+    }
+    EBinary(_, lhs, rhs, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let (ls, le, _) = qt_expr_tok_range(ft, lhs)
+      let (wls, _) = qt_wrap_parens(ft, ls, le)
+      let (rs, re, _) = qt_expr_tok_range(ft, rhs)
+      let (_, wre) = qt_wrap_parens(ft, rs, re)
+      let start_ti = if wls >= 0 { wls } else { sp_ti }
+      let end_ti = if wre >= 0 { wre } else { sp_ti }
+      (start_ti, end_ti, sp_ti)
+    }
+    ECall(callee, args, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      if sp_ti >= 0 {
+        match ft.tokens[sp_ti].kind {
+          Lt => {
+            let end_ti = qt_find_matching_jsx_end(ft, sp_ti)
+            return (sp_ti, end_ti, -1)
+          }
+          PipeGt => {
+            let (as0, ae0, _) = if args.length() > 0 {
+              qt_expr_tok_range(ft, args[0])
+            } else {
+              (sp_ti, sp_ti, -1)
+            }
+            let (was0, _) = qt_wrap_parens(ft, as0, ae0)
+            let (cs, ce, _) = qt_expr_tok_range(ft, callee)
+            let (_, wce) = qt_wrap_parens(ft, cs, ce)
+            return (if was0 >= 0 { was0 } else { sp_ti }, if wce >= 0 { wce } else { sp_ti }, sp_ti)
+          }
+          LParen => {
+            let (cs, ce, _) = qt_expr_tok_range(ft, callee)
+            let (wcs, _) = qt_wrap_parens(ft, cs, ce)
+            let raw_close = ft.match_close[sp_ti]
+            let mut has_arg0 = false
+            let mut as0 = -1
+            let mut ae0 = -1
+            if args.length() >= 1 {
+              let (a0s, a0e, _) = qt_expr_tok_range(ft, args[0])
+              has_arg0 = true
+              as0 = a0s
+              ae0 = a0e
+            }
+            let close_ti = if raw_close >= 0 {
+              raw_close
+            } else if args.length() > 1 {
+              let (las, lae, _) = qt_expr_tok_range(ft, args[args.length() - 1])
+              let (_, wlae) = qt_wrap_parens(ft, las, lae)
+              if wlae >= 0 { wlae } else { max_real }
+            } else if has_arg0 {
+              let (_, wlae) = qt_wrap_parens(ft, as0, ae0)
+              if wlae >= 0 { wlae } else { max_real }
+            } else {
+              max_real
+            }
+            if has_arg0 {
+              let (was0, _) = qt_wrap_parens(ft, as0, ae0)
+              if was0 >= 0 && wcs >= 0 && was0 < wcs {
+                // Pipe call `a |> f(b)` or `a |> (f(b))`
+                let (_, wend) = qt_wrap_parens(ft, cs, close_ti)
+                return (was0, if wend >= 0 { wend } else { close_ti }, sp_ti)
+              }
+            }
+            return (if wcs >= 0 { wcs } else { sp_ti }, close_ti, sp_ti)
+          }
+          _ => ()
+        }
+      }
+      let (cs, ce, _) = qt_expr_tok_range(ft, callee)
+      let (wcs, wce) = qt_wrap_parens(ft, cs, ce)
+      (if wcs >= 0 { wcs } else { sp_ti }, if wce >= 0 { wce } else { sp_ti }, sp_ti)
+    }
+    EMethodCall(obj, _, args, sp) => {
+      let (os, oe, _) = qt_expr_tok_range(ft, obj)
+      let (wos, _) = qt_wrap_parens(ft, os, oe)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let mut lp_ti = -1
+      if sp_ti >= 0 {
+        match ft.tokens[sp_ti].kind {
+          LParen => lp_ti = sp_ti
+          Dot =>
+          if sp_ti + 2 <= max_real {
+            match ft.tokens[sp_ti + 2].kind {
+              LParen => lp_ti = sp_ti + 2
+              _ => ()
+            }
+          }
+          _ =>
+          if sp_ti + 1 <= max_real {
+            match ft.tokens[sp_ti + 1].kind {
+              LParen => lp_ti = sp_ti + 1
+              _ => ()
+            }
+          }
+        }
+      }
+      let end_ti = if lp_ti >= 0 && ft.match_close[lp_ti] >= 0 {
+        ft.match_close[lp_ti]
+      } else if args.length() > 0 {
+        let (las, lae, _) = qt_expr_tok_range(ft, args[args.length() - 1])
+        let (_, wlae) = qt_wrap_parens(ft, las, lae)
+        if wlae >= 0 { wlae } else { max_real }
+      } else if sp_ti >= 0 {
+        max_real
+      } else {
+        -1
+      }
+      (if wos >= 0 { wos } else { sp_ti }, end_ti, sp_ti)
+    }
+    EField(obj, _, sp) => {
+      let (os, oe, _) = qt_expr_tok_range(ft, obj)
+      let (wos, _) = qt_wrap_parens(ft, os, oe)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let end_ti = if sp_ti >= 0 && sp_ti + 1 <= max_real {
+        match ft.tokens[sp_ti].kind {
+          Dot => sp_ti + 1
+          _ => sp_ti
+        }
+      } else {
+        sp_ti
+      }
+      (if wos >= 0 { wos } else { sp_ti }, end_ti, sp_ti)
+    }
+    EIndex(obj, idx, sp) => {
+      let (os, oe, _) = qt_expr_tok_range(ft, obj)
+      let (wos, _) = qt_wrap_parens(ft, os, oe)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let end_ti = if sp_ti >= 0 && ft.match_close[sp_ti] >= 0 {
+        ft.match_close[sp_ti]
+      } else {
+        let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, idx)
+        let (_, wie) = qt_wrap_parens(ft, is_ti, ie_ti)
+        if wie >= 0 { wie } else { max_real }
+      }
+      (if wos >= 0 { wos } else { sp_ti }, end_ti, sp_ti)
+    }
+    EArrayLit(_, sp) | EBlock(_, sp) | ETuple(_, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let end_ti = if sp_ti >= 0 && ft.match_close[sp_ti] >= 0 {
+        ft.match_close[sp_ti]
+      } else {
+        max_real
+      }
+      (sp_ti, end_ti, -1)
+    }
+    EStructLit(_, _, _, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let lb = qt_find_next_lbrace(ft, sp_ti)
+      let end_ti = if lb >= 0 && ft.match_close[lb] >= 0 {
+        ft.match_close[lb]
+      } else {
+        max_real
+      }
+      (sp_ti, end_ti, -1)
+    }
+    EIf(cond, _, else_opt, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let end_ti = match else_opt {
+        Some(ee) => {
+          let (es, ee_ti, _) = qt_expr_tok_range(ft, ee)
+          let (_, wee) = qt_wrap_parens(ft, es, ee_ti)
+          if wee >= 0 { wee } else { max_real }
+        }
+        None => {
+          let (cs, ce, _) = qt_expr_tok_range(ft, cond)
+          let (_, wce) = qt_wrap_parens(ft, cs, ce)
+          let lb = qt_find_next_lbrace(ft, if wce >= 0 { wce + 1 } else { sp_ti + 1 })
+          if lb >= 0 && ft.match_close[lb] >= 0 {
+            ft.match_close[lb]
+          } else {
+            max_real
+          }
+        }
+      }
+      (sp_ti, end_ti, -1)
+    }
+    EMatch(scrut, _, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let (ss, se, _) = qt_expr_tok_range(ft, scrut)
+      let (_, wse) = qt_wrap_parens(ft, ss, se)
+      let lb = qt_find_next_lbrace(ft, if wse >= 0 { wse + 1 } else { sp_ti + 1 })
+      let end_ti = if lb >= 0 && ft.match_close[lb] >= 0 {
+        ft.match_close[lb]
+      } else {
+        max_real
+      }
+      (sp_ti, end_ti, -1)
+    }
+    EIs(scrut, pat, sp) => {
+      let (ss, se, _) = qt_expr_tok_range(ft, scrut)
+      let (wss, _) = qt_wrap_parens(ft, ss, se)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let pe = qt_pat_end_ti(ft, pat)
+      (if wss >= 0 { wss } else { sp_ti }, pe, sp_ti)
+    }
+    EClosure(_, _, _, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let lb = qt_find_next_lbrace(ft, sp_ti + 1)
+      let end_ti = if lb >= 0 && ft.match_close[lb] >= 0 {
+        ft.match_close[lb]
+      } else {
+        max_real
+      }
+      (sp_ti, end_ti, -1)
+    }
+    EScope(_, body, sp) | ESpawn(_, body, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let (bs, be, _) = qt_expr_tok_range(ft, body)
+      let (_, wbe) = qt_wrap_parens(ft, bs, be)
+      (sp_ti, if wbe >= 0 { wbe } else { max_real }, sp_ti)
+    }
+    EAs(inner, ty_expr, sp) => {
+      let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, inner)
+      let (wis, _) = qt_wrap_parens(ft, is_ti, ie_ti)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let te_end = qt_type_expr_end_ti(ft, ty_expr)
+      (if wis >= 0 { wis } else { sp_ti }, te_end, sp_ti)
+    }
+    ETry(inner, sp) => {
+      let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, inner)
+      let (wis, _) = qt_wrap_parens(ft, is_ti, ie_ti)
+      let sp_ti = qt_tok_at_span(ft, sp)
+      (if wis >= 0 { wis } else { sp_ti }, sp_ti, sp_ti)
+    }
+    EInterp(_, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let end_ti = if sp_ti >= 0 && ft.match_close[sp_ti] >= 0 {
+        ft.match_close[sp_ti]
+      } else {
+        max_real
+      }
+      (sp_ti, end_ti, -1)
+    }
+    ENamedArg(_, _, inner, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      if sp_ti >= 0 && sp_ti + 1 <= max_real {
+        let is_tilde = match ft.tokens[sp_ti + 1].kind {
+          Tilde => true
+          _ => false
+        }
+        if is_tilde {
+          return (sp_ti, sp_ti + 1, -1)
+        }
+      }
+      let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, inner)
+      let (_, wie) = qt_wrap_parens(ft, is_ti, ie_ti)
+      (sp_ti, if wie >= 0 { wie } else { sp_ti }, -1)
+    }
+    EMutArg(inner, sp) => {
+      let sp_ti = qt_tok_at_span(ft, sp)
+      let (is_ti, ie_ti, _) = qt_expr_tok_range(ft, inner)
+      let (_, wie) = qt_wrap_parens(ft, is_ti, ie_ti)
+      (sp_ti, if wie >= 0 { wie } else { sp_ti }, sp_ti)
+    }
+  }
+}
+
+///|
+fn qt_find_ident_after(ft : QtFileTokens, from_ti : Int, skip_count : Int) -> Int {
+  let max_real = qt_last_real_tok(ft)
+  let mut i = if from_ti < 0 { 0 } else { from_ti }
+  let mut seen = 0
+  while i <= max_real {
+    match ft.tokens[i].kind {
+      Ident(w) => {
+        // Skip contextual `into` when followed by another Ident (e.g. `into x : T`)
+        if w == "into" && i + 1 <= max_real {
+          let next_is_id = match ft.tokens[i + 1].kind {
+            Ident(_) => true
+            _ => false
+          }
+          if next_is_id {
+            i = i + 1
+            continue
+          }
+        }
+        if seen == skip_count {
+          return i
+        }
+        seen = seen + 1
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn qt_collect_binding(
+  c : QtFileCollector,
+  sp : Span,
+  bind_kind : String,
+  bind_index : Int,
+  name_ti : Int,
+) -> Unit {
+  if sp.line <= 0 || name_ti < 0 || name_ti >= c.ft.starts.length() {
+    return
+  }
+  let k = span_key(sp) + "#" + bind_kind + "#" + bind_index.to_string()
+  if c.seen_binds.contains(k) {
+    return
+  }
+  match c.tc.qt_bindings.get(k) {
+    Some(rec) => {
+      c.seen_binds.set(k, true)
+      c.binds.push(QtBindOut::{
+        start_byte: c.ft.starts[name_ti],
+        end_byte: c.ft.ends[name_ti],
+        rec: rec,
+      })
+    }
+    None => ()
+  }
+}
+
+///|
+fn qt_collect_pat(c : QtFileCollector, pat : Pattern) -> Unit {
+  match pat {
+    PWild(_) | PBool(_, _) | PInt(_, _) | PString(_, _) | PChar(_, _) => ()
+    PIdent(_, psp) => {
+      let ti = qt_tok_at_span(c.ft, psp)
+      qt_collect_binding(c, psp, "pattern", 0, ti)
+    }
+    PVariant(_, _, sub, _, _) | PTuple(sub, _) => {
+      let mut i = 0
+      while i < sub.length() {
+        qt_collect_pat(c, sub[i])
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn qt_collect_expr(c : QtFileCollector, e : Expr, role : String) -> Unit {
+  let sp = expr_span(e)
+  if sp.line <= 0 {
+    return
+  }
+  // Skip synthetic JSX parent ident `__jsx_p_*`
+  match e {
+    EIdent(name, _) =>
+    if starts_with_str(name, "__jsx_p_") {
+      return
+    }
+    _ => ()
+  }
+  // Skip synthetic match-arm `EBlock` (not backed by `{`)
+  let is_synth_block = match e {
+    EBlock(_, bsp) => {
+      let bti = qt_tok_at_span(c.ft, bsp)
+      if bti < 0 {
+        true
+      } else {
+        match c.ft.tokens[bti].kind {
+          LBrace => false
+          _ => true
+        }
+      }
+    }
+    _ => false
+  }
+  if !is_synth_block {
+    let tag = expr_variant_tag(e)
+    let k = span_key(sp) + "#" + tag
+    let (s_ti, e_ti, op_ti) = qt_expr_tok_range(c.ft, e)
+    if s_ti >= 0 && e_ti >= 0 && s_ti < c.ft.starts.length() && e_ti < c.ft.ends.length() {
+      let sb = c.ft.starts[s_ti]
+      let eb = c.ft.ends[e_ti]
+      let ob = if op_ti >= 0 && op_ti < c.ft.starts.length() {
+        c.ft.starts[op_ti]
+      } else {
+        -1
+      }
+      if !c.seen_exprs.contains(k) {
+        match c.tc.qt_expr_tys.get(k) {
+          Some(rec) => {
+            c.seen_exprs.set(k, true)
+            c.exprs.push(QtExprOut::{
+              start_byte: sb,
+              end_byte: eb,
+              op_byte: ob,
+              role: role,
+              rec: rec,
+            })
+          }
+          None => ()
+        }
+      }
+      if !c.seen_calls.contains(k) {
+        match c.tc.qt_call_infos.get(k) {
+          Some(crec) => {
+            c.seen_calls.set(k, true)
+            c.calls.push(QtCallOut::{
+              start_byte: sb,
+              end_byte: eb,
+              op_byte: ob,
+              rec: crec,
+            })
+          }
+          None => ()
+        }
+      }
+    }
+  }
+
+  // Recurse into children
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EDouble(_, _) | EFloat(_, _) | EBool(_, _) | EByte(_, _) | EChar(_, _) | EString(_, _) | EIdent(_, _) | EPath(_, _, _) | EUnit(_) => ()
+    EDotVariant(_, args, _) => {
+      let mut i = 0
+      while i < args.length() {
+        qt_collect_expr(c, args[i], "")
+        i = i + 1
+      }
+    }
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) | EMutArg(inner, _) =>
+    qt_collect_expr(c, inner, "")
+    ENamedArg(_, _, inner, asp) => {
+      let ati = qt_tok_at_span(c.ft, asp)
+      let is_shorthand = ati >= 0 &&
+      ati + 1 < c.ft.tokens.length() &&
+      match c.ft.tokens[ati + 1].kind {
+        Tilde => true
+        _ => false
+      }
+      if !is_shorthand {
+        qt_collect_expr(c, inner, "")
+      }
+    }
+    EBinary(_, lhs, rhs, _) => {
+      qt_collect_expr(c, lhs, "")
+      qt_collect_expr(c, rhs, "")
+    }
+    ECall(callee, args, _) => {
+      qt_collect_expr(c, callee, "")
+      let mut i = 0
+      while i < args.length() {
+        qt_collect_expr(c, args[i], "")
+        i = i + 1
+      }
+    }
+    EField(obj, _, _) => qt_collect_expr(c, obj, "")
+    EMethodCall(obj, _, args, _) => {
+      qt_collect_expr(c, obj, "")
+      let mut i = 0
+      while i < args.length() {
+        qt_collect_expr(c, args[i], "")
+        i = i + 1
+      }
+    }
+    EIndex(obj, idx, _) => {
+      qt_collect_expr(c, obj, "")
+      qt_collect_expr(c, idx, "")
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        qt_collect_expr(c, elems[i], "")
+        i = i + 1
+      }
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => qt_collect_expr(c, base, "")
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        qt_collect_expr(c, fields[i].value, "")
+        i = i + 1
+      }
+    }
+    EBlock(stmts, _) => qt_collect_stmts(c, stmts)
+    EIf(cond, then_s, else_opt, _) => {
+      qt_collect_expr(c, cond, "")
+      qt_collect_stmts(c, then_s)
+      match else_opt {
+        Some(ee) => qt_collect_expr(c, ee, "")
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      qt_collect_expr(c, scrut, "")
+      let mut i = 0
+      while i < arms.length() {
+        qt_collect_pat(c, arms[i].pat)
+        match arms[i].guard_expr {
+          Some(g) => qt_collect_expr(c, g, "")
+          None => ()
+        }
+        qt_collect_expr(c, arms[i].body, "")
+        i = i + 1
+      }
+    }
+    EIs(scrut, pat, _) => {
+      qt_collect_expr(c, scrut, "")
+      qt_collect_pat(c, pat)
+    }
+    EClosure(params, _, body, _) => {
+      let mut i = 0
+      while i < params.length() {
+        let pti = qt_tok_at_span(c.ft, params[i].span)
+        let id_ti = qt_find_ident_after(c.ft, pti, 0)
+        qt_collect_binding(c, params[i].span, "closure_param", i, id_ti)
+        i = i + 1
+      }
+      qt_collect_stmts(c, body)
+    }
+    EScope(w, body, _) | ESpawn(w, body, _) => {
+      qt_collect_expr(c, w, "")
+      qt_collect_expr(c, body, "")
+    }
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        let is_lit_seg = match parts[i] {
+          EString(_, psp) => {
+            let ti = qt_tok_at_span(c.ft, psp)
+            ti >= 0 &&
+            match c.ft.tokens[ti].kind {
+              InterpStart(_) | InterpMid(_) | InterpEnd(_) => true
+              _ => false
+            }
+          }
+          _ => false
+        }
+        if !is_lit_seg {
+          qt_collect_expr(c, parts[i], "interp_hole")
+        }
+        i = i + 1
+      }
+    }
+  }
+}
+
+///|
+fn qt_collect_stmts(c : QtFileCollector, stmts : Array[Stmt]) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(name, _, _, init, sp) => {
+        if name != "_" {
+          let lti = qt_tok_at_span(c.ft, sp)
+          let id_ti = qt_find_ident_after(c.ft, lti, 0)
+          qt_collect_binding(c, sp, "let", 0, id_ti)
+        }
+        qt_collect_expr(c, init, "")
+      }
+      SLetTuple(names, _, init, sp) => {
+        let lti = qt_tok_at_span(c.ft, sp)
+        let mut ni = 0
+        while ni < names.length() {
+          if names[ni] != "_" {
+            let id_ti = qt_find_ident_after(c.ft, lti, ni)
+            qt_collect_binding(c, sp, "let_tuple", ni, id_ti)
+          }
+          ni = ni + 1
+        }
+        qt_collect_expr(c, init, "")
+      }
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        qt_collect_expr(c, lhs, "")
+        qt_collect_expr(c, rhs, "")
+      }
+      SGuard(cond, else_body, _) => {
+        qt_collect_expr(c, cond, "")
+        qt_collect_stmts(c, else_body)
+      }
+      SWhile(cond, body, _) => {
+        qt_collect_expr(c, cond, "")
+        qt_collect_stmts(c, body)
+      }
+      SFor(init_s, cond, step_s, body, _) => {
+        qt_collect_stmts(c, [init_s])
+        qt_collect_expr(c, cond, "")
+        qt_collect_stmts(c, [step_s])
+        qt_collect_stmts(c, body)
+      }
+      SForRange(vname, start_e, end_e, _, body, sp) => {
+        if vname != "_" {
+          let fti = qt_tok_at_span(c.ft, sp)
+          let id_ti = qt_find_ident_after(c.ft, fti, 0)
+          qt_collect_binding(c, sp, "for_range", 0, id_ti)
+        }
+        qt_collect_expr(c, start_e, "")
+        qt_collect_expr(c, end_e, "")
+        qt_collect_stmts(c, body)
+      }
+      SForIn(idx_name, vname, iter_e, body, sp) => {
+        let fti = qt_tok_at_span(c.ft, sp)
+        if idx_name != "" && idx_name != "_" {
+          let id0 = qt_find_ident_after(c.ft, fti, 0)
+          qt_collect_binding(c, sp, "for_in_idx", 0, id0)
+        }
+        if vname != "_" {
+          let vidx = if idx_name != "" { 1 } else { 0 }
+          let id1 = qt_find_ident_after(c.ft, fti, vidx)
+          qt_collect_binding(c, sp, "for_in", vidx, id1)
+        }
+        qt_collect_expr(c, iter_e, "for_iter")
+        qt_collect_stmts(c, body)
+      }
+      SReturn(opt, _) =>
+      match opt {
+        Some(e) => qt_collect_expr(c, e, "")
+        None => ()
+      }
+      SBreak(_) | SContinue(_) => ()
+      SDebugAssert(cond, msg, _) => {
+        qt_collect_expr(c, cond, "")
+        qt_collect_expr(c, msg, "")
+      }
+      SExpr(e, _) => qt_collect_expr(c, e, "")
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn qt_collect_fn_params(c : QtFileCollector, params : Array[Param]) -> Unit {
+  let mut i = 0
+  while i < params.length() {
+    if params[i].name != "_" {
+      let pti = qt_tok_at_span(c.ft, params[i].span)
+      let id_ti = qt_find_ident_after(c.ft, pti, 0)
+      qt_collect_binding(c, params[i].span, "param", i, id_ti)
+    }
+    match params[i].default_expr {
+      Some(def) => qt_collect_expr(c, def, "")
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn qt_collect_file(
+  sf : SourceFile,
+  source : String,
+  tc : TypeChecker,
+) -> QtFileCollector {
+  let ft = qt_build_file_tokens(sf.path, source)
+  let c = QtFileCollector::{
+    ft: ft,
+    tc: tc,
+    exprs: [],
+    calls: [],
+    binds: [],
+    seen_exprs: Map([]),
+    seen_calls: Map([]),
+    seen_binds: Map([]),
+  }
+  let mut di = 0
+  while di < sf.decls.length() {
+    match sf.decls[di] {
+      DFn(fd) => {
+        qt_collect_fn_params(c, fd.params)
+        qt_collect_stmts(c, fd.body)
+      }
+      DExternFn(ed) =>
+      if ed.has_body {
+        qt_collect_fn_params(c, ed.params)
+        qt_collect_stmts(c, ed.body)
+      }
+      DImpl(id) => {
+        let mut mi = 0
+        while mi < id.methods.length() {
+          qt_collect_fn_params(c, id.methods[mi].params)
+          qt_collect_stmts(c, id.methods[mi].body)
+          mi = mi + 1
+        }
+      }
+      DConst(cd) => {
+        let cti = qt_tok_at_span(c.ft, cd.span)
+        let id_ti = qt_find_ident_after(c.ft, cti, 0)
+        qt_collect_binding(c, cd.span, "const", 0, id_ti)
+        qt_collect_expr(c, cd.value, "")
+      }
+      DTest(td) => qt_collect_stmts(c, td.body)
+      _ => ()
+    }
+    di = di + 1
+  }
+  c
+}
+
+///|
+fn qt_render_ty_pair(rc : QtRenderCache, t : Ty) -> (String, String) {
+  let canon = ty_to_string(t)
+  match rc.ty_disp.get(canon) {
+    Some(disp) => (disp, canon)
+    None => {
+      let disp = match tc_render_ty_for_file(rc.tc, t, rc.file) {
+        Some(s) => s
+        None => tc_strip_canon_hash(canon)
+      }
+      rc.ty_disp.set(canon, disp)
+      (disp, canon)
+    }
+  }
+}
+
+///|
+fn qt_render_target_pair(rc : QtRenderCache, target : String) -> (String, String) {
+  if target.length() == 0 || starts_with_str(target, "builtin::") {
+    return (target, target)
+  }
+  let disp = match tc_render_qual_name_for_file(rc.tc, target, rc.file) {
+    Some(s) => s
+    None => tc_strip_canon_hash(target)
+  }
+  (disp, target)
+}
+
+///|
+fn qt_str_lt(a : String, b : String) -> Bool {
+  let la = a.length()
+  let lb = b.length()
+  let n = if la < lb { la } else { lb }
+  let mut i = 0
+  while i < n {
+    let ca = str_code_at(a, i)
+    let cb = str_code_at(b, i)
+    if ca != cb {
+      return ca < cb
+    }
+    i = i + 1
+  }
+  la < lb
+}
+
+///|
+fn qt_sort_dedup_strs(arr : Array[String]) -> Array[String] {
+  // Simple insertion sort (candidates array is tiny, typically 2-4 items)
+  let out : Array[String] = []
+  let mut i = 0
+  while i < arr.length() {
+    let item = arr[i]
+    let mut dup = false
+    let mut j = 0
+    while j < out.length() {
+      if out[j] == item {
+        dup = true
+        break
+      }
+      j = j + 1
+    }
+    if !dup {
+      out.push(item)
+      let mut k = out.length() - 1
+      while k > 0 && qt_str_lt(out[k], out[k - 1]) {
+        let tmp = out[k - 1]
+        out[k - 1] = out[k]
+        out[k] = tmp
+        k = k - 1
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qt_write_call_cand_json(sb : StringBuilder, rc : QtRenderCache, cand : QtCallCand) -> Unit {
+  let (tdisp, tcanon) = qt_render_target_pair(rc, cand.target)
+  sb.write_string("{\"kind\":")
+  sb.write_string(json_quote(cand.kind))
+  sb.write_string(",\"target\":")
+  sb.write_string(json_quote(tdisp))
+  if tcanon != tdisp {
+    sb.write_string(",\"target_canon\":")
+    sb.write_string(json_quote(tcanon))
+  }
+  if cand.type_args.length() > 0 {
+    sb.write_string(",\"type_args\":[")
+    let mut i = 0
+    while i < cand.type_args.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      let (d, _) = qt_render_ty_pair(rc, cand.type_args[i])
+      sb.write_string(json_quote(d))
+      i = i + 1
+    }
+    sb.write_string("]")
+  }
+  if cand.param_tys.length() > 0 {
+    sb.write_string(",\"param_tys\":[")
+    let mut i = 0
+    while i < cand.param_tys.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      let (d, _) = qt_render_ty_pair(rc, cand.param_tys[i])
+      sb.write_string(json_quote(d))
+      i = i + 1
+    }
+    sb.write_string("]")
+  }
+  let (rdisp, rcanon) = qt_render_ty_pair(rc, cand.ret_ty)
+  sb.write_string(",\"ret_ty\":")
+  sb.write_string(json_quote(rdisp))
+  if rcanon != rdisp {
+    sb.write_string(",\"ret_ty_canon\":")
+    sb.write_string(json_quote(rcanon))
+  }
+  sb.write_string("}")
+}
+
+///|
+fn qt_write_file_types_json(
+  sb : StringBuilder,
+  display_path : String,
+  c : QtFileCollector,
+) -> Unit {
+  let rc = QtRenderCache::{ tc: c.tc, file: c.ft.path, ty_disp: Map([]) }
+  sb.write_string("{\"file\":")
+  sb.write_string(json_quote(display_path))
+  sb.write_string(",\"expr_tys\":[")
+  let mut i = 0
+  while i < c.exprs.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    let e = c.exprs[i]
+    sb.write_string("{\"start_byte\":")
+    sb.write_string(e.start_byte.to_string())
+    sb.write_string(",\"end_byte\":")
+    sb.write_string(e.end_byte.to_string())
+    if e.op_byte >= 0 {
+      sb.write_string(",\"op_byte\":")
+      sb.write_string(e.op_byte.to_string())
+    }
+    if e.role.length() > 0 {
+      sb.write_string(",\"role\":")
+      sb.write_string(json_quote(e.role))
+    }
+    if e.rec.ambiguous {
+      sb.write_string(",\"ty\":\"\",\"ambiguous\":true,\"candidates\":[")
+      let raw_cands : Array[String] = []
+      let mut ci = 0
+      while ci < e.rec.cand_tys.length() {
+        let (cd, _) = qt_render_ty_pair(rc, e.rec.cand_tys[ci])
+        raw_cands.push(cd)
+        ci = ci + 1
+      }
+      let sorted = qt_sort_dedup_strs(raw_cands)
+      ci = 0
+      while ci < sorted.length() {
+        if ci > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(json_quote(sorted[ci]))
+        ci = ci + 1
+      }
+      sb.write_string("]")
+    } else {
+      let (disp, canon) = qt_render_ty_pair(rc, e.rec.ty)
+      sb.write_string(",\"ty\":")
+      sb.write_string(json_quote(disp))
+      if canon != disp {
+        sb.write_string(",\"ty_canon\":")
+        sb.write_string(json_quote(canon))
+      }
+    }
+    if e.rec.has_receiver {
+      let (rdisp, rcanon) = qt_render_ty_pair(rc, e.rec.receiver_ty)
+      sb.write_string(",\"receiver_ty\":")
+      sb.write_string(json_quote(rdisp))
+      if rcanon != rdisp {
+        sb.write_string(",\"receiver_ty_canon\":")
+        sb.write_string(json_quote(rcanon))
+      }
+    }
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("],\"call_targets\":[")
+  i = 0
+  while i < c.calls.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    let cl = c.calls[i]
+    sb.write_string("{\"start_byte\":")
+    sb.write_string(cl.start_byte.to_string())
+    sb.write_string(",\"end_byte\":")
+    sb.write_string(cl.end_byte.to_string())
+    if cl.op_byte >= 0 {
+      sb.write_string(",\"op_byte\":")
+      sb.write_string(cl.op_byte.to_string())
+    }
+    if cl.rec.ambiguous {
+      sb.write_string(",\"kind\":\"ambiguous\",\"target\":\"\",\"ambiguous\":true,\"candidates\":[")
+      let cjsons : Array[String] = []
+      let mut ci = 0
+      while ci < cl.rec.candidates.length() {
+        let csb = StringBuilder()
+        qt_write_call_cand_json(csb, rc, cl.rec.candidates[ci])
+        cjsons.push(csb.to_string())
+        ci = ci + 1
+      }
+      let sorted = qt_sort_dedup_strs(cjsons)
+      ci = 0
+      while ci < sorted.length() {
+        if ci > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(sorted[ci])
+        ci = ci + 1
+      }
+      sb.write_string("]")
+    } else {
+      let (tdisp, tcanon) = qt_render_target_pair(rc, cl.rec.target)
+      sb.write_string(",\"kind\":")
+      sb.write_string(json_quote(cl.rec.kind))
+      sb.write_string(",\"target\":")
+      sb.write_string(json_quote(tdisp))
+      if tcanon != tdisp {
+        sb.write_string(",\"target_canon\":")
+        sb.write_string(json_quote(tcanon))
+      }
+      if cl.rec.type_args.length() > 0 {
+        sb.write_string(",\"type_args\":[")
+        let mut ti = 0
+        while ti < cl.rec.type_args.length() {
+          if ti > 0 {
+            sb.write_string(",")
+          }
+          let (d, _) = qt_render_ty_pair(rc, cl.rec.type_args[ti])
+          sb.write_string(json_quote(d))
+          ti = ti + 1
+        }
+        sb.write_string("]")
+      }
+      if cl.rec.param_tys.length() > 0 {
+        sb.write_string(",\"param_tys\":[")
+        let mut pi = 0
+        while pi < cl.rec.param_tys.length() {
+          if pi > 0 {
+            sb.write_string(",")
+          }
+          let (d, _) = qt_render_ty_pair(rc, cl.rec.param_tys[pi])
+          sb.write_string(json_quote(d))
+          pi = pi + 1
+        }
+        sb.write_string("]")
+      }
+      let (rdisp, rcanon) = qt_render_ty_pair(rc, cl.rec.ret_ty)
+      sb.write_string(",\"ret_ty\":")
+      sb.write_string(json_quote(rdisp))
+      if rcanon != rdisp {
+        sb.write_string(",\"ret_ty_canon\":")
+        sb.write_string(json_quote(rcanon))
+      }
+    }
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("],\"bindings\":[")
+  i = 0
+  while i < c.binds.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    let b = c.binds[i]
+    sb.write_string("{\"name\":")
+    sb.write_string(json_quote(b.rec.name))
+    sb.write_string(",\"kind\":")
+    sb.write_string(json_quote(b.rec.bind_kind))
+    sb.write_string(",\"start_byte\":")
+    sb.write_string(b.start_byte.to_string())
+    sb.write_string(",\"end_byte\":")
+    sb.write_string(b.end_byte.to_string())
+    if b.rec.ambiguous {
+      sb.write_string(",\"ty\":\"\",\"ambiguous\":true,\"candidates\":[")
+      let raw_cands : Array[String] = []
+      let mut ci = 0
+      while ci < b.rec.cand_tys.length() {
+        let (cd, _) = qt_render_ty_pair(rc, b.rec.cand_tys[ci])
+        raw_cands.push(cd)
+        ci = ci + 1
+      }
+      let sorted = qt_sort_dedup_strs(raw_cands)
+      ci = 0
+      while ci < sorted.length() {
+        if ci > 0 {
+          sb.write_string(",")
+        }
+        sb.write_string(json_quote(sorted[ci]))
+        ci = ci + 1
+      }
+      sb.write_string("]")
+    } else {
+      let (disp, canon) = qt_render_ty_pair(rc, b.rec.ty)
+      sb.write_string(",\"ty\":")
+      sb.write_string(json_quote(disp))
+      if canon != disp {
+        sb.write_string(",\"ty_canon\":")
+        sb.write_string(json_quote(canon))
+      }
+    }
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+}
+
+///|
+/// Writes `"files":[...]` entries for `query types` / `check --server` (`include_types: true`).
+/// `display_paths` (same length as `pkg.files` and `sources`) gives the root-relative path to emit.
+/// `filter_mode`: 0 = all files, 1 = explicit empty filter (emit `[]`), 2 = only files in `filter_files` (keyed by `sf.path`).
+pub fn query_types_files_json_into(
+  sb : StringBuilder,
+  pkg : Package,
+  sources : Array[String],
+  display_paths : Array[String],
+  tc : TypeChecker,
+  filter_mode : Int,
+  filter_files : Map[String, Bool],
+) -> Unit {
+  sb.write_string("[")
+  if filter_mode != 1 {
+    let mut emitted = 0
+    let mut fi = 0
+    while fi < pkg.files.length() && fi < sources.length() {
+      let sf = pkg.files[fi]
+      if filter_mode == 2 && !filter_files.contains(sf.path) {
+        fi = fi + 1
+        continue
+      }
+      let disp_path = if fi < display_paths.length() {
+        display_paths[fi]
+      } else {
+        sf.path
+      }
+      let col = qt_collect_file(sf, sources[fi], tc)
+      if emitted > 0 {
+        sb.write_string(",")
+      }
+      qt_write_file_types_json(sb, disp_path, col)
+      emitted = emitted + 1
+      fi = fi + 1
+    }
+  }
+  sb.write_string("]")
+}
+
+///|
+/// Full JSON response for `pionc query types --json`.
+pub fn query_types_response_json(
+  pkg : Package,
+  sources : Array[String],
+  display_paths : Array[String],
+  tc : TypeChecker,
+  diags : Array[Diagnostic],
+  filter_mode : Int,
+  filter_files : Map[String, Bool],
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"ok\":")
+  sb.write_string(if diags.length() == 0 { "true" } else { "false" })
+  sb.write_string(",\"diagnostics\":")
+  sb.write_string(diagnostics_array_to_json(diags))
+  sb.write_string(",\"files\":")
+  query_types_files_json_into(sb, pkg, sources, display_paths, tc, filter_mode, filter_files)
+  sb.write_string("}")
+  sb.to_string()
+}

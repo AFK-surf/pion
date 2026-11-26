@@ -420,7 +420,11 @@ fn check_field_assign_target(
                   "declare the field as `mut " + fname + " : ...`",
                 )
               }
-              return subst_ty(sinfo.field_tys[fi], subst)
+              let fty = subst_ty(sinfo.field_tys[fi], subst)
+              if tc.record_types {
+                qt_record_expr(tc, env, lsp, "EField", fty, false, TError)
+              }
+              return fty
             }
             fi = fi + 1
           }
@@ -517,6 +521,7 @@ pub struct VarBinding {
   name : String
   ty : Ty
   is_mut : Bool
+  is_param : Bool
   /// Span of the `let` keyword that introduced the binding (line 0 for
   /// parameters, loop variables and pattern bindings).
   decl_span : Span
@@ -616,6 +621,55 @@ pub struct ImportedPkg {
 ///|
 pub fn imported_pkg_new(name : String, tc : TypeChecker) -> ImportedPkg {
   ImportedPkg::{ name: name, tc: tc }
+}
+
+///|
+pub struct QtExprRec {
+  ty : Ty
+  has_receiver : Bool
+  receiver_ty : Ty
+  ambiguous : Bool
+  cand_tys : Array[Ty]
+}
+
+///|
+pub struct QtCallCand {
+  target : String
+  kind : String
+  type_args : Array[Ty]
+  param_tys : Array[Ty]
+  ret_ty : Ty
+}
+
+///|
+pub struct QtCallRec {
+  target : String
+  kind : String
+  type_args : Array[Ty]
+  param_tys : Array[Ty]
+  ret_ty : Ty
+  ambiguous : Bool
+  candidates : Array[QtCallCand]
+}
+
+///|
+pub struct QtBindRec {
+  name : String
+  bind_kind : String
+  bind_index : Int
+  ty : Ty
+  ambiguous : Bool
+  cand_tys : Array[Ty]
+}
+
+///|
+struct QtUndoEntry {
+  table_id : Int
+  key : String
+  has_prev : Bool
+  prev_expr : Option[QtExprRec]
+  prev_call : Option[QtCallRec]
+  prev_bind : Option[QtBindRec]
 }
 
 ///|
@@ -730,6 +784,20 @@ pub struct TypeChecker {
   /// Qualified names (`pkg::Type`) of private imported types lazily registered for expanded default args;
   /// direct references outside default-arg expansion must still emit `E_PRIVATE_SYMBOL`.
   priv_imported_types : Map[String, Bool]
+  /// Opt-in query-types recording state (all disabled on normal builds).
+  mut record_types : Bool
+  /// 3-state filter: 0 = all root files, 1 = explicit empty filter_files [] (record nothing), 2 = whitelist in `qt_filter_files`.
+  mut qt_filter_mode : Int
+  qt_filter_files : Map[String, Bool]
+  mut qt_log_depth : Int
+  qt_write_log : Array[QtUndoEntry]
+  mut qt_last_call_key : String
+  mut qt_last_call_cand : Option[QtCallCand]
+  qt_pending_refs : Map[String, Array[String]]
+  qt_last_expr_ty : Map[String, Ty]
+  qt_expr_tys : Map[String, QtExprRec]
+  qt_call_infos : Map[String, QtCallRec]
+  qt_bindings : Map[String, QtBindRec]
 }
 
 ///|
@@ -909,6 +977,36 @@ fn env_define_line(
     name: name,
     ty: ty,
     is_mut: is_mut,
+    is_param: false,
+    decl_span: span_empty(),
+    decl_line: decl_line,
+    ty_span: span_empty(),
+    ty_end_col: -1,
+    init_span: span_empty(),
+    init_end_col: -1,
+  })
+  match ty {
+    TWorld => env.has_world = true
+    _ => ()
+  }
+  env_record_define_moved_shadow(env, name, already_in_top)
+}
+
+///|
+fn env_define_param(
+  env : Env,
+  name : String,
+  ty : Ty,
+  is_mut : Bool,
+  decl_line : Int,
+) -> Unit {
+  let top = env.scopes[env.scopes.length() - 1]
+  let already_in_top = top.contains(name)
+  top.set(name, VarBinding::{
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    is_param: true,
     decl_span: span_empty(),
     decl_line: decl_line,
     ty_span: span_empty(),
@@ -962,6 +1060,7 @@ fn env_define_let(
     name: name,
     ty: ty,
     is_mut: is_mut,
+    is_param: false,
     decl_span: decl_span,
     decl_line: decl_span.line,
     ty_span: ty_span,
@@ -8631,6 +8730,9 @@ fn bind_pattern(
       if env.in_verify {
         tc.expr_tys.set(span_key(psp), scrut_ty)
       }
+      if tc.record_types {
+        qt_record_binding(tc, env, psp, "pattern", 0, name, scrut_ty)
+      }
     }
     PBool(_, sp) =>
       if !ty_compat(TBool, scrut_ty) {
@@ -9635,6 +9737,7 @@ fn infer_refine_binding(tc : TypeChecker, env : Env, name : String, new_ty : Ty)
             name: b.name,
             ty: new_ty,
             is_mut: b.is_mut,
+            is_param: b.is_param,
             decl_span: b.decl_span,
             decl_line: b.decl_line,
             ty_span: b.ty_span,
@@ -9642,6 +9745,9 @@ fn infer_refine_binding(tc : TypeChecker, env : Env, name : String, new_ty : Ty)
             init_span: b.init_span,
             init_end_col: b.init_end_col,
           })
+          if tc.record_types {
+            qt_refine_let(tc, env, b.decl_span, b.init_span, new_ty)
+          }
         }
         return
       }
@@ -10064,9 +10170,12 @@ fn check_cond_with_bindings(
           cur = lhs
           continue
         }
-        EIs(scrut, pat, _) => {
+        EIs(scrut, pat, isp) => {
           let sty = check_expr(tc, env, scrut, None)
           bind_pattern(tc, env, pat, sty)
+          if tc.record_types {
+            qt_record_expr(tc, env, isp, "EIs", TBool, false, TError)
+          }
           cur_ty = TBool
           has_val = true
         }
@@ -10105,6 +10214,9 @@ fn check_cond_with_bindings(
         )
       }
       cur_ty = TBool
+      if tc.record_types {
+        qt_record_expr(tc, env, sp, "EBinary", TBool, false, TError)
+      }
       has_val = true
     }
   }
@@ -10196,6 +10308,9 @@ fn check_let(
       expr_span(init),
       expr_end_col(init),
     )
+    if tc.record_types {
+      qt_record_binding(tc, env, sp, "let", 0, name, final_ty)
+    }
   }
   TUnit
 }
@@ -10718,6 +10833,9 @@ fn check_stmt(
             while ni < names.length() {
               if names[ni] != "_" {
                 env_define_line(env, names[ni], elem_tys[ni], false, sp.line)
+                if tc.record_types {
+                  qt_record_binding(tc, env, sp, "let_tuple", ni, names[ni], elem_tys[ni])
+                }
               }
               ni = ni + 1
             }
@@ -10761,6 +10879,9 @@ fn check_stmt(
         EIdent(name, lsp) =>
           match env_lookup(env, name) {
             Some(b) => {
+              if tc.record_types {
+                qt_record_expr(tc, env, lsp, "EIdent", b.ty, false, TError)
+              }
               if !b.is_mut {
                 tc_err(
                   tc,
@@ -10890,6 +11011,9 @@ fn check_stmt(
           if env.in_verify || tc.record_analyze {
             tc.expr_tys.set(span_key(lsp), lty)
           }
+          if tc.record_types {
+            qt_record_expr(tc, env, lsp, "EIndex", lty, false, TError)
+          }
           let rty = check_expr(tc, env, rhs, Some(lty))
           if !ty_compat(lty, rty) {
             tc_err(
@@ -10926,6 +11050,9 @@ fn check_stmt(
         EIdent(name, lsp) =>
           match env_lookup(env, name) {
             Some(b) => {
+              if tc.record_types {
+                qt_record_expr(tc, env, lsp, "EIdent", b.ty, false, TError)
+              }
               if !b.is_mut {
                 tc_err(
                   tc,
@@ -11012,6 +11139,9 @@ fn check_stmt(
           }
           if env.in_verify || tc.record_analyze {
             tc.expr_tys.set(span_key(lsp), t)
+          }
+          if tc.record_types {
+            qt_record_expr(tc, env, lsp, "EIndex", t, false, TError)
           }
           t
         }
@@ -11187,6 +11317,9 @@ fn check_stmt(
       let loop_var_ty = if valid_start { sty } else { TInt }
       env_push(env)
       env_define_line(env, vname, loop_var_ty, false, sp.line)
+      if tc.record_types && vname != "_" {
+        qt_record_binding(tc, env, sp, "for_range", 0, vname, loop_var_ty)
+      }
       env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
       env.in_loop_depth = env.in_loop_depth - 1
@@ -11214,8 +11347,15 @@ fn check_stmt(
       env_push(env)
       if idx_name != "" && idx_name != "_" {
         env_define_line(env, idx_name, TInt, false, sp.line)
+        if tc.record_types {
+          qt_record_binding(tc, env, sp, "for_in_idx", 0, idx_name, TInt)
+        }
       }
       env_define_line(env, vname, elem_ty, false, sp.line)
+      if tc.record_types && vname != "_" {
+        let vidx = if idx_name != "" { 1 } else { 0 }
+        qt_record_binding(tc, env, sp, "for_in", vidx, vname, elem_ty)
+      }
       env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
       env.in_loop_depth = env.in_loop_depth - 1
@@ -11407,10 +11547,18 @@ fn check_variant_ctor(
       if tc.record_analyze {
         tc.call_targets.set(span_key(sp), "Option::None")
       }
-      return match exp_inner {
+      let rty = match exp_inner {
         Some(t) => TOption(t)
         None => TOption(TError)
       }
+      if tc.record_types {
+        let targs : Array[Ty] = match exp_inner {
+          Some(t) => [t]
+          None => [TError]
+        }
+        qt_record_call(tc, env, sp, "ECall", "Option::None", "ctor", targs, [], rty)
+      }
+      return rty
     }
     let aty = if args.length() >= 1 {
       check_expr(tc, env, args[0], exp_inner)
@@ -11420,7 +11568,11 @@ fn check_variant_ctor(
     if tc.record_analyze {
       tc.call_targets.set(span_key(sp), "Option::" + vname)
     }
-    return TOption(aty)
+    let rty = TOption(aty)
+    if tc.record_types {
+      qt_record_call(tc, env, sp, "ECall", "Option::" + vname, "ctor", [aty], [aty], rty)
+    }
+    return rty
   }
   if enum_name == "Result" || (enum_name == "" && (vname == "Ok" || vname == "Err")) {
     if vname != "Ok" && vname != "Err" {
@@ -11462,7 +11614,11 @@ fn check_variant_ctor(
       if tc.record_analyze {
         tc.call_targets.set(span_key(sp), "Result::Ok")
       }
-      return TResult(oty, ety)
+      let rty = TResult(oty, ety)
+      if tc.record_types {
+        qt_record_call(tc, env, sp, "ECall", "Result::Ok", "ctor", [oty, ety], [oty], rty)
+      }
+      return rty
     } else {
       let ety = if args.length() >= 1 {
         check_expr(tc, env, args[0], exp_err)
@@ -11476,7 +11632,11 @@ fn check_variant_ctor(
       if tc.record_analyze {
         tc.call_targets.set(span_key(sp), "Result::Err")
       }
-      return TResult(oty, ety)
+      let rty = TResult(oty, ety)
+      if tc.record_types {
+        qt_record_call(tc, env, sp, "ECall", "Result::Err", "ctor", [oty, ety], [ety], rty)
+      }
+      return rty
     }
   }
   let resolved_enum = if enum_name != "" {
@@ -11578,13 +11738,14 @@ fn check_variant_ctor(
           vname,
           "check the variant name on enum `" + resolved_enum + "`",
         )
+        if tc.record_types {
+          qt_record_call(tc, env, sp, "ECall", "", "unresolved", [], [], TError)
+        }
         return TError
       }
+      let ctor_target = tc_qualify_local_name(tc, resolved_enum) + "::" + vname
       if tc.record_analyze {
-        tc.call_targets.set(
-          span_key(sp),
-          tc_qualify_local_name(tc, resolved_enum) + "::" + vname,
-        )
+        tc.call_targets.set(span_key(sp), ctor_target)
       }
       let targs : Array[Ty] = []
       let mut ti = 0
@@ -11596,6 +11757,18 @@ fn check_variant_ctor(
         ti = ti + 1
       }
       let res_ty = TEnum(resolved_enum, targs)
+      if tc.record_types {
+        let ptys : Array[Ty] = []
+        if vi < einfo.variants.length() {
+          let v = einfo.variants[vi]
+          let mut pfi = 0
+          while pfi < v.field_tys.length() {
+            ptys.push(subst_ty(v.field_tys[pfi], subst))
+            pfi = pfi + 1
+          }
+        }
+        qt_record_call(tc, env, sp, "ECall", ctor_target, "ctor", targs, ptys, res_ty)
+      }
       if targs.length() > 0 {
         tc_check_map_keys_in_ty_rec(tc, env.fn_key, res_ty, sp, true, Map([]), Map([]))
       }
@@ -11976,9 +12149,1219 @@ fn check_extern_fn_call(
 }
 
 ///|
+pub fn ty_has_error(t : Ty) -> Bool {
+  match t {
+    TError => true
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      ty_has_error(e)
+    TResult(a, b) | TMap(a, b) => ty_has_error(a) || ty_has_error(b)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ty_has_error(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(params, ret) => {
+      let mut i = 0
+      while i < params.length() {
+        if ty_has_error(params[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      ty_has_error(ret)
+    }
+    _ => false
+  }
+}
+
+///|
+pub fn expr_variant_tag(e : Expr) -> String {
+  match e {
+    EInt(_, _) => "EInt"
+    EInt64(_, _) => "EInt64"
+    EUInt(_, _) => "EUInt"
+    EUInt64(_, _) => "EUInt64"
+    EDouble(_, _) => "EDouble"
+    EFloat(_, _) => "EFloat"
+    EBool(_, _) => "EBool"
+    EByte(_, _) => "EByte"
+    EChar(_, _) => "EChar"
+    EString(_, _) => "EString"
+    EIdent(_, _) => "EIdent"
+    EPath(_, _, _) => "EPath"
+    EDotVariant(_, _, _) => "EDotVariant"
+    EUnary(_, _, _) => "EUnary"
+    EBinary(_, _, _, _) => "EBinary"
+    ECall(_, _, _) => "ECall"
+    EField(_, _, _) => "EField"
+    EMethodCall(_, _, _, _) => "EMethodCall"
+    EIndex(_, _, _) => "EIndex"
+    EArrayLit(_, _) => "EArrayLit"
+    EStructLit(_, _, _, _) => "EStructLit"
+    ETuple(_, _) => "ETuple"
+    EBlock(_, _) => "EBlock"
+    EIf(_, _, _, _) => "EIf"
+    EMatch(_, _, _) => "EMatch"
+    EIs(_, _, _) => "EIs"
+    EClosure(_, _, _, _) => "EClosure"
+    EScope(_, _, _) => "EScope"
+    ESpawn(_, _, _) => "ESpawn"
+    EMove(_, _) => "EMove"
+    EAs(_, _, _) => "EAs"
+    ETry(_, _) => "ETry"
+    EInterp(_, _) => "EInterp"
+    ENamedArg(_, _, _, _) => "ENamedArg"
+    EMutArg(_, _) => "EMutArg"
+    EUnit(_) => "EUnit"
+  }
+}
+
+///|
+fn tc_rec_qt(tc : TypeChecker, env : Env, sp : Span) -> Bool {
+  if !tc.record_types {
+    return false
+  }
+  if env.in_default_arg || tc.in_default_arg_expansion || sp.line <= 0 {
+    return false
+  }
+  if tc.qt_filter_mode == 1 {
+    return false
+  }
+  if tc.qt_filter_mode == 2 {
+    return tc.qt_filter_files.contains(sp.file)
+  }
+  true
+}
+
+///|
+fn qt_tx_begin(tc : TypeChecker) -> Int {
+  if !tc.record_types {
+    return 0
+  }
+  let mark = tc.qt_write_log.length()
+  tc.qt_log_depth = tc.qt_log_depth + 1
+  mark
+}
+
+///|
+fn qt_tx_rollback(tc : TypeChecker, mark : Int) -> Unit {
+  if !tc.record_types {
+    return
+  }
+  while tc.qt_write_log.length() > mark {
+    match tc.qt_write_log.pop() {
+      Some(e) =>
+        if e.table_id == 0 {
+          if e.has_prev {
+            match e.prev_expr {
+              Some(v) => tc.qt_expr_tys.set(e.key, v)
+              None => ()
+            }
+          } else {
+            tc.qt_expr_tys.remove(e.key)
+          }
+        } else if e.table_id == 1 {
+          if e.has_prev {
+            match e.prev_call {
+              Some(v) => tc.qt_call_infos.set(e.key, v)
+              None => ()
+            }
+          } else {
+            tc.qt_call_infos.remove(e.key)
+          }
+        } else {
+          if e.has_prev {
+            match e.prev_bind {
+              Some(v) => tc.qt_bindings.set(e.key, v)
+              None => ()
+            }
+          } else {
+            tc.qt_bindings.remove(e.key)
+          }
+        }
+      None => ()
+    }
+  }
+}
+
+///|
+fn qt_tx_commit(tc : TypeChecker) -> Unit {
+  if !tc.record_types {
+    return
+  }
+  if tc.qt_log_depth > 0 {
+    tc.qt_log_depth = tc.qt_log_depth - 1
+  }
+  if tc.qt_log_depth == 0 && tc.qt_write_log.length() > 0 {
+    tc.qt_write_log.clear()
+  }
+}
+
+///|
+fn qt_ty_arr_eq(a : Array[Ty], b : Array[Ty]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if ty_to_string(a[i]) != ty_to_string(b[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn qt_cand_ty_push_unique(arr : Array[Ty], t : Ty) -> Unit {
+  let ts = ty_to_string(t)
+  let mut i = 0
+  while i < arr.length() {
+    if ty_to_string(arr[i]) == ts {
+      return
+    }
+    i = i + 1
+  }
+  arr.push(t)
+}
+
+///|
+fn qt_call_cand_eq(a : QtCallCand, b : QtCallCand) -> Bool {
+  a.target == b.target &&
+  a.kind == b.kind &&
+  qt_ty_arr_eq(a.type_args, b.type_args) &&
+  qt_ty_arr_eq(a.param_tys, b.param_tys) &&
+  ty_to_string(a.ret_ty) == ty_to_string(b.ret_ty)
+}
+
+///|
+fn qt_call_cand_push_unique(arr : Array[QtCallCand], c : QtCallCand) -> Unit {
+  let mut i = 0
+  while i < arr.length() {
+    if qt_call_cand_eq(arr[i], c) {
+      return
+    }
+    i = i + 1
+  }
+  arr.push(c)
+}
+
+///|
+fn qt_record_expr(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  tag : String,
+  ty : Ty,
+  has_recv : Bool,
+  recv_ty : Ty,
+) -> Unit {
+  if !tc_rec_qt(tc, env, sp) {
+    return
+  }
+  let k = span_key(sp) + "#" + tag
+  tc.qt_last_expr_ty.set(k, ty)
+  let prev_opt = tc.qt_expr_tys.get(k)
+  if tc.qt_log_depth > 0 {
+    let has_prev = match prev_opt {
+      Some(_) => true
+      None => false
+    }
+    tc.qt_write_log.push(QtUndoEntry::{
+      table_id: 0,
+      key: k,
+      has_prev: has_prev,
+      prev_expr: prev_opt,
+      prev_call: None,
+      prev_bind: None,
+    })
+  }
+  match prev_opt {
+    None =>
+      tc.qt_expr_tys.set(
+        k,
+        QtExprRec::{
+          ty: ty,
+          has_receiver: has_recv,
+          receiver_ty: recv_ty,
+          ambiguous: false,
+          cand_tys: [],
+        },
+      )
+    Some(prev) => {
+      let same_ty = ty_to_string(prev.ty) == ty_to_string(ty)
+      let same_recv = prev.has_receiver == has_recv &&
+        (!has_recv || ty_to_string(prev.receiver_ty) == ty_to_string(recv_ty))
+      if !prev.ambiguous && same_ty && same_recv {
+        return
+      }
+      let cands : Array[Ty] = []
+      if prev.ambiguous {
+        let mut i = 0
+        while i < prev.cand_tys.length() {
+          cands.push(prev.cand_tys[i])
+          i = i + 1
+        }
+      } else {
+        qt_cand_ty_push_unique(cands, prev.ty)
+      }
+      qt_cand_ty_push_unique(cands, ty)
+      let keep_recv = prev.has_receiver &&
+        has_recv &&
+        ty_to_string(prev.receiver_ty) == ty_to_string(recv_ty)
+      tc.qt_expr_tys.set(
+        k,
+        QtExprRec::{
+          ty: TError,
+          has_receiver: keep_recv,
+          receiver_ty: if keep_recv { prev.receiver_ty } else { TError },
+          ambiguous: true,
+          cand_tys: cands,
+        },
+      )
+    }
+  }
+}
+
+///|
+fn qt_update_coerced_ty(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  tag : String,
+  ty : Ty,
+) -> Unit {
+  if !tc_rec_qt(tc, env, sp) {
+    return
+  }
+  let k = span_key(sp) + "#" + tag
+  tc.qt_last_expr_ty.set(k, ty)
+  match tc.qt_expr_tys.get(k) {
+    Some(prev) =>
+      if !prev.ambiguous && ty_to_string(prev.ty) != ty_to_string(ty) {
+        if tc.qt_log_depth > 0 {
+          tc.qt_write_log.push(QtUndoEntry::{
+            table_id: 0,
+            key: k,
+            has_prev: true,
+            prev_expr: Some(prev),
+            prev_call: None,
+            prev_bind: None,
+          })
+        }
+        tc.qt_expr_tys.set(
+          k,
+          QtExprRec::{
+            ty: ty,
+            has_receiver: prev.has_receiver,
+            receiver_ty: prev.receiver_ty,
+            ambiguous: false,
+            cand_tys: [],
+          },
+        )
+      }
+    None => qt_record_expr(tc, env, sp, tag, ty, false, TError)
+  }
+}
+
+///|
+fn qt_record_call(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  tag : String,
+  target : String,
+  kind : String,
+  type_args : Array[Ty],
+  param_tys : Array[Ty],
+  ret_ty : Ty,
+) -> Unit {
+  let k = span_key(sp) + "#" + tag
+  tc.qt_last_call_key = k
+  if !tc_rec_qt(tc, env, sp) {
+    return
+  }
+  let prev_opt = tc.qt_call_infos.get(k)
+  if tc.qt_log_depth > 0 {
+    let has_prev = match prev_opt {
+      Some(_) => true
+      None => false
+    }
+    tc.qt_write_log.push(QtUndoEntry::{
+      table_id: 1,
+      key: k,
+      has_prev: has_prev,
+      prev_expr: None,
+      prev_call: prev_opt,
+      prev_bind: None,
+    })
+  }
+  let cur_cand = QtCallCand::{
+    target: target,
+    kind: kind,
+    type_args: type_args,
+    param_tys: param_tys,
+    ret_ty: ret_ty,
+  }
+  tc.qt_last_call_cand = Some(cur_cand)
+  match prev_opt {
+    None =>
+      tc.qt_call_infos.set(
+        k,
+        QtCallRec::{
+          target: target,
+          kind: kind,
+          type_args: type_args,
+          param_tys: param_tys,
+          ret_ty: ret_ty,
+          ambiguous: false,
+          candidates: [],
+        },
+      )
+    Some(prev) => {
+      let prev_cand = QtCallCand::{
+        target: prev.target,
+        kind: prev.kind,
+        type_args: prev.type_args,
+        param_tys: prev.param_tys,
+        ret_ty: prev.ret_ty,
+      }
+      if !prev.ambiguous && qt_call_cand_eq(prev_cand, cur_cand) {
+        return
+      }
+      let cands : Array[QtCallCand] = []
+      if prev.ambiguous {
+        let mut i = 0
+        while i < prev.candidates.length() {
+          cands.push(prev.candidates[i])
+          i = i + 1
+        }
+      } else {
+        qt_call_cand_push_unique(cands, prev_cand)
+      }
+      qt_call_cand_push_unique(cands, cur_cand)
+      tc.qt_call_infos.set(
+        k,
+        QtCallRec::{
+          target: "",
+          kind: "ambiguous",
+          type_args: [],
+          param_tys: [],
+          ret_ty: TError,
+          ambiguous: true,
+          candidates: cands,
+        },
+      )
+    }
+  }
+}
+
+///|
+fn qt_record_binding(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  bind_kind : String,
+  bind_index : Int,
+  name : String,
+  ty : Ty,
+) -> Unit {
+  if !tc_rec_qt(tc, env, sp) {
+    return
+  }
+  let k = span_key(sp) + "#" + bind_kind + "#" + bind_index.to_string()
+  let prev_opt = tc.qt_bindings.get(k)
+  if tc.qt_log_depth > 0 {
+    let has_prev = match prev_opt {
+      Some(_) => true
+      None => false
+    }
+    tc.qt_write_log.push(QtUndoEntry::{
+      table_id: 2,
+      key: k,
+      has_prev: has_prev,
+      prev_expr: None,
+      prev_call: None,
+      prev_bind: prev_opt,
+    })
+  }
+  match prev_opt {
+    None =>
+      tc.qt_bindings.set(
+        k,
+        QtBindRec::{
+          name: name,
+          bind_kind: bind_kind,
+          bind_index: bind_index,
+          ty: ty,
+          ambiguous: false,
+          cand_tys: [],
+        },
+      )
+    Some(prev) => {
+      if !prev.ambiguous && ty_to_string(prev.ty) == ty_to_string(ty) {
+        return
+      }
+      let cands : Array[Ty] = []
+      if prev.ambiguous {
+        let mut i = 0
+        while i < prev.cand_tys.length() {
+          cands.push(prev.cand_tys[i])
+          i = i + 1
+        }
+      } else {
+        qt_cand_ty_push_unique(cands, prev.ty)
+      }
+      qt_cand_ty_push_unique(cands, ty)
+      tc.qt_bindings.set(
+        k,
+        QtBindRec::{
+          name: name,
+          bind_kind: bind_kind,
+          bind_index: bind_index,
+          ty: TError,
+          ambiguous: true,
+          cand_tys: cands,
+        },
+      )
+    }
+  }
+}
+
+///|
+fn qt_refine_let(
+  tc : TypeChecker,
+  env : Env,
+  decl_sp : Span,
+  init_sp : Span,
+  new_ty : Ty,
+) -> Unit {
+  if !tc_rec_qt(tc, env, decl_sp) {
+    return
+  }
+  let bk = span_key(decl_sp) + "#let#0"
+  match tc.qt_bindings.get(bk) {
+    Some(prev) =>
+      if !prev.ambiguous && ty_has_error(prev.ty) {
+        if tc.qt_log_depth > 0 {
+          tc.qt_write_log.push(QtUndoEntry::{
+            table_id: 2,
+            key: bk,
+            has_prev: true,
+            prev_expr: None,
+            prev_call: None,
+            prev_bind: Some(prev),
+          })
+        }
+        tc.qt_bindings.set(
+          bk,
+          QtBindRec::{
+            name: prev.name,
+            bind_kind: prev.bind_kind,
+            bind_index: prev.bind_index,
+            ty: new_ty,
+            ambiguous: false,
+            cand_tys: [],
+          },
+        )
+      }
+    None => ()
+  }
+  if init_sp.line > 0 {
+    let tags : Array[String] = ["EArrayLit", "ECall", "EIdent", "EPath"]
+    let mut ti = 0
+    while ti < tags.length() {
+      let ek = span_key(init_sp) + "#" + tags[ti]
+      match tc.qt_expr_tys.get(ek) {
+        Some(prev) =>
+          if !prev.ambiguous && ty_has_error(prev.ty) {
+            if tc.qt_log_depth > 0 {
+              tc.qt_write_log.push(QtUndoEntry::{
+                table_id: 0,
+                key: ek,
+                has_prev: true,
+                prev_expr: Some(prev),
+                prev_call: None,
+                prev_bind: None,
+              })
+            }
+            tc.qt_expr_tys.set(
+              ek,
+              QtExprRec::{
+                ty: new_ty,
+                has_receiver: prev.has_receiver,
+                receiver_ty: prev.receiver_ty,
+                ambiguous: false,
+                cand_tys: [],
+              },
+            )
+          }
+        None => ()
+      }
+      ti = ti + 1
+    }
+  }
+  let dk = span_key(decl_sp)
+  match tc.qt_pending_refs.get(dk) {
+    Some(refs) => {
+      let mut ri = 0
+      while ri < refs.length() {
+        let ek = refs[ri]
+        match tc.qt_expr_tys.get(ek) {
+          Some(prev) =>
+            if !prev.ambiguous {
+              let upd_ty = if !prev.has_receiver && ty_has_error(prev.ty) {
+                new_ty
+              } else {
+                prev.ty
+              }
+              let upd_recv = if prev.has_receiver && ty_has_error(prev.receiver_ty) {
+                new_ty
+              } else {
+                prev.receiver_ty
+              }
+              if ty_to_string(upd_ty) != ty_to_string(prev.ty) ||
+                ty_to_string(upd_recv) != ty_to_string(prev.receiver_ty) {
+                if tc.qt_log_depth > 0 {
+                  tc.qt_write_log.push(QtUndoEntry::{
+                    table_id: 0,
+                    key: ek,
+                    has_prev: true,
+                    prev_expr: Some(prev),
+                    prev_call: None,
+                    prev_bind: None,
+                  })
+                }
+                tc.qt_expr_tys.set(
+                  ek,
+                  QtExprRec::{
+                    ty: upd_ty,
+                    has_receiver: prev.has_receiver,
+                    receiver_ty: upd_recv,
+                    ambiguous: false,
+                    cand_tys: [],
+                  },
+                )
+              }
+            }
+          None => ()
+        }
+        ri = ri + 1
+      }
+    }
+    None => ()
+  }
+}
+
+///|
+fn qt_add_pending_ref(tc : TypeChecker, decl_sp : Span, expr_key : String) -> Unit {
+  let dk = span_key(decl_sp)
+  match tc.qt_pending_refs.get(dk) {
+    Some(arr) => arr.push(expr_key)
+    None => tc.qt_pending_refs.set(dk, [expr_key])
+  }
+}
+
+///|
+fn qt_collect_arg_tys(tc : TypeChecker, args : Array[Expr]) -> Option[Array[Ty]] {
+  let out : Array[Ty] = []
+  let mut i = 0
+  while i < args.length() {
+    let a = args[i]
+    let ek = span_key(expr_span(a)) + "#" + expr_variant_tag(a)
+    match tc.qt_last_expr_ty.get(ek) {
+      Some(ty) => out.push(ty)
+      None => return None
+    }
+    i = i + 1
+  }
+  Some(out)
+}
+
+///|
+fn qt_record_builtin_method_sig(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  oty : Ty,
+  method_name : String,
+  rty : Ty,
+) -> Bool {
+  let mut targs : Array[Ty] = []
+  let ptys_opt : Option[Array[Ty]] = match oty {
+    TInt | TInt8 | TInt64 | TUInt | TUInt64 =>
+      if method_name == "min" || method_name == "max" {
+        Some([oty])
+      } else if method_name == "clamp" {
+        Some([oty, oty])
+      } else if method_name == "rotate_left" || method_name == "rotate_right" {
+        Some([TInt])
+      } else if method_name == "to_string" ||
+        method_name == "abs" ||
+        method_name == "to_int" ||
+        method_name == "to_int8" ||
+        method_name == "to_int64" ||
+        method_name == "to_uint" ||
+        method_name == "to_uint64" ||
+        method_name == "to_byte" ||
+        method_name == "unsafe_to_char" ||
+        method_name == "to_float" ||
+        method_name == "to_double" ||
+        method_name == "reinterpret_as_int" ||
+        method_name == "reinterpret_as_int64" ||
+        method_name == "reinterpret_as_uint" ||
+        method_name == "reinterpret_as_uint64" ||
+        method_name == "reinterpret_as_float" ||
+        method_name == "reinterpret_as_double" ||
+        method_name == "lnot" ||
+        method_name == "leading_zeros" ||
+        method_name == "trailing_zeros" ||
+        method_name == "count_ones" {
+        Some([])
+      } else {
+        None
+      }
+    TFloat | TDouble =>
+      if method_name == "min" ||
+        method_name == "max" ||
+        method_name == "pow" ||
+        method_name == "atan2" ||
+        method_name == "compare" {
+        Some([oty])
+      } else if method_name == "clamp" {
+        Some([oty, oty])
+      } else if method_name == "to_string" ||
+        method_name == "to_int" ||
+        method_name == "to_int8" ||
+        method_name == "to_int64" ||
+        method_name == "to_float" ||
+        method_name == "to_double" ||
+        method_name == "to_bits" ||
+        method_name == "reinterpret_as_int" ||
+        method_name == "reinterpret_as_int64" ||
+        method_name == "reinterpret_as_uint" ||
+        method_name == "reinterpret_as_uint64" ||
+        method_name == "is_nan" ||
+        method_name == "is_inf" ||
+        method_name == "is_finite" ||
+        method_name == "abs" ||
+        method_name == "floor" ||
+        method_name == "ceil" ||
+        method_name == "round" ||
+        method_name == "trunc" ||
+        method_name == "sqrt" ||
+        method_name == "cbrt" ||
+        method_name == "exp" ||
+        method_name == "ln" ||
+        method_name == "log" ||
+        method_name == "log1p" ||
+        method_name == "sin" ||
+        method_name == "cos" ||
+        method_name == "tan" ||
+        method_name == "asin" ||
+        method_name == "acos" ||
+        method_name == "atan" {
+        Some([])
+      } else {
+        None
+      }
+    TBool | TChar | TByte =>
+      if method_name == "to_string" || method_name == "to_int" || method_name == "to_int8" {
+        Some([])
+      } else {
+        None
+      }
+    TOption(inner) =>
+      if method_name == "is_some" || method_name == "is_none" {
+        targs = [inner]
+        Some([])
+      } else if method_name == "unwrap_or" {
+        targs = [inner]
+        Some([inner])
+      } else {
+        None
+      }
+    TResult(ok, err) =>
+      if method_name == "is_ok" || method_name == "is_err" {
+        targs = [ok, err]
+        Some([])
+      } else if method_name == "unwrap_or" {
+        targs = [ok, err]
+        Some([ok])
+      } else {
+        None
+      }
+    TString =>
+      if method_name == "length" ||
+        method_name == "to_string" ||
+        method_name == "to_int" ||
+        method_name == "to_int64" ||
+        method_name == "to_double" ||
+        method_name == "trim" ||
+        method_name == "to_bytes" ||
+        method_name == "as_cstr" ||
+        method_name == "as_view" {
+        Some([])
+      } else if method_name == "code_unit_at" {
+        Some([TInt])
+      } else if method_name == "slice" || method_name == "view" {
+        Some([TInt, TInt])
+      } else if method_name == "starts_with" ||
+        method_name == "ends_with" ||
+        method_name == "contains" ||
+        method_name == "index_of" ||
+        method_name == "split" {
+        Some([TString])
+      } else if method_name == "replace" {
+        Some([TString, TString])
+      } else {
+        None
+      }
+    TStrView =>
+      if method_name == "length" ||
+        method_name == "is_empty" ||
+        method_name == "trim" ||
+        method_name == "to_string" {
+        Some([])
+      } else if method_name == "code_unit_at" {
+        Some([TInt])
+      } else if method_name == "index_of_byte" {
+        Some([TByte])
+      } else if method_name == "subview" {
+        Some([TInt, TInt])
+      } else if method_name == "starts_with" ||
+        method_name == "ends_with" ||
+        method_name == "eq_str" {
+        Some([TString])
+      } else {
+        None
+      }
+    TBytes =>
+      if method_name == "length" || method_name == "to_string" || method_name == "as_view" {
+        Some([])
+      } else if method_name == "slice" || method_name == "view" {
+        Some([TInt, TInt])
+      } else if method_name == "concat" {
+        Some([TBytes])
+      } else if method_name == "read_i8" ||
+        method_name == "read_u8" ||
+        method_name == "read_i16_le" ||
+        method_name == "read_u16_le" ||
+        method_name == "read_i32_le" ||
+        method_name == "read_u32_le" ||
+        method_name == "read_i64_le" ||
+        method_name == "read_u64_le" ||
+        method_name == "read_f32_le" ||
+        method_name == "read_f64_le" {
+        Some([TInt])
+      } else {
+        None
+      }
+    TBytesView =>
+      if method_name == "length" ||
+        method_name == "is_empty" ||
+        method_name == "to_bytes" ||
+        method_name == "to_string" {
+        Some([])
+      } else if method_name == "read_i8" || method_name == "read_f32_le" {
+        Some([TInt])
+      } else if method_name == "subview" {
+        Some([TInt, TInt])
+      } else {
+        None
+      }
+    TStringBuilder =>
+      if method_name == "write_string" {
+        Some([TString])
+      } else if method_name == "write_substring" {
+        Some([TString, TInt, TInt])
+      } else if method_name == "write_char" {
+        Some([TChar])
+      } else if method_name == "write_byte" {
+        Some([TByte])
+      } else if method_name == "write_bytes" {
+        Some([TBytes])
+      } else if method_name == "to_string" || method_name == "length" || method_name == "reset" {
+        Some([])
+      } else {
+        None
+      }
+    TArray(elem) =>
+      if method_name == "length" ||
+        method_name == "is_empty" ||
+        method_name == "pop" ||
+        method_name == "copy" ||
+        method_name == "to_imm" ||
+        method_name == "clear" ||
+        method_name == "reverse" ||
+        method_name == "sort" {
+        targs = [elem]
+        Some([])
+      } else if method_name == "truncate" {
+        targs = [elem]
+        Some([TInt])
+      } else if method_name == "push" {
+        let pe = if ty_has_unresolved(elem) && tc.infer_hit.length() >= 1 {
+          tc.infer_hit[0]
+        } else {
+          elem
+        }
+        targs = [pe]
+        Some([pe])
+      } else if method_name == "contains" {
+        targs = [elem]
+        Some([elem])
+      } else if method_name == "swap" {
+        targs = [elem]
+        Some([TInt, TInt])
+      } else if method_name == "join" {
+        targs = [elem]
+        Some([TString])
+      } else {
+        None
+      }
+    TFixedArray(elem) =>
+      if method_name == "length" || method_name == "copy" {
+        targs = [elem]
+        Some([])
+      } else if method_name == "swap" {
+        targs = [elem]
+        Some([TInt, TInt])
+      } else if method_name == "contains" || method_name == "fill" {
+        targs = [elem]
+        Some([elem])
+      } else if method_name == "blit_to" {
+        targs = [elem]
+        Some([TFixedArray(elem), TInt, TInt, TInt])
+      } else {
+        None
+      }
+    TImmArray(elem) =>
+      if method_name == "length" ||
+        method_name == "is_empty" ||
+        method_name == "copy" ||
+        method_name == "to_array" {
+        targs = [elem]
+        Some([])
+      } else {
+        None
+      }
+    TMap(kty, vty) =>
+      if method_name == "length" ||
+        method_name == "keys" ||
+        method_name == "copy" ||
+        method_name == "clear" {
+        targs = [kty, vty]
+        Some([])
+      } else if method_name == "set" {
+        let sk = if ty_has_unresolved(kty) && tc.infer_hit.length() >= 2 {
+          tc.infer_hit[0]
+        } else {
+          kty
+        }
+        let sv = if ty_has_unresolved(vty) && tc.infer_hit.length() >= 2 {
+          tc.infer_hit[1]
+        } else {
+          vty
+        }
+        targs = [sk, sv]
+        Some([sk, sv])
+      } else if method_name == "get" || method_name == "contains" || method_name == "remove" {
+        targs = [kty, vty]
+        Some([kty])
+      } else {
+        None
+      }
+    TChannel(elem) =>
+      if method_name == "send" {
+        targs = [elem]
+        Some([elem])
+      } else if method_name == "recv" || method_name == "close" {
+        targs = [elem]
+        Some([])
+      } else {
+        None
+      }
+    TMutex(elem) =>
+      if method_name == "lock" || method_name == "unlock" {
+        targs = [elem]
+        Some([])
+      } else if method_name == "set" {
+        targs = [elem]
+        Some([elem])
+      } else {
+        None
+      }
+    TAtomicInt =>
+      if method_name == "load" {
+        Some([])
+      } else if method_name == "store" || method_name == "fetch_add" {
+        Some([TInt])
+      } else {
+        None
+      }
+    _ => None
+  }
+  match ptys_opt {
+    Some(ptys) => {
+      qt_record_call(
+        tc,
+        env,
+        sp,
+        "EMethodCall",
+        "builtin::" + ty_base_name(oty) + "::" + method_name,
+        "builtin",
+        targs,
+        ptys,
+        rty,
+      )
+      true
+    }
+    None => false
+  }
+}
+
+///|
+fn qt_record_builtin_call_sig(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  callee : Expr,
+  args : Array[Expr],
+  rty : Ty,
+) -> Bool {
+  let has_world_arg = if args.length() > 0 {
+    let ek = span_key(expr_span(args[0])) + "#" + expr_variant_tag(args[0])
+    match tc.qt_last_expr_ty.get(ek) {
+      Some(TWorld) => true
+      _ => false
+    }
+  } else {
+    false
+  }
+  let w_ptys = fn(rest : Array[Ty]) -> Array[Ty] {
+    let out : Array[Ty] = []
+    if has_world_arg || !env.has_world {
+      out.push(TWorld)
+    }
+    let mut pi = 0
+    while pi < rest.length() {
+      out.push(rest[pi])
+      pi = pi + 1
+    }
+    out
+  }
+  match callee {
+    EPath(qual, mem, _) => {
+      let ptys_opt : Option[Array[Ty]] = if qual == "Double" && mem == "from_bits" {
+        Some([TInt64])
+      } else if (qual == "Float" || qual == "Float32") && mem == "from_double" {
+        Some([TDouble])
+      } else if (qual == "Float" || qual == "Float32") && (mem == "from_int" || mem == "from_bits") {
+        Some([TInt])
+      } else if qual == "StringBuilder" && mem == "new" {
+        Some([])
+      } else if qual == "StringBuilder" && mem == "with_capacity" {
+        Some([TInt])
+      } else if qual == "Bytes" && mem == "new" {
+        if args.length() == 0 {
+          Some([])
+        } else {
+          Some([TInt])
+        }
+      } else if qual == "Bytes" && mem == "with_capacity" {
+        Some([TInt])
+      } else if qual == "Bytes" && mem == "from_string" {
+        Some([TString])
+      } else if (qual == "Map" || qual == "Array" || qual == "ImmArray") && mem == "new" {
+        Some([])
+      } else if (qual == "Map" || qual == "Array") && mem == "with_capacity" {
+        Some([TInt])
+      } else if qual == "Array" && mem == "make" {
+        match rty {
+          TArray(elem) => Some([TInt, elem])
+          _ => Some([TInt, TError])
+        }
+      } else if qual == "FixedArray" && mem == "make" {
+        match rty {
+          TFixedArray(elem) => Some([TInt, elem])
+          _ => Some([TInt, TError])
+        }
+      } else if qual == "FixedArray" && mem == "makei" {
+        match rty {
+          TFixedArray(elem) => Some([TInt, TFn([TInt], elem)])
+          _ => Some([TInt, TError])
+        }
+      } else if qual == "FixedArray" && mem == "from_array" {
+        match rty {
+          TFixedArray(elem) => Some([TArray(elem)])
+          _ => Some([TArray(TError)])
+        }
+      } else if qual == "ImmArray" && mem == "make" {
+        match rty {
+          TImmArray(elem) => Some([TInt, elem])
+          _ => Some([TInt, TError])
+        }
+      } else if qual == "ImmArray" && mem == "from_array" {
+        match rty {
+          TImmArray(elem) => Some([TArray(elem)])
+          _ => Some([TArray(TError)])
+        }
+      } else if qual == "Channel" && mem == "new" {
+        if args.length() == 0 {
+          Some([])
+        } else {
+          Some([TInt])
+        }
+      } else if qual == "Mutex" && mem == "new" {
+        match rty {
+          TMutex(elem) => Some([elem])
+          _ => Some([TError])
+        }
+      } else if qual == "AtomicInt" && mem == "new" {
+        Some([TInt])
+      } else {
+        None
+      }
+      match ptys_opt {
+        Some(ptys) => {
+          qt_record_call(
+            tc,
+            env,
+            sp,
+            "ECall",
+            "builtin::" + qual + "::" + mem,
+            "builtin",
+            [],
+            ptys,
+            rty,
+          )
+          true
+        }
+        None => false
+      }
+    }
+    EIdent(name, _) => {
+      match rt_prim_info(name) {
+        Some(pr) => {
+          let ptys : Array[Ty] = []
+          if pr.world {
+            ptys.push(TWorld)
+          }
+          let mut pi = 0
+          while pi < pr.param_tys.length() {
+            ptys.push(pr.param_tys[pi])
+            pi = pi + 1
+          }
+          qt_record_call(tc, env, sp, "ECall", "builtin::" + name, "builtin", [], ptys, pr.ret_ty)
+          return true
+        }
+        None => ()
+      }
+      let ptys_opt : Option[Array[Ty]] = if name == "io_print" ||
+        name == "io_println" ||
+        name == "io_eprintln" {
+        Some(w_ptys([TString]))
+      } else if name == "io_read_line" ||
+        name == "args_get" ||
+        name == "world_args" ||
+        name == "clock_now_ms" ||
+        name == "world_argc" {
+        Some(w_ptys([]))
+      } else if name == "fs_read" ||
+        name == "fs_lstat" ||
+        name == "fs_readlink" ||
+        name == "fs_read_bytes" ||
+        name == "fs_mtime_ms" ||
+        name == "fs_exists" ||
+        name == "fs_is_dir" ||
+        name == "fs_mkdir_p" ||
+        name == "fs_remove" ||
+        name == "fs_size" ||
+        name == "fs_list_dir" ||
+        name == "env_get" {
+        Some(w_ptys([TString]))
+      } else if name == "fs_write" ||
+        name == "fs_append" ||
+        name == "fs_rename" ||
+        name == "fs_symlink" {
+        Some(w_ptys([TString, TString]))
+      } else if name == "fs_read_range_nofollow" {
+        Some(w_ptys([TString, TInt64, TInt, TInt64]))
+      } else if name == "fs_write_bytes" {
+        Some(w_ptys([TString, TBytes]))
+      } else if name == "fs_chmod" {
+        Some(w_ptys([TString, TInt]))
+      } else if name == "proc_exec" ||
+        name == "proc_exec_capture" ||
+        name == "proc_exec_capture_bytes" {
+        Some(w_ptys([TArray(TString)]))
+      } else if name == "world_argv" {
+        Some(w_ptys([TInt]))
+      } else if name == "StringBuilder" || name == "ptr_null" {
+        Some([])
+      } else if name == "sha256_hex" || name == "str_data_ptr" || name == "fs_mmap_ro" {
+        Some([TString])
+      } else if name == "fs_write_atomic_bytes" {
+        Some([TString, TBytes])
+      } else if name == "bytes_data_ptr" {
+        Some([TBytes])
+      } else if name == "ptr_is_null" || name == "ptr_addr" {
+        Some([TPtr])
+      } else if name == "assert_true" {
+        Some([TBool])
+      } else if name == "debug_assert" {
+        Some([TBool, TString])
+      } else if name == "slice_str" {
+        Some([TString, TInt, TInt])
+      } else if name == "str_code_at" {
+        Some([TString, TInt])
+      } else if name == "math_sqrt" ||
+        name == "math_cbrt" ||
+        name == "math_abs" ||
+        name == "math_floor" ||
+        name == "math_ceil" ||
+        name == "math_sin" ||
+        name == "math_cos" ||
+        name == "math_tan" ||
+        name == "math_asin" ||
+        name == "math_acos" ||
+        name == "math_atan" ||
+        name == "math_exp" ||
+        name == "math_log" ||
+        name == "math_log1p" ||
+        name == "math_round" ||
+        name == "math_trunc" {
+        Some([TDouble])
+      } else if name == "math_pow" || name == "math_atan2" {
+        Some([TDouble, TDouble])
+      } else {
+        None
+      }
+      match ptys_opt {
+        Some(ptys) => {
+          qt_record_call(tc, env, sp, "ECall", "builtin::" + name, "builtin", [], ptys, rty)
+          true
+        }
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn tc_record_ty(tc : TypeChecker, env : Env, e : Expr, ty : Ty) -> Unit {
   if env.in_verify {
     tc.expr_tys.set(span_key(expr_span(e)), ty)
+  }
+  if tc.record_types {
+    qt_record_expr(tc, env, expr_span(e), expr_variant_tag(e), ty, false, TError)
   }
 }
 
@@ -13703,6 +15086,7 @@ fn make_default_arg_env(
         name: pj.name,
         ty: pty,
         is_mut: pj.is_mut,
+        is_param: true,
         decl_span: span_new("", 0, 0),
         decl_line: pj.span.line,
         ty_span: span_new("", 0, 0),
@@ -16047,6 +17431,7 @@ fn check_fn_call(
         []
       }
       let diag_mark = tc.diagnostics.length()
+      let qt_mark = qt_tx_begin(tc)
       let eq_uses_mark = tc.eq_uses.length()
       let op_key_mark = tc.op_keys.length()
       let op_cur_len = if env.fn_key != "" {
@@ -16103,6 +17488,7 @@ fn check_fn_call(
         }
         unify_tparams(finfo.param_tys[i], eff_aty, subst)
         if unbound_param_tps.length() > 0 && any_tparam_now_concrete(unbound_param_tps, subst) {
+          qt_tx_rollback(tc, qt_mark)
           while tc.diagnostics.length() > diag_mark {
             let _ = tc.diagnostics.pop()
           }
@@ -16172,6 +17558,13 @@ fn check_fn_call(
           )
         }
       }
+      if tc.record_types && raw_i >= 0 && raw_i < args.length() {
+        match args[raw_i] {
+          ENamedArg(_, _, _, asp) => qt_record_expr(tc, env, asp, "ENamedArg", aty, false, TError)
+          _ => ()
+        }
+      }
+      qt_tx_commit(tc)
     }
     ci = ci + 1
   }
@@ -16217,7 +17610,27 @@ fn check_fn_call(
   }
   // A type param no argument fixed is unresolved, never the callee's own
   // `TParam` leaking into the caller (`pass(second)` before `T` is known).
-  subst_ty_mask_unbound(finfo.ret_ty, finfo.decl.type_params, subst)
+  let final_ret = subst_ty_mask_unbound(finfo.ret_ty, finfo.decl.type_params, subst)
+  if tc.record_types {
+    let targs : Array[Ty] = []
+    let mut ti = 0
+    while ti < finfo.decl.type_params.length() {
+      match subst.get(finfo.decl.type_params[ti]) {
+        Some(t) => targs.push(t)
+        None => targs.push(TError)
+      }
+      ti = ti + 1
+    }
+    let ptys : Array[Ty] = []
+    let mut pi = 0
+    while pi < finfo.param_tys.length() {
+      ptys.push(subst_ty_mask_unbound(finfo.param_tys[pi], finfo.decl.type_params, subst))
+      pi = pi + 1
+    }
+    let ckind = if finfo.decl.receiver_type != "" { "pkg_method" } else { "pkg_fn" }
+    qt_record_call(tc, env, sp, "ECall", target, ckind, targs, ptys, final_ret)
+  }
+  final_ret
 }
 
 ///|
@@ -16409,6 +17822,9 @@ fn check_method_call(
       while i < args.length() {
         let _ = check_expr(tc, env, args[i], None)
         i = i + 1
+      }
+      if tc.record_types {
+        qt_record_call(tc, env, sp, "EMethodCall", "", "unresolved", [], [], TError)
       }
       return TError
     }
@@ -18093,6 +19509,7 @@ fn check_method_call(
                 []
               }
               let diag_mark = tc.diagnostics.length()
+              let qt_mark = qt_tx_begin(tc)
               let eq_uses_mark = tc.eq_uses.length()
               let op_key_mark = tc.op_keys.length()
               let op_cur_len = if env.fn_key != "" {
@@ -18149,6 +19566,7 @@ fn check_method_call(
                 }
                 unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
                 if unbound_param_tps.length() > 0 && any_tparam_now_concrete(unbound_param_tps, subst) {
+                  qt_tx_rollback(tc, qt_mark)
                   while tc.diagnostics.length() > diag_mark {
                     let _ = tc.diagnostics.pop()
                   }
@@ -18218,6 +19636,13 @@ fn check_method_call(
                   )
                 }
               }
+              if tc.record_types && raw_i >= 0 && raw_i < args.length() {
+                match args[raw_i] {
+                  ENamedArg(_, _, _, asp) => qt_record_expr(tc, env, asp, "ENamedArg", aty, false, TError)
+                  _ => ()
+                }
+              }
+              qt_tx_commit(tc)
             }
             ci = ci + 1
           }
@@ -18252,7 +19677,26 @@ fn check_method_call(
             tc_record_gcall(tc, minfo.decl, subst, sp)
             tc.let_infer.set(span_key(sp) + "#gmeth", TStruct(sname, []))
           }
-          return subst_ty_mask_unbound(minfo.ret_ty, minfo.decl.type_params, subst)
+          let mret = subst_ty_mask_unbound(minfo.ret_ty, minfo.decl.type_params, subst)
+          if tc.record_types {
+            let targs : Array[Ty] = []
+            let mut ti = 0
+            while ti < minfo.decl.type_params.length() {
+              match subst.get(minfo.decl.type_params[ti]) {
+                Some(t) => targs.push(t)
+                None => targs.push(TError)
+              }
+              ti = ti + 1
+            }
+            let ptys : Array[Ty] = []
+            let mut pi = 1
+            while pi < minfo.param_tys.length() {
+              ptys.push(subst_ty_mask_unbound(minfo.param_tys[pi], minfo.decl.type_params, subst))
+              pi = pi + 1
+            }
+            qt_record_call(tc, env, sp, "EMethodCall", mtarget, "pkg_method", targs, ptys, mret)
+          }
+          return mret
         }
         None => {
           let qp = split_qual_name(sname)
@@ -18349,6 +19793,9 @@ fn check_method_call(
                         _ => ()
                       }
                       tc.resolved_method_calls.set(span_key(sp), "@field::" + sname + "::" + method_name)
+                      if tc.record_types {
+                        qt_record_call(tc, env, sp, "EMethodCall", sname + "." + method_name, "closure_field", [], ptys, rty)
+                      }
                       return rty
                     }
                     _ => ()
@@ -18422,6 +19869,15 @@ fn check_method_call(
               match tm.ret_ty {
                 TNever => tc.never_calls.set(span_key(sp), true)
                 _ => ()
+              }
+              if tc.record_types {
+                let ptys : Array[Ty] = []
+                let mut pi = 1
+                while pi < tm.param_tys.length() {
+                  ptys.push(tm.param_tys[pi])
+                  pi = pi + 1
+                }
+                qt_record_call(tc, env, sp, "EMethodCall", tname + "::" + method_name, "trait_method", [], ptys, tm.ret_ty)
               }
               return tm.ret_ty
             }
@@ -18499,6 +19955,25 @@ fn check_method_call(
                       TNever => tc.never_calls.set(span_key(sp), true)
                       _ => ()
                     }
+                    if tc.record_types {
+                      let ptys : Array[Ty] = []
+                      let mut pi = 1
+                      while pi < tm.param_tys.length() {
+                        ptys.push(subst_ty(tm.param_tys[pi], self_subst))
+                        pi = pi + 1
+                      }
+                      qt_record_call(
+                        tc,
+                        env,
+                        sp,
+                        "EMethodCall",
+                        bound_traits[bi] + "::" + tp_name + "::" + method_name,
+                        "trait_method",
+                        [],
+                        ptys,
+                        subst_rt,
+                      )
+                    }
                     return subst_rt
                   }
                   mi = mi + 1
@@ -18562,6 +20037,15 @@ fn check_method_call(
       if env.in_verify || tc.record_analyze {
         tc.call_targets.set(span_key(sp), itarget)
       }
+      if tc.record_types {
+        let ptys : Array[Ty] = []
+        let mut pi = 1
+        while pi < minfo.param_tys.length() {
+          ptys.push(minfo.param_tys[pi])
+          pi = pi + 1
+        }
+        qt_record_call(tc, env, sp, "EMethodCall", itarget, "trait_method", [], ptys, minfo.ret_ty)
+      }
       return minfo.ret_ty
     }
     None => ()
@@ -18575,6 +20059,9 @@ fn check_method_call(
     method_name,
     "define `fn " + ty_to_string(recv_ty) + "::" + method_name + "` or check method name",
   )
+  if tc.record_types {
+    qt_record_call(tc, env, sp, "EMethodCall", "", "unresolved", [], [], TError)
+  }
   TError
 }
 
@@ -18815,6 +20302,9 @@ fn check_binary_chain(
             if env.in_verify || tc.record_analyze {
               tc.expr_tys.set(span_key(sp), cur_ty)
             }
+            if tc.record_types {
+              qt_record_expr(tc, env, sp, "EBinary", cur_ty, false, TError)
+            }
             has_val = true
             continue
           }
@@ -18903,6 +20393,9 @@ fn check_binary_chain(
       if env.in_verify || tc.record_analyze {
         tc.expr_tys.set(span_key(sp), cur_ty)
       }
+      if tc.record_types {
+        qt_record_expr(tc, env, sp, "EBinary", cur_ty, false, TError)
+      }
       has_val = true
     } else if st == 2 {
       frame.state = 3
@@ -18917,6 +20410,9 @@ fn check_binary_chain(
       cur_ty = check_binary_combine(tc, env, op, lty, rty, sp)
       if env.in_verify || tc.record_analyze {
         tc.expr_tys.set(span_key(sp), cur_ty)
+      }
+      if tc.record_types {
+        qt_record_expr(tc, env, sp, "EBinary", cur_ty, false, TError)
       }
       has_val = true
     }
@@ -19055,11 +20551,132 @@ fn check_expr(
   expr : Expr,
   expected : Option[Ty],
 ) -> Ty {
+  let diag_before = if tc.record_types { tc.diagnostics.length() } else { 0 }
+  if tc.record_types {
+    match expr {
+      ECall(_, _, _) => {
+        tc.qt_last_call_key = ""
+        tc.qt_last_call_cand = None
+      }
+      _ => ()
+    }
+  }
   let ty0 = check_expr_inner(tc, env, expr, expected)
   let ty = check_expr_dyn_coerce(tc, env, expr, expected, ty0)
   if env.in_verify || tc.record_analyze {
     tc.expr_tys.set(span_key(expr_span(expr)), ty)
     tc_record_fallback_target(tc, env, expr)
+  }
+  if tc.record_types {
+    match expr {
+      EMethodCall(_, _, _, msp) =>
+        if ty_to_string(ty) != ty_to_string(ty0) {
+          qt_update_coerced_ty(tc, env, msp, "EMethodCall", ty)
+        }
+      ECall(callee, args, csp) => {
+        let ck = span_key(csp) + "#ECall"
+        let mut has_declared = tc.qt_last_call_key == ck
+        if !has_declared {
+          has_declared = qt_record_builtin_call_sig(tc, env, csp, callee, args, ty0)
+        }
+        let mut fallback_has_err = false
+        if !has_declared {
+          let call_had_diag = tc.diagnostics.length() > diag_before
+          let fallback_ptys = if call_had_diag || ty_has_error(ty0) {
+            fallback_has_err = true
+            []
+          } else {
+            match qt_collect_arg_tys(tc, args) {
+              Some(ts) => {
+                let mut fi = 0
+                while fi < ts.length() {
+                  if ty_has_error(ts[fi]) {
+                    fallback_has_err = true
+                  }
+                  fi = fi + 1
+                }
+                if fallback_has_err { [] } else { ts }
+              }
+              None => {
+                fallback_has_err = true
+                []
+              }
+            }
+          }
+          match callee {
+            EIdent(n, _) =>
+              qt_record_call(tc, env, csp, "ECall", "builtin::" + n, "builtin", [], fallback_ptys, ty0)
+            EPath(q, m, _) =>
+              qt_record_call(
+                tc,
+                env,
+                csp,
+                "ECall",
+                "builtin::" + q + "::" + m,
+                "builtin",
+                [],
+                fallback_ptys,
+                ty0,
+              )
+            _ => ()
+          }
+        }
+        match tc.qt_last_call_cand {
+          Some(cand) => {
+            let mut cand_params_clean = true
+            let mut ci = 0
+            while ci < cand.param_tys.length() {
+              if ty_has_error(cand.param_tys[ci]) {
+                cand_params_clean = false
+                break
+              }
+              ci = ci + 1
+            }
+            if cand.kind != "unresolved" &&
+              (cand.kind != "builtin" ||
+                (has_declared &&
+                  cand.param_tys.length() == args.length() &&
+                  !ty_has_error(cand.ret_ty) &&
+                  cand_params_clean)) {
+              match callee {
+                EIdent(_, cal_sp) =>
+                  qt_record_expr(
+                    tc,
+                    env,
+                    cal_sp,
+                    "EIdent",
+                    TFn(cand.param_tys, cand.ret_ty),
+                    false,
+                    TError,
+                  )
+                EPath(_, _, cal_sp) =>
+                  qt_record_expr(
+                    tc,
+                    env,
+                    cal_sp,
+                    "EPath",
+                    TFn(cand.param_tys, cand.ret_ty),
+                    false,
+                    TError,
+                  )
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+        qt_record_expr(tc, env, csp, "ECall", ty, false, TError)
+      }
+      EScope(_, _, ssp) => {
+        qt_record_call(tc, env, ssp, "EScope", "builtin::scope", "builtin", [], [], ty)
+        qt_record_expr(tc, env, ssp, "EScope", ty, false, TError)
+      }
+      ESpawn(_, _, ssp) => {
+        qt_record_call(tc, env, ssp, "ESpawn", "builtin::spawn", "builtin", [], [], ty)
+        qt_record_expr(tc, env, ssp, "ESpawn", ty, false, TError)
+      }
+      _ => qt_record_expr(tc, env, expr_span(expr), expr_variant_tag(expr), ty, false, TError)
+    }
   }
   ty
 }
@@ -19230,6 +20847,9 @@ fn check_expr_inner(
                   return exp_ty
                 }
               None => ()
+            }
+            if tc.record_types && ty_has_error(b.ty) {
+              qt_add_pending_ref(tc, b.decl_span, span_key(sp) + "#EIdent")
             }
           }
           return b.ty
@@ -19455,6 +21075,9 @@ fn check_expr_inner(
                   "." + vname,
                   "check the variant name on enum `" + ename + "`",
                 )
+                if tc.record_types {
+                  qt_record_call(tc, env, sp, "EDotVariant", "", "unresolved", [], [], TError)
+                }
                 return TError
               }
               tc.dot_variant_resolve.set(span_key(sp), ename)
@@ -19516,6 +21139,25 @@ fn check_expr_inner(
                 ti = ti + 1
               }
               let res_ty = TEnum(ename, targs)
+              if tc.record_types {
+                let ptys : Array[Ty] = []
+                let mut pfi = 0
+                while pfi < v.field_tys.length() {
+                  ptys.push(subst_ty(v.field_tys[pfi], subst))
+                  pfi = pfi + 1
+                }
+                qt_record_call(
+                  tc,
+                  env,
+                  sp,
+                  "EDotVariant",
+                  tc_qualify_local_name(tc, ename) + "::" + vname,
+                  "ctor",
+                  targs,
+                  ptys,
+                  res_ty,
+                )
+              }
               if targs.length() > 0 {
                 tc_check_map_keys_in_ty_rec(tc, env.fn_key, res_ty, sp, true, Map([]), Map([]))
               }
@@ -20449,6 +22091,10 @@ fn check_expr_inner(
                     TNever => tc.never_calls.set(span_key(sp), true)
                     _ => ()
                   }
+                  if tc.record_types {
+                    let ckind = if b.is_param { "closure_param" } else { "closure_local" }
+                    qt_record_call(tc, env, sp, "ECall", name, ckind, [], ptys, rty)
+                  }
                   return rty
                 }
                 _ => ()
@@ -20500,6 +22146,9 @@ fn check_expr_inner(
                   TNever => tc.never_calls.set(span_key(sp), true)
                   _ => ()
                 }
+                if tc.record_types {
+                  qt_record_call(tc, env, sp, "ECall", tc_qualify_local_name(tc, name), "indirect", [], ptys, rty)
+                }
                 return rty
               }
               _ => ()
@@ -20530,10 +22179,15 @@ fn check_expr_inner(
             match tc.extern_fns.get(name) {
               Some(einfo) => {
                 tc.resolved_method_calls.set("call_pkg:" + span_key(sp), name)
+                let etarget = tc_qualify_local_name(tc, name)
                 if tc.record_analyze {
-                  tc.call_targets.set(span_key(sp), tc_qualify_local_name(tc, name))
+                  tc.call_targets.set(span_key(sp), etarget)
                 }
-                return check_extern_fn_call(tc, env, einfo, args, sp)
+                let eret = check_extern_fn_call(tc, env, einfo, args, sp)
+                if tc.record_types {
+                  qt_record_call(tc, env, sp, "ECall", etarget, "pkg_fn", [], einfo.param_tys, eret)
+                }
+                return eret
               }
               None => ()
             }
@@ -20547,6 +22201,9 @@ fn check_expr_inner(
             name,
             "define `fn " + name + "` before calling it",
           )
+          if tc.record_types {
+            qt_record_call(tc, env, sp, "ECall", "", "unresolved", [], [], TError)
+          }
           TError
         }
         EPath(qual, mem, _) => {
@@ -21270,16 +22927,16 @@ fn check_expr_inner(
                   if !ei.decl.is_pub && !env.in_default_arg {
                     emit_private_err(tc, sp, "extern fn", ipkg.name, mem)
                   }
+                  let etarget = ipkg.name + "::" + mem
                   if tc.record_analyze {
-                    tc.call_targets.set(span_key(sp), ipkg.name + "::" + mem)
+                    tc.call_targets.set(span_key(sp), etarget)
                   }
-                  return check_extern_fn_call(
-                    tc,
-                    env,
-                    qualify_extern_fn_info(ipkg, ei),
-                    args,
-                    sp,
-                  )
+                  let qei = qualify_extern_fn_info(ipkg, ei)
+                  let eret = check_extern_fn_call(tc, env, qei, args, sp)
+                  if tc.record_types {
+                    qt_record_call(tc, env, sp, "ECall", etarget, "pkg_fn", [], qei.param_tys, eret)
+                  }
+                  return eret
                 }
                 None => ()
               }
@@ -21337,6 +22994,9 @@ fn check_expr_inner(
                         TNever => tc.never_calls.set(span_key(sp), true)
                         _ => ()
                       }
+                      if tc.record_types {
+                        qt_record_call(tc, env, sp, "ECall", ipkg.name + "::" + mem, "indirect", [], ptys, rty)
+                      }
                       return rty
                     }
                     _ => ()
@@ -21391,6 +23051,9 @@ fn check_expr_inner(
             key,
             "check `" + key + "` spelling",
           )
+          if tc.record_types {
+            qt_record_call(tc, env, sp, "ECall", "", "unresolved", [], [], TError)
+          }
           TError
         }
         _ => {
@@ -21436,9 +23099,22 @@ fn check_expr_inner(
                 TNever => tc.never_calls.set(span_key(sp), true)
                 _ => ()
               }
+              if tc.record_types {
+                match callee {
+                  EField(_, fname, _) =>
+                    qt_record_call(tc, env, sp, "ECall", fname, "closure_field", [], ptys, rty)
+                  _ =>
+                    qt_record_call(tc, env, sp, "ECall", "", "indirect", [], ptys, rty)
+                }
+              }
               rty
             }
-            TError => TError
+            TError => {
+              if tc.record_types {
+                qt_record_call(tc, env, sp, "ECall", "", "unresolved", [], [], TError)
+              }
+              TError
+            }
             _ => {
               let mut i = 0
               while i < args.length() {
@@ -21454,6 +23130,9 @@ fn check_expr_inner(
                 ty_to_string(cty),
                 "call a function or closure value",
               )
+              if tc.record_types {
+                qt_record_call(tc, env, sp, "ECall", "", "unresolved", [], [], TError)
+              }
               TError
             }
           }
@@ -21556,7 +23235,63 @@ fn check_expr_inner(
     EMethodCall(obj, method_name, args, sp) => {
       let oty = check_expr(tc, env, obj, None)
       tc.infer_hit.clear()
+      let m_diag_before = if tc.record_types { tc.diagnostics.length() } else { 0 }
+      if tc.record_types {
+        tc.qt_last_call_key = ""
+        tc.qt_last_call_cand = None
+      }
       let rty = check_method_call(tc, env, oty, method_name, args, expected, sp)
+      if tc.record_types {
+        let mk = span_key(sp) + "#EMethodCall"
+        if tc.qt_last_call_key != mk {
+          if !qt_record_builtin_method_sig(tc, env, sp, oty, method_name, rty) {
+            let m_had_diag = tc.diagnostics.length() > m_diag_before
+            let fallback_ptys = if m_had_diag || ty_has_error(rty) {
+              []
+            } else {
+              match qt_collect_arg_tys(tc, args) {
+                Some(ts) => {
+                  let mut has_err = false
+                  let mut fi = 0
+                  while fi < ts.length() {
+                    if ty_has_error(ts[fi]) {
+                      has_err = true
+                    }
+                    fi = fi + 1
+                  }
+                  if has_err { [] } else { ts }
+                }
+                None => []
+              }
+            }
+            qt_record_call(
+              tc,
+              env,
+              sp,
+              "EMethodCall",
+              "builtin::" + ty_base_name(oty) + "::" + method_name,
+              "builtin",
+              [],
+              fallback_ptys,
+              rty,
+            )
+          }
+        }
+        qt_record_expr(tc, env, sp, "EMethodCall", rty, true, oty)
+        if ty_has_error(oty) {
+          match obj {
+            EIdent(oname, _) =>
+              match env_lookup(env, oname) {
+                Some(b) =>
+                  if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
+                    qt_add_pending_ref(tc, b.decl_span, mk)
+                  }
+                None => ()
+              }
+            _ => ()
+          }
+        }
+      }
       if !tc.resolved_method_calls.contains(span_key(sp)) {
         match oty {
           TStruct(_, _) | TEnum(_, _) | TDynTrait(_) | TParam(_) | TError => ()
@@ -22293,7 +24028,10 @@ fn check_expr_inner(
             _ => ()
           }
         }
-        env_define_line(env, params[j].name, pty_def, false, params[j].span.line)
+        env_define_param(env, params[j].name, pty_def, false, params[j].span.line)
+        if tc.record_types && params[j].name != "_" {
+          qt_record_binding(tc, env, params[j].span, "closure_param", j, params[j].name, pty_def)
+        }
         j = j + 1
       }
       let body_ty = check_stmts(tc, env, body, ret_opt)
@@ -22840,6 +24578,35 @@ fn check_package_with_imports_mapped_plan(
   record_analyze : Bool,
   plan_out : Option[Array[ConstInitPlan]],
 ) -> CheckedPackage {
+  check_package_with_imports_mapped_plan_qt(
+    pkg,
+    check_file,
+    imported,
+    dep_aliases,
+    dep_targets,
+    multi_pkg,
+    record_analyze,
+    plan_out,
+    false,
+    0,
+    Map([]),
+  )
+}
+
+///|
+fn check_package_with_imports_mapped_plan_qt(
+  pkg : Package,
+  check_file : Array[Bool],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  record_analyze : Bool,
+  plan_out : Option[Array[ConstInitPlan]],
+  record_types : Bool,
+  qt_filter_mode : Int,
+  qt_filter_files : Map[String, Bool],
+) -> CheckedPackage {
   let dep_map : Map[String, String] = Map([])
   let mut dmi = 0
   while dmi < dep_aliases.length() && dmi < dep_targets.length() {
@@ -22920,6 +24687,18 @@ fn check_package_with_imports_mapped_plan(
     in_default_arg_expansion: false,
     in_imported_default_arg: false,
     priv_imported_types: Map([]),
+    record_types: record_types,
+    qt_filter_mode: qt_filter_mode,
+    qt_filter_files: qt_filter_files,
+    qt_log_depth: 0,
+    qt_write_log: [],
+    qt_last_call_key: "",
+    qt_last_call_cand: None,
+    qt_pending_refs: Map([]),
+    qt_last_expr_ty: Map([]),
+    qt_expr_tys: Map([]),
+    qt_call_infos: Map([]),
+    qt_bindings: Map([]),
   }
 
   let mut ipi = 0
@@ -24414,7 +26193,10 @@ fn check_package_with_imports_mapped_plan(
                     _ => ()
                   }
                 }
-                env_define_line(env, fd.params[pi].name, pty_def, fd.params[pi].is_mut, fd.params[pi].span.line)
+                env_define_param(env, fd.params[pi].name, pty_def, fd.params[pi].is_mut, fd.params[pi].span.line)
+                if tc.record_types && fd.params[pi].name != "_" {
+                  qt_record_binding(tc, env, fd.params[pi].span, "param", pi, fd.params[pi].name, pty_def)
+                }
                 if fd.params[pi].is_mut {
                   env.mut_params.set(fd.params[pi].name, true)
                 }
@@ -24507,7 +26289,10 @@ fn check_package_with_imports_mapped_plan(
                 let env = env_new(einfo.ret_ty, [])
                 let mut pi = 0
                 while pi < ed.params.length() && pi < einfo.param_tys.length() {
-                  env_define_line(env, ed.params[pi].name, einfo.param_tys[pi], false, ed.params[pi].span.line)
+                  env_define_param(env, ed.params[pi].name, einfo.param_tys[pi], false, ed.params[pi].span.line)
+                  if tc.record_types && ed.params[pi].name != "_" {
+                    qt_record_binding(tc, env, ed.params[pi].span, "param", pi, ed.params[pi].name, einfo.param_tys[pi])
+                  }
                   pi = pi + 1
                 }
                 let body_ty = check_stmts(tc, env, ed.body, Some(einfo.ret_ty))
@@ -24625,7 +26410,10 @@ fn check_package_with_imports_mapped_plan(
                           _ => ()
                         }
                       }
-                      env_define_line(env, md.params[pi].name, pty_def, md.params[pi].is_mut, md.params[pi].span.line)
+                      env_define_param(env, md.params[pi].name, pty_def, md.params[pi].is_mut, md.params[pi].span.line)
+                      if tc.record_types && md.params[pi].name != "_" {
+                        qt_record_binding(tc, env, md.params[pi].span, "param", pi, md.params[pi].name, pty_def)
+                      }
                       if md.params[pi].is_mut {
                         env.mut_params.set(md.params[pi].name, true)
                       }
@@ -24687,6 +26475,9 @@ fn check_package_with_imports_mapped_plan(
             None => TError
           }
           let env = env_new(TUnit, [])
+          if tc.record_types {
+            qt_record_binding(tc, env, cd.span, "const", 0, cd.name, cty)
+          }
           let vty = check_expr(tc, env, cd.value, Some(cty))
           let cms = move_state_new()
           tc_check_moves_in_expr(tc, cms, cd.value)
@@ -24944,6 +26735,129 @@ fn check_source_files_with_imports_mapped_plan(
     multi_pkg,
     record_analyze,
     plan_out,
+  )
+  let mut k = 0
+  while k < cr.diagnostics.length() {
+    all_diags.push(cr.diagnostics[k])
+    k = k + 1
+  }
+  CheckedPackage::{ pkg: pkg, tc: cr.tc, diagnostics: all_diags }
+}
+
+///|
+pub fn check_source_files_with_imports_types(
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  qt_filter_mode : Int,
+  qt_filter_files : Map[String, Bool],
+) -> CheckedPackage {
+  let all_diags : Array[Diagnostic] = []
+  let files : Array[SourceFile] = []
+  let mut i = 0
+  while i < paths.length() && i < sources.length() {
+    let pr = parse_source(paths[i], sources[i])
+    let mut j = 0
+    while j < pr.diagnostics.length() {
+      all_diags.push(pr.diagnostics[j])
+      j = j + 1
+    }
+    files.push(pr.file)
+    i = i + 1
+  }
+  let pkg = Package::{ name: pkg_name, files: files }
+  let cr = check_package_with_imports_mapped_plan_qt(
+    pkg,
+    [],
+    imported,
+    dep_aliases,
+    dep_targets,
+    multi_pkg,
+    false,
+    None,
+    true,
+    qt_filter_mode,
+    qt_filter_files,
+  )
+  let mut k = 0
+  while k < cr.diagnostics.length() {
+    all_diags.push(cr.diagnostics[k])
+    k = k + 1
+  }
+  CheckedPackage::{ pkg: pkg, tc: cr.tc, diagnostics: all_diags }
+}
+
+///|
+pub fn check_parsed_files_with_imports_mapped(
+  pkg_name : String,
+  files : Array[SourceFile],
+  parse_diags : Array[Diagnostic],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  record_analyze : Bool,
+) -> CheckedPackage {
+  let all_diags : Array[Diagnostic] = []
+  let mut pi = 0
+  while pi < parse_diags.length() {
+    all_diags.push(parse_diags[pi])
+    pi = pi + 1
+  }
+  let pkg = Package::{ name: pkg_name, files: files }
+  let cr = check_package_with_imports_mapped_plan(
+    pkg,
+    [],
+    imported,
+    dep_aliases,
+    dep_targets,
+    multi_pkg,
+    record_analyze,
+    None,
+  )
+  let mut k = 0
+  while k < cr.diagnostics.length() {
+    all_diags.push(cr.diagnostics[k])
+    k = k + 1
+  }
+  CheckedPackage::{ pkg: pkg, tc: cr.tc, diagnostics: all_diags }
+}
+
+///|
+pub fn check_parsed_files_with_imports_types(
+  pkg_name : String,
+  files : Array[SourceFile],
+  parse_diags : Array[Diagnostic],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  qt_filter_mode : Int,
+  qt_filter_files : Map[String, Bool],
+) -> CheckedPackage {
+  let all_diags : Array[Diagnostic] = []
+  let mut pi = 0
+  while pi < parse_diags.length() {
+    all_diags.push(parse_diags[pi])
+    pi = pi + 1
+  }
+  let pkg = Package::{ name: pkg_name, files: files }
+  let cr = check_package_with_imports_mapped_plan_qt(
+    pkg,
+    [],
+    imported,
+    dep_aliases,
+    dep_targets,
+    multi_pkg,
+    false,
+    None,
+    true,
+    qt_filter_mode,
+    qt_filter_files,
   )
   let mut k = 0
   while k < cr.diagnostics.length() {
