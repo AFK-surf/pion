@@ -1386,8 +1386,11 @@ pub fn coerce_numeric_token_at_col(ln : String, col : Int, suffix_method : Strin
 ///| Collect every identifier occurring anywhere in `content` so Stage B temporary bindings
 ///| can never shadow or capture a user variable (Round 2 P0-3).
 fn collect_used_idents(content : String) -> Map[String, Bool] {
+  collect_used_idents_from_tokens(lex_moonbit(content))
+}
+
+fn collect_used_idents_from_tokens(toks : Array[Token]) -> Map[String, Bool] {
   let used : Map[String, Bool] = Map()
-  let toks = lex_moonbit(content)
   let mut i = 0
   while i < toks.length() - 1 {
     if toks[i].kind == TokenKind::Ident {
@@ -1396,6 +1399,69 @@ fn collect_used_idents(content : String) -> Map[String, Bool] {
     i = i + 1
   }
   used
+}
+
+///| Stage B content-versioned cache toggle (default ON) & perf counters.
+///| Counters: [0]=lex_calls, [1]=shrink_pkg_builds, [2]=sort_key_env_builds, [3]=pkg_fns_builds, [4]=rounds.
+let stage_b_cache_flag : Array[Bool] = [true]
+let stage_b_perf_stats : Array[Int] = [0, 0, 0, 0, 0]
+
+pub fn stage_b_set_cache_enabled(enabled : Bool) -> Unit {
+  stage_b_cache_flag[0] = enabled
+}
+
+pub fn stage_b_cache_is_enabled() -> Bool {
+  stage_b_cache_flag[0]
+}
+
+pub fn stage_b_reset_perf_counters() -> Unit {
+  stage_b_perf_stats[0] = 0
+  stage_b_perf_stats[1] = 0
+  stage_b_perf_stats[2] = 0
+  stage_b_perf_stats[3] = 0
+  stage_b_perf_stats[4] = 0
+}
+
+pub fn stage_b_get_perf_counters() -> (Int, Int, Int, Int, Int) {
+  (stage_b_perf_stats[0], stage_b_perf_stats[1], stage_b_perf_stats[2], stage_b_perf_stats[3], stage_b_perf_stats[4])
+}
+
+///| Fetch tokens for `f_rel`, reusing cross-round content-versioned cache when enabled.
+fn stage_b_get_file_tokens(
+  round_file_tokens : Map[String, Array[Token]],
+  token_cache : Map[String, (Int, Array[Token])],
+  file_vers : Map[String, Int],
+  f_rel : String,
+  content : String,
+) -> Array[Token] {
+  if stage_b_cache_flag[0] {
+    match round_file_tokens.get(f_rel) {
+      Some(ts) => return ts
+      None => ()
+    }
+    let ver = match file_vers.get(f_rel) {
+      Some(v) => v
+      None => 0
+    }
+    match token_cache.get(f_rel) {
+      Some((cver, cts)) =>
+      if cver == ver {
+        round_file_tokens[f_rel] = cts
+        return cts
+      }
+      None => ()
+    }
+    stage_b_perf_stats[0] = stage_b_perf_stats[0] + 1
+    let ts = lex_moonbit(content)
+    round_file_tokens[f_rel] = ts
+    token_cache[f_rel] = (ver, ts)
+    ts
+  } else {
+    stage_b_perf_stats[0] = stage_b_perf_stats[0] + 1
+    let ts = lex_moonbit(content)
+    round_file_tokens[f_rel] = ts
+    ts
+  }
 }
 
 ///| Allocate a guaranteed collision-free identifier not present in `used`, then record it.
@@ -1728,9 +1794,24 @@ pub fn run_stage_b_with_ops(
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> (Array[GeneratedFile], Int, Array[(String, Int)]) {
+  run_stage_b_with_ops_and_deps(files, api_map, op_lookup, Map(), check_fn, diags, drift_ledger)
+}
+
+pub fn run_stage_b_with_ops_and_deps(
+  files : Array[GeneratedFile],
+  api_map : ApiMap,
+  op_lookup : Map[String, String],
+  dep_methods : Map[String, Bool],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Array[(String, Int)]) {
   let mut cur_files : Array[GeneratedFile] = []
+  let file_vers : Map[String, Int] = Map()
+  let token_cache : Map[String, (Int, Array[Token])] = Map()
   for f in files {
     let with_bounds = apply_api_boundary_conversions(f.content, api_map, f.rel_path, diags, drift_ledger)
+    file_vers[f.rel_path] = 0
     cur_files.push(GeneratedFile::{
       rel_path: f.rel_path,
       content: with_bounds,
@@ -1743,6 +1824,7 @@ pub fn run_stage_b_with_ops(
   let mut final_hist : Array[(String, Int)] = []
 
   while iter < 16 {
+    stage_b_perf_stats[4] = stage_b_perf_stats[4] + 1
     let batch : Array[(String, String)] = []
     for f in cur_files {
       batch.push((f.rel_path, f.content))
@@ -1773,11 +1855,53 @@ pub fn run_stage_b_with_ops(
       break
     }
 
-    // Hoisted per-round lazy caches for `arr_retain`/`arr_filter_map` mutation checks (§D1-2)
+    // Hoisted per-round lazy caches backed by cross-round content-versioned `token_cache`
     let mut round_pkg_fns : Option[Map[String, StageBPkgFn]] = None
     let round_file_tokens : Map[String, Array[Token]] = Map()
+    let mut round_shrink_pkg : Option[ShrinkPkg] = None
+    let mut round_sort_key_env : Option[SortKeyEnv] = None
+    let get_all_round_tokens = fn() -> Array[Array[Token]] {
+      let out : Array[Array[Token]] = []
+      for cf in cur_files {
+        out.push(stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, cf.rel_path, cf.content))
+      }
+      out
+    }
+    let get_shrink_pkg = fn() -> ShrinkPkg {
+      if stage_b_cache_flag[0] {
+        match round_shrink_pkg {
+          Some(sp) => sp
+          None => {
+            stage_b_perf_stats[1] = stage_b_perf_stats[1] + 1
+            let sp = collect_shrink_pkg_tokens(get_all_round_tokens())
+            round_shrink_pkg = Some(sp)
+            sp
+          }
+        }
+      } else {
+        stage_b_perf_stats[1] = stage_b_perf_stats[1] + 1
+        collect_shrink_pkg_tokens(get_all_round_tokens())
+      }
+    }
+    let get_sort_key_env = fn() -> SortKeyEnv {
+      if stage_b_cache_flag[0] {
+        match round_sort_key_env {
+          Some(env) => env
+          None => {
+            stage_b_perf_stats[2] = stage_b_perf_stats[2] + 1
+            let env = sort_key_env_of_with_deps(get_all_round_tokens(), dep_methods)
+            round_sort_key_env = Some(env)
+            env
+          }
+        }
+      } else {
+        stage_b_perf_stats[2] = stage_b_perf_stats[2] + 1
+        sort_key_env_of_with_deps(get_all_round_tokens(), dep_methods)
+      }
+    }
 
     let mut changed = false
+    let changed_rels : Array[String] = []
     let next_files : Array[GeneratedFile] = []
     for f in cur_files {
       let lines = f.content.split("\n")
@@ -1786,7 +1910,8 @@ pub fn run_stage_b_with_ops(
         match used_idents_opt {
           Some(m) => m
           None => {
-            let m = collect_used_idents(f.content)
+            let ts = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+            let m = collect_used_idents_from_tokens(ts)
             used_idents_opt = Some(m)
             m
           }
@@ -1854,6 +1979,8 @@ pub fn run_stage_b_with_ops(
                     let pkg_fns = match round_pkg_fns {
                       Some(m) => m
                       None => {
+                        stage_b_perf_stats[3] = stage_b_perf_stats[3] + 1
+                        let _ = get_all_round_tokens()
                         let m = collect_stage_b_pkg_fns_cached(cur_files, round_file_tokens)
                         round_pkg_fns = Some(m)
                         m
@@ -1862,19 +1989,26 @@ pub fn run_stage_b_with_ops(
                     stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
                   }
                   let mut skip_rewrite = false
-                  if helper == "mbt_compat::arr_shrink_to_fit" &&
-                  !stage_b_check_shrink_snapshot(round_file_tokens, cur_files, f.rel_path, f.content, d.line, d.col, diags) {
-                    skip_rewrite = true
+                  if helper == "mbt_compat::arr_shrink_to_fit" {
+                    let ftoks = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+                    if !stage_b_check_shrink_snapshot_cached(ftoks, get_shrink_pkg(), f.rel_path, d.line, d.col, diags) {
+                      skip_rewrite = true
+                    }
                   }
-                  if helper == "mbt_compat::arr_sort_by_key" &&
-                  !stage_b_check_sort_key_closure(round_file_tokens, cur_files, f.rel_path, f.content, d.line, d.col, diags) {
-                    skip_rewrite = true
+                  if helper == "mbt_compat::arr_sort_by_key" {
+                    let ftoks = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+                    if !stage_b_check_sort_key_closure_cached(ftoks, get_sort_key_env(), f.rel_path, d.line, d.col, diags) {
+                      skip_rewrite = true
+                    }
                   }
-                  if helper == "mbt_compat::arr_iter" &&
-                  !stage_b_check_kept_iter(round_file_tokens, f.rel_path, f.content, d.line, d.col, diags) {
-                    skip_rewrite = true
+                  if helper == "mbt_compat::arr_iter" {
+                    let _ = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+                    if !stage_b_check_kept_iter(round_file_tokens, f.rel_path, f.content, d.line, d.col, diags) {
+                      skip_rewrite = true
+                    }
                   }
                   if helper == "mbt_compat::arr_push_iter" {
+                    let _ = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
                     let pi_status = stage_b_check_push_iter_arg(round_file_tokens, f.rel_path, f.content, d.line, d.col, true, diags)
                     if pi_status < 0 {
                       skip_rewrite = true
@@ -2820,6 +2954,7 @@ pub fn run_stage_b_with_ops(
       }
       if file_changed {
         changed = true
+        changed_rels.push(f.rel_path)
         let sb = StringBuilder()
         let mut li = 0
         while li < lines.length() {
@@ -2840,6 +2975,13 @@ pub fn run_stage_b_with_ops(
       }
     }
     cur_files = next_files
+    for rel in changed_rels {
+      let prev_ver = match file_vers.get(rel) {
+        Some(v) => v
+        None => 0
+      }
+      file_vers[rel] = prev_ver + 1
+    }
     if !changed {
       break
     }
@@ -2973,23 +3115,14 @@ fn stage_b_audit_final_push_iter_calls(cur_files : Array[GeneratedFile], diags :
 ///|  -1  -> `arg` is non-array / custom `.iter()` / mapped iterator / opaque variable: emit `MBT2PION_ARRAY_ITER_MUTATION` and block rewrite.
 ///| `xs.shrink_to_fit()` on a Pion `Array` (`lower_capacity.pion`): true when no buffer snapshot can observe
 ///| it; otherwise records `MBT2PION_ARRAY_SHRINK_ITER` and returns false (the call is left unlowered).
-fn stage_b_check_shrink_snapshot(
-  file_tokens : Map[String, Array[Token]],
-  cur_files : Array[GeneratedFile],
+fn stage_b_check_shrink_snapshot_cached(
+  tokens : Array[Token],
+  shrink_pkg : ShrinkPkg,
   f_rel : String,
-  content : String,
   line : Int,
   col : Int,
   diags : Array[Diag],
 ) -> Bool {
-  let tokens = match file_tokens.get(f_rel) {
-    Some(ts) => ts
-    None => {
-      let ts = lex_moonbit(content)
-      file_tokens[f_rel] = ts
-      ts
-    }
-  }
   let mut name_i = -1
   let mut best = 1000000
   let mut ti = 1
@@ -3007,11 +3140,7 @@ fn stage_b_check_shrink_snapshot(
   if name_i < 0 {
     return false
   }
-  let contents : Array[String] = []
-  for cf in cur_files {
-    contents.push(cf.content)
-  }
-  let why = shrink_snapshot_hazard(tokens, name_i, collect_shrink_pkg(contents))
+  let why = shrink_snapshot_hazard(tokens, name_i, shrink_pkg)
   if why.length() == 0 {
     return true
   }
@@ -3090,23 +3219,14 @@ fn stage_b_check_kept_iter(
 ///| parameter, a variable, a function name) could push to `xs` while it is sorted -- MoonBit sorts a view of the
 ///| old buffer, `arr_sort_by` the live array. Only `fn(..) { .. }` keys are lowered; others record
 ///| `MBT2PION_ARRAY_ITER_MUTATION`.
-fn stage_b_check_sort_key_closure(
-  file_tokens : Map[String, Array[Token]],
-  cur_files : Array[GeneratedFile],
+fn stage_b_check_sort_key_closure_cached(
+  tokens : Array[Token],
+  env : SortKeyEnv,
   f_rel : String,
-  content : String,
   line : Int,
   col : Int,
   diags : Array[Diag],
 ) -> Bool {
-  let tokens = match file_tokens.get(f_rel) {
-    Some(ts) => ts
-    None => {
-      let ts = lex_moonbit(content)
-      file_tokens[f_rel] = ts
-      ts
-    }
-  }
   let mut open = -1
   let mut best = 1000000
   let mut ti = 1
@@ -3126,7 +3246,7 @@ fn stage_b_check_sort_key_closure(
   }
   if open + 1 < tokens.length() && tokens[open + 1].raw == "fn" {
     // The closure body may not run code the receiver-mutation gate cannot see.
-    let why = sort_key_closure_opacity(tokens, open, sort_key_env_of(stage_b_all_tokens(file_tokens, cur_files)))
+    let why = sort_key_closure_opacity(tokens, open, env)
     if why.length() == 0 {
       return true
     }
@@ -3159,26 +3279,18 @@ fn stage_b_check_sort_key_closure(
   false
 }
 
-///| Tokens of every generated file (lexed once a round, through `file_tokens`).
-fn stage_b_all_tokens(file_tokens : Map[String, Array[Token]], cur_files : Array[GeneratedFile]) -> Array[Array[Token]] {
-  let out : Array[Array[Token]] = []
-  for f in cur_files {
-    match file_tokens.get(f.rel_path) {
-      Some(ts) => out.push(ts)
-      None => {
-        let ts = lex_moonbit(f.content)
-        file_tokens[f.rel_path] = ts
-        out.push(ts)
-      }
-    }
-  }
-  out
-}
-
 ///| After Stage B has converged: every `mbt_compat::arr_sort_by_key(xs, key)` must have a pure closure-literal key
 ///| (`sort_key_closure_purity_at`) as it reads now -- later rounds lower operators (`a + b` on a user type becomes
 ///| `mbt_op_add_T(a, b)`) and other calls the first check could not see.
 pub fn stage_b_audit_final_sort_keys(cur_files : Array[GeneratedFile], diags : Array[Diag]) -> Unit {
+  stage_b_audit_final_sort_keys_with_deps(cur_files, Map(), diags)
+}
+
+pub fn stage_b_audit_final_sort_keys_with_deps(
+  cur_files : Array[GeneratedFile],
+  dep_methods : Map[String, Bool],
+  diags : Array[Diag],
+) -> Unit {
   let all : Array[Array[Token]] = []
   let lexed : Array[(GeneratedFile, Array[Token])] = []
   for f in cur_files {
@@ -3191,7 +3303,7 @@ pub fn stage_b_audit_final_sort_keys(cur_files : Array[GeneratedFile], diags : A
   if lexed.length() == 0 {
     return
   }
-  let env = sort_key_env_of(all)
+  let env = sort_key_env_of_with_deps(all, dep_methods)
   for fp in lexed {
     let f = fp.0
     let tokens = fp.1
