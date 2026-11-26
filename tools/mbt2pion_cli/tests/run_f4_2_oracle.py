@@ -497,34 +497,40 @@ def main():
             ("local_fn_shadows_map_ret", "fn make() -> Map[String, Int] { Map([]) }\nfn sm(ys : Array[Int], v : ArrayView[Int]) -> Int { let make = fn() { ys }; let x = make(); x[0] = 99; v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { sm(ys, xs[0:2]) }\n"),
             ("fresh_each_cb_mut", "fn fe(cb : (Int) -> Unit, v : ArrayView[Int]) -> Int { let local = [1]; local.each(cb); v[0] }\npub fn f(cb : (Int) -> Unit, xs : Array[Int]) -> Int { fe(cb, xs[0:2]) }\n"),
             ("arrow_param_shadows_global", "let ys : Array[String] = []\nfn asg(arr : Array[Array[Int]], v : ArrayView[Int]) -> Int { let _ = arr.map(ys => { ys.swap(0, 1); 0 }); v[0] }\npub fn f(arr : Array[Array[Int]], xs : Array[Int]) -> Int { asg(arr, xs[0:2]) }\n"),
+            ("callee_multiline_interp_mut", "fn mark(ys : Array[Int]) -> Int { ys[0] = 99; 0 }\nfn ml(v : ArrayView[Int], ys : Array[Int]) -> Int {\n  let _ =\n    $|\\{mark(ys)}\n  v[0]\n}\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { ml(xs[0:2], ys) }\n"),
+            ("pipe_ignore_param_shadow", "fn pi(ignore : (Int) -> Unit, v : ArrayView[Int]) -> Int { 0 |> ignore; v[0] }\npub fn f(cb : (Int) -> Unit, xs : Array[Int]) -> Int { pi(cb, xs[0:2]) }\n"),
+            ("pkg_fn_ignore_shadow", "fn ignore(a : Array[Int]) -> Unit { a.swap(0, 1) }\nfn upi(ys : Array[Int], v : ArrayView[Int]) -> Int { ignore(ys); v[0] }\npub fn f(xs : Array[Int], ys : Array[Int]) -> Int { upi(ys, xs[0:2]) }\n"),
         ]:
             assert_publish_blocked(bin_path, args.pionc, work, nm, src, "MBT2PION_BORROWED_ARRAY_SLICE")
 
-        # 3l-split. Same-package split-file global `let h : Hook` with `impl Add` in sibling file MUST fail closed
-        sp_src = os.path.join(work, "neg_split_hook_src")
-        sp_out = os.path.join(work, "neg_split_hook_out")
-        sp_rep = os.path.join(work, "neg_split_hook_rep.json")
-        os.makedirs(sp_src)
-        os.makedirs(sp_out)
-        with open(os.path.join(sp_src, "g.mbt"), "w") as fh:
-            fh.write(
-                "struct Hook { xs : Array[Int] }\n"
-                "impl Add for Hook with add(self, other) { let _ = other; self.xs[0] = 99; self }\n"
-                "let h : Hook = { xs: [1] }\n"
+        # 3l-split. Same-package split-file global `let h : Hook` & `let hs : Array[Hook]` with `impl Add` in sibling file MUST fail closed
+        for sp_name, f_body in [
+            ("split_hook", "fn use_g(v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_hook_arr_idx", "fn use_g(v : ArrayView[Int]) -> Int { let _ = hs[0] + hs[0]; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+            ("split_hook_arr_for", "fn use_g(v : ArrayView[Int]) -> Int { for x in hs { let _ = x + x }; v[0] }\npub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"),
+        ]:
+            sp_src = os.path.join(work, f"neg_{sp_name}_src")
+            sp_out = os.path.join(work, f"neg_{sp_name}_out")
+            sp_rep = os.path.join(work, f"neg_{sp_name}_rep.json")
+            os.makedirs(sp_src)
+            os.makedirs(sp_out)
+            with open(os.path.join(sp_src, "g.mbt"), "w") as fh:
+                fh.write(
+                    "struct Hook { xs : Array[Int] }\n"
+                    "impl Add for Hook with add(self, other) { let _ = other; self.xs[0] = 99; self }\n"
+                    "let h : Hook = { xs: [1] }\n"
+                    "let hs : Array[Hook] = [{ xs: [1] }]\n"
+                )
+            with open(os.path.join(sp_src, "f.mbt"), "w") as fh:
+                fh.write(f_body)
+            p_sp = subprocess.run(
+                [bin_path, "--src", sp_src, "--out", sp_out, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", sp_rep],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
             )
-        with open(os.path.join(sp_src, "f.mbt"), "w") as fh:
-            fh.write(
-                "fn use_g(v : ArrayView[Int]) -> Int { let _ = h + h; v[0] }\n"
-                "pub fn f(xs : Array[Int]) -> Int { use_g(xs[0:2]) }\n"
-            )
-        p_sp = subprocess.run(
-            [bin_path, "--src", sp_src, "--out", sp_out, "--target", "native", "--mode", "publish",
-             "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", sp_rep],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
-        )
-        sp_comb = p_sp.stdout + "\n" + p_sp.stderr + "\n" + (open(sp_rep).read() if os.path.exists(sp_rep) else "")
-        assert p_sp.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in sp_comb, f"split_hook must block:\n{sp_comb}"
-        assert not os.listdir(sp_out), "blocked publish `split_hook` must leave --out empty"
+            sp_comb = p_sp.stdout + "\n" + p_sp.stderr + "\n" + (open(sp_rep).read() if os.path.exists(sp_rep) else "")
+            assert p_sp.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in sp_comb, f"{sp_name} must block:\n{sp_comb}"
+            assert not os.listdir(sp_out), f"blocked publish `{sp_name}` must leave --out empty"
 
         # 3l. Cross-package `@dep.Hook` equality and method dispatch inside RO_VIEW callee MUST fail closed
         hook_src = os.path.join(work, "hookdep_src")

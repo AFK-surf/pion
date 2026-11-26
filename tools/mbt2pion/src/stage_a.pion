@@ -17794,9 +17794,33 @@ fn is_known_nominal_or_prim_f42(ctx : StageAContext, t : String) -> Bool {
   ctx.symtab.local_types.contains(t)
 }
 
+///| True iff `tokens` declares a top-level `struct <name>` in the current file.
+fn file_declares_struct_f42(tokens : Array[Token], name : String) -> Bool {
+  let n = tokens.length()
+  let mut bd = 0
+  let mut k = 0
+  while k < n {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LBrace { bd = bd + 1 }
+    else if kk == TokenKind::RBrace { if bd > 0 { bd = bd - 1 } }
+    else if bd == 0 && tokens[k].raw == "struct" && k + 1 < n &&
+    tokens[k + 1].kind == TokenKind::UpperIdent && tokens[k + 1].raw == name {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
 ///| True iff `name` is a module-level `let` of type `Array[E]` whose element type `E` is provably
-///| disjoint from `target_elem_ty` (e.g. `keyed_ats : Array[KeyedAt]` vs `Json`), rejecting type aliases.
-fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_ty : String) -> Bool {
+///| disjoint from `target_elem_ty` (e.g. `keyed_ats : Array[KeyedAt]` vs `Json`), rejecting type aliases
+///| and cross-file nominal structs.
+fn is_disjoint_global_array_f42(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  name : String,
+  target_elem_ty : String,
+) -> Bool {
   if target_elem_ty.length() == 0 {
     return false
   }
@@ -17810,8 +17834,14 @@ fn is_disjoint_global_array_f42(ctx : StageAContext, name : String, target_elem_
       if t.starts_with("Array[") && t.ends_with("]") {
         let e = t.slice(6, t.length() - 1).trim()
         let norm_e = if e == "mbt_compat::MbtJson" || e == "MbtJson" { "Json" } else { e }
-        return norm_e.length() > 0 && norm_e != norm_target && !str_has(norm_e, "Array") &&
-        is_known_nominal_or_prim_f42(ctx, norm_e)
+        if !(norm_e.length() > 0 && norm_e != norm_target && !str_has(norm_e, "Array") &&
+          is_known_nominal_or_prim_f42(ctx, norm_e)) {
+          return false
+        }
+        if ctx.symtab.local_types.contains(norm_e) && !file_declares_struct_f42(tokens, norm_e) {
+          return false
+        }
+        return true
       }
       false
     }
@@ -18140,7 +18170,8 @@ fn fn_has_no_nonfresh_mutation_f42(
     if tk.kind == TokenKind::PkgRef {
       return false
     }
-    if tk.kind == TokenKind::InterpString || (tk.kind == TokenKind::StringLit && str_has(tk.raw, "\\{")) {
+    if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline ||
+    (tk.kind == TokenKind::StringLit && str_has(tk.raw, "\\{")) {
       return false
     }
     if tk.kind == TokenKind::UpperIdent && ctx.symtab.local_types.contains(tk.raw) {
@@ -18156,7 +18187,7 @@ fn fn_has_no_nonfresh_mutation_f42(
         tokens[i - 3].kind == TokenKind::Dot &&
         tokens[i - 4].kind == TokenKind::Ident &&
         !bound_scope_has_f42(bound_scope, tokens[i - 4].raw) &&
-        is_disjoint_global_array_f42(ctx, tokens[i - 4].raw, target_elem_ty)
+        is_disjoint_global_array_f42(ctx, tokens, tokens[i - 4].raw, target_elem_ty)
         if !ok_disjoint_push {
           return false
         }
@@ -18458,13 +18489,46 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       }
     }
-    // Reject free references to non-builtin / non-disjoint module globals (e.g. `let h : Hook` in same or split file)
+    // Reject free references to non-builtin / non-disjoint module globals; restrict disjoint global array use sites
     if tk.kind == TokenKind::Ident &&
     !(i > fn_open && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) &&
     !bound_scope_has_f42(bound_scope, tk.raw) && !ctx.symtab.local_fn_names.contains(tk.raw) {
       match ctx.symtab.val_types.get(tk.raw) {
         Some(vt) =>
-        if !(is_closed_builtin_ty_f42(ctx, vt.trim()) || is_disjoint_global_array_f42(ctx, tk.raw, target_elem_ty)) {
+        if is_closed_builtin_ty_f42(ctx, vt.trim()) {
+          ()
+        } else if is_disjoint_global_array_f42(ctx, tokens, tk.raw, target_elem_ty) {
+          let is_allowed_method = i + 3 < fn_close &&
+          tokens[i + 1].kind == TokenKind::Dot &&
+          tokens[i + 2].kind == TokenKind::Ident &&
+          tokens[i + 3].kind == TokenKind::LParen &&
+          (tokens[i + 2].raw == "length" || tokens[i + 2].raw == "remove" ||
+            tokens[i + 2].raw == "push" || tokens[i + 2].raw == "clear" || tokens[i + 2].raw == "pop")
+          let is_allowed_for = i >= fn_open + 2 &&
+          tokens[i - 1].kind == TokenKind::Keyword && tokens[i - 1].raw == "in" &&
+          tokens[i - 2].kind == TokenKind::Ident &&
+          i + 1 < fn_close && tokens[i + 1].kind == TokenKind::LBrace
+          if is_allowed_for {
+            let lv = tokens[i - 2].raw
+            let lc = find_matching_delim(tokens, i + 1)
+            let mut lk = i + 2
+            while lk < lc {
+              if tokens[lk].kind == TokenKind::Ident && tokens[lk].raw == lv &&
+              !(lk > i + 1 && (tokens[lk - 1].kind == TokenKind::Dot || tokens[lk - 1].kind == TokenKind::ColonColon)) {
+                let is_field_read = lk + 2 < lc &&
+                tokens[lk + 1].kind == TokenKind::Dot &&
+                tokens[lk + 2].kind == TokenKind::Ident &&
+                !(lk + 3 < lc && tokens[lk + 3].kind == TokenKind::LParen)
+                if !is_field_read {
+                  return false
+                }
+              }
+              lk = lk + 1
+            }
+          } else if !is_allowed_method {
+            return false
+          }
+        } else {
           return false
         }
         None => ()
@@ -18478,7 +18542,8 @@ fn fn_has_no_nonfresh_mutation_f42(
       return false
     }
     if tk.kind == TokenKind::PipeGt {
-      if !(i + 1 < fn_close && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 1].raw == "ignore") {
+      if !(i + 1 < fn_close && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 1].raw == "ignore" &&
+        !bound_scope_has_f42(bound_scope, "ignore") && !ctx.symtab.local_fn_names.contains("ignore")) {
         return false
       }
     }
@@ -18496,7 +18561,7 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
         let r = tokens[i - 1].raw
         if !(map_scope_lookup_f42(fresh_scope, r) || map_scope_lookup_f42(map_scope, r) ||
-          (!bound_scope_has_f42(bound_scope, r) && is_disjoint_global_array_f42(ctx, r, target_elem_ty))) {
+          (!bound_scope_has_f42(bound_scope, r) && is_disjoint_global_array_f42(ctx, tokens, r, target_elem_ty))) {
           return false
         }
       }
@@ -18525,7 +18590,7 @@ fn fn_has_no_nonfresh_mutation_f42(
           }
           let r = tokens[i - 2].raw
           if !(map_scope_lookup_f42(fresh_scope, r) || map_scope_lookup_f42(map_scope, r) ||
-            (!bound_scope_has_f42(bound_scope, r) && is_disjoint_global_array_f42(ctx, r, target_elem_ty))) {
+            (!bound_scope_has_f42(bound_scope, r) && is_disjoint_global_array_f42(ctx, tokens, r, target_elem_ty))) {
             return false
           }
         }
@@ -18539,7 +18604,8 @@ fn fn_has_no_nonfresh_mutation_f42(
         }
       } else {
         let g = tk.raw
-        if ((g == "ignore" || g == "physical_equal") && !bound_scope_has_f42(bound_scope, g)) ||
+        if ((g == "ignore" || g == "physical_equal") &&
+          !bound_scope_has_f42(bound_scope, g) && !ctx.symtab.local_fn_names.contains(g)) ||
         map_scope_lookup_f42(closure_scope, g) {
           ()
         } else if !bound_scope_has_f42(bound_scope, g) && ctx.symtab.local_fn_names.contains(g) {
