@@ -169,6 +169,16 @@ fn format_simple_default_expr(e : Expr) -> Option[String] {
 
 ///|
 fn write_param_sig(sb : StringBuilder, param : Param, spaced_colon : Bool) -> Unit {
+  write_param_sig_ex(sb, param, spaced_colon, false)
+}
+
+///|
+fn write_param_sig_ex(
+  sb : StringBuilder,
+  param : Param,
+  spaced_colon : Bool,
+  emit_stub_default : Bool,
+) -> Unit {
   if param.is_into {
     sb.write_string("into ")
   }
@@ -181,18 +191,29 @@ fn write_param_sig(sb : StringBuilder, param : Param, spaced_colon : Bool) -> Un
   } else if param.label_kind == 2 {
     sb.write_string("?")
   }
-  if spaced_colon {
-    sb.write_string(" : ")
-  } else {
-    sb.write_string(": ")
+  let skip_ty = emit_stub_default &&
+    match param.ty {
+      TyMissing(_) => true
+      _ => false
+    }
+  if !skip_ty {
+    if spaced_colon {
+      sb.write_string(" : ")
+    } else {
+      sb.write_string(": ")
+    }
+    sb.write_string(type_expr_to_string(param.ty))
   }
-  sb.write_string(type_expr_to_string(param.ty))
   match param.default_expr {
     Some(def) => {
       sb.write_string(" = ")
-      match format_simple_default_expr(def) {
-        Some(s) => sb.write_string(s)
-        None => sb.write_string("<expr>")
+      if emit_stub_default {
+        stub_write_expr(sb, def)
+      } else {
+        match format_simple_default_expr(def) {
+          Some(s) => sb.write_string(s)
+          None => sb.write_string("<expr>")
+        }
       }
     }
     None => ()
@@ -7908,15 +7929,38 @@ pub fn xpkg_fn_is_inlinable_tc(tc : TypeChecker, fd : FnDecl) -> Bool {
 }
 
 ///|
+/// Lexer preserves escape sequences verbatim inside `CharLit` / `ByteLit`
+/// payloads (`'\n'` -> `"\\n"`, `b'\x1b'` -> `"\\x1b"`, `'\''` -> `"\\'"`),
+/// so emit the payload verbatim without double-escaping.
 fn stub_write_char_lit(sb : StringBuilder, prefix : String, s : String) -> Unit {
   sb.write_string(prefix)
+  sb.write_string(s)
+  sb.write_string("'")
+}
+
+///|
+/// Escape a decoded string payload using Pion's own string escape syntax
+/// (`\n`, `\r`, `\t`, `\\`, `\"`, `\0`, and `\u{XX}` for other control bytes),
+/// avoiding JSON `\u00XX` escapes that Pion's lexer rejects.
+fn stub_write_str_escaped(sb : StringBuilder, s : String) -> Unit {
+  let len = s.length()
   let mut i = 0
-  while i < s.length() {
+  while i < len {
     let ch = str_code_at(s, i)
+    if ch >= 0x80 {
+      // Copy the whole non-ASCII UTF-8 run unchanged (never slice byte-by-byte).
+      let mut j = i + 1
+      while j < len && str_code_at(s, j) >= 0x80 {
+        j = j + 1
+      }
+      sb_write_range(sb, s, i, j)
+      i = j
+      continue
+    }
     if ch == 92 {
       sb.write_string("\\\\")
-    } else if ch == 39 {
-      sb.write_string("\\'")
+    } else if ch == 34 {
+      sb.write_string("\\\"")
     } else if ch == 10 {
       sb.write_string("\\n")
     } else if ch == 13 {
@@ -7926,15 +7970,22 @@ fn stub_write_char_lit(sb : StringBuilder, prefix : String, s : String) -> Unit 
     } else if ch == 0 {
       sb.write_string("\\0")
     } else if ch < 32 || ch == 127 {
-      sb.write_string("\\x")
+      sb.write_string("\\u{")
       sb.write_char(hex_digit((ch >> 4) & 15))
       sb.write_char(hex_digit(ch & 15))
+      sb.write_string("}")
     } else {
       sb.write_string(slice_str(s, i, i + 1))
     }
     i = i + 1
   }
-  sb.write_string("'")
+}
+
+///|
+fn stub_write_str_lit(sb : StringBuilder, s : String) -> Unit {
+  sb.write_string("\"")
+  stub_write_str_escaped(sb, s)
+  sb.write_string("\"")
 }
 
 ///|
@@ -7944,7 +7995,7 @@ fn stub_write_pat(sb : StringBuilder, pat : Pattern) -> Unit {
     PIdent(name, _) => sb.write_string(name)
     PBool(b, _) => sb.write_string(if b { "true" } else { "false" })
     PInt(s, _) => sb.write_string(s)
-    PString(s, _) => sb.write_string(json_quote(s))
+    PString(s, _) => stub_write_str_lit(sb, s)
     PChar(s, _) => stub_write_char_lit(sb, "'", s)
     PTuple(subs, _) => {
       sb.write_string("(")
@@ -8014,13 +8065,29 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
     EBool(b, _) => sb.write_string(if b { "true" } else { "false" })
     EByte(s, _) => stub_write_char_lit(sb, "b'", s)
     EChar(s, _) => stub_write_char_lit(sb, "'", s)
-    EString(s, _) => sb.write_string(json_quote(s))
+    EString(s, _) => stub_write_str_lit(sb, s)
     EUnit(_) => sb.write_string("()")
     EIdent(name, _) => sb.write_string(name)
     EPath(q, m, _) => {
       sb.write_string(q)
       sb.write_string("::")
       sb.write_string(m)
+    }
+    EDotVariant(vname, args, _) => {
+      sb.write_string(".")
+      sb.write_string(vname)
+      if args.length() > 0 {
+        sb.write_string("(")
+        let mut i = 0
+        while i < args.length() {
+          if i > 0 {
+            sb.write_string(", ")
+          }
+          stub_write_expr(sb, args[i])
+          i = i + 1
+        }
+        sb.write_string(")")
+      }
     }
     EUnary(op, inner, _) => {
       sb.write_string("(")
@@ -8079,14 +8146,24 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       }
       sb.write_string(")")
     }
-    EStructLit(sname, _, fields, _) => {
+    EStructLit(sname, spread_opt, fields, _) => {
       sb.write_string(sname)
       sb.write_string("::{ ")
+      let mut need_comma = false
+      match spread_opt {
+        Some(base) => {
+          sb.write_string("..")
+          stub_write_expr(sb, base)
+          need_comma = true
+        }
+        None => ()
+      }
       let mut i = 0
       while i < fields.length() {
-        if i > 0 {
+        if need_comma {
           sb.write_string(", ")
         }
+        need_comma = true
         sb.write_string(fields[i].name)
         sb.write_string(": ")
         stub_write_expr(sb, fields[i].value)
@@ -8095,7 +8172,17 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       sb.write_string(" }")
     }
     ECall(callee, args, _) => {
-      stub_write_expr(sb, callee)
+      let need_paren = match callee {
+        EIdent(_, _) | EPath(_, _, _) => false
+        _ => true
+      }
+      if need_paren {
+        sb.write_string("(")
+        stub_write_expr(sb, callee)
+        sb.write_string(")")
+      } else {
+        stub_write_expr(sb, callee)
+      }
       sb.write_string("(")
       let mut i = 0
       while i < args.length() {
@@ -8178,6 +8265,139 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       }
       stub_write_expr(sb, inner)
     }
+    EMutArg(inner, _) => {
+      sb.write_string("mut ")
+      stub_write_expr(sb, inner)
+    }
+    EMove(inner, _) => {
+      sb.write_string("move ")
+      stub_write_expr(sb, inner)
+    }
+    EIs(inner, pat, _) => {
+      sb.write_string("(")
+      stub_write_expr(sb, inner)
+      sb.write_string(" is ")
+      stub_write_pat(sb, pat)
+      sb.write_string(")")
+    }
+    EClosure(params, ret_ty, body, _) => {
+      sb.write_string("fn(")
+      let mut i = 0
+      while i < params.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        if params[i].is_mut {
+          sb.write_string("mut ")
+        }
+        sb.write_string(params[i].name)
+        match params[i].ty {
+          TyMissing(_) => ()
+          _ => {
+            sb.write_string(" : ")
+            sb.write_string(type_expr_to_string(params[i].ty))
+          }
+        }
+        i = i + 1
+      }
+      sb.write_string(")")
+      match ret_ty {
+        TyMissing(_) => ()
+        _ => {
+          sb.write_string(" -> ")
+          sb.write_string(type_expr_to_string(ret_ty))
+        }
+      }
+      sb.write_string(" {\n")
+      stub_write_stmts(sb, body)
+      sb.write_string("}")
+    }
+    EScope(world_e, body_e, _) => {
+      sb.write_string("scope(")
+      stub_write_expr(sb, world_e)
+      sb.write_string(", ")
+      stub_write_expr(sb, body_e)
+      sb.write_string(")")
+    }
+    ESpawn(scope_e, body_e, _) => {
+      sb.write_string("spawn(")
+      stub_write_expr(sb, scope_e)
+      sb.write_string(", ")
+      stub_write_expr(sb, body_e)
+      sb.write_string(")")
+    }
+    EInterp(parts, _) => {
+      sb.write_string("\"")
+      let mut i = 0
+      while i < parts.length() {
+        match parts[i] {
+          EString(s, _) => stub_write_str_escaped(sb, s)
+          other => {
+            sb.write_string("\\{")
+            stub_write_expr(sb, other)
+            sb.write_string("}")
+          }
+        }
+        i = i + 1
+      }
+      sb.write_string("\"")
+    }
+  }
+}
+
+///|
+fn stub_write_stmt_inline(sb : StringBuilder, st : Stmt) -> Unit {
+  match st {
+    SLet(name, is_mut, ty, init, _) => {
+      sb.write_string("let ")
+      if is_mut {
+        sb.write_string("mut ")
+      }
+      sb.write_string(name)
+      match ty {
+        TyMissing(_) => ()
+        _ => {
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(ty))
+        }
+      }
+      sb.write_string(" = ")
+      stub_write_expr(sb, init)
+    }
+    SLetTuple(names, ty, init, _) => {
+      sb.write_string("let (")
+      let mut ni = 0
+      while ni < names.length() {
+        if ni > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(names[ni])
+        ni = ni + 1
+      }
+      sb.write_string(")")
+      match ty {
+        TyMissing(_) => ()
+        _ => {
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(ty))
+        }
+      }
+      sb.write_string(" = ")
+      stub_write_expr(sb, init)
+    }
+    SAssign(lhs, rhs, _) => {
+      stub_write_expr(sb, lhs)
+      sb.write_string(" = ")
+      stub_write_expr(sb, rhs)
+    }
+    SCompoundAssign(op, lhs, rhs, _) => {
+      stub_write_expr(sb, lhs)
+      sb.write_string(" ")
+      sb.write_string(op)
+      sb.write_string("= ")
+      stub_write_expr(sb, rhs)
+    }
+    SExpr(e, _) => stub_write_expr(sb, e)
     _ => sb.write_string("panic()")
   }
 }
@@ -8194,6 +8414,27 @@ fn stub_write_stmts(sb : StringBuilder, stmts : Array[Stmt]) -> Unit {
           sb.write_string("mut ")
         }
         sb.write_string(name)
+        match ty {
+          TyMissing(_) => ()
+          _ => {
+            sb.write_string(" : ")
+            sb.write_string(type_expr_to_string(ty))
+          }
+        }
+        sb.write_string(" = ")
+        stub_write_expr(sb, init)
+      }
+      SLetTuple(names, ty, init, _) => {
+        sb.write_string("let (")
+        let mut ni = 0
+        while ni < names.length() {
+          if ni > 0 {
+            sb.write_string(", ")
+          }
+          sb.write_string(names[ni])
+          ni = ni + 1
+        }
+        sb.write_string(")")
         match ty {
           TyMissing(_) => ()
           _ => {
@@ -8239,9 +8480,54 @@ fn stub_write_stmts(sb : StringBuilder, stmts : Array[Stmt]) -> Unit {
         stub_write_stmts(sb, wbody)
         sb.write_string("  }")
       }
+      SFor(init_st, cond_e, step_st, fbody, _) => {
+        sb.write_string("for ")
+        stub_write_stmt_inline(sb, init_st)
+        sb.write_string("; ")
+        stub_write_expr(sb, cond_e)
+        sb.write_string("; ")
+        stub_write_stmt_inline(sb, step_st)
+        sb.write_string(" {\n")
+        stub_write_stmts(sb, fbody)
+        sb.write_string("  }")
+      }
+      SForRange(vname, start_e, end_e, inclusive, fbody, _) => {
+        sb.write_string("for ")
+        sb.write_string(vname)
+        sb.write_string(" in ")
+        stub_write_expr(sb, start_e)
+        sb.write_string(if inclusive { "..=" } else { "..<" })
+        stub_write_expr(sb, end_e)
+        sb.write_string(" {\n")
+        stub_write_stmts(sb, fbody)
+        sb.write_string("  }")
+      }
+      SForIn(kname, vname, iter_e, fbody, _) => {
+        sb.write_string("for ")
+        if kname.length() > 0 && vname.length() > 0 {
+          sb.write_string(kname)
+          sb.write_string(", ")
+          sb.write_string(vname)
+        } else if vname.length() > 0 {
+          sb.write_string(vname)
+        } else {
+          sb.write_string(kname)
+        }
+        sb.write_string(" in ")
+        stub_write_expr(sb, iter_e)
+        sb.write_string(" {\n")
+        stub_write_stmts(sb, fbody)
+        sb.write_string("  }")
+      }
+      SDebugAssert(cond_e, msg_e, _) => {
+        sb.write_string("debug_assert(")
+        stub_write_expr(sb, cond_e)
+        sb.write_string(", ")
+        stub_write_expr(sb, msg_e)
+        sb.write_string(")")
+      }
       SBreak(_) => sb.write_string("break")
       SContinue(_) => sb.write_string("continue")
-      _ => sb.write_string("panic()")
     }
     sb.write_string("\n")
     i = i + 1
@@ -8249,16 +8535,273 @@ fn stub_write_stmts(sb : StringBuilder, stmts : Array[Stmt]) -> Unit {
 }
 
 ///|
+/// Collect identifiers/method names referenced inside `e` for private-helper
+/// reachability from generic fns/impls and complex pub default args.
+fn stub_collect_refs_expr(
+  e : Expr,
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  match e {
+    EIdent(name, _) => out_names.push(name)
+    EPath(q, m, _) => {
+      out_names.push(q + "::" + m)
+      out_names.push(m)
+    }
+    EDotVariant(_, args, _) => stub_collect_refs_exprs(args, out_names, out_methods)
+    EUnary(_, inner, _) | EMutArg(inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
+      stub_collect_refs_expr(inner, out_names, out_methods)
+    EIs(inner, _, _) => stub_collect_refs_expr(inner, out_names, out_methods)
+    EBinary(_, lhs, rhs, _) => {
+      stub_collect_refs_expr(lhs, out_names, out_methods)
+      stub_collect_refs_expr(rhs, out_names, out_methods)
+    }
+    ECall(callee, args, _) => {
+      stub_collect_refs_expr(callee, out_names, out_methods)
+      stub_collect_refs_exprs(args, out_names, out_methods)
+    }
+    EField(obj, _, _) => stub_collect_refs_expr(obj, out_names, out_methods)
+    EMethodCall(recv, mname, args, _) => {
+      out_methods.push(mname)
+      stub_collect_refs_expr(recv, out_names, out_methods)
+      stub_collect_refs_exprs(args, out_names, out_methods)
+    }
+    EIndex(obj, idx, _) => {
+      stub_collect_refs_expr(obj, out_names, out_methods)
+      stub_collect_refs_expr(idx, out_names, out_methods)
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) =>
+      stub_collect_refs_exprs(elems, out_names, out_methods)
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => stub_collect_refs_expr(base, out_names, out_methods)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        stub_collect_refs_expr(fields[i].value, out_names, out_methods)
+        i = i + 1
+      }
+    }
+    EBlock(stmts, _) => stub_collect_refs_stmts(stmts, out_names, out_methods)
+    EIf(cond, then_stmts, else_opt, _) => {
+      stub_collect_refs_expr(cond, out_names, out_methods)
+      stub_collect_refs_stmts(then_stmts, out_names, out_methods)
+      match else_opt {
+        Some(el) => stub_collect_refs_expr(el, out_names, out_methods)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      stub_collect_refs_expr(scrut, out_names, out_methods)
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(g) => stub_collect_refs_expr(g, out_names, out_methods)
+          None => ()
+        }
+        stub_collect_refs_expr(arms[i].body, out_names, out_methods)
+        i = i + 1
+      }
+    }
+    EClosure(_, _, body, _) => stub_collect_refs_stmts(body, out_names, out_methods)
+    EScope(a, b, _) | ESpawn(a, b, _) => {
+      stub_collect_refs_expr(a, out_names, out_methods)
+      stub_collect_refs_expr(b, out_names, out_methods)
+    }
+    ENamedArg(_, _, inner, _) => stub_collect_refs_expr(inner, out_names, out_methods)
+    _ => ()
+  }
+}
+
+///|
+fn stub_collect_refs_exprs(
+  es : Array[Expr],
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  let mut i = 0
+  while i < es.length() {
+    stub_collect_refs_expr(es[i], out_names, out_methods)
+    i = i + 1
+  }
+}
+
+///|
+fn stub_collect_refs_stmts(
+  stmts : Array[Stmt],
+  out_names : Array[String],
+  out_methods : Array[String],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) =>
+        stub_collect_refs_expr(init, out_names, out_methods)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        stub_collect_refs_expr(lhs, out_names, out_methods)
+        stub_collect_refs_expr(rhs, out_names, out_methods)
+      }
+      SGuard(cond, body, _) | SWhile(cond, body, _) => {
+        stub_collect_refs_expr(cond, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SFor(init_st, cond, step_st, body, _) => {
+        stub_collect_refs_stmts([init_st], out_names, out_methods)
+        stub_collect_refs_expr(cond, out_names, out_methods)
+        stub_collect_refs_stmts([step_st], out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SForRange(_, s, e, _, body, _) => {
+        stub_collect_refs_expr(s, out_names, out_methods)
+        stub_collect_refs_expr(e, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SForIn(_, _, it, body, _) => {
+        stub_collect_refs_expr(it, out_names, out_methods)
+        stub_collect_refs_stmts(body, out_names, out_methods)
+      }
+      SReturn(Some(e), _) | SExpr(e, _) => stub_collect_refs_expr(e, out_names, out_methods)
+      SDebugAssert(c, m, _) => {
+        stub_collect_refs_expr(c, out_names, out_methods)
+        stub_collect_refs_expr(m, out_names, out_methods)
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn stub_fn_key(fd : FnDecl) -> String {
+  if fd.receiver_type != "" {
+    fd.receiver_type + "::" + fd.name
+  } else {
+    fd.name
+  }
+}
+
+///|
+/// Compute the transitive closure of private functions and private constants
+/// reachable from generic fn/impl bodies or pub default-arg expressions so
+/// cross-package monomorphization/default expansion never calls a `{ panic() }`
+/// private stub.
+fn stub_collect_reachable_priv_deps(
+  pkg : Package,
+) -> (Map[String, Bool], Map[String, Bool]) {
+  let priv_fns : Map[String, FnDecl] = Map([])
+  let priv_methods_by_name : Map[String, Array[String]] = Map([])
+  let priv_consts : Map[String, Expr] = Map([])
+  let q_names : Array[String] = []
+  let q_methods : Array[String] = []
+
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) => {
+          let fk = stub_fn_key(fd)
+          if !fd.is_pub && fd.type_params.length() == 0 {
+            priv_fns.set(fk, fd)
+            if fd.receiver_type != "" {
+              sig_demand_map_push_unique(priv_methods_by_name, fd.name, fk)
+            }
+          }
+          if fd.type_params.length() > 0 {
+            stub_collect_refs_stmts(fd.body, q_names, q_methods)
+          }
+          if fd.is_pub {
+            let mut pi = 0
+            while pi < fd.params.length() {
+              match fd.params[pi].default_expr {
+                Some(def) => stub_collect_refs_expr(def, q_names, q_methods)
+                None => ()
+              }
+              pi = pi + 1
+            }
+          }
+        }
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            let m = id.methods[mi]
+            if id.type_params.length() > 0 || m.type_params.length() > 0 {
+              stub_collect_refs_stmts(m.body, q_names, q_methods)
+            }
+            mi = mi + 1
+          }
+        }
+        DConst(cd) =>
+          if !cd.is_pub {
+            priv_consts.set(cd.name, cd.value)
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+
+  let keep_fns : Map[String, Bool] = Map([])
+  let keep_consts : Map[String, Bool] = Map([])
+  let mut ni = 0
+  let mut mi = 0
+  while ni < q_names.length() || mi < q_methods.length() {
+    while ni < q_names.length() {
+      let nm = q_names[ni]
+      ni = ni + 1
+      if !keep_fns.contains(nm) {
+        match priv_fns.get(nm) {
+          Some(fd) => {
+            keep_fns.set(nm, true)
+            stub_collect_refs_stmts(fd.body, q_names, q_methods)
+          }
+          None => ()
+        }
+      }
+      if !keep_consts.contains(nm) {
+        match priv_consts.get(nm) {
+          Some(val_e) => {
+            keep_consts.set(nm, true)
+            stub_collect_refs_expr(val_e, q_names, q_methods)
+          }
+          None => ()
+        }
+      }
+    }
+    while mi < q_methods.length() {
+      let mn = q_methods[mi]
+      mi = mi + 1
+      match priv_methods_by_name.get(mn) {
+        Some(fks) => {
+          let mut ki = 0
+          while ki < fks.length() {
+            q_names.push(fks[ki])
+            ki = ki + 1
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  (keep_fns, keep_consts)
+}
+
+///|
 /// Emit a minimal parseable `.pion` stub containing only top-level declarations
 /// (structs, enums, const types, and fn signatures with `{ panic() }` bodies).
 pub fn emit_file_stub(f : SourceFile) -> String {
-  emit_file_stub_with_syms(f, None)
+  emit_file_stub_with_syms(f, None, Map([]), Map([]))
 }
 
 ///|
 fn emit_file_stub_with_syms(
   f : SourceFile,
   xpkg_syms : Option[XpkgPubSyms],
+  keep_priv_fns : Map[String, Bool],
+  keep_priv_consts : Map[String, Bool],
 ) -> String {
   let sb = StringBuilder()
   let mut di = 0
@@ -8354,17 +8897,19 @@ fn emit_file_stub_with_syms(
           if i > 0 {
             sb.write_string(", ")
           }
-          write_param_sig(sb, fd.params[i], true)
+          write_param_sig_ex(sb, fd.params[i], true, true)
           i = i + 1
         }
         sb.write_string(") -> ")
         sb.write_string(type_expr_to_string(fd.ret_ty))
-        let emit_body = match xpkg_syms {
-          Some(syms) =>
-            xpkg_fn_is_inlinable(syms, fd) ||
-            xpkg_fn_is_inlinable_priv_leaf(syms, fd)
-          None => false
-        }
+        let emit_body = fd.type_params.length() > 0 ||
+          keep_priv_fns.contains(stub_fn_key(fd)) ||
+          match xpkg_syms {
+            Some(syms) =>
+              xpkg_fn_is_inlinable(syms, fd) ||
+              xpkg_fn_is_inlinable_priv_leaf(syms, fd)
+            None => false
+          }
         if emit_body {
           sb.write_string(" {\n")
           stub_write_stmts(sb, fd.body)
@@ -8432,12 +8977,7 @@ fn emit_file_stub_with_syms(
             if j > 0 {
               sb.write_string(", ")
             }
-            if m.params[j].is_mut {
-              sb.write_string("mut ")
-            }
-            sb.write_string(m.params[j].name)
-            sb.write_string(" : ")
-            sb.write_string(type_expr_to_string(m.params[j].ty))
+            write_param_sig_ex(sb, m.params[j], true, true)
             j = j + 1
           }
           sb.write_string(") -> ")
@@ -8480,23 +9020,25 @@ fn emit_file_stub_with_syms(
           }
           sb.write_string("  fn ")
           sb.write_string(m.name)
+          sb.write_string(format_type_params_with_bounds(m.type_params, m.type_bounds))
           sb.write_string("(")
           let mut j = 0
           while j < m.params.length() {
             if j > 0 {
               sb.write_string(", ")
             }
-            if m.params[j].is_mut {
-              sb.write_string("mut ")
-            }
-            sb.write_string(m.params[j].name)
-            sb.write_string(" : ")
-            sb.write_string(type_expr_to_string(m.params[j].ty))
+            write_param_sig_ex(sb, m.params[j], true, true)
             j = j + 1
           }
           sb.write_string(") -> ")
           sb.write_string(type_expr_to_string(m.ret_ty))
-          sb.write_string(" { panic() }\n")
+          if id.type_params.length() > 0 || m.type_params.length() > 0 {
+            sb.write_string(" {\n")
+            stub_write_stmts(sb, m.body)
+            sb.write_string("  }\n")
+          } else {
+            sb.write_string(" { panic() }\n")
+          }
           i = i + 1
         }
         sb.write_string("}\n")
@@ -8509,10 +9051,11 @@ fn emit_file_stub_with_syms(
         sb.write_string(cd.name)
         sb.write_string(" : ")
         sb.write_string(type_expr_to_string(cd.ty))
-        let emit_const_val = match xpkg_syms {
-          Some(_) => !cd.is_pub && xpkg_is_const_scalar_expr(cd.value)
-          None => false
-        }
+        let emit_const_val = keep_priv_consts.contains(cd.name) ||
+          match xpkg_syms {
+            Some(_) => !cd.is_pub && xpkg_is_const_scalar_expr(cd.value)
+            None => false
+          }
         if emit_const_val {
           sb.write_string(" = ")
           stub_write_expr(sb, cd.value)
@@ -8613,13 +9156,45 @@ pub fn pkg_has_generic_impl(pkg : Package) -> Bool {
 }
 
 ///|
+fn pkg_non_generic_fn_count(pkg : Package) -> Int {
+  let mut cnt = 0
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) =>
+          if fd.type_params.length() == 0 {
+            cnt = cnt + 1
+          }
+        DImpl(id) =>
+          if id.type_params.length() == 0 {
+            let mut mi = 0
+            while mi < id.methods.length() {
+              if id.methods[mi].type_params.length() == 0 {
+                cnt = cnt + 1
+              }
+              mi = mi + 1
+            }
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  cnt
+}
+
+///|
 pub fn emit_pion_stub(pkg : Package) -> String {
-  // A `pub` generic fn, generic `impl`, or method may be monomorphized in the
-  // importing package from its body (trait bounds, `==`/`!=`, or `Option[T]`
-  // null-niche); a `{ panic() }` stub would be instantiated instead. Return ""
-  // so the driver loads this package from source. Also skip stubbing if a `pub fn`
-  // has a non-literal default argument expression.
-  if pkg_has_pub_generic_fn(pkg) || pkg_has_generic_impl(pkg) || pkg_has_complex_pub_default(pkg) {
+  // Emit real bodies for generic fns / generic impls and real default-arg
+  // expressions while folding non-generic bodies to `{ panic() }`. For tiny
+  // generic-only packages (< 4 non-generic fns), stubbing saves nothing over
+  // source loading, so keep returning "" (preserving empty-stub CAS behavior).
+  if (pkg_has_pub_generic_fn(pkg) || pkg_has_generic_impl(pkg)) &&
+  pkg_non_generic_fn_count(pkg) < 4 {
     return ""
   }
   let sb = StringBuilder()
@@ -8644,12 +9219,20 @@ pub fn emit_pion_stub(pkg : Package) -> String {
     fi = fi + 1
   }
   let syms = xpkg_pub_syms_from_pkg(pkg)
+  let (keep_priv_fns, keep_priv_consts) = stub_collect_reachable_priv_deps(pkg)
   fi = 0
   while fi < pkg.files.length() {
-    sb.write_string(emit_file_stub_with_syms(pkg.files[fi], Some(syms)))
+    sb.write_string(emit_file_stub_with_syms(pkg.files[fi], Some(syms), keep_priv_fns, keep_priv_consts))
     fi = fi + 1
   }
-  sb.to_string()
+  let stub_txt = sb.to_string()
+  if stub_txt.length() > 0 {
+    let pr = parse_source(pkg.name + ".pionstub", stub_txt)
+    if pr.diagnostics.length() > 0 {
+      return ""
+    }
+  }
+  stub_txt
 }
 
 ///|
@@ -13420,14 +14003,224 @@ pub fn compute_const_init_plan_from_pkg_tc_full(
 }
 
 ///|
-fn sig_demand_check_fallback_tok(tok : String) -> String {
-  if starts_with_str(tok, "$ret:") || starts_with_str(tok, "$retp:") {
-    return "ret_target:" + tok
+struct SigDemandRetState {
+  fret_targets : Map[String, Array[String]]
+  falias_rhs : Map[String, String]
+  fslot_targets : Map[String, Array[String]]
+  rev_alias_slot : Map[String, Array[String]]
+  rev_fwd : Map[String, Array[String]]
+  ret_needed : Map[String, Bool]
+  ret_trans : Map[String, Bool]
+  retp_needed : Map[String, Bool]
+  retp_trans : Map[String, Bool]
+  call_cb_args : Map[String, Array[String]]
+  fdef_cb_args : Map[String, Array[String]]
+  all_falias_lhs : Map[String, Bool]
+  pending_ret_keys : Array[String]
+  pending_ret_trans : Array[Bool]
+  pending_retp_keys : Array[String]
+  pending_retp_trans : Array[Bool]
+}
+
+///|
+fn sig_demand_ret_state_new() -> SigDemandRetState {
+  SigDemandRetState::{
+    fret_targets: Map([]),
+    falias_rhs: Map([]),
+    fslot_targets: Map([]),
+    rev_alias_slot: Map([]),
+    rev_fwd: Map([]),
+    ret_needed: Map([]),
+    ret_trans: Map([]),
+    retp_needed: Map([]),
+    retp_trans: Map([]),
+    call_cb_args: Map([]),
+    fdef_cb_args: Map([]),
+    all_falias_lhs: Map([]),
+    pending_ret_keys: [],
+    pending_ret_trans: [],
+    pending_retp_keys: [],
+    pending_retp_trans: [],
   }
-  if starts_with_str(tok, "cf:") ||
-  starts_with_str(tok, "cf?:") ||
-  starts_with_str(tok, "fw:") ||
-  starts_with_str(tok, "fp:") {
+}
+
+///|
+fn sig_demand_push_ret(rs : SigDemandRetState, tok : String, is_trans : Bool) -> Unit {
+  if tok.length() == 0 || tok == "?" || tok == "$fp" {
+    return
+  }
+  let mut cur = tok
+  let mut depth = 0
+  while starts_with_str(cur, "$ret:") {
+    depth = depth + 1
+    cur = slice_str(cur, 5, cur.length())
+  }
+  let trans = is_trans || depth > 0
+  if starts_with_str(cur, "$retp:") {
+    let (fn_name, pidx_s) = sig_demand_split_retp(slice_str(cur, 6, cur.length()))
+    if fn_name.length() > 0 && pidx_s.length() > 0 {
+      rs.pending_retp_keys.push(fn_name + "|" + pidx_s)
+      rs.pending_retp_trans.push(trans)
+    }
+  } else if cur.length() > 0 {
+    rs.pending_ret_keys.push(cur)
+    rs.pending_ret_trans.push(trans)
+  }
+}
+
+///|
+fn sig_demand_push_retp(rs : SigDemandRetState, key : String, is_trans : Bool) -> Unit {
+  if key.length() == 0 {
+    return
+  }
+  rs.pending_retp_keys.push(key)
+  rs.pending_retp_trans.push(is_trans)
+}
+
+///|
+fn sig_demand_enqueue_ret_tok_if_needed(rs : SigDemandRetState, raw_tok : String) -> Bool {
+  if starts_with_str(raw_tok, "$ret:") {
+    let inner = slice_str(raw_tok, 5, raw_tok.length())
+    sig_demand_push_ret(rs, inner, false)
+    return true
+  }
+  if starts_with_str(raw_tok, "$retp:") {
+    let (fn_name, pidx_s) = sig_demand_split_retp(slice_str(raw_tok, 6, raw_tok.length()))
+    if fn_name.length() > 0 && pidx_s.length() > 0 {
+      sig_demand_push_retp(rs, fn_name + "|" + pidx_s, false)
+    }
+    return true
+  }
+  false
+}
+
+///|
+fn sig_demand_fire_retp_for_cb(
+  rs : SigDemandRetState,
+  callee : String,
+  slot_k : String,
+  cbt : String,
+  fn_by_key : Map[String, Array[Int]],
+  method_by_bare : Map[String, Array[Int]],
+  fn_key_arr : Array[String],
+  fn_decl_arr : Array[FnDecl],
+) -> Unit {
+  let candidates : Array[String] = []
+  if starts_with_str(callee, ".") {
+    match method_by_bare.get(callee) {
+      Some(idxs) => {
+        let mut i = 0
+        while i < idxs.length() {
+          candidates.push(fn_key_arr[idxs[i]])
+          i = i + 1
+        }
+      }
+      None => ()
+    }
+  } else {
+    candidates.push(callee)
+  }
+  let mut ci = 0
+  while ci < candidates.length() {
+    let cname = candidates[ci]
+    let pref = cname + "|"
+    let rkeys = rs.retp_needed.keys()
+    let mut ri = 0
+    while ri < rkeys.length() {
+      let rk = rkeys[ri]
+      if starts_with_str(rk, pref) {
+        let pidx_s = slice_str(rk, pref.length(), rk.length())
+        if sig_demand_slot_matches_pidx(cname, pidx_s, slot_k, fn_by_key, fn_decl_arr) {
+          sig_demand_push_ret(rs, cbt, rs.retp_trans.contains(rk))
+        }
+      }
+      ri = ri + 1
+    }
+    ci = ci + 1
+  }
+}
+
+///|
+fn sig_demand_map_push_unique(m : Map[String, Array[String]], k : String, v : String) -> Unit {
+  if k.length() == 0 || v.length() == 0 {
+    return
+  }
+  match m.get(k) {
+    Some(arr) => {
+      let mut i = 0
+      while i < arr.length() {
+        if arr[i] == v {
+          return
+        }
+        i = i + 1
+      }
+      arr.push(v)
+    }
+    None => m.set(k, [v])
+  }
+}
+
+///|
+fn sig_demand_split_retp(rest : String) -> (String, String) {
+  let tilde = sig_demand_find_last_char(rest, 126)
+  if tilde > 0 && tilde + 1 < rest.length() {
+    (slice_str(rest, 0, tilde), slice_str(rest, tilde + 1, rest.length()))
+  } else {
+    ("", "")
+  }
+}
+
+///|
+fn sig_demand_bare_method_of(fn_key : String) -> String {
+  let sep = sig_find_char(fn_key, 58, 0)
+  if sep > 0 && sep + 2 < fn_key.length() && str_code_at(fn_key, sep + 1) == 58 {
+    "." + slice_str(fn_key, sep + 2, fn_key.length())
+  } else {
+    ""
+  }
+}
+
+///|
+fn sig_demand_slot_matches_pidx(
+  fn_key : String,
+  pidx_s : String,
+  slot_k : String,
+  fn_by_key : Map[String, Array[Int]],
+  fn_decl_arr : Array[FnDecl],
+) -> Bool {
+  if slot_k == pidx_s {
+    return true
+  }
+  if sig_is_digits(slot_k) {
+    return false
+  }
+  match fn_by_key.get(fn_key) {
+    Some(idxs) => {
+      let pidx = sig_parse_nonneg_int(pidx_s)
+      let mut i = 0
+      while i < idxs.length() {
+        let fd = fn_decl_arr[idxs[i]]
+        if pidx >= 0 && pidx < fd.params.length() && fd.params[pidx].name == slot_k {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    None => false
+  }
+}
+
+///|
+fn sig_demand_check_fallback_tok(tok : String) -> String {
+  let mut cur = tok
+  while starts_with_str(cur, "$ret:") {
+    cur = slice_str(cur, 5, cur.length())
+  }
+  if starts_with_str(cur, "cf:") ||
+  starts_with_str(cur, "cf?:") ||
+  starts_with_str(cur, "fw:") ||
+  starts_with_str(cur, "fp:") {
     return "field_call:" + tok
   }
   ""
@@ -13982,6 +14775,7 @@ fn sig_demand_enqueue_tok(
   fdef_active_slots : Map[String, Bool],
   fdef_lines_by_slot : Map[String, Array[String]],
   fn_observed_calls : Map[String, Array[SigCallDesc]],
+  ret_state : SigDemandRetState,
 ) -> Unit {
   if raw_tok.length() == 0 || fallback_ref[0].length() > 0 {
     return
@@ -13991,6 +14785,7 @@ fn sig_demand_enqueue_tok(
     fallback_ref[0] = fb
     return
   }
+  let _ = sig_demand_enqueue_ret_tok_if_needed(ret_state, raw_tok)
   sig_demand_activate_key(
     raw_tok,
     allow_const_aux,
@@ -14058,6 +14853,7 @@ fn sig_demand_enqueue_call_desc(
   fdef_active_slots : Map[String, Bool],
   fdef_lines_by_slot : Map[String, Array[String]],
   fn_observed_calls : Map[String, Array[SigCallDesc]],
+  ret_state : SigDemandRetState,
 ) -> Unit {
   if raw_desc.length() == 0 || fallback_ref[0].length() > 0 {
     return
@@ -14085,6 +14881,7 @@ fn sig_demand_enqueue_call_desc(
     fdef_active_slots,
     fdef_lines_by_slot,
     fn_observed_calls,
+    ret_state,
   )
   if fallback_ref[0].length() == 0 && desc.has_at {
     let tgt_idxs_opt = if starts_with_str(desc.target, ".") {
@@ -14121,11 +14918,26 @@ fn sig_demand_enqueue_call_desc(
   let mut i = 0
   while i < desc.cb_targets.length() && fallback_ref[0].length() == 0 {
     let cbt = desc.cb_targets[i]
+    let slot_k = if i < desc.cb_slots.length() { desc.cb_slots[i] } else { "" }
+    if slot_k.length() > 0 && cbt.length() > 0 {
+      sig_demand_map_push_unique(ret_state.call_cb_args, desc.target, slot_k + "|" + cbt)
+      if ret_state.retp_needed.length() > 0 {
+        sig_demand_fire_retp_for_cb(
+          ret_state,
+          desc.target,
+          slot_k,
+          cbt,
+          fn_by_key,
+          method_by_bare,
+          fn_key_arr,
+          fn_decl_arr,
+        )
+      }
+    }
     if starts_with_str(cbt, "$ret:") || starts_with_str(cbt, "$retp:") {
-      // Defer `$ret:`/`$retp:` callback arguments: only trigger fallback if `desc.target`
-      // actually invokes or forwards this parameter slot (avoids false fallbacks on plain
-      // value calls like `ref_new(mk_val())` or `trans(spec=tween(...))`).
-      let slot_k = if i < desc.cb_slots.length() { desc.cb_slots[i] } else { "" }
+      // Defer `$ret:`/`$retp:` callback arguments: only activate if `desc.target`
+      // actually invokes or forwards this parameter slot (avoids scanning unneeded
+      // return targets on plain value calls like `ref_new(mk_val())`).
       ret_cb_callees.push(desc.target)
       ret_cb_slots.push(slot_k)
       ret_cb_toks.push(cbt)
@@ -14173,6 +14985,7 @@ fn sig_demand_enqueue_call_desc(
         fdef_active_slots,
         fdef_lines_by_slot,
         fn_observed_calls,
+        ret_state,
       )
     }
     i = i + 1
@@ -14296,6 +15109,7 @@ fn sig_demand_fn_uses_slot(
 
 ///|
 fn sig_demand_enqueue_fwd_edges(
+  owner : String,
   edges_csv : String,
   const_aux_lines : Map[String, Array[String]],
   activated_const_aux : Map[String, Bool],
@@ -14313,6 +15127,7 @@ fn sig_demand_enqueue_fwd_edges(
   fdef_active_slots : Map[String, Bool],
   fdef_lines_by_slot : Map[String, Array[String]],
   fn_observed_calls : Map[String, Array[SigCallDesc]],
+  ret_state : SigDemandRetState,
 ) -> Unit {
   let edges = sig_split_csv(edges_csv)
   let mut ei = 0
@@ -14322,7 +15137,64 @@ fn sig_demand_enqueue_fwd_edges(
     if g1 > 0 {
       let g2 = sig_find_char(edge, 62, g1 + 1)
       if g2 > g1 + 1 && g2 + 1 < edge.length() {
+        let my_pidx_s = slice_str(edge, 0, g1)
         let tgt = slice_str(edge, g1 + 1, g2)
+        let slot = slice_str(edge, g2 + 1, edge.length())
+        if owner.length() > 0 && my_pidx_s.length() > 0 {
+          let src_k = owner + "|" + my_pidx_s
+          sig_demand_map_push_unique(ret_state.rev_fwd, tgt + "|" + slot, src_k)
+          if starts_with_str(tgt, ".") {
+            match method_by_bare.get(tgt) {
+              Some(idxs) => {
+                let mut mi = 0
+                while mi < idxs.length() {
+                  let tfk = fn_key_arr[idxs[mi]]
+                  sig_demand_map_push_unique(ret_state.rev_fwd, tfk + "|" + slot, src_k)
+                  let fd = fn_decl_arr[idxs[mi]]
+                  let mut pi = 0
+                  while pi < fd.params.length() {
+                    if fd.params[pi].name == slot || pi.to_string() == slot {
+                      let tk = tfk + "|" + pi.to_string()
+                      sig_demand_map_push_unique(ret_state.rev_fwd, tk, src_k)
+                      if ret_state.retp_needed.contains(tk) {
+                        sig_demand_push_retp(ret_state, src_k, ret_state.retp_trans.contains(tk))
+                      }
+                    }
+                    pi = pi + 1
+                  }
+                  mi = mi + 1
+                }
+              }
+              None => ()
+            }
+          } else {
+            let tk0 = tgt + "|" + slot
+            if ret_state.retp_needed.contains(tk0) {
+              sig_demand_push_retp(ret_state, src_k, ret_state.retp_trans.contains(tk0))
+            }
+            match fn_by_key.get(tgt) {
+              Some(idxs) => {
+                let mut fi2 = 0
+                while fi2 < idxs.length() {
+                  let fd = fn_decl_arr[idxs[fi2]]
+                  let mut pi = 0
+                  while pi < fd.params.length() {
+                    if fd.params[pi].name == slot || pi.to_string() == slot {
+                      let tk = tgt + "|" + pi.to_string()
+                      sig_demand_map_push_unique(ret_state.rev_fwd, tk, src_k)
+                      if ret_state.retp_needed.contains(tk) {
+                        sig_demand_push_retp(ret_state, src_k, ret_state.retp_trans.contains(tk))
+                      }
+                    }
+                    pi = pi + 1
+                  }
+                  fi2 = fi2 + 1
+                }
+              }
+              None => ()
+            }
+          }
+        }
         sig_demand_enqueue_tok(
           tgt,
           true,
@@ -14343,6 +15215,7 @@ fn sig_demand_enqueue_fwd_edges(
           fdef_active_slots,
           fdef_lines_by_slot,
           fn_observed_calls,
+          ret_state,
         )
       }
     }
@@ -14526,155 +15399,599 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
   let ret_cb_callees : Array[String] = []
   let ret_cb_slots : Array[String] = []
   let ret_cb_toks : Array[String] = []
+  let ret_cb_activated : Array[Bool] = []
   let fdef_all_active_fns : Map[String, Bool] = Map([])
   let fdef_active_slots : Map[String, Bool] = Map([])
   let fdef_lines_by_slot : Map[String, Array[String]] = Map([])
   let fn_observed_calls : Map[String, Array[SigCallDesc]] = Map([])
+  let ret_state = sig_demand_ret_state_new()
 
   let mut head = 0
-  while head < bfs_lines.length() && fallback_ref[0].length() == 0 {
-    let line = bfs_lines[head]
-    head = head + 1
-    if !starts_with_str(line, "#") || starts_with_str(line, "#derive(") {
-      continue
-    }
-    if starts_with_str(line, "#cdep ") || starts_with_str(line, "#fdep ") {
-      let p1 = sig_find_char(line, 124, 6)
-      if p1 > 6 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          let id_arr = sig_split_csv(slice_str(line, p1 + 1, p2))
-          let ca_arr = sig_split_csv(slice_str(line, p2 + 1, line.length()))
-          let mut ii = 0
-          while ii < id_arr.length() && fallback_ref[0].length() == 0 {
-            sig_demand_enqueue_tok(
-              id_arr[ii],
-              false,
-              false,
-              const_aux_lines,
-              activated_const_aux,
-              fn_by_key,
-              method_by_bare,
-              fn_key_arr,
-              fn_decl_arr,
-              visited_fn,
-              fn_sig_cache,
-              tc.resolved_method_calls,
-              bfs_lines,
-              scanned_ref,
-              fallback_ref,
-              fdef_all_active_fns,
-              fdef_active_slots,
-              fdef_lines_by_slot,
-              fn_observed_calls,
-            )
-            ii = ii + 1
+  let mut outer_progress = true
+  while outer_progress && fallback_ref[0].length() == 0 {
+    outer_progress = false
+    while (head < bfs_lines.length() ||
+    ret_state.pending_ret_keys.length() > 0 ||
+    ret_state.pending_retp_keys.length() > 0) &&
+    fallback_ref[0].length() == 0 {
+      if ret_state.pending_ret_keys.length() > 0 {
+        let owner = ret_state.pending_ret_keys[ret_state.pending_ret_keys.length() - 1]
+        let is_trans = ret_state.pending_ret_trans[ret_state.pending_ret_trans.length() - 1]
+        let _ = ret_state.pending_ret_keys.pop()
+        let _ = ret_state.pending_ret_trans.pop()
+        let already = if is_trans {
+          ret_state.ret_trans.contains(owner)
+        } else {
+          ret_state.ret_needed.contains(owner) || ret_state.ret_trans.contains(owner)
+        }
+        if !already {
+          ret_state.ret_needed.set(owner, true)
+          if is_trans {
+            ret_state.ret_trans.set(owner, true)
           }
-          let mut ci = 0
-          while ci < ca_arr.length() && fallback_ref[0].length() == 0 {
-            sig_demand_enqueue_call_desc(
-              ca_arr[ci],
-              const_aux_lines,
-              activated_const_aux,
-              fn_by_key,
-              method_by_bare,
-              fn_key_arr,
-              fn_decl_arr,
-              visited_fn,
-              fn_sig_cache,
-              tc.resolved_method_calls,
-              bfs_lines,
-              scanned_ref,
-              fallback_ref,
-              ret_cb_callees,
-              ret_cb_slots,
-              ret_cb_toks,
-              fdef_all_active_fns,
-              fdef_active_slots,
-              fdef_lines_by_slot,
-              fn_observed_calls,
-            )
-            ci = ci + 1
+          sig_demand_enqueue_tok(
+            owner,
+            true,
+            true,
+            const_aux_lines,
+            activated_const_aux,
+            fn_by_key,
+            method_by_bare,
+            fn_key_arr,
+            fn_decl_arr,
+            visited_fn,
+            fn_sig_cache,
+            tc.resolved_method_calls,
+            bfs_lines,
+            scanned_ref,
+            fallback_ref,
+            fdef_all_active_fns,
+            fdef_active_slots,
+            fdef_lines_by_slot,
+            fn_observed_calls,
+            ret_state,
+          )
+          match ret_state.fret_targets.get(owner) {
+            Some(ts) => {
+              let mut ti = 0
+              while ti < ts.length() && fallback_ref[0].length() == 0 {
+                sig_demand_enqueue_tok(
+                  ts[ti],
+                  true,
+                  true,
+                  const_aux_lines,
+                  activated_const_aux,
+                  fn_by_key,
+                  method_by_bare,
+                  fn_key_arr,
+                  fn_decl_arr,
+                  visited_fn,
+                  fn_sig_cache,
+                  tc.resolved_method_calls,
+                  bfs_lines,
+                  scanned_ref,
+                  fallback_ref,
+                  fdef_all_active_fns,
+                  fdef_active_slots,
+                  fdef_lines_by_slot,
+                  fn_observed_calls,
+                  ret_state,
+                )
+                if is_trans {
+                  sig_demand_push_ret(ret_state, ts[ti], true)
+                }
+                ti = ti + 1
+              }
+            }
+            None => ()
+          }
+          match ret_state.falias_rhs.get(owner) {
+            Some(rhs) => sig_demand_push_ret(ret_state, rhs, is_trans)
+            None => ()
+          }
+          match ret_state.fslot_targets.get(owner) {
+            Some(sts) => {
+              let mut si = 0
+              while si < sts.length() {
+                sig_demand_push_ret(ret_state, sts[si], is_trans)
+                si = si + 1
+              }
+            }
+            None => ()
+          }
+          if starts_with_str(owner, ".") {
+            match method_by_bare.get(owner) {
+              Some(idxs) => {
+                let mut mi = 0
+                while mi < idxs.length() {
+                  sig_demand_push_ret(ret_state, fn_key_arr[idxs[mi]], is_trans)
+                  mi = mi + 1
+                }
+              }
+              None => ()
+            }
           }
         }
+        continue
       }
-    } else if starts_with_str(line, "#fdef ") {
-      let p1 = sig_find_char(line, 124, 6)
-      if p1 > 6 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          let p3 = sig_find_char(line, 124, p2 + 1)
-          if p3 > p2 {
-            let p4 = sig_find_char(line, 124, p3 + 1)
-            if p4 > p3 {
-              let id_arr = sig_split_csv(slice_str(line, p3 + 1, p4))
-              let ca_arr = sig_split_csv(slice_str(line, p4 + 1, line.length()))
-              let mut ii = 0
-              while ii < id_arr.length() && fallback_ref[0].length() == 0 {
-                sig_demand_enqueue_tok(
-                  id_arr[ii],
-                  false,
-                  false,
-                  const_aux_lines,
-                  activated_const_aux,
-                  fn_by_key,
-                  method_by_bare,
-                  fn_key_arr,
-                  fn_decl_arr,
-                  visited_fn,
-                  fn_sig_cache,
-                  tc.resolved_method_calls,
-                  bfs_lines,
-                  scanned_ref,
-                  fallback_ref,
-                  fdef_all_active_fns,
-                  fdef_active_slots,
-                  fdef_lines_by_slot,
-                  fn_observed_calls,
-                )
-                ii = ii + 1
+      if ret_state.pending_retp_keys.length() > 0 {
+        let rpk = ret_state.pending_retp_keys[ret_state.pending_retp_keys.length() - 1]
+        let is_trans = ret_state.pending_retp_trans[ret_state.pending_retp_trans.length() - 1]
+        let _ = ret_state.pending_retp_keys.pop()
+        let _ = ret_state.pending_retp_trans.pop()
+        let already = if is_trans {
+          ret_state.retp_trans.contains(rpk)
+        } else {
+          ret_state.retp_needed.contains(rpk) || ret_state.retp_trans.contains(rpk)
+        }
+        if !already {
+          ret_state.retp_needed.set(rpk, true)
+          if is_trans {
+            ret_state.retp_trans.set(rpk, true)
+          }
+          let bar = sig_find_char(rpk, 124, 0)
+          if bar > 0 && bar + 1 < rpk.length() {
+            let fn_name = slice_str(rpk, 0, bar)
+            let pidx_s = slice_str(rpk, bar + 1, rpk.length())
+            sig_demand_enqueue_tok(
+              fn_name,
+              true,
+              true,
+              const_aux_lines,
+              activated_const_aux,
+              fn_by_key,
+              method_by_bare,
+              fn_key_arr,
+              fn_decl_arr,
+              visited_fn,
+              fn_sig_cache,
+              tc.resolved_method_calls,
+              bfs_lines,
+              scanned_ref,
+              fallback_ref,
+              fdef_all_active_fns,
+              fdef_active_slots,
+              fdef_lines_by_slot,
+              fn_observed_calls,
+              ret_state,
+            )
+            match ret_state.rev_alias_slot.get(fn_name) {
+              Some(srcs) => {
+                let mut si = 0
+                while si < srcs.length() {
+                  sig_demand_push_retp(ret_state, srcs[si] + "|" + pidx_s, is_trans)
+                  si = si + 1
+                }
               }
-              let mut ci = 0
-              while ci < ca_arr.length() && fallback_ref[0].length() == 0 {
-                sig_demand_enqueue_call_desc(
-                  ca_arr[ci],
-                  const_aux_lines,
-                  activated_const_aux,
-                  fn_by_key,
-                  method_by_bare,
-                  fn_key_arr,
-                  fn_decl_arr,
-                  visited_fn,
-                  fn_sig_cache,
-                  tc.resolved_method_calls,
-                  bfs_lines,
-                  scanned_ref,
-                  fallback_ref,
-                  ret_cb_callees,
-                  ret_cb_slots,
-                  ret_cb_toks,
-                  fdef_all_active_fns,
-                  fdef_active_slots,
-                  fdef_lines_by_slot,
-                  fn_observed_calls,
-                )
-                ci = ci + 1
+              None => ()
+            }
+            match ret_state.rev_fwd.get(rpk) {
+              Some(outers) => {
+                let mut oi = 0
+                while oi < outers.length() {
+                  sig_demand_push_retp(ret_state, outers[oi], is_trans)
+                  oi = oi + 1
+                }
+              }
+              None => ()
+            }
+            let bare_m = sig_demand_bare_method_of(fn_name)
+            if bare_m.length() > 0 {
+              match ret_state.rev_fwd.get(bare_m + "|" + pidx_s) {
+                Some(outers) => {
+                  let mut oi = 0
+                  while oi < outers.length() {
+                    sig_demand_push_retp(ret_state, outers[oi], is_trans)
+                    oi = oi + 1
+                  }
+                }
+                None => ()
+              }
+            }
+            match ret_state.call_cb_args.get(fn_name) {
+              Some(args) => {
+                let mut ai = 0
+                while ai < args.length() {
+                  let item = args[ai]
+                  let sp = sig_find_char(item, 124, 0)
+                  if sp > 0 && sp + 1 < item.length() {
+                    let sk = slice_str(item, 0, sp)
+                    let cbt = slice_str(item, sp + 1, item.length())
+                    if sig_demand_slot_matches_pidx(fn_name, pidx_s, sk, fn_by_key, fn_decl_arr) {
+                      sig_demand_push_ret(ret_state, cbt, is_trans)
+                    }
+                  }
+                  ai = ai + 1
+                }
+              }
+              None => ()
+            }
+            if bare_m.length() > 0 {
+              match ret_state.call_cb_args.get(bare_m) {
+                Some(args) => {
+                  let mut ai = 0
+                  while ai < args.length() {
+                    let item = args[ai]
+                    let sp = sig_find_char(item, 124, 0)
+                    if sp > 0 && sp + 1 < item.length() {
+                      let sk = slice_str(item, 0, sp)
+                      let cbt = slice_str(item, sp + 1, item.length())
+                      if sig_demand_slot_matches_pidx(fn_name, pidx_s, sk, fn_by_key, fn_decl_arr) {
+                        sig_demand_push_ret(ret_state, cbt, is_trans)
+                      }
+                    }
+                    ai = ai + 1
+                  }
+                }
+                None => ()
+              }
+            }
+            match ret_state.fdef_cb_args.get(rpk) {
+              Some(dargs) => {
+                let mut di = 0
+                while di < dargs.length() {
+                  sig_demand_push_ret(ret_state, dargs[di], is_trans)
+                  di = di + 1
+                }
+              }
+              None => ()
+            }
+          }
+        }
+        continue
+      }
+      let line = bfs_lines[head]
+      head = head + 1
+      if !starts_with_str(line, "#") || starts_with_str(line, "#derive(") {
+        continue
+      }
+      if starts_with_str(line, "#cdep ") || starts_with_str(line, "#fdep ") {
+        let p1 = sig_find_char(line, 124, 6)
+        if p1 > 6 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            let id_arr = sig_split_csv(slice_str(line, p1 + 1, p2))
+            let ca_arr = sig_split_csv(slice_str(line, p2 + 1, line.length()))
+            let mut ii = 0
+            while ii < id_arr.length() && fallback_ref[0].length() == 0 {
+              sig_demand_enqueue_tok(
+                id_arr[ii],
+                false,
+                false,
+                const_aux_lines,
+                activated_const_aux,
+                fn_by_key,
+                method_by_bare,
+                fn_key_arr,
+                fn_decl_arr,
+                visited_fn,
+                fn_sig_cache,
+                tc.resolved_method_calls,
+                bfs_lines,
+                scanned_ref,
+                fallback_ref,
+                fdef_all_active_fns,
+                fdef_active_slots,
+                fdef_lines_by_slot,
+                fn_observed_calls,
+                ret_state,
+              )
+              ii = ii + 1
+            }
+            let mut ci = 0
+            while ci < ca_arr.length() && fallback_ref[0].length() == 0 {
+              sig_demand_enqueue_call_desc(
+                ca_arr[ci],
+                const_aux_lines,
+                activated_const_aux,
+                fn_by_key,
+                method_by_bare,
+                fn_key_arr,
+                fn_decl_arr,
+                visited_fn,
+                fn_sig_cache,
+                tc.resolved_method_calls,
+                bfs_lines,
+                scanned_ref,
+                fallback_ref,
+                ret_cb_callees,
+                ret_cb_slots,
+                ret_cb_toks,
+                fdef_all_active_fns,
+                fdef_active_slots,
+                fdef_lines_by_slot,
+                fn_observed_calls,
+                ret_state,
+              )
+              ci = ci + 1
+            }
+          }
+        }
+      } else if starts_with_str(line, "#fdef ") {
+        let p1 = sig_find_char(line, 124, 6)
+        if p1 > 6 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            let p3 = sig_find_char(line, 124, p2 + 1)
+            if p3 > p2 {
+              let p4 = sig_find_char(line, 124, p3 + 1)
+              if p4 > p3 {
+                let id_arr = sig_split_csv(slice_str(line, p3 + 1, p4))
+                let ca_arr = sig_split_csv(slice_str(line, p4 + 1, line.length()))
+                let mut ii = 0
+                while ii < id_arr.length() && fallback_ref[0].length() == 0 {
+                  sig_demand_enqueue_tok(
+                    id_arr[ii],
+                    false,
+                    false,
+                    const_aux_lines,
+                    activated_const_aux,
+                    fn_by_key,
+                    method_by_bare,
+                    fn_key_arr,
+                    fn_decl_arr,
+                    visited_fn,
+                    fn_sig_cache,
+                    tc.resolved_method_calls,
+                    bfs_lines,
+                    scanned_ref,
+                    fallback_ref,
+                    fdef_all_active_fns,
+                    fdef_active_slots,
+                    fdef_lines_by_slot,
+                    fn_observed_calls,
+                    ret_state,
+                  )
+                  ii = ii + 1
+                }
+                let mut ci = 0
+                while ci < ca_arr.length() && fallback_ref[0].length() == 0 {
+                  sig_demand_enqueue_call_desc(
+                    ca_arr[ci],
+                    const_aux_lines,
+                    activated_const_aux,
+                    fn_by_key,
+                    method_by_bare,
+                    fn_key_arr,
+                    fn_decl_arr,
+                    visited_fn,
+                    fn_sig_cache,
+                    tc.resolved_method_calls,
+                    bfs_lines,
+                    scanned_ref,
+                    fallback_ref,
+                    ret_cb_callees,
+                    ret_cb_slots,
+                    ret_cb_toks,
+                    fdef_all_active_fns,
+                    fdef_active_slots,
+                    fdef_lines_by_slot,
+                    fn_observed_calls,
+                    ret_state,
+                  )
+                  ci = ci + 1
+                }
               }
             }
           }
         }
-      }
-    } else if starts_with_str(line, "#fdefcb ") {
-      let p1 = sig_find_char(line, 124, 8)
-      if p1 > 8 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          let dt = sig_split_csv(slice_str(line, p2 + 1, line.length()))
-          let mut dti = 0
-          while dti < dt.length() && fallback_ref[0].length() == 0 {
-            if !starts_with_str(dt[dti], "$p") {
+      } else if starts_with_str(line, "#fdefcb ") {
+        let p1 = sig_find_char(line, 124, 8)
+        if p1 > 8 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            let fdef_owner = slice_str(line, 8, p1)
+            let fdef_pidx = slice_str(line, p1 + 1, p2)
+            let fdef_k = fdef_owner + "|" + fdef_pidx
+            let dt = sig_split_csv(slice_str(line, p2 + 1, line.length()))
+            let mut dti = 0
+            while dti < dt.length() && fallback_ref[0].length() == 0 {
+              if !starts_with_str(dt[dti], "$p") {
+                sig_demand_map_push_unique(ret_state.fdef_cb_args, fdef_k, dt[dti])
+                if ret_state.retp_needed.contains(fdef_k) {
+                  sig_demand_push_ret(ret_state, dt[dti], ret_state.retp_trans.contains(fdef_k))
+                }
+                sig_demand_enqueue_tok(
+                  dt[dti],
+                  true,
+                  true,
+                  const_aux_lines,
+                  activated_const_aux,
+                  fn_by_key,
+                  method_by_bare,
+                  fn_key_arr,
+                  fn_decl_arr,
+                  visited_fn,
+                  fn_sig_cache,
+                  tc.resolved_method_calls,
+                  bfs_lines,
+                  scanned_ref,
+                  fallback_ref,
+                  fdef_all_active_fns,
+                  fdef_active_slots,
+                  fdef_lines_by_slot,
+                  fn_observed_calls,
+                  ret_state,
+                )
+              }
+              dti = dti + 1
+            }
+          }
+        }
+      } else if starts_with_str(line, "#fdefpcall ") {
+        ()
+      } else if starts_with_str(line, "#fdeffwd ") {
+        let p1 = sig_find_char(line, 124, 9)
+        if p1 > 9 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            sig_demand_enqueue_fwd_edges(
+              slice_str(line, 9, p1),
+              slice_str(line, p2 + 1, line.length()),
+              const_aux_lines,
+              activated_const_aux,
+              fn_by_key,
+              method_by_bare,
+              fn_key_arr,
+              fn_decl_arr,
+              visited_fn,
+              fn_sig_cache,
+              tc.resolved_method_calls,
+              bfs_lines,
+              scanned_ref,
+              fallback_ref,
+              fdef_all_active_fns,
+              fdef_active_slots,
+              fdef_lines_by_slot,
+              fn_observed_calls,
+              ret_state,
+            )
+          }
+        }
+      } else if starts_with_str(line, "#fcallp ") {
+        let p1 = sig_find_char(line, 124, 8)
+        if p1 > 8 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            let p3 = sig_find_char(line, 124, p2 + 1)
+            if p3 > p2 {
+              sig_demand_enqueue_fwd_edges(
+                slice_str(line, 8, p1),
+                slice_str(line, p3 + 1, line.length()),
+                const_aux_lines,
+                activated_const_aux,
+                fn_by_key,
+                method_by_bare,
+                fn_key_arr,
+                fn_decl_arr,
+                visited_fn,
+                fn_sig_cache,
+                tc.resolved_method_calls,
+                bfs_lines,
+                scanned_ref,
+                fallback_ref,
+                fdef_all_active_fns,
+                fdef_active_slots,
+                fdef_lines_by_slot,
+                fn_observed_calls,
+                ret_state,
+              )
+            }
+          }
+        }
+      } else if starts_with_str(line, "#falias ") {
+        let p1 = sig_find_char(line, 124, 8)
+        if p1 > 8 && p1 + 1 < line.length() {
+          let lhs = slice_str(line, 8, p1)
+          let rhs = slice_str(line, p1 + 1, line.length())
+          ret_state.falias_rhs.set(lhs, rhs)
+          ret_state.all_falias_lhs.set(lhs, true)
+          sig_demand_map_push_unique(ret_state.rev_alias_slot, rhs, lhs)
+          if ret_state.ret_trans.contains(lhs) {
+            sig_demand_push_ret(ret_state, rhs, true)
+          } else if ret_state.ret_needed.contains(lhs) {
+            sig_demand_push_ret(ret_state, rhs, false)
+          }
+          if ret_state.retp_needed.length() > 0 {
+            let pref = rhs + "|"
+            let rkeys = ret_state.retp_needed.keys()
+            let mut rki = 0
+            while rki < rkeys.length() {
+              let rk = rkeys[rki]
+              if starts_with_str(rk, pref) {
+                let suf = slice_str(rk, pref.length(), rk.length())
+                sig_demand_push_retp(ret_state, lhs + "|" + suf, ret_state.retp_trans.contains(rk))
+              }
+              rki = rki + 1
+            }
+          }
+          sig_demand_enqueue_tok(
+            rhs,
+            true,
+            true,
+            const_aux_lines,
+            activated_const_aux,
+            fn_by_key,
+            method_by_bare,
+            fn_key_arr,
+            fn_decl_arr,
+            visited_fn,
+            fn_sig_cache,
+            tc.resolved_method_calls,
+            bfs_lines,
+            scanned_ref,
+            fallback_ref,
+            fdef_all_active_fns,
+            fdef_active_slots,
+            fdef_lines_by_slot,
+            fn_observed_calls,
+            ret_state,
+          )
+        }
+      } else if starts_with_str(line, "#cfalias ") {
+        let p1 = sig_find_char(line, 124, 9)
+        if p1 > 9 && p1 + 1 < line.length() {
+          sig_demand_enqueue_tok(
+            slice_str(line, p1 + 1, line.length()),
+            true,
+            true,
+            const_aux_lines,
+            activated_const_aux,
+            fn_by_key,
+            method_by_bare,
+            fn_key_arr,
+            fn_decl_arr,
+            visited_fn,
+            fn_sig_cache,
+            tc.resolved_method_calls,
+            bfs_lines,
+            scanned_ref,
+            fallback_ref,
+            fdef_all_active_fns,
+            fdef_active_slots,
+            fdef_lines_by_slot,
+            fn_observed_calls,
+            ret_state,
+          )
+        }
+      } else if starts_with_str(line, "#cfspread ") {
+        let p1 = sig_find_char(line, 124, 10)
+        if p1 > 10 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 {
+            sig_demand_enqueue_tok(
+              slice_str(line, p1 + 1, p2),
+              true,
+              true,
+              const_aux_lines,
+              activated_const_aux,
+              fn_by_key,
+              method_by_bare,
+              fn_key_arr,
+              fn_decl_arr,
+              visited_fn,
+              fn_sig_cache,
+              tc.resolved_method_calls,
+              bfs_lines,
+              scanned_ref,
+              fallback_ref,
+              fdef_all_active_fns,
+              fdef_active_slots,
+              fdef_lines_by_slot,
+              fn_observed_calls,
+              ret_state,
+            )
+          }
+        }
+      } else if starts_with_str(line, "#cfdef ") {
+        let p1 = sig_find_char(line, 124, 7)
+        if p1 > 7 {
+          let ts = sig_split_csv(slice_str(line, p1 + 1, line.length()))
+          let mut ti = 0
+          while ti < ts.length() && fallback_ref[0].length() == 0 {
+            if ts[ti] != "?" && ts[ti] != "$fp" {
               sig_demand_enqueue_tok(
-                dt[dti],
+                ts[ti],
                 true,
                 true,
                 const_aux_lines,
@@ -14693,224 +16010,82 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
                 fdef_active_slots,
                 fdef_lines_by_slot,
                 fn_observed_calls,
+                ret_state,
               )
             }
-            dti = dti + 1
+            ti = ti + 1
           }
         }
-      }
-    } else if starts_with_str(line, "#fdefpcall ") {
-      ()
-    } else if starts_with_str(line, "#fdeffwd ") {
-      let p1 = sig_find_char(line, 124, 9)
-      if p1 > 9 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          sig_demand_enqueue_fwd_edges(
-            slice_str(line, p2 + 1, line.length()),
-            const_aux_lines,
-            activated_const_aux,
-            fn_by_key,
-            method_by_bare,
-            fn_key_arr,
-            fn_decl_arr,
-            visited_fn,
-            fn_sig_cache,
-            tc.resolved_method_calls,
-            bfs_lines,
-            scanned_ref,
-            fallback_ref,
-            fdef_all_active_fns,
-            fdef_active_slots,
-            fdef_lines_by_slot,
-            fn_observed_calls,
-          )
-        }
-      }
-    } else if starts_with_str(line, "#fcallp ") {
-      let p1 = sig_find_char(line, 124, 8)
-      if p1 > 8 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          let p3 = sig_find_char(line, 124, p2 + 1)
-          if p3 > p2 {
-            sig_demand_enqueue_fwd_edges(
-              slice_str(line, p3 + 1, line.length()),
-              const_aux_lines,
-              activated_const_aux,
-              fn_by_key,
-              method_by_bare,
-              fn_key_arr,
-              fn_decl_arr,
-              visited_fn,
-              fn_sig_cache,
-              tc.resolved_method_calls,
-              bfs_lines,
-              scanned_ref,
-              fallback_ref,
-              fdef_all_active_fns,
-              fdef_active_slots,
-              fdef_lines_by_slot,
-              fn_observed_calls,
-            )
-          }
-        }
-      }
-    } else if starts_with_str(line, "#falias ") {
-      let p1 = sig_find_char(line, 124, 8)
-      if p1 > 8 && p1 + 1 < line.length() {
-        sig_demand_enqueue_tok(
-          slice_str(line, p1 + 1, line.length()),
-          true,
-          true,
-          const_aux_lines,
-          activated_const_aux,
-          fn_by_key,
-          method_by_bare,
-          fn_key_arr,
-          fn_decl_arr,
-          visited_fn,
-          fn_sig_cache,
-          tc.resolved_method_calls,
-          bfs_lines,
-          scanned_ref,
-          fallback_ref,
-          fdef_all_active_fns,
-          fdef_active_slots,
-          fdef_lines_by_slot,
-          fn_observed_calls,
-        )
-      }
-    } else if starts_with_str(line, "#cfalias ") {
-      let p1 = sig_find_char(line, 124, 9)
-      if p1 > 9 && p1 + 1 < line.length() {
-        sig_demand_enqueue_tok(
-          slice_str(line, p1 + 1, line.length()),
-          true,
-          true,
-          const_aux_lines,
-          activated_const_aux,
-          fn_by_key,
-          method_by_bare,
-          fn_key_arr,
-          fn_decl_arr,
-          visited_fn,
-          fn_sig_cache,
-          tc.resolved_method_calls,
-          bfs_lines,
-          scanned_ref,
-          fallback_ref,
-          fdef_all_active_fns,
-          fdef_active_slots,
-          fdef_lines_by_slot,
-          fn_observed_calls,
-        )
-      }
-    } else if starts_with_str(line, "#cfspread ") {
-      let p1 = sig_find_char(line, 124, 10)
-      if p1 > 10 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 {
-          sig_demand_enqueue_tok(
-            slice_str(line, p1 + 1, p2),
-            true,
-            true,
-            const_aux_lines,
-            activated_const_aux,
-            fn_by_key,
-            method_by_bare,
-            fn_key_arr,
-            fn_decl_arr,
-            visited_fn,
-            fn_sig_cache,
-            tc.resolved_method_calls,
-            bfs_lines,
-            scanned_ref,
-            fallback_ref,
-            fdef_all_active_fns,
-            fdef_active_slots,
-            fdef_lines_by_slot,
-            fn_observed_calls,
-          )
-        }
-      }
-    } else if starts_with_str(line, "#cfdef ") {
-      let p1 = sig_find_char(line, 124, 7)
-      if p1 > 7 {
-        let ts = sig_split_csv(slice_str(line, p1 + 1, line.length()))
-        let mut ti = 0
-        while ti < ts.length() && fallback_ref[0].length() == 0 {
-          if ts[ti] != "?" && ts[ti] != "$fp" {
-            sig_demand_enqueue_tok(
-              ts[ti],
-              true,
-              true,
-              const_aux_lines,
-              activated_const_aux,
-              fn_by_key,
-              method_by_bare,
-              fn_key_arr,
-              fn_decl_arr,
-              visited_fn,
-              fn_sig_cache,
-              tc.resolved_method_calls,
-              bfs_lines,
-              scanned_ref,
-              fallback_ref,
-              fdef_all_active_fns,
-              fdef_active_slots,
-              fdef_lines_by_slot,
-              fn_observed_calls,
-            )
-          }
-          ti = ti + 1
-        }
-      }
-    } else if starts_with_str(line, "#fret ") {
-      // Equivalence invariant: `#fret <fn>|<targets>` only feeds `$ret:<fn>` nodes, which are
-      // consumed solely at reachable call targets, aliases, slots, or active callback arguments
-      // carrying `$ret:` / `$retp:` (all of which trigger fail-closed fallback).
-      ()
-    } else if starts_with_str(line, "#fslot ") {
-      let p1 = sig_find_char(line, 124, 7)
-      if p1 > 7 && p1 + 1 < line.length() {
-        let ts = sig_split_csv(slice_str(line, p1 + 1, line.length()))
-        let mut ti = 0
-        while ti < ts.length() && fallback_ref[0].length() == 0 {
-          sig_demand_enqueue_tok(
-            ts[ti],
-            true,
-            true,
-            const_aux_lines,
-            activated_const_aux,
-            fn_by_key,
-            method_by_bare,
-            fn_key_arr,
-            fn_decl_arr,
-            visited_fn,
-            fn_sig_cache,
-            tc.resolved_method_calls,
-            bfs_lines,
-            scanned_ref,
-            fallback_ref,
-            fdef_all_active_fns,
-            fdef_active_slots,
-            fdef_lines_by_slot,
-            fn_observed_calls,
-          )
-          ti = ti + 1
-        }
-      }
-    } else if starts_with_str(line, "#fmutw ") {
-      let p1 = sig_find_char(line, 124, 7)
-      if p1 > 7 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 + 1 && p2 + 1 < line.length() {
-          let ts = sig_split_csv(slice_str(line, p2 + 1, line.length()))
+      } else if starts_with_str(line, "#fret ") {
+        let p1 = sig_find_char(line, 124, 6)
+        if p1 > 6 && p1 + 1 < line.length() {
+          let owner = slice_str(line, 6, p1)
+          let ts = sig_split_csv(slice_str(line, p1 + 1, line.length()))
+          let is_trans = ret_state.ret_trans.contains(owner)
+          let is_needed = is_trans || ret_state.ret_needed.contains(owner)
           let mut ti = 0
           while ti < ts.length() && fallback_ref[0].length() == 0 {
+            sig_demand_map_push_unique(ret_state.fret_targets, owner, ts[ti])
+            if is_needed {
+              sig_demand_enqueue_tok(
+                ts[ti],
+                true,
+                true,
+                const_aux_lines,
+                activated_const_aux,
+                fn_by_key,
+                method_by_bare,
+                fn_key_arr,
+                fn_decl_arr,
+                visited_fn,
+                fn_sig_cache,
+                tc.resolved_method_calls,
+                bfs_lines,
+                scanned_ref,
+                fallback_ref,
+                fdef_all_active_fns,
+                fdef_active_slots,
+                fdef_lines_by_slot,
+                fn_observed_calls,
+                ret_state,
+              )
+              if is_trans {
+                sig_demand_push_ret(ret_state, ts[ti], true)
+              }
+            }
+            ti = ti + 1
+          }
+        }
+      } else if starts_with_str(line, "#fslot ") {
+        let p1 = sig_find_char(line, 124, 7)
+        if p1 > 7 && p1 + 1 < line.length() {
+          let lhs = slice_str(line, 7, p1)
+          let ts = sig_split_csv(slice_str(line, p1 + 1, line.length()))
+          let is_trans = ret_state.ret_trans.contains(lhs)
+          let is_needed = is_trans || ret_state.ret_needed.contains(lhs)
+          let mut ti = 0
+          while ti < ts.length() && fallback_ref[0].length() == 0 {
+            let t = ts[ti]
+            sig_demand_map_push_unique(ret_state.fslot_targets, lhs, t)
+            sig_demand_map_push_unique(ret_state.rev_alias_slot, t, lhs)
+            if is_needed {
+              sig_demand_push_ret(ret_state, t, is_trans)
+            }
+            if ret_state.retp_needed.length() > 0 {
+              let pref = t + "|"
+              let rkeys = ret_state.retp_needed.keys()
+              let mut rki = 0
+              while rki < rkeys.length() {
+                let rk = rkeys[rki]
+                if starts_with_str(rk, pref) {
+                  let suf = slice_str(rk, pref.length(), rk.length())
+                  sig_demand_push_retp(ret_state, lhs + "|" + suf, ret_state.retp_trans.contains(rk))
+                }
+                rki = rki + 1
+              }
+            }
             sig_demand_enqueue_tok(
-              ts[ti],
+              t,
               true,
               true,
               const_aux_lines,
@@ -14929,78 +16104,17 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
               fdef_active_slots,
               fdef_lines_by_slot,
               fn_observed_calls,
+              ret_state,
             )
             ti = ti + 1
           }
         }
-      }
-    } else if starts_with_str(line, "#fmutfwd ") {
-      let p1 = sig_find_char(line, 124, 9)
-      if p1 > 9 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 + 1 {
-          let p3 = sig_find_char(line, 124, p2 + 1)
-          if p3 > p2 + 1 {
-            sig_demand_enqueue_tok(
-              slice_str(line, p2 + 1, p3),
-              true,
-              true,
-              const_aux_lines,
-              activated_const_aux,
-              fn_by_key,
-              method_by_bare,
-              fn_key_arr,
-              fn_decl_arr,
-              visited_fn,
-              fn_sig_cache,
-              tc.resolved_method_calls,
-              bfs_lines,
-              scanned_ref,
-              fallback_ref,
-              fdef_all_active_fns,
-              fdef_active_slots,
-              fdef_lines_by_slot,
-              fn_observed_calls,
-            )
-          }
-        }
-      }
-    } else if starts_with_str(line, "#fmutlink ") {
-      let p1 = sig_find_char(line, 124, 10)
-      if p1 > 10 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 + 1 {
-          sig_demand_enqueue_tok(
-            slice_str(line, p1 + 1, p2),
-            true,
-            true,
-            const_aux_lines,
-            activated_const_aux,
-            fn_by_key,
-            method_by_bare,
-            fn_key_arr,
-            fn_decl_arr,
-            visited_fn,
-            fn_sig_cache,
-            tc.resolved_method_calls,
-            bfs_lines,
-            scanned_ref,
-            fallback_ref,
-            fdef_all_active_fns,
-            fdef_active_slots,
-            fdef_lines_by_slot,
-            fn_observed_calls,
-          )
-        }
-      }
-    } else if starts_with_str(line, "#fcbw ") {
-      let p1 = sig_find_char(line, 124, 6)
-      if p1 > 6 {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 + 1 {
-          let p3 = sig_find_char(line, 124, p2 + 1)
-          if p3 > p2 + 1 && p3 + 1 < line.length() {
-            let ts = sig_split_csv(slice_str(line, p3 + 1, line.length()))
+      } else if starts_with_str(line, "#fmutw ") {
+        let p1 = sig_find_char(line, 124, 7)
+        if p1 > 7 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 + 1 && p2 + 1 < line.length() {
+            let ts = sig_split_csv(slice_str(line, p2 + 1, line.length()))
             let mut ti = 0
             while ti < ts.length() && fallback_ref[0].length() == 0 {
               sig_demand_enqueue_tok(
@@ -15023,24 +16137,21 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
                 fdef_active_slots,
                 fdef_lines_by_slot,
                 fn_observed_calls,
+                ret_state,
               )
               ti = ti + 1
             }
           }
         }
-      }
-    } else if starts_with_str(line, "#fcbfwd ") || starts_with_str(line, "#fcbcallfwd ") {
-      let start_off = if starts_with_str(line, "#fcbfwd ") { 8 } else { 12 }
-      let p1 = sig_find_char(line, 124, start_off)
-      if p1 > start_off {
-        let p2 = sig_find_char(line, 124, p1 + 1)
-        if p2 > p1 + 1 {
-          let p3 = sig_find_char(line, 124, p2 + 1)
-          if p3 > p2 + 1 {
-            let p4 = sig_find_char(line, 124, p3 + 1)
-            if p4 > p3 + 1 {
+      } else if starts_with_str(line, "#fmutfwd ") {
+        let p1 = sig_find_char(line, 124, 9)
+        if p1 > 9 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 + 1 {
+            let p3 = sig_find_char(line, 124, p2 + 1)
+            if p3 > p2 + 1 {
               sig_demand_enqueue_tok(
-                slice_str(line, p3 + 1, p4),
+                slice_str(line, p2 + 1, p3),
                 true,
                 true,
                 const_aux_lines,
@@ -15059,78 +16170,184 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
                 fdef_active_slots,
                 fdef_lines_by_slot,
                 fn_observed_calls,
+                ret_state,
               )
             }
           }
         }
-      }
-    } else if starts_with_str(line, "#fcbcall ") {
-      ()
-    } else if starts_with_str(line, "#fieldw ") || starts_with_str(line, "#fieldp ") {
-      // Field writes/puts are only consumed when a reachable `fw:`/`fp:`/`cf?:` call exists,
-      // which already triggers fail-closed fallback on the call site itself.
-      ()
-    } else if starts_with_str(line, "#fieldwp ") || starts_with_str(line, "#fieldpp ") {
-      ()
-    } else {
-      fallback_ref[0] = "unknown_tag:" + line
-    }
-  }
-
-  // Validate deferred `$ret:` / `$retp:` callback arguments against scanned callee `#fcallp`
-  // and inner function `#fret` presence.
-  if fallback_ref[0].length() == 0 && ret_cb_callees.length() > 0 {
-    let mut rci = 0
-    while rci < ret_cb_callees.length() && fallback_ref[0].length() == 0 {
-      let callee = ret_cb_callees[rci]
-      let slot_k = ret_cb_slots[rci]
-      let rtok = ret_cb_toks[rci]
-      if sig_demand_ret_tok_is_empty_local(rtok, fn_by_key, visited_fn, fn_sig_cache) {
-        rci = rci + 1
-        continue
-      }
-      if callee == "__builtin__::push" ||
-      callee == "__builtin__::set" ||
-      callee == "__builtin__::insert" ||
-      callee == "Array::make" ||
-      callee == "FixedArray::make" ||
-      callee == "Array::new" ||
-      callee == "Array::with_capacity" ||
-      callee == "Map::new" ||
-      callee == "Map::with_capacity" ||
-      callee == "Map" ||
-      callee == "Bytes::new" {
-        rci = rci + 1
-        continue
-      }
-      if starts_with_str(callee, ".") {
-        // Mirror `sig_demand_activate_key`: if stripping trailing `_<digits>` from
-        // bare method `.m` hits any host method `T::<prefix>`, a synthetic closure key
-        // `$cb_fn_T::<prefix>_*` could collide with `.m` in `method_name_to_idxs` and
-        // invoke `slot_k`, so fail closed immediately.
-        let mut cur_m = slice_str(callee, 1, callee.length())
-        let mut strip_more = true
-        while strip_more && fallback_ref[0].length() == 0 {
-          strip_more = false
-          let us = sig_demand_find_last_char(cur_m, 95)
-          if us > 0 && us + 1 < cur_m.length() {
-            let tail = slice_str(cur_m, us + 1, cur_m.length())
-            if sig_is_digits(tail) {
-              cur_m = slice_str(cur_m, 0, us)
-              strip_more = true
-              match method_by_bare.get("." + cur_m) {
-                Some(_) => fallback_ref[0] = "ret_cb_synth_method:" + callee + ":" + rtok
-                None => ()
+      } else if starts_with_str(line, "#fmutlink ") {
+        let p1 = sig_find_char(line, 124, 10)
+        if p1 > 10 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 + 1 {
+            sig_demand_enqueue_tok(
+              slice_str(line, p1 + 1, p2),
+              true,
+              true,
+              const_aux_lines,
+              activated_const_aux,
+              fn_by_key,
+              method_by_bare,
+              fn_key_arr,
+              fn_decl_arr,
+              visited_fn,
+              fn_sig_cache,
+              tc.resolved_method_calls,
+              bfs_lines,
+              scanned_ref,
+              fallback_ref,
+              fdef_all_active_fns,
+              fdef_active_slots,
+              fdef_lines_by_slot,
+              fn_observed_calls,
+              ret_state,
+            )
+          }
+        }
+      } else if starts_with_str(line, "#fcbw ") {
+        let p1 = sig_find_char(line, 124, 6)
+        if p1 > 6 {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 + 1 {
+            let p3 = sig_find_char(line, 124, p2 + 1)
+            if p3 > p2 + 1 && p3 + 1 < line.length() {
+              let ts = sig_split_csv(slice_str(line, p3 + 1, line.length()))
+              let mut ti = 0
+              while ti < ts.length() && fallback_ref[0].length() == 0 {
+                sig_demand_enqueue_tok(
+                  ts[ti],
+                  true,
+                  true,
+                  const_aux_lines,
+                  activated_const_aux,
+                  fn_by_key,
+                  method_by_bare,
+                  fn_key_arr,
+                  fn_decl_arr,
+                  visited_fn,
+                  fn_sig_cache,
+                  tc.resolved_method_calls,
+                  bfs_lines,
+                  scanned_ref,
+                  fallback_ref,
+                  fdef_all_active_fns,
+                  fdef_active_slots,
+                  fdef_lines_by_slot,
+                  fn_observed_calls,
+                  ret_state,
+                )
+                ti = ti + 1
               }
             }
           }
         }
-        if fallback_ref[0].length() == 0 {
-          match method_by_bare.get(callee) {
-            Some(idxs) => {
-              if idxs.length() == 0 {
-                fallback_ref[0] = "ret_cb_method:" + callee + ":" + rtok
-              } else {
+      } else if starts_with_str(line, "#fcbfwd ") || starts_with_str(line, "#fcbcallfwd ") {
+        let start_off = if starts_with_str(line, "#fcbfwd ") { 8 } else { 12 }
+        let p1 = sig_find_char(line, 124, start_off)
+        if p1 > start_off {
+          let p2 = sig_find_char(line, 124, p1 + 1)
+          if p2 > p1 + 1 {
+            let p3 = sig_find_char(line, 124, p2 + 1)
+            if p3 > p2 + 1 {
+              let p4 = sig_find_char(line, 124, p3 + 1)
+              if p4 > p3 + 1 {
+                sig_demand_enqueue_tok(
+                  slice_str(line, p3 + 1, p4),
+                  true,
+                  true,
+                  const_aux_lines,
+                  activated_const_aux,
+                  fn_by_key,
+                  method_by_bare,
+                  fn_key_arr,
+                  fn_decl_arr,
+                  visited_fn,
+                  fn_sig_cache,
+                  tc.resolved_method_calls,
+                  bfs_lines,
+                  scanned_ref,
+                  fallback_ref,
+                  fdef_all_active_fns,
+                  fdef_active_slots,
+                  fdef_lines_by_slot,
+                  fn_observed_calls,
+                  ret_state,
+                )
+              }
+            }
+          }
+        }
+      } else if starts_with_str(line, "#fcbcall ") {
+        ()
+      } else if starts_with_str(line, "#fieldw ") || starts_with_str(line, "#fieldp ") {
+        // Field writes/puts are only consumed when a reachable `fw:`/`fp:`/`cf?:` call exists,
+        // which already triggers fail-closed fallback on the call site itself.
+        ()
+      } else if starts_with_str(line, "#fieldwp ") || starts_with_str(line, "#fieldpp ") {
+        ()
+      } else {
+        fallback_ref[0] = "unknown_tag:" + line
+      }
+    }
+
+    // Validate deferred `$ret:` / `$retp:` callback arguments against scanned callee `#fcallp`
+    // and inner function `#fret` presence. When a callee actually uses the slot, activate `rtok`
+    // demand-driven instead of falling back to Stage 3.
+    if fallback_ref[0].length() == 0 && ret_cb_callees.length() > 0 {
+      while ret_cb_activated.length() < ret_cb_callees.length() {
+        ret_cb_activated.push(false)
+      }
+      let mut rci = 0
+      while rci < ret_cb_callees.length() && fallback_ref[0].length() == 0 {
+        if ret_cb_activated[rci] {
+          rci = rci + 1
+          continue
+        }
+        let callee = ret_cb_callees[rci]
+        let slot_k = ret_cb_slots[rci]
+        let rtok = ret_cb_toks[rci]
+        if sig_demand_ret_tok_is_empty_local(rtok, fn_by_key, visited_fn, fn_sig_cache) {
+          ret_cb_activated[rci] = true
+          rci = rci + 1
+          continue
+        }
+        if callee == "__builtin__::push" ||
+        callee == "__builtin__::set" ||
+        callee == "__builtin__::insert" ||
+        callee == "Array::make" ||
+        callee == "FixedArray::make" ||
+        callee == "Array::new" ||
+        callee == "Array::with_capacity" ||
+        callee == "Map::new" ||
+        callee == "Map::with_capacity" ||
+        callee == "Map" ||
+        callee == "Bytes::new" {
+          ret_cb_activated[rci] = true
+          rci = rci + 1
+          continue
+        }
+        let mut need_activate = false
+        if starts_with_str(callee, ".") {
+          let mut cur_m = slice_str(callee, 1, callee.length())
+          let mut strip_more = true
+          while strip_more && !need_activate {
+            strip_more = false
+            let us = sig_demand_find_last_char(cur_m, 95)
+            if us > 0 && us + 1 < cur_m.length() {
+              let tail = slice_str(cur_m, us + 1, cur_m.length())
+              if sig_is_digits(tail) {
+                cur_m = slice_str(cur_m, 0, us)
+                strip_more = true
+                match method_by_bare.get("." + cur_m) {
+                  Some(_) => need_activate = true
+                  None => ()
+                }
+              }
+            }
+          }
+          if !need_activate {
+            match method_by_bare.get(callee) {
+              Some(idxs) => {
                 let mut mi = 0
                 while mi < idxs.length() {
                   let why = sig_demand_fn_uses_slot(
@@ -15141,39 +16358,74 @@ pub fn compute_const_init_plan_from_pkg_tc_with_stats(
                     fdef_active_slots,
                   )
                   if why.length() > 0 {
-                    fallback_ref[0] = "ret_cb_called:" + callee + ":" + rtok + ":" + why
+                    need_activate = true
                     break
                   }
                   mi = mi + 1
                 }
               }
+              None => ()
             }
-            None => fallback_ref[0] = "ret_cb_method:" + callee + ":" + rtok
           }
-        }
-      } else {
-        match fn_by_key.get(callee) {
-          Some(idxs) => {
-            let mut fi2 = 0
-            while fi2 < idxs.length() {
-              let why = sig_demand_fn_uses_slot(
-                fn_sig_cache[idxs[fi2]],
-                fn_key_arr[idxs[fi2]],
-                slot_k,
-                fdef_all_active_fns,
-                fdef_active_slots,
-              )
-              if why.length() > 0 {
-                fallback_ref[0] = "ret_cb_called:" + callee + ":" + rtok + ":" + why
-                break
+        } else {
+          match fn_by_key.get(callee) {
+            Some(idxs) => {
+              let mut fi2 = 0
+              while fi2 < idxs.length() {
+                let why = sig_demand_fn_uses_slot(
+                  fn_sig_cache[idxs[fi2]],
+                  fn_key_arr[idxs[fi2]],
+                  slot_k,
+                  fdef_all_active_fns,
+                  fdef_active_slots,
+                )
+                if why.length() > 0 {
+                  need_activate = true
+                  break
+                }
+                fi2 = fi2 + 1
               }
-              fi2 = fi2 + 1
             }
+            None =>
+              // Cross-package function (not in local `fn_by_key`, not a local synthetic
+              // closure/slot or `#falias` LHS): the full planner has no `#fcallp`/`#fdef`
+              // rows for external callees, so it cannot invoke or forward `slot_k`.
+              if starts_with_str(callee, "$") ||
+              starts_with_str(callee, "@") ||
+              const_aux_lines.contains(callee) ||
+              ret_state.all_falias_lhs.contains(callee) {
+                need_activate = true
+              }
           }
-          None => fallback_ref[0] = "ret_cb_xpkg:" + callee + ":" + rtok
         }
+        if need_activate {
+          ret_cb_activated[rci] = true
+          sig_demand_enqueue_tok(
+            rtok,
+            true,
+            true,
+            const_aux_lines,
+            activated_const_aux,
+            fn_by_key,
+            method_by_bare,
+            fn_key_arr,
+            fn_decl_arr,
+            visited_fn,
+            fn_sig_cache,
+            tc.resolved_method_calls,
+            bfs_lines,
+            scanned_ref,
+            fallback_ref,
+            fdef_all_active_fns,
+            fdef_active_slots,
+            fdef_lines_by_slot,
+            fn_observed_calls,
+            ret_state,
+          )
+          outer_progress = true
+        }
+        rci = rci + 1
       }
-      rci = rci + 1
     }
   }
 
