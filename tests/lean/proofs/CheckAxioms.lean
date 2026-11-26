@@ -40,6 +40,7 @@ import PionProofs.QbeBinarySizeOpts
 import PionProofs.QbeCompileSpeedZ1
 import PionProofs.QbeRealWorkloadDataOpts
 import PionProofs.WaveAA3Drops
+import PionProofs.WaveAA2InlineRc
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -926,3 +927,20 @@ import PionProofs.WaveAA3Drops
 #print axioms PionWaveAA3Drops.suffix_injective
 #print axioms PionWaveAA3Drops.nodup_getElem_inj
 #print axioms PionWaveAA3Drops.table_index_contract
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_inc_bisim
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_bisim
+#print axioms PionWaveAA2InlineRc.SingleSite.rt_rc_inc_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.rt_rc_dec_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_inc_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_preserves_wf
+#print axioms PionWaveAA2InlineRc.SingleSite.rc_inc_wrap32
+#print axioms PionWaveAA2InlineRc.SingleSite.inline_rc_dec_destroy_exact_once
+#print axioms PionWaveAA2InlineRc.SingleSite.phi_remap_bisim
+#print axioms PionWaveAA2InlineRc.MaskEquiv.step_mask_equiv
+#print axioms PionWaveAA2InlineRc.MaskEquiv.exec_with_mask_equiv
+#print axioms PionWaveAA2InlineRc.MaskEquiv.any_two_masks_equiv
+#print axioms PionWaveAA2InlineRc.ForwardDag.forward_path_lt
+#print axioms PionWaveAA2InlineRc.ForwardDag.forward_no_cycle
+#print axioms PionWaveAA2InlineRc.ForwardDag.cfgAllForward_strictly_forward
+#print axioms PionWaveAA2InlineRc.ForwardDag.cfgAllForward_acyclic
+#print axioms PionWaveAA2InlineRc.ForwardDag.unreachable_not_on_entry_path
