@@ -272,6 +272,15 @@ pub impl Eq for FnEqKey with fn equal(a, b) {
   a.code == b.code
 }
 
+// 8. R4: Single-file alias-mediated recursive #derive(Eq) (cross-file mutual recursion in alias_a.mbt / alias_b.mbt)
+type AliasKids = Array[AliasTree]
+
+#derive(Eq)
+priv enum AliasTree {
+  ALeaf(Int)
+  ABranch(AliasKids)
+}
+
 pub fn run_all() -> String {
   // Case 1: non-primitive #derive(Eq) + H2 nested custom impl Eq + single-eval !=
   let h1 = [0]
@@ -386,7 +395,33 @@ pub fn run_all() -> String {
   let fn_v = mfn.get({ code: 7 }).unwrap_or(-1)
   let line7 = "F3d1b-7:\{md1 == md2},\{md1 == md3},\{tr1 == tr2},\{tr1 == tr3},\{mw_eq},\{fn_v}"
 
-  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6 + "\n" + line7
+  // Case 8: R4 single-file & cross-file type-alias recursive #derive(Eq)
+  let at1 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(2)])])
+  let at2 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(2)])])
+  let at3 : AliasTree = ABranch([ALeaf(1), ABranch([ALeaf(9)])])
+  let xa1 : CrossA = CrossA::More([{ a: CrossA::Done }])
+  let xa2 : CrossA = CrossA::More([{ a: CrossA::Done }])
+  let xa3 : CrossA = CrossA::Done
+  let line8 = "F3d1b-8:\{at1 == at2},\{at1 == at3},\{xa1 == xa2},\{xa1 == xa3}"
+
+  line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5 + "\n" + line6 + "\n" + line7 + "\n" + line8
+}
+'''
+
+LIB_ALIAS_A_MBT = r'''
+#derive(Eq)
+pub(all) enum CrossA {
+  Done
+  More(CrossKids)
+}
+'''
+
+LIB_ALIAS_B_MBT = r'''
+pub type CrossKids = Array[CrossB]
+
+#derive(Eq)
+pub(all) struct CrossB {
+  a : CrossA
 }
 '''
 
@@ -473,6 +508,8 @@ def main():
             ("dep_eq/dep_eq.mbt", DEP_EQ_MBT),
             ("lib/moon.pkg", 'import {\n  "f3d1b/oracle/dep_eq",\n}\n'),
             ("lib/f3d1b.mbt", F3D1B_MBT),
+            ("lib/alias_a.mbt", LIB_ALIAS_A_MBT),
+            ("lib/alias_b.mbt", LIB_ALIAS_B_MBT),
             ("cmd/moon.pkg", 'import { "f3d1b/oracle/lib" }\npkgtype(kind: "executable")\n'),
             ("cmd/main.mbt", 'fn main { println(@lib.run_all()) }\n'),
         ]:
@@ -517,7 +554,8 @@ def main():
             "F3d1b-4:true,true,true\n"
             "F3d1b-5:100,ok\n"
             "F3d1b-6:true,true,true,true,true,true,42,true\n"
-            "F3d1b-7:true,false,true,false,true,42"
+            "F3d1b-7:true,false,true,false,true,42\n"
+            "F3d1b-8:true,false,true,false"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
