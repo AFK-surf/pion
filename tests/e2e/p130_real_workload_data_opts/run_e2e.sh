@@ -27,7 +27,8 @@
 #      `pion_i32_literal_0` / `pion_i32_literal_0_words` (dev, --release),
 #      linked into a C host: same output; twopkg: an `--entry-symbol` equal
 #      to a dependency's first word table name gives byte-identical warm
-#      (dependency cached) and cold static libraries that run correctly.
+#      (dependency cached) and cold static library objects that run
+#      correctly.
 # Each program: check.py on the dev and --release SSA, exact stdout natively
 # (dev, --release) and on Wasm32 (Node, dev and --release); ints and records
 # (and collide, edges) also under ASan/LSan; sparse and sparsecap also
@@ -154,7 +155,7 @@ done
 # The entry symbol is keyed only into the entry package: an entry symbol equal
 # to the dependency's first word table name leaves the dependency's object
 # unchanged, so a warm build (dependency cached from a default build) and a
-# cold build produce the same library.
+# cold build produce byte-identical member objects.
 APP="$GEN/twopkg/app"
 TP="$TMP_DIR/twopkg"
 mkdir -p "$TP"
@@ -168,16 +169,33 @@ case "$DEP_SYM" in
 esac
 PION_CACHE_DIR="$WARM_CAS" "$PIONC" build --release --entry-symbol "$DEP_SYM" --emit-staticlib "$TP/warm.a" "$APP"
 build --release --entry-symbol "$DEP_SYM" --emit-staticlib "$TP/cold.a" "$APP"
-if [ ! -s "$TP/cold.a" ] || ! cmp -s "$TP/warm.a" "$TP/cold.a"; then
-  echo "FAIL: p130 twopkg: warm and cold --entry-symbol $DEP_SYM libraries differ" >&2
+# Compare member objects, not archives: BSD ar stamps member headers with the
+# archive time.
+for KIND in warm cold; do
+  mkdir -p "$TP/${KIND}_objs"
+  (cd "$TP/${KIND}_objs" && ar x "$TP/$KIND.a")
+  rm -f "$TP/${KIND}_objs"/__.SYMDEF*
+  (cd "$TP/${KIND}_objs" && ls) > "$TP/$KIND.members"
+  [ "$(ar t "$TP/$KIND.a" | grep -v '^__\.SYMDEF' | sort | uniq -d)" = "" ] ||
+    { echo "FAIL: p130 twopkg: duplicate member names in $KIND.a" >&2; exit 1; }
+done
+if [ "$(grep -c '\.o$' "$TP/cold.members")" -lt 2 ] || ! cmp -s "$TP/warm.members" "$TP/cold.members"; then
+  diff -u "$TP/warm.members" "$TP/cold.members" >&2 || true
+  echo "FAIL: p130 twopkg: warm and cold libraries hold different objects" >&2
   exit 1
 fi
+while read -r OBJ; do
+  if ! cmp -s "$TP/warm_objs/$OBJ" "$TP/cold_objs/$OBJ"; then
+    echo "FAIL: p130 twopkg: $OBJ differs between warm and cold --entry-symbol $DEP_SYM builds" >&2
+    exit 1
+  fi
+done < "$TP/cold.members"
 printf 'int %s(int argc, char **argv);\nint main(int argc, char **argv) { return %s(argc, argv); }\n' \
   "$DEP_SYM" "$DEP_SYM" > "$TP/host.c"
 "$CC_BIN" -O1 "$TP/host.c" "$TP/cold.a" "$RT_LIB" -lm -lpthread -o "$TP/host"
 "$TP/host" > "$TP/host.out" 2> "$TP/host.err"
 same_output "twopkg --entry-symbol $DEP_SYM" "$GEN/twopkg.expected" "$TP/host.out"
 no_stderr "twopkg --entry-symbol $DEP_SYM" "$TP/host.err"
-echo "p130 twopkg: --entry-symbol $DEP_SYM warm == cold library, output equals the reference"
+echo "p130 twopkg: --entry-symbol $DEP_SYM warm == cold objects ($(wc -l < "$TP/cold.members" | tr -d ' ')), output equals the reference"
 
 echo "PASS: p130_real_workload_data_opts"
