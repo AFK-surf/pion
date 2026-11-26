@@ -1,0 +1,908 @@
+///| Tests for PR-2: QBE shared early-exit RC cleanup chains (2A) and unified AST inline budget (2B).
+
+///|
+fn qso_count_substr(s : String, needle : String) -> Int {
+  let mut c = 0
+  let mut i = 0
+  while i + needle.length() <= s.length() {
+    if slice_str(s, i, i + needle.length()) == needle {
+      c = c + 1
+      i = i + needle.length()
+    } else {
+      i = i + 1
+    }
+  }
+  c
+}
+
+///|
+fn qso_extract_fn(ssa : String, fn_sym : String) -> String {
+  let marker = " " + fn_sym + "("
+  let n = ssa.length()
+  let mut start = -1
+  let mut i = 0
+  while i + marker.length() <= n {
+    if slice_str(ssa, i, i + marker.length()) == marker {
+      start = i
+      break
+    }
+    i = i + 1
+  }
+  if start < 0 {
+    return ""
+  }
+  let mut end = start
+  while end < n {
+    if str_code_at(ssa, end) == 125 {
+      return slice_str(ssa, start, end + 1)
+    }
+    end = end + 1
+  }
+  slice_str(ssa, start, n)
+}
+
+///|
+fn qso_find_substr(s : String, needle : String) -> Int {
+  let mut i = 0
+  while i + needle.length() <= s.length() {
+    if slice_str(s, i, i + needle.length()) == needle {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn qso_split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if str_code_at(s, i) == 10 {
+      out.push(slice_str(s, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start <= n {
+    out.push(slice_str(s, start, n))
+  }
+  out
+}
+
+///|
+fn qso_check_cln_jumps_strictly_forward(fn_ssa : String) -> Bool {
+  let lines = qso_split_lines(fn_ssa)
+  let lbl_line : Map[String, Int] = Map([])
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    if line.length() > 1 && str_code_at(line, 0) == 64 {
+      lbl_line.set(line, i)
+    }
+    i = i + 1
+  }
+  let mut saw_cln = false
+  i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    if line.starts_with(" jmp @cln_") || line.starts_with(" jmp @ret_epi_") {
+      let target = slice_str(line, 5, line.length())
+      if target.starts_with("@cln_") {
+        saw_cln = true
+      }
+      match lbl_line.get(target) {
+        Some(tline) =>
+        if tline <= i {
+          return false
+        }
+        None => return false
+      }
+    }
+    i = i + 1
+  }
+  saw_cln
+}
+
+///|
+fn qso_read_uleb(body : Array[Int], start : Int) -> (Int, Int) {
+  let mut res = 0
+  let mut shift = 0
+  let mut i = start
+  while i < body.length() {
+    let b = body[i]
+    i = i + 1
+    res = res | ((b & 127) << shift)
+    if (b & 128) == 0 {
+      return (res, i)
+    }
+    shift = shift + 7
+  }
+  (res, i)
+}
+
+///|
+fn qso_skip_leb(body : Array[Int], start : Int) -> Int {
+  let mut i = start
+  while i < body.length() {
+    let b = body[i]
+    i = i + 1
+    if (b & 128) == 0 {
+      return i
+    }
+  }
+  i
+}
+
+///|
+fn qso_wasm_body_has_br_table(body : Array[Int]) -> Bool {
+  // Decode local declarations first, then walk the Wasm instruction stream accurately.
+  let (lcnt, i0) = qso_read_uleb(body, 0)
+  let mut i = i0
+  let mut li = 0
+  while li < lcnt && i < body.length() {
+    i = qso_skip_leb(body, i)
+    i = i + 1
+    li = li + 1
+  }
+  while i < body.length() {
+    let op = body[i]
+    i = i + 1
+    if op == 14 {
+      return true
+    } else if op == 2 || op == 3 || op == 4 || op == 12 || op == 13 || op == 16 ||
+    (op >= 32 && op <= 36) || op == 63 || op == 64 || op == 65 || op == 66 {
+      // block/loop/if (blocktype), br/br_if/call, local.*/global.*, memory.size/grow, i32/i64.const
+      i = qso_skip_leb(body, i)
+    } else if op == 17 || (op >= 40 && op <= 62) {
+      // call_indirect (typeidx, tableidx), memory loads/stores (align, offset)
+      i = qso_skip_leb(body, i)
+      i = qso_skip_leb(body, i)
+    } else if op == 67 {
+      // f32.const
+      i = i + 4
+    } else if op == 68 {
+      // f64.const
+      i = i + 8
+    } else if op == 252 {
+      // 0xfc prefix (trunc_sat, bulk memory)
+      let (sub, next_i) = qso_read_uleb(body, i)
+      i = next_i
+      if sub == 8 || sub == 10 {
+        i = qso_skip_leb(body, i)
+        i = qso_skip_leb(body, i)
+      } else if sub == 9 || sub == 11 {
+        i = qso_skip_leb(body, i)
+      }
+    }
+  }
+  false
+}
+
+///|
+struct QsoPair {
+  a : Int
+  b : String
+}
+
+///|
+enum QsoKind {
+  KZero
+  KOne(Int)
+  KStr(String)
+}
+
+///|
+fn qso_multi_early_exit_runtime(x : Int) -> Int {
+  let s1 = "alpha_" + x.to_string()
+  let s2 = "beta_" + (x + 1).to_string()
+  let arr = [x, x + 1, x + 2]
+  if x == 0 {
+    return 100
+  }
+  if x == 1 {
+    return s1.length()
+  }
+  if x == 2 {
+    return s2.length()
+  }
+  if x == 3 {
+    let inner = "gamma_" + x.to_string()
+    return inner.length() + s1.length()
+  }
+  if x == 4 {
+    let inner1 = "d1_" + x.to_string()
+    let inner2 = "d2_" + x.to_string()
+    if x > 0 {
+      return inner1.length() + inner2.length()
+    }
+  }
+  if x == 5 {
+    return arr.length() + 50
+  }
+  if x == 6 {
+    return 600
+  }
+  if x == 7 {
+    return 700
+  }
+  if x == 8 {
+    return 800
+  }
+  if x == 9 {
+    return 900
+  }
+  if x == 10 {
+    return 1000
+  }
+  s1.length() + s2.length() + arr.length()
+}
+
+///|
+fn qso_moved_and_cell_runtime(x : Int) -> String {
+  let a = "head_" + x.to_string()
+  let b = "tail_" + x.to_string()
+  let mut acc = x
+  let bump = fn(d : Int) -> Int {
+    acc = acc + d
+    acc
+  }
+  let _ = bump(1)
+  if x == 1 {
+    return a
+  }
+  if x == 2 {
+    return b
+  }
+  if x == 3 {
+    let c = "mid_" + acc.to_string()
+    return c
+  }
+  a + ":" + b + ":" + acc.to_string()
+}
+
+///|
+fn qso_mut_int_ref_slot_runtime(mut counter : Int, flag : Int) -> Int {
+  let s1 = "owned1_" + counter.to_string()
+  let s2 = "owned2_" + flag.to_string()
+  counter = counter + 10
+  if flag == 1 {
+    counter = counter + 1
+    return s1.length()
+  }
+  if flag == 2 {
+    counter = counter + 2
+    return s2.length()
+  }
+  if flag == 3 {
+    counter = counter + 3
+    return s1.length() + s2.length()
+  }
+  counter = counter + 100
+  s1.length() + s2.length() + 1
+}
+
+///|
+fn qso_ret_int8(x : Int) -> Int8 {
+  let s1 = "i8a_" + x.to_string()
+  let s2 = "i8b_" + x.to_string()
+  if x == 1 {
+    return (-42).to_int8()
+  }
+  if x == 2 {
+    return (127).to_int8()
+  }
+  if x == 3 {
+    return (-128).to_int8()
+  }
+  (s1.length() + s2.length()).to_int8()
+}
+
+///|
+fn qso_ret_bool(x : Int) -> Bool {
+  let s1 = "ba_" + x.to_string()
+  let s2 = "bb_" + x.to_string()
+  if x == 1 {
+    return true
+  }
+  if x == 2 {
+    return false
+  }
+  s1.length() == s2.length()
+}
+
+///|
+fn qso_ret_float(x : Int) -> Float {
+  let s1 = "fa_" + x.to_string()
+  let s2 = "fb_" + x.to_string()
+  if x == 1 {
+    return 1.5.to_float()
+  }
+  if x == 2 {
+    return (-2.25).to_float()
+  }
+  if s1.length() + s2.length() > 0 {
+    return 3.75.to_float()
+  }
+  0.0.to_float()
+}
+
+///|
+fn qso_ret_double(x : Int) -> Double {
+  let s1 = "da_" + x.to_string()
+  let s2 = "db_" + x.to_string()
+  if x == 1 {
+    return 12.5
+  }
+  if x == 2 {
+    return -99.125
+  }
+  (s1.length() + s2.length()).to_double()
+}
+
+///|
+fn qso_ret_unit(out : Array[Int], x : Int) -> Unit {
+  let s1 = "ua_" + x.to_string()
+  let s2 = "ub_" + x.to_string()
+  if x == 1 {
+    out.push(s1.length())
+    return
+  }
+  if x == 2 {
+    out.push(s2.length() + 10)
+    return
+  }
+  out.push(s1.length() + s2.length())
+}
+
+///|
+fn qso_ret_struct(x : Int) -> QsoPair {
+  let s1 = "sa_" + x.to_string()
+  let s2 = "sb_" + x.to_string()
+  if x == 1 {
+    return QsoPair::{ a: 11, b: s1 }
+  }
+  if x == 2 {
+    return QsoPair::{ a: 22, b: s2 }
+  }
+  QsoPair::{ a: 33, b: s1 + "+" + s2 }
+}
+
+///|
+fn qso_ret_enum(x : Int) -> QsoKind {
+  let s1 = "ea_" + x.to_string()
+  let s2 = "eb_" + x.to_string()
+  if x == 1 {
+    return KZero
+  }
+  if x == 2 {
+    return KOne(s1.length())
+  }
+  if x == 3 {
+    return KStr(s2)
+  }
+  KStr(s1 + s2)
+}
+
+///|
+fn qso_nested_closure_runtime(x : Int) -> Int {
+  let s1 = "outer1_" + x.to_string()
+  let s2 = "outer2_" + x.to_string()
+  let inner_fn = fn(k : Int) -> Int {
+    let c1 = "clo1_" + k.to_string()
+    let c2 = "clo2_" + k.to_string()
+    let deep_fn = fn(m : Int) -> Int {
+      let d1 = "deep1_" + m.to_string()
+      let d2 = "deep2_" + m.to_string()
+      if m == 1 {
+        return d1.length()
+      }
+      if m == 2 {
+        return d2.length() + 5
+      }
+      d1.length() + d2.length()
+    }
+    if k == 1 {
+      return c1.length() + deep_fn(1)
+    }
+    if k == 2 {
+      return c2.length() + deep_fn(2)
+    }
+    c1.length() + c2.length() + deep_fn(k)
+  }
+  if x == 1 {
+    return inner_fn(1)
+  }
+  if x == 2 {
+    return inner_fn(2)
+  }
+  inner_fn(x) + s1.length() + s2.length()
+}
+
+///|
+fn qso_make_res_boxed(x : Int) -> Result[Int, String] {
+  if x < 0 {
+    Err("neg_" + x.to_string())
+  } else {
+    Ok(x * 2)
+  }
+}
+
+///|
+fn qso_try_result_paths(x : Int, y : Int) -> Result[Int, String] {
+  let s1 = "r1_" + x.to_string()
+  let s2 = "r2_" + y.to_string()
+  let a = qso_make_res_boxed(x)?
+  let b = qso_make_res_boxed(y)?
+  if a == 0 {
+    return Err("zero_" + s1)
+  }
+  Ok(a + b + s1.length() + s2.length())
+}
+
+///|
+fn qso_make_opt_niche(x : Int) -> Option[String] {
+  if x < 0 {
+    None
+  } else {
+    Some("ok_" + x.to_string())
+  }
+}
+
+///|
+fn qso_try_opt_niche(x : Int, y : Int) -> Option[String] {
+  let s1 = "on1_" + x.to_string()
+  let s2 = "on2_" + y.to_string()
+  let a = qso_make_opt_niche(x)?
+  let b = qso_make_opt_niche(y)?
+  Some(a + ":" + b + ":" + s1 + ":" + s2)
+}
+
+///|
+fn qso_make_opt_int(x : Int) -> Option[Int] {
+  if x < 0 {
+    None
+  } else {
+    Some(x + 10)
+  }
+}
+
+///|
+fn qso_try_opt_non_niche(x : Int, y : Int) -> Option[Int] {
+  let s1 = "oi1_" + x.to_string()
+  let s2 = "oi2_" + y.to_string()
+  let a = qso_make_opt_int(x)?
+  let b = qso_make_opt_int(y)?
+  Some(a + b + s1.length() + s2.length())
+}
+
+///|
+fn qso_generic_tparam[T](v : T, flag : Int) -> Int {
+  let s1 = "g1_" + flag.to_string()
+  let s2 = "g2_" + flag.to_string()
+  let local_t = v
+  let _ = local_t
+  if flag == 1 {
+    return s1.length()
+  }
+  if flag == 2 {
+    return s2.length()
+  }
+  s1.length() + s2.length()
+}
+
+///|
+test "qbe_size_opt_shared_cleanup_runtime_and_types" {
+  // 10+ early exits & fallthrough
+  assert_eq(qso_multi_early_exit_runtime(0), 100)
+  assert_eq(qso_multi_early_exit_runtime(1), 7)
+  assert_eq(qso_multi_early_exit_runtime(2), 6)
+  assert_eq(qso_multi_early_exit_runtime(3), 14)
+  assert_eq(qso_multi_early_exit_runtime(4), 8)
+  assert_eq(qso_multi_early_exit_runtime(5), 53)
+  assert_eq(qso_multi_early_exit_runtime(6), 600)
+  assert_eq(qso_multi_early_exit_runtime(10), 1000)
+  assert_eq(qso_multi_early_exit_runtime(11), 18)
+
+  // moved_slots + is_cell
+  assert_eq(qso_moved_and_cell_runtime(1), "head_1")
+  assert_eq(qso_moved_and_cell_runtime(2), "tail_2")
+  assert_eq(qso_moved_and_cell_runtime(3), "mid_4")
+  assert_eq(qso_moved_and_cell_runtime(4), "head_4:tail_4:5")
+
+  // mut Int ref_slot writeback + 2 owned locals on both early-exit and fallthrough
+  let mut c1 = 5
+  let r1 = qso_mut_int_ref_slot_runtime(mut c1, 1)
+  assert_eq(c1, 16)
+  assert_eq(r1, 8)
+  let mut c2 = 5
+  let r2 = qso_mut_int_ref_slot_runtime(mut c2, 2)
+  assert_eq(c2, 17)
+  assert_eq(r2, 8)
+  let mut c3 = 5
+  let r3 = qso_mut_int_ref_slot_runtime(mut c3, 9)
+  assert_eq(c3, 115)
+  assert_eq(r3, 17)
+
+  // Int8 / Bool / Float / Double / Unit / struct / enum
+  assert_eq(qso_ret_int8(1), (-42).to_int8())
+  assert_eq(qso_ret_int8(2), (127).to_int8())
+  assert_eq(qso_ret_int8(3), (-128).to_int8())
+  assert_eq(qso_ret_int8(4), (10).to_int8())
+
+  assert_eq(qso_ret_bool(1), true)
+  assert_eq(qso_ret_bool(2), false)
+  assert_eq(qso_ret_bool(3), true)
+
+  assert_eq(qso_ret_float(1), 1.5.to_float())
+  assert_eq(qso_ret_float(2), (-2.25).to_float())
+  assert_eq(qso_ret_float(3), 3.75.to_float())
+
+  assert_eq(qso_ret_double(1), 12.5)
+  assert_eq(qso_ret_double(2), -99.125)
+  assert_eq(qso_ret_double(3), 8.0)
+
+  let uout : Array[Int] = []
+  qso_ret_unit(uout, 1)
+  qso_ret_unit(uout, 2)
+  qso_ret_unit(uout, 3)
+  assert_eq(uout.length(), 3)
+  assert_eq(uout[0], 4)
+  assert_eq(uout[1], 14)
+  assert_eq(uout[2], 8)
+
+  let p1 = qso_ret_struct(1)
+  assert_eq(p1.a, 11)
+  assert_eq(p1.b, "sa_1")
+  let p2 = qso_ret_struct(2)
+  assert_eq(p2.a, 22)
+  assert_eq(p2.b, "sb_2")
+  let p3 = qso_ret_struct(3)
+  assert_eq(p3.a, 33)
+  assert_eq(p3.b, "sa_3+sb_3")
+
+  match qso_ret_enum(1) {
+    KZero => ()
+    _ => assert_true(false, "expected KZero")
+  }
+  match qso_ret_enum(2) {
+    KOne(n) => assert_eq(n, 4)
+    _ => assert_true(false, "expected KOne")
+  }
+  match qso_ret_enum(3) {
+    KStr(s) => assert_eq(s, "eb_3")
+    _ => assert_true(false, "expected KStr")
+  }
+
+  // Nested closures (outer + inner + deep, each with multiple early exits)
+  assert_eq(qso_nested_closure_runtime(1), 13)
+  assert_eq(qso_nested_closure_runtime(2), 18)
+  assert_eq(qso_nested_closure_runtime(3), 42)
+
+  // Result & Option try paths
+  match qso_try_result_paths(-1, 2) {
+    Err(e) => assert_eq(e, "neg_-1")
+    _ => assert_true(false, "expected Err")
+  }
+  match qso_try_result_paths(2, -3) {
+    Err(e) => assert_eq(e, "neg_-3")
+    _ => assert_true(false, "expected Err")
+  }
+  match qso_try_result_paths(2, 3) {
+    Ok(v) => assert_eq(v, 18)
+    _ => assert_true(false, "expected Ok")
+  }
+
+  match qso_try_opt_niche(-1, 2) {
+    None => ()
+    _ => assert_true(false, "expected None")
+  }
+  match qso_try_opt_niche(1, 2) {
+    Some(s) => assert_eq(s, "ok_1:ok_2:on1_1:on2_2")
+    _ => assert_true(false, "expected Some")
+  }
+
+  match qso_try_opt_non_niche(-1, 2) {
+    None => ()
+    _ => assert_true(false, "expected None")
+  }
+  match qso_try_opt_non_niche(1, 2) {
+    Some(v) => assert_eq(v, 33)
+    _ => assert_true(false, "expected Some")
+  }
+
+  // Generic TParam fallback
+  assert_eq(qso_generic_tparam("hi", 1), 4)
+  assert_eq(qso_generic_tparam(42, 2), 4)
+}
+
+///|
+test "qbe_size_opt_ssa_shared_cleanup_topology_and_wasm_structured" {
+  let src =
+  #|pub fn many_exits(x : Int) -> Int {
+    #| let a = "a_" + x.to_string()
+    #| let b = "b_" + x.to_string()
+    #| let c = "c_" + x.to_string()
+    #| if x == 1 { return 1 }
+    #| if x == 2 { return 2 }
+    #| if x == 3 { return 3 }
+    #| if x == 4 { return 4 }
+    #| if x == 5 { return 5 }
+    #| if x == 6 { return 6 }
+    #| if x == 7 { return 7 }
+    #| if x == 8 { return 8 }
+    #| if x == 9 { return 9 }
+    #| if x == 10 { return 10 }
+    #| a.length() + b.length() + c.length()
+    #|}
+  let pkg = parse_package("test", ["many.pion"], [src])
+  let res = emit_qbe_package(pkg, true)
+  let fn_ssa = qso_extract_fn(res.ssa, "$pion_fn_many_exits")
+  assert_true(fn_ssa.length() > 0, "expected $pion_fn_many_exits in SSA")
+  assert_true(fn_ssa.contains("@cln_"), "expected shared @cln_ labels")
+  assert_true(fn_ssa.contains("@ret_epi_"), "expected @ret_epi_ label")
+  assert_true(
+    qso_check_cln_jumps_strictly_forward(fn_ssa),
+    "all @cln_ and @ret_epi_ jumps must be strictly forward",
+  )
+  // 3 owned locals across 11 exits: unshared would emit 36 rc_dec calls (33 exits + 3 to_string temps); shared emits 6!
+  let dec_cnt = qso_count_substr(fn_ssa, "call $pion_rc_dec(")
+  assert_true(
+    dec_cnt <= 8,
+    "expected shared cleanup to collapse rc_dec calls (got " + dec_cnt.to_string() + ")",
+  )
+
+  // Wasm32 structured CFG check: multi-early-exit with shared cleanup must not emit br_table
+  let tc = build_typechecker_for_codegen(pkg)
+  let wasm_res = emit_qbe_package_with_tc_target(pkg, tc, true, "wasm32")
+  let wasm_fn = qso_extract_fn(wasm_res.ssa, "$pion_fn_many_exits")
+  assert_true(wasm_fn.length() > 0, "expected wasm $pion_fn_many_exits in SSA")
+  assert_true(
+    qso_check_cln_jumps_strictly_forward(wasm_fn),
+    "wasm @cln_ jumps must be strictly forward",
+  )
+  let wasm_bin = emit_wasm_from_ssa(wasm_res.ssa)
+  let bodies = test_aa1_extract_code_bodies(wasm_bin)
+  assert_true(bodies.length() >= 1, "valid wasm binary for shared cleanup")
+  assert_eq(qso_wasm_body_has_br_table(bodies[0]), false)
+
+  // Spawn body + outer function isolation check in SSA
+  let spawn_src =
+  #|pub fn with_spawn(world : World, x : Int) -> Int {
+    #| let o1 = "o1_" + x.to_string()
+    #| let o2 = "o2_" + x.to_string()
+    #| let ch : Channel[Int] = Channel::new(2)
+    #| scope(world, fn(sp : Scope) -> Unit {
+      #| spawn(sp, fn() -> Unit {
+        #| let t1 = "t1_" + x.to_string()
+        #| let t2 = "t2_" + x.to_string()
+        #| if x == 1 {
+          #| let _ = ch.send(t1.length())
+          #| return
+          #| }
+        #| if x == 2 {
+          #| let _ = ch.send(t2.length())
+          #| return
+          #| }
+        #| let _ = ch.send(t1.length() + t2.length())
+        #| })
+      #| })
+    #| if x == 1 { return o1.length() }
+    #| if x == 2 { return o2.length() }
+    #| o1.length() + o2.length()
+    #|}
+  let sp_pkg = parse_package("test", ["sp.pion"], [spawn_src])
+  let sp_res = emit_qbe_package(sp_pkg, true)
+  let sp_outer = qso_extract_fn(sp_res.ssa, "$pion_fn_with_spawn")
+  assert_true(sp_outer.length() > 0, "expected $pion_fn_with_spawn in SSA")
+  assert_true(
+    qso_check_cln_jumps_strictly_forward(sp_outer),
+    "outer function with spawn must keep valid forward shared cleanup",
+  )
+  // Verify the spawned body function itself also emits strictly-forward @cln_ pads
+  let sp_funcs = sp_res.ssa.split("function ")
+  let mut saw_spawn_cln = false
+  let mut sfi = 0
+  while sfi < sp_funcs.length() {
+    let sf = sp_funcs[sfi]
+    if !sf.contains("$pion_fn_with_spawn(") && sf.contains("@cln_") {
+      assert_true(
+        qso_check_cln_jumps_strictly_forward(sf),
+        "spawn body must keep valid strictly-forward shared cleanup",
+      )
+      saw_spawn_cln = true
+    }
+    sfi = sfi + 1
+  }
+  assert_true(saw_spawn_cln, "expected spawned body function to emit @cln_ pads")
+
+  // Struct return with multiple early exits must emit shared @cln_ + @ret_epi_
+  let struct_src =
+  #|struct SRet { a : Int; b : String }
+  #|pub fn ret_struct_exits(x : Int) -> SRet {
+    #| let s1 = "sa_" + x.to_string()
+    #| let s2 = "sb_" + x.to_string()
+    #| let s3 = "sc_" + x.to_string()
+    #| if x == 1 { return SRet::{ a: 11 + s3.length(), b: s1 } }
+    #| if x == 2 { return SRet::{ a: 22 + s3.length(), b: s2 } }
+    #| if x == 3 { return SRet::{ a: 33 + s2.length(), b: s1 } }
+    #| SRet::{ a: 44 + s1.length(), b: s2 }
+    #|}
+  let st_pkg = parse_package("test", ["st.pion"], [struct_src])
+  let st_res = emit_qbe_package(st_pkg, true)
+  let st_fn = qso_extract_fn(st_res.ssa, "$pion_fn_ret_struct_exits")
+  assert_true(st_fn.length() > 0, "expected $pion_fn_ret_struct_exits in SSA")
+  assert_true(st_fn.contains("@cln_") && st_fn.contains("@ret_epi_"), st_fn)
+  assert_true(
+    qso_check_cln_jumps_strictly_forward(st_fn),
+    "struct return shared cleanup must be strictly forward",
+  )
+
+  // Scalarized adjacent `let r = mk_opt(x)` + `return match r` must route through shared @cln_ + @ret_epi_ (single ret)
+  let rmatch_src =
+  #|fn mk_opt(x : Int) -> Option[Int] {
+    #| if x > 0 { Some(x + 1) } else { None }
+    #|}
+  #|pub fn ret_match_shared(x : Int) -> Int {
+    #| let s1 = "m1_" + x.to_string()
+    #| let s2 = "m2_" + x.to_string()
+    #| if x == 0 { return s1.length() }
+    #| let r = mk_opt(x)
+    #| return match r {
+      #| Some(v) => v + s1.length()
+      #| None => s2.length()
+      #| }
+    #|}
+  let rm_pkg = parse_package("test", ["rm.pion"], [rmatch_src])
+  let rm_res = emit_qbe_package(rm_pkg, true)
+  let rm_fn = qso_extract_fn(rm_res.ssa, "$pion_fn_ret_match_shared")
+  assert_true(rm_fn.length() > 0, "expected $pion_fn_ret_match_shared in SSA")
+  assert_true(rm_fn.contains("@cln_") && rm_fn.contains("@ret_epi_"), rm_fn)
+  assert_true(
+    qso_check_cln_jumps_strictly_forward(rm_fn),
+    "scalarized return match shared cleanup must be strictly forward",
+  )
+  assert_eq(qso_count_substr(rm_fn, "\n ret "), 1)
+
+  // Scalar mut Int ref_slot fallback: must not share cleanup when ref_slot is active
+  let ref_src =
+  #|pub fn with_mut_int(mut c : Int, x : Int) -> Int {
+    #| let a = "a_" + x.to_string()
+    #| let b = "b_" + x.to_string()
+    #| c = c + 1
+    #| if x == 1 { return a.length() }
+    #| if x == 2 { return b.length() }
+    #| a.length() + b.length()
+    #|}
+  let ref_pkg = parse_package("test", ["ref.pion"], [ref_src])
+  let ref_res = emit_qbe_package(ref_pkg, true)
+  let ref_fn = qso_extract_fn(ref_res.ssa, "$pion_fn_with_mut_int")
+  assert_true(ref_fn.length() > 0, "expected $pion_fn_with_mut_int in SSA")
+  assert_eq(ref_fn.contains("@cln_"), false)
+}
+
+///|
+test "qbe_size_opt_inline_rc_skips_cln_blocks" {
+  let ssa =
+  #|export function l $f(l %p, l %q, w %c) {
+    #|@start
+    #| %s1 =l alloc8 8
+    #| storel %p, %s1
+    #| %s2 =l alloc8 8
+    #| storel %q, %s2
+    #| jnz %c, @early, @norm
+    #|@early
+    #| jmp @cln_1
+    #|@norm
+    #| call $pion_rc_dec(l %p)
+    #| ret 1
+    #|@cln_1
+    #| %v1 =l loadl %s2
+    #| call $pion_rc_dec(l %v1)
+    #| jmp @cln_2
+    #|@cln_2
+    #| %v2 =l loadl %s1
+    #| call $pion_rc_dec(l %v2)
+    #| jmp @ret_epi_3
+    #|@ret_epi_3
+    #| ret 0
+    #|}
+  let out = inline_native_rc_ssa(ssa)
+  // Normal block's rc_dec is expanded (small function), while @cln_1 and @cln_2 keep call $pion_rc_dec
+  let idx_cln = qso_find_substr(out, "@cln_1")
+  assert_true(idx_cln > 0, "expected @cln_1 in output")
+  let before_cln = slice_str(out, 0, idx_cln)
+  let after_cln = slice_str(out, idx_cln, out.length())
+  assert_eq(before_cln.contains("call $pion_rc_dec(l %p)"), false)
+  assert_eq(after_cln.contains("call $pion_rc_dec(l %v1)"), true)
+  assert_eq(after_cln.contains("call $pion_rc_dec(l %v2)"), true)
+}
+
+///|
+test "qbe_size_opt_inline_budget_non_loop_vs_loop_and_tiny" {
+  let src =
+  #|fn tiny(x : Int) -> Int {
+    #| x + 1
+    #|}
+  #|fn med_helper(x : Int) -> Int {
+    #| let a = x + 1
+    #| let b = a * 3
+    #| let c = b + a * 2
+    #| let d = c - b + x
+    #| let e = d * 5 + c
+    #| let f = e + d * 2 - a
+    #| f + e + d + c + b + a
+    #|}
+  #|pub fn caller_non_loop(x : Int) -> Int {
+    #| let t = tiny(x)
+    #| med_helper(t) + med_helper(t + 1)
+    #|}
+  #|pub fn caller_in_loop(n : Int) -> Int {
+    #| let mut acc = 0
+    #| let mut i = 0
+    #| while i < n {
+      #| acc = acc + med_helper(i)
+      #| i = i + 1
+      #| }
+    #| acc
+    #|}
+  let pkg = parse_package("test", ["inl.pion"], [src])
+  let res = emit_qbe_package(pkg, true)
+  let non_loop_ssa = qso_extract_fn(res.ssa, "$pion_fn_caller_non_loop")
+  let loop_ssa = qso_extract_fn(res.ssa, "$pion_fn_caller_in_loop")
+  assert_true(non_loop_ssa.length() > 0, "expected $pion_fn_caller_non_loop")
+  assert_true(loop_ssa.length() > 0, "expected $pion_fn_caller_in_loop")
+  // Tiny callee (cost <= 4) is inlined even outside loops
+  assert_eq(non_loop_ssa.contains("call $pion_fn_tiny("), false)
+  // Medium callee (cost > 18) is NOT inlined outside loops under 2B
+  assert_eq(non_loop_ssa.contains("call $pion_fn_med_helper("), true)
+  // Hot loop still inlines private med_helper (loop_max_cost = 220 preserved)
+  assert_eq(loop_ssa.contains("call $pion_fn_med_helper("), false)
+}
+
+///|
+test "qbe_size_opt_inline_budget_xpkg_cold_vs_loop_and_pub_in_loop" {
+  // 1. Two-package: cross-package pub fn with cost 17 is NOT inlined in cold non-loop
+  //    caller (cap = 10), but IS inlined in hot while loop (cap = 22 preserved).
+  let lib_src =
+  #|pub fn xpkg_med(x : Int) -> Int {
+    #| let a = x * 3 + 7
+    #| if a > 50 { a - 13 } else { a + 19 }
+    #|}
+  let app_src =
+  #|import "xlib" as xlib
+  #|pub fn pub_same_file_med(x : Int) -> Int {
+    #| let a = x * 3 + 7
+    #| let b = if a > 50 { a - 13 } else { a + 19 }
+    #| (a ^ b) + b * 2
+    #|}
+  #|pub fn cold_callers(x : Int) -> Int {
+    #| xlib::xpkg_med(x) + pub_same_file_med(x)
+    #|}
+  #|pub fn loop_callers(n : Int) -> Int {
+    #| let mut acc = 0
+    #| let mut i = 0
+    #| while i < n {
+      #| acc = acc + xlib::xpkg_med(i) + pub_same_file_med(i)
+      #| i = i + 1
+      #| }
+    #| acc
+    #|}
+  let lcr = check_source_files_with_imports("xlib", ["lib.pion"], [lib_src], [], true)
+  assert_true(lcr.diagnostics.length() == 0, check_result_to_json(lcr.diagnostics))
+  let imp = [ImportedPkg::{ name: "xlib", tc: lcr.tc }]
+  let acr = check_source_files_with_imports("xapp", ["app.pion"], [app_src], imp, true)
+  assert_true(acr.diagnostics.length() == 0, check_result_to_json(acr.diagnostics))
+  let ssa = emit_qbe_package_multi(acr.pkg, acr.tc, true, false, ["xlib"]).ssa
+  let cold_ssa = qso_extract_fn(ssa, "$pion_pkg_xapp_fn_cold_callers")
+  let loop_ssa = qso_extract_fn(ssa, "$pion_pkg_xapp_fn_loop_callers")
+  assert_true(cold_ssa.length() > 0 && loop_ssa.length() > 0, ssa)
+  // Cold non-loop: xpkg_med (cost 17 > 10) and pub_same_file_med (cost 25 > 18) both stay calls
+  assert_true(cold_ssa.contains("call $pion_pkg_xlib_fn_xpkg_med("), cold_ssa)
+  assert_true(cold_ssa.contains("call $pion_pkg_xapp_fn_pub_same_file_med("), cold_ssa)
+  // In-loop: xpkg_med (cost 17 <= 22) and pub_same_file_med (cost 25 <= 42) both inline!
+  assert_true(!loop_ssa.contains("call $pion_pkg_xlib_fn_xpkg_med("), loop_ssa)
+  assert_true(!loop_ssa.contains("call $pion_pkg_xapp_fn_pub_same_file_med("), loop_ssa)
+}
