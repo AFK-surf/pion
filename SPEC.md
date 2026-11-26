@@ -550,6 +550,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   - `char*   pion_cli_sha256_file(const char *path);` (streaming raw-byte SHA-256 of any regular file with a 64 KiB buffer and O(1) memory, returning a `malloc`-allocated 64-char lowercase hex string or `NULL` on error/directory)
   - `int64_t pion_cli_path_change_ms(const char *path);` (`stat`-based `max(mtime_ms, ctime_ms)` on POSIX, `CreateFileW` + `FileBasicInfo` `max(LastWriteTime, ChangeTime)` at 100ns precision on Windows, or `-1` on error; used by the `cstub` compile-race guard to detect both content edits and preserved-`mtime` atomic renames)
   - `int64_t pion_cli_lpath_change_ms(const char *path);` (`lstat`-based `max(mtime_ms, ctime_ms)` on POSIX, `FILE_FLAG_OPEN_REPARSE_POINT` + `FileBasicInfo` `max(LastWriteTime, ChangeTime)` on Windows, or `-1` on error; detects symlink retargeting during compilation)
+  - `char*   pion_fs_readlink(const char *path);` (single-hop POSIX `readlink` returning a `malloc`-allocated raw symlink target string or `NULL` on non-link/error; returns `NULL` on Windows for fail-closed handling; used by `cstub` multi-hop symlink chain race checking)
 - `void*   pion_world_fs_list_dir(void *w, void *path_str);` (MUST return entries sorted lexicographically for deterministic builds!)
 - `int32_t pion_world_fs_remove(void *w, void *path_str);` (for CAS LRU eviction; returns 1 on success)
 - `int32_t pion_world_fs_rename(void *w, void *old_path, void *new_path);` (for atomic concurrent CAS writes; returns 1 on success)

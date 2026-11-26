@@ -1217,6 +1217,25 @@ extern "C" fn c_cli_path_change_ms(path : Ptr) -> Int64 = "pion_cli_path_change_
 extern "C" fn c_cli_lpath_change_ms(path : Ptr) -> Int64 = "pion_cli_lpath_change_ms"
 
 ///|
+extern "C" fn c_fs_readlink(path : Ptr) -> Ptr = "pion_fs_readlink"
+
+///|
+fn drv_fs_readlink(path : String) -> Option[String] {
+  let p = path
+  let ptr = c_fs_readlink(drv_cpath(p))
+  if ptr_is_null(ptr) {
+    return None
+  }
+  let res = cstr_to_str(ptr)
+  ptr_free(ptr)
+  if res.length() > 0 {
+    Some(res)
+  } else {
+    None
+  }
+}
+
+///|
 /// Streams a file through native C SHA-256 (64 KiB buffer, raw bytes, O(1) memory),
 /// bypassing any in-process memoization (used on cold CAS publish verification).
 fn drv_cas_sha256_file_uncached(path : String) -> Option[String] {
@@ -5289,23 +5308,23 @@ fn drv_cstub_cc_version_fp(
 fn drv_cstub_rt_inc_dirs(world : World, rt_lib : String) -> Array[String] {
   let rt_dir_raw = drv_parent_dir(rt_lib)
   let rt_dir = if rt_dir_raw.length() > 0 { rt_dir_raw } else { "." }
-  let rt_inc_dirs : Array[String] = [rt_dir]
+  if fs_exists(world, drv_join_path(rt_dir, "pion_rt.h")) {
+    return [rt_dir]
+  }
   let alt_rt_dir = drv_resolve_rel_path(rt_dir, "../runtime")
   if alt_rt_dir != rt_dir &&
     fs_exists(world, drv_join_path(alt_rt_dir, "pion_rt.h")) {
-    rt_inc_dirs.push(alt_rt_dir)
-  } else if !fs_exists(world, drv_join_path(rt_dir, "pion_rt.h")) {
-    let rt_c = drv_find_pion_rt_c(world)
-    if rt_c.length() > 0 {
-      let src_rt_dir = drv_parent_dir(rt_c)
-      if src_rt_dir.length() > 0 &&
-        src_rt_dir != rt_dir &&
-        fs_exists(world, drv_join_path(src_rt_dir, "pion_rt.h")) {
-        rt_inc_dirs.push(src_rt_dir)
-      }
+    return [alt_rt_dir]
+  }
+  let rt_c = drv_find_pion_rt_c(world)
+  if rt_c.length() > 0 {
+    let src_rt_dir = drv_parent_dir(rt_c)
+    if src_rt_dir.length() > 0 &&
+      fs_exists(world, drv_join_path(src_rt_dir, "pion_rt.h")) {
+      return [src_rt_dir]
     }
   }
-  rt_inc_dirs
+  [rt_dir]
 }
 
 ///|
@@ -5405,6 +5424,40 @@ fn drv_cstub_collect_search_dirs(
   eff_cc_flags : Array[String],
   rt_inc_dirs : Array[String],
 ) -> Array[String] {
+  // Collect include directories in true GCC/Clang compiler search order:
+  // `[src_dir]` -> `-iquote` -> `-I`/`/I` -> `-isystem` -> `rt_inc_dirs`.
+  let iquote_dirs : Array[String] = []
+  let i_dirs : Array[String] = []
+  let isystem_dirs : Array[String] = []
+  let mut i = 0
+  while i < eff_cc_flags.length() {
+    let fl = eff_cc_flags[i]
+    if fl == "-iquote" && i + 1 < eff_cc_flags.length() {
+      iquote_dirs.push(eff_cc_flags[i + 1])
+      i = i + 2
+      continue
+    }
+    if (fl == "-I" || fl == "/I") && i + 1 < eff_cc_flags.length() {
+      i_dirs.push(eff_cc_flags[i + 1])
+      i = i + 2
+      continue
+    }
+    if fl == "-isystem" && i + 1 < eff_cc_flags.length() {
+      isystem_dirs.push(eff_cc_flags[i + 1])
+      i = i + 2
+      continue
+    }
+    if drv_starts_with(fl, "-iquote") && fl.length() > 7 {
+      iquote_dirs.push(slice_str(fl, 7, fl.length()))
+    } else if drv_starts_with(fl, "-I") && fl.length() > 2 {
+      i_dirs.push(slice_str(fl, 2, fl.length()))
+    } else if drv_starts_with(fl, "/I") && fl.length() > 2 {
+      i_dirs.push(slice_str(fl, 2, fl.length()))
+    } else if drv_starts_with(fl, "-isystem") && fl.length() > 8 {
+      isystem_dirs.push(slice_str(fl, 8, fl.length()))
+    }
+    i = i + 1
+  }
   let out : Array[String] = []
   let seen : Map[String, Bool] = Map([])
   let add_dir = fn(d : String) -> Unit {
@@ -5419,24 +5472,19 @@ fn drv_cstub_collect_search_dirs(
   }
   let src_dir = drv_parent_dir(src_path)
   add_dir(if src_dir.length() > 0 { src_dir } else { "." })
-  let mut i = 0
-  while i < eff_cc_flags.length() {
-    let fl = eff_cc_flags[i]
-    if (fl == "-I" || fl == "/I" || fl == "-isystem" || fl == "-iquote") &&
-      i + 1 < eff_cc_flags.length() {
-      add_dir(eff_cc_flags[i + 1])
-      i = i + 2
-      continue
-    }
-    if drv_starts_with(fl, "-I") && fl.length() > 2 {
-      add_dir(slice_str(fl, 2, fl.length()))
-    } else if drv_starts_with(fl, "/I") && fl.length() > 2 {
-      add_dir(slice_str(fl, 2, fl.length()))
-    } else if drv_starts_with(fl, "-isystem") && fl.length() > 8 {
-      add_dir(slice_str(fl, 8, fl.length()))
-    } else if drv_starts_with(fl, "-iquote") && fl.length() > 7 {
-      add_dir(slice_str(fl, 7, fl.length()))
-    }
+  i = 0
+  while i < iquote_dirs.length() {
+    add_dir(iquote_dirs[i])
+    i = i + 1
+  }
+  i = 0
+  while i < i_dirs.length() {
+    add_dir(i_dirs[i])
+    i = i + 1
+  }
+  i = 0
+  while i < isystem_dirs.length() {
+    add_dir(isystem_dirs[i])
     i = i + 1
   }
   i = 0
@@ -5591,25 +5639,71 @@ fn drv_cstub_ts_is_racy(mt : Int64, start_ms : Int64) -> Bool {
   (mt % 1000L == 0L && mt >= start_ms - 2000L)
 }
 
+fn drv_strip_trailing_slash(p : String) -> String {
+  let mut n = p.length()
+  while n > 1 && str_code_at(p, n - 1) == 47 {
+    if n == 3 && str_code_at(p, 1) == 58 {
+      break
+    }
+    n = n - 1
+  }
+  if n == p.length() { p } else { slice_str(p, 0, n) }
+}
+
 ///|
-/// Shared world-writable OS temp/root directories whose mtime changes whenever
-/// unrelated processes create temp files; still checked if they are symlinks.
-fn drv_cstub_is_shared_os_root(p : String) -> Bool {
-  p == "/" ||
-  p == "/tmp" ||
-  p == "/var" ||
-  p == "/var/tmp" ||
-  p == "/private" ||
-  p == "/private/tmp"
+/// Shared OS / per-user temp root directories whose mtime changes whenever
+/// unrelated concurrent processes create sibling temp dirs (`mktemp -d`),
+/// including macOS `$TMPDIR` (`/private/var/folders/.../T`) and `%TEMP%`.
+/// Still checked if a component itself is a symlink (`kind == 3`).
+fn drv_cstub_is_shared_os_root(world : World, raw_p : String) -> Bool {
+  let p = drv_strip_trailing_slash(raw_p)
+  if p.length() == 0 ||
+    p == "/" ||
+    p == "/tmp" ||
+    p == "/var" ||
+    p == "/var/tmp" ||
+    p == "/private" ||
+    p == "/private/tmp" ||
+    p == "/Users" ||
+    p == "/home" ||
+    p == "/root" {
+    return true
+  }
+  if (p.length() == 2 && str_code_at(p, 1) == 58) ||
+    (p.length() == 3 && str_code_at(p, 1) == 58 && str_code_at(p, 2) == 47) {
+    return true
+  }
+  if (drv_starts_with(p, "/var/folders/") ||
+    drv_starts_with(p, "/private/var/folders/")) &&
+    drv_ends_with(p, "/T") {
+    return true
+  }
+  let env_names : Array[String] = ["TMPDIR", "TEMP", "TMP"]
+  let mut ei = 0
+  while ei < env_names.length() {
+    let ev = drv_env_str(world, env_names[ei])
+    if ev.length() > 0 {
+      let lex = drv_strip_trailing_slash(drv_cstub_abs_lexical_path(world, ev))
+      if p == lex {
+        return true
+      }
+      let can = drv_strip_trailing_slash(drv_cstub_canon_path(world, ev))
+      if p == can {
+        return true
+      }
+    }
+    ei = ei + 1
+  }
+  false
 }
 
 ///|
 /// Walks `path` and all of its ancestor prefixes (deduplicated via
 /// `checked_paths`), checking `pion_cli_lpath_change_ms` at every prefix and,
-/// whenever any component (leaf or intermediate directory) is a symlink, also
-/// checking its target (`pion_cli_path_change_ms`) and recursing along its
-/// canonical target's ancestors. Catches direct edits, preserved-mtime atomic
-/// renames, leaf symlink retargeting, AND intermediate directory symlink swaps.
+/// whenever any component (leaf or intermediate directory) is a symlink,
+/// expanding it hop-by-hop via `pion_fs_readlink` (up to 40 hops; fail-closed
+/// on readlink failure or > 40 hops) so every intermediate hop in a multi-hop
+/// symlink chain (`a -> b -> c`) and all of its ancestors are checked.
 fn drv_cstub_racy_ancestors(
   world : World,
   path : String,
@@ -5617,7 +5711,10 @@ fn drv_cstub_racy_ancestors(
   checked_paths : Map[String, Bool],
   depth : Int,
 ) -> Bool {
-  if depth > 8 || path.length() == 0 {
+  if depth > 40 {
+    return true
+  }
+  if path.length() == 0 {
     return false
   }
   let mut cur = path
@@ -5633,17 +5730,24 @@ fn drv_cstub_racy_ancestors(
       if drv_cstub_ts_is_racy(lmt, start_ms) {
         return true
       }
-      let mt = c_cli_path_change_ms(drv_cpath(lp))
-      if drv_cstub_ts_is_racy(mt, start_ms) {
-        return true
+      match drv_fs_readlink(cur) {
+        None => return true
+        Some(raw_target) => {
+          let hop = if str_code_at(raw_target, 0) == 47 || drv_is_drive_abs(raw_target) {
+            drv_cstub_abs_lexical_path(world, raw_target)
+          } else {
+            let pdir = drv_parent_dir(cur)
+            let base = if pdir.length() > 0 { pdir } else { "." }
+            drv_cstub_abs_lexical_path(world, drv_join_path(base, raw_target))
+          }
+          if drv_cstub_racy_ancestors(world, hop, start_ms, checked_paths, depth + 1) {
+            return true
+          }
+        }
       }
-      let rp = drv_cstub_canon_path(world, cur)
-      if rp.length() > 0 &&
-        rp != cur &&
-        drv_cstub_racy_ancestors(world, rp, start_ms, checked_paths, depth + 1) {
-        return true
-      }
-    } else if !drv_cstub_is_shared_os_root(cur) {
+    } else if drv_cstub_is_shared_os_root(world, cur) {
+      break
+    } else {
       let lp = cur
       let lmt = c_cli_lpath_change_ms(drv_cpath(lp))
       if drv_cstub_ts_is_racy(lmt, start_ms) {
@@ -5926,14 +6030,28 @@ fn drv_cstub_parse_and_hash_deps(
   if !saw_src {
     return None
   }
-  // Hash all headers uncached FIRST, then run racy-change checks AFTER hashing
-  // so any concurrent file/symlink/rename mutation in the window between check
-  // and open/read is guaranteed to be caught.
+  // 1. Hash all headers uncached FIRST.
   drv_sort_strings(hdrs)
   let hdrs_fp = match drv_cstub_hash_dep_headers_uncached(world, hdrs) {
     Some(v) => v
     None => return None
   }
+  // 2. Sample negative-cache shadow candidates (partition into absent vs existing).
+  let cands = drv_cstub_shadow_candidates(hdrs, search_dirs)
+  let absent : Array[String] = []
+  let existing_cands : Array[String] = []
+  let mut ci = 0
+  while ci < cands.length() {
+    let cand = cands[ci]
+    if !fs_exists(world, cand) {
+      absent.push(cand)
+    } else {
+      existing_cands.push(cand)
+    }
+    ci = ci + 1
+  }
+  // 3. Run unified post-hash, post-sample racy check across src, hdrs,
+  //    search_dirs, and existing shadow candidates (deduped via checked_paths).
   let checked_paths : Map[String, Bool] = Map([])
   if drv_cstub_racy_file(world, src_path, pre_hash_ms, checked_paths) {
     return None
@@ -5945,16 +6063,27 @@ fn drv_cstub_parse_and_hash_deps(
     }
     i = i + 1
   }
-  // Negative-cache shadow candidates: record ONLY paths that do not exist now.
-  let cands = drv_cstub_shadow_candidates(hdrs, search_dirs)
-  let absent : Array[String] = []
-  let mut ci = 0
-  while ci < cands.length() {
-    let cand = cands[ci]
-    if !fs_exists(world, cand) {
-      absent.push(cand)
+  i = 0
+  while i < search_dirs.length() {
+    let sd = search_dirs[i]
+    if drv_lstat_kind(sd) != 0 {
+      if drv_cstub_racy_file(world, sd, pre_hash_ms, checked_paths) {
+        return None
+      }
+    } else {
+      let pd = drv_parent_dir(sd)
+      if pd.length() > 0 && drv_cstub_racy_file(world, pd, pre_hash_ms, checked_paths) {
+        return None
+      }
     }
-    ci = ci + 1
+    i = i + 1
+  }
+  i = 0
+  while i < existing_cands.length() {
+    if drv_cstub_racy_file(world, existing_cands[i], pre_hash_ms, checked_paths) {
+      return None
+    }
+    i = i + 1
   }
   Some((hdrs, absent, hdrs_fp))
 }
@@ -11529,9 +11658,12 @@ fn drv_build_targets(
     if !drv_write_cas_text_atomic(world, sig_path, compiled.sig) {
       return Err("failed to write CAS sig: " + sig_path)
     }
-    if !drv_write_cas_text_atomic(world, ssa_path, final_ssa) {
-      return Err("failed to write CAS ssa: " + ssa_path)
+    let stamp = drv_tmp_tag(world, obj_path)
+    let ssa_tmp = ssa_path + ".tmp." + stamp
+    if !drv_write_text_atomic(world, ssa_tmp, final_ssa) {
+      return Err("failed to write private ssa: " + ssa_tmp)
     }
+    pin.temp_files.push(ssa_tmp)
     if emit_ssa_path != "" {
       drv_ensure_parent_dir(world, emit_ssa_path)
       if !drv_write_text_atomic(world, emit_ssa_path, final_ssa) {
@@ -11539,35 +11671,39 @@ fn drv_build_targets(
       }
     }
     if ssa_only {
+      let _ = drv_cas_publish_file_pinned(world, cache_dir, pin, [key], ssa_tmp, ssa_path)
+      drv_cas_pin_close(world, pin)
       return Ok(emit_ssa_path)
     }
     if asm_only {
       drv_ensure_parent_dir(world, emit_asm_path)
       let rc_qbe = proc_exec(
         world,
-        drv_qbe_text_argv(qbe_bin, qbe_arch, qbe_seh, emit_asm_path, ssa_path),
+        drv_qbe_text_argv(qbe_bin, qbe_arch, qbe_seh, emit_asm_path, ssa_tmp),
       )
       if rc_qbe != 0 {
+        drv_cas_pin_close(world, pin)
         return Err(
-          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_tmp,
         )
       }
+      let _ = drv_cas_publish_file_pinned(world, cache_dir, pin, [key], ssa_tmp, ssa_path)
+      drv_cas_pin_close(world, pin)
       return Ok(emit_asm_path)
     }
 
-    let stamp = drv_tmp_tag(world, obj_path)
     let obj_tmp = obj_path + ".tmp." + stamp
     let mut published_obj = false
     if direct_obj {
       let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, false)
       argv.push("-o")
       argv.push(obj_tmp)
-      argv.push(ssa_path)
+      argv.push(ssa_tmp)
       let rc_qbe = proc_exec(world, argv)
       if rc_qbe != 0 {
         let _ = fs_remove(world, obj_tmp)
         return Err(
-          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_tmp,
         )
       }
       published_obj = drv_cas_publish_file_pinned(
@@ -11582,12 +11718,12 @@ fn drv_build_targets(
       let asm_path = cache_dir + "/obj/" + key + ".s." + stamp
       let rc_qbe = proc_exec(
         world,
-        drv_qbe_text_argv(qbe_bin, qbe_arch, qbe_seh, asm_path, ssa_path),
+        drv_qbe_text_argv(qbe_bin, qbe_arch, qbe_seh, asm_path, ssa_tmp),
       )
       if rc_qbe != 0 {
         let _ = fs_remove(world, asm_path)
         return Err(
-          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_tmp,
         )
       }
       if emit_asm_path != "" {
@@ -11628,6 +11764,7 @@ fn drv_build_targets(
         obj_path,
       )
     }
+    let _ = drv_cas_publish_file_pinned(world, cache_dir, pin, [key], ssa_tmp, ssa_path)
 
     if published_obj {
       let sz_sig = fs_size(world, sig_path)
@@ -11638,7 +11775,16 @@ fn drv_build_targets(
         (if sz_obj > 0L { sz_obj } else { 0L })
       drv_cas_record_and_evict_pinned(world, cache_dir, key, total_sz, pin)
     } else {
-      pin.temp_files.push(obj_tmp)
+      // Only register `obj_tmp` for cleanup if we will NOT return it directly
+      // to the caller (no-main single-file build without `-o` / `--emit-*`).
+      let returning_obj_directly = !has_main &&
+        out_bin_arg == "" &&
+        emit_obj_path == "" &&
+        emit_staticlib_path == "" &&
+        emit_cdylib_path == ""
+      if !returning_obj_directly {
+        pin.temp_files.push(obj_tmp)
+      }
       active_obj_path = obj_tmp
     }
   }

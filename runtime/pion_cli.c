@@ -602,6 +602,11 @@ int64_t pion_cli_lpath_change_ms(const char *path) {
     return pion_cli_win_change_ms(path, FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
+char *pion_fs_readlink(const char *path) {
+    (void)path;
+    return NULL;
+}
+
 #else /* POSIX */
 
 #ifdef __linux__
@@ -1301,6 +1306,11 @@ int64_t pion_cli_lpath_change_ms(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
     return pion_cli_stat_change_ms(&st);
+}
+
+char *pion_fs_readlink(const char *path) {
+    if (!path || !*path) return NULL;
+    return pion_cli_readlink(path);
 }
 
 #endif /* _WIN32 */

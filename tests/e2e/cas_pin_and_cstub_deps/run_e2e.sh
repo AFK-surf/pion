@@ -1128,4 +1128,138 @@ grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/l3_2.trace" || fail "Scenario L3 e
 
 echo "(L) dual-header #include_next HIT + external sibling shadow + intermediate symlink swap self-heal -> OK"
 
+# ============================================================================
+# Scenario M (Round 6): single-file no-main .o survives post-run,
+#   -isystem SDK -I gen compiler search order, and 2-hop symlink chain swap
+# ============================================================================
+# M1: Single-file library (no fn main) without -o under PION_CACHE_MAX_KB=1 -> .o survives
+cat > "$TMP_DIR/nomain_lib.pion" <<'EOF'
+pub fn add_one(x : Int) -> Int { x + 1 }
+EOF
+CAS_M1="$TMP_DIR/cas_m1"
+mkdir -p "$CAS_M1"
+PION_CACHE_DIR="$CAS_M1" PION_CACHE_MAX_KB=1 "$PIONC" build "$TMP_DIR/nomain_lib.pion"
+M1_OBJ="$(ls "$CAS_M1/obj/"*.o 2>/dev/null | head -n 1 || true)"
+[ -n "$M1_OBJ" ] && [ -s "$M1_OBJ" ] && [ -r "$M1_OBJ" ] || fail "Scenario M1 expected readable non-empty .o after single-file no-main build"
+
+# M2: `-isystem SDK -I gen` (flag order puts -isystem first, but compiler searches -I first!)
+WS_M2="$TMP_DIR/ws_m2"
+mkdir -p "$WS_M2/pkg/src" "$WS_M2/sdk" "$WS_M2/gen"
+cat > "$WS_M2/sdk/cfg.h" <<'EOF'
+#define M2_VAL 10
+EOF
+cat > "$WS_M2/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "cfg.h"
+int64_t m2_val(void) { return M2_VAL; }
+EOF
+cat > "$WS_M2/pkg/pion.toml" <<EOF
+[package]
+name = "m2_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-isystem", "$WS_M2/sdk", "-I../gen"]
+EOF
+cat > "$WS_M2/pkg/src/main.pion" <<'EOF'
+extern "C" fn m2_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, m2_val().to_string()) }
+EOF
+CAS_M2="$TMP_DIR/cas_m2"
+mkdir -p "$CAS_M2"
+PION_CACHE_DIR="$CAS_M2" "$PIONC" build -o "$TMP_DIR/m2_bin1" "$WS_M2/pkg"
+[ "$("$TMP_DIR/m2_bin1")" = "10" ] || fail "Scenario M2 cold expected 10"
+# Add gen/cfg.h which outranks -isystem sdk despite appearing later on argv!
+cat > "$WS_M2/gen/cfg.h" <<'EOF'
+#define M2_VAL 77
+EOF
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M2" "$PIONC" build -o "$TMP_DIR/m2_bin2" "$WS_M2/pkg" 2>"$TMP_DIR/m2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/m2.trace" || fail "Scenario M2 expected MISS when -I gen shadows earlier -isystem sdk"
+[ "$("$TMP_DIR/m2_bin2")" = "77" ] || fail "Scenario M2 expected 77 after -I gen shadowed -isystem sdk"
+
+# M3: 2-hop directory symlink chain (`proj_link -> sdk_sel -> dir_v1`), swap mid-hop `sdk_sel -> dir_v2`
+WS_M3="$TMP_DIR/ws_m3"
+mkdir -p "$WS_M3/pkg/src" "$WS_M3/dir_v1" "$WS_M3/dir_v2"
+cat > "$WS_M3/dir_v1/hdr.h" <<'EOF'
+#define M3_VAL 123
+EOF
+cat > "$WS_M3/dir_v2/hdr.h" <<'EOF'
+#define M3_VAL 456
+EOF
+touch -t 202001010000 "$WS_M3/dir_v1/hdr.h" "$WS_M3/dir_v2/hdr.h" "$WS_M3/dir_v1" "$WS_M3/dir_v2"
+ln -s "$WS_M3/dir_v1" "$WS_M3/sdk_sel"
+ln -s "$WS_M3/sdk_sel" "$WS_M3/pkg/proj_link"
+cat > "$WS_M3/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include "proj_link/hdr.h"
+int64_t m3_val(void) { return M3_VAL; }
+EOF
+cat > "$WS_M3/pkg/pion.toml" <<'EOF'
+[package]
+name = "m3_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_M3/pkg/src/main.pion" <<'EOF'
+extern "C" fn m3_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, m3_val().to_string()) }
+EOF
+CAS_M3="$TMP_DIR/cas_m3"
+mkdir -p "$CAS_M3"
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_SWAP=1 SWAP_LINK="$WS_M3/sdk_sel" SWAP_TARGET="$WS_M3/dir_v2" CC="$RACY_SYMLINK_CC" \
+  PION_CACHE_DIR="$CAS_M3" "$PIONC" build -o "$TMP_DIR/m3_bin1" "$WS_M3/pkg"
+[ "$("$TMP_DIR/m3_bin1")" = "123" ] || fail "Scenario M3 run 1 expected 123"
+REAL_CC_BIN="$REAL_CC_ABS" INJECT_SWAP=0 SWAP_LINK="$WS_M3/sdk_sel" SWAP_TARGET="$WS_M3/dir_v2" CC="$RACY_SYMLINK_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M3" "$PIONC" build -o "$TMP_DIR/m3_bin2" "$WS_M3/pkg" 2>"$TMP_DIR/m3_2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/m3_2.trace" || fail "Scenario M3 expected MISS after mid-hop symlink swap"
+[ "$("$TMP_DIR/m3_bin2")" = "456" ] || fail "Scenario M3 expected 456 after mid-hop symlink swap"
+
+echo "(M) single-file no-main .o + -isystem/-I order + 2-hop symlink swap -> OK"
+
+# M4 (macOS $TMPDIR parallel mktemp regression): mutating $TMPDIR with sibling
+# temp dirs during compile must NOT trigger false-positive racy-skip of .deps!
+CUSTOM_TMP="$TMP_DIR/custom_tmpdir"
+WS_M4="$CUSTOM_TMP/ws_m4"
+mkdir -p "$WS_M4/pkg/src"
+cat > "$WS_M4/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+int64_t m4_val(void) { return 88; }
+EOF
+cat > "$WS_M4/pkg/pion.toml" <<'EOF'
+[package]
+name = "m4_pkg"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_M4/pkg/src/main.pion" <<'EOF'
+extern "C" fn m4_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, m4_val().to_string()) }
+EOF
+SIBLING_TMP_CC="$TMP_DIR/sibling_tmp_cc.sh"
+cat > "$SIBLING_TMP_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+if [ "${TOUCH_TMPDIR:-0}" = "1" ]; then
+  mkdir -p "${TMPDIR}/unrelated_peer_tmp_$$"
+fi
+exec "${REAL_CC_BIN}" "$@"
+EOF
+chmod +x "$SIBLING_TMP_CC"
+CAS_M4="$TMP_DIR/cas_m4"
+mkdir -p "$CAS_M4"
+TMPDIR="$CUSTOM_TMP" REAL_CC_BIN="$REAL_CC_ABS" TOUCH_TMPDIR=1 CC="$SIBLING_TMP_CC" \
+  PION_CACHE_DIR="$CAS_M4" "$PIONC" build -o "$TMP_DIR/m4_bin1" "$WS_M4/pkg"
+[ "$("$TMP_DIR/m4_bin1")" = "88" ] || fail "Scenario M4 cold expected 88"
+TMPDIR="$CUSTOM_TMP" REAL_CC_BIN="$REAL_CC_ABS" TOUCH_TMPDIR=0 CC="$SIBLING_TMP_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_M4" "$PIONC" build -o "$TMP_DIR/m4_bin2" "$WS_M4/pkg" 2>"$TMP_DIR/m4_hot.trace"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/m4_hot.trace" || fail "Scenario M4 expected warm HIT despite sibling creation in TMPDIR"
+echo "(M4) active sibling creation in \$TMPDIR does not trigger false racy-skip -> OK"
+
 echo "PASS: cas_pin_and_cstub_deps"
