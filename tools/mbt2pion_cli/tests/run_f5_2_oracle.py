@@ -179,6 +179,37 @@ pub extern "C" fn ffi_read_buf(tag : String) -> Bytes = "demo_read_buf"
 pub extern "C" fn ffi_mutate_and_alias(a : Bytes, b : Bytes) -> Int = "demo_mutate_and_alias"
 
 pub extern "C" fn greeting() -> String = "greeting"
+
+#borrow(inst, out)
+pub extern "C" fn ffi_draw_timed(
+  inst : FixedArray[Double],
+  count : Int,
+  r : Double,
+  g : Double,
+  b : Double,
+  out : FixedArray[Double],
+) -> Unit = "demo_draw_timed"
+
+#borrow(keys)
+pub extern "C" fn ffi_xform_int(keys : FixedArray[Int], delta : Int) -> Int = "demo_xform_int"
+
+#borrow(ts)
+pub extern "C" fn ffi_xform_i64(ts : FixedArray[Int64]) -> Int64 = "demo_xform_i64"
+
+#borrow(out)
+pub extern "C" fn ffi_xform_byte(key : Int, out : FixedArray[Byte]) -> Int = "demo_xform_byte"
+
+#borrow(a, b)
+pub extern "C" fn ffi_xform_f32(a : FixedArray[Float], b : FixedArray[Float32]) -> Int = "demo_xform_f32"
+
+#borrow(arr)
+pub extern "C" fn ffi_check_empty_f64(arr : FixedArray[Double]) -> Int = "demo_check_empty_f64"
+
+#borrow(val)
+pub extern "C" fn ffi_kw_val(val : FixedArray[Int]) -> Int = "demo_kw_val"
+
+#borrow(bits)
+pub extern "C" fn ffi_f32_bits(bits : FixedArray[Float]) -> Int = "demo_f32_bits"
 '''
 
 FFI_SHADOW_MBT = r'''
@@ -265,6 +296,84 @@ int32_t pion_demo_mutate_and_alias(uint8_t *a_ptr, int32_t a_len, const uint8_t 
 const char *pion_greeting(void) {
   return "ok";
 }
+
+void pion_demo_draw_timed(
+    double *inst_ptr, int32_t inst_len,
+    int32_t count, double r, double g, double b,
+    double *out_ptr, int32_t out_len) {
+  double sum = 0.0;
+  for (int32_t i = 0; i < inst_len; i++) {
+    sum += inst_ptr[i];
+  }
+  if (out_len >= 1 && out_ptr != NULL) {
+    out_ptr[0] = sum + (double)count;
+  }
+  if (out_len >= 2 && out_ptr != NULL) {
+    out_ptr[1] = r + g + b;
+  }
+}
+
+int32_t pion_demo_xform_int(int32_t *keys_ptr, int32_t keys_len, int32_t delta) {
+  int32_t total = 0;
+  for (int32_t i = 0; i < keys_len; i++) {
+    keys_ptr[i] += delta;
+    total += keys_ptr[i];
+  }
+  return total;
+}
+
+int64_t pion_demo_xform_i64(int64_t *ts_ptr, int32_t ts_len) {
+  int64_t acc = 0;
+  for (int32_t i = 0; i < ts_len; i++) {
+    ts_ptr[i] = ts_ptr[i] * 2 + 1;
+    acc += ts_ptr[i];
+  }
+  return acc;
+}
+
+int32_t pion_demo_xform_byte(int32_t key, uint8_t *out_ptr, int32_t out_len) {
+  int32_t sum = 0;
+  for (int32_t i = 0; i < out_len; i++) {
+    out_ptr[i] = (uint8_t)((out_ptr[i] + (uint8_t)(key & 0xff)) & 0xff);
+    sum += (int32_t)out_ptr[i];
+  }
+  return sum;
+}
+
+int32_t pion_demo_xform_f32(float *a_ptr, int32_t a_len, float *b_ptr, int32_t b_len) {
+  int32_t n = a_len < b_len ? a_len : b_len;
+  for (int32_t i = 0; i < n; i++) {
+    float s = a_ptr[i] + b_ptr[i];
+    a_ptr[i] = s;
+    b_ptr[i] = s * 2.0f;
+  }
+  return n;
+}
+
+int32_t pion_demo_check_empty_f64(double *arr_ptr, int32_t arr_len) {
+  return (arr_len == 0 && arr_ptr == NULL) ? 1 : 0;
+}
+
+int32_t pion_demo_kw_val(int32_t *val_ptr, int32_t val_len) {
+  int32_t s = 0;
+  for (int32_t i = 0; i < val_len; i++) {
+    val_ptr[i] += 1;
+    s += val_ptr[i];
+  }
+  return s;
+}
+
+int32_t pion_demo_f32_bits(float *bits_ptr, int32_t bits_len) {
+  if (bits_len < 3 || bits_ptr == NULL) return 0;
+  uint32_t b0 = 0, b1 = 0, b2 = 0;
+  memcpy(&b0, &bits_ptr[0], 4);
+  memcpy(&b1, &bits_ptr[1], 4);
+  memcpy(&b2, &bits_ptr[2], 4);
+  int32_t ok = (b0 == 0x7f800001u && b1 == 0x80000000u && b2 == 0x00000001u) ? 1 : 0;
+  uint32_t out0 = 0x7f800003u;
+  memcpy(&bits_ptr[0], &out0, 4);
+  return ok;
+}
 '''
 
 FFI_E2E_MAIN_PION = r'''
@@ -289,6 +398,47 @@ pub fn main(w : World) -> Int {
   let b1 = out[1].to_int()
   let b2 = out[2].to_int()
   let gr = greeting()
+  let d_inst : FixedArray[Double] = FixedArray::make(3, 0.0)
+  d_inst[0] = 1.5
+  d_inst[1] = 2.5
+  d_inst[2] = 3.0
+  let d_out : FixedArray[Double] = FixedArray::make(2, 0.0)
+  ffi_draw_timed(d_inst, 10, 0.25, 0.5, 1.25, d_out)
+  let i_keys : FixedArray[Int] = FixedArray::make(3, 0)
+  i_keys[0] = 10
+  i_keys[1] = 20
+  i_keys[2] = 30
+  let i_sum = ffi_xform_int(i_keys, 5)
+  let l_ts : FixedArray[Int64] = FixedArray::make(2, 0L)
+  l_ts[0] = 1000000000L
+  l_ts[1] = -5L
+  let l_sum = ffi_xform_i64(l_ts)
+  let b_out : FixedArray[Byte] = FixedArray::make(3, 0.to_byte())
+  b_out[0] = 1.to_byte()
+  b_out[1] = 250.to_byte()
+  b_out[2] = 10.to_byte()
+  let b_sum = ffi_xform_byte(10, b_out)
+  let f_a : FixedArray[Float] = FixedArray::make(2, 0.0.to_float())
+  f_a[0] = 1.25.to_float()
+  f_a[1] = 2.5.to_float()
+  let f_b : FixedArray[Float32] = FixedArray::make(2, 0.0.to_float())
+  f_b[0] = 0.75.to_float()
+  f_b[1] = 1.5.to_float()
+  let f_n = ffi_xform_f32(f_a, f_b)
+  let empty_f64 : FixedArray[Double] = FixedArray::make(0, 0.0)
+  let empty_ok = ffi_check_empty_f64(empty_f64)
+  let kw_arr : FixedArray[Int] = FixedArray::make(2, 0)
+  kw_arr[0] = 4
+  kw_arr[1] = 6
+  let kw_sum = ffi_kw_val(kw_arr)
+  let f32_raw : FixedArray[Float] = FixedArray::make(3, 0.0.to_float())
+  f32_raw[0] = Float::from_bits(0x7f800001)
+  f32_raw[1] = Float::from_bits(0x80000000U.reinterpret_as_int())
+  f32_raw[2] = Float::from_bits(0x00000001)
+  let f32_in_ok = ffi_f32_bits(f32_raw)
+  let f32_out_ok = if f32_raw[0].to_bits() == 0x7f800003 &&
+    f32_raw[1].to_bits() == 0x80000000U.reinterpret_as_int() &&
+    f32_raw[2].to_bits() == 0x00000001 { 1 } else { 0 }
   io_println(
     w,
     sc.to_string() + "|" + s.to_string() + "|" + u.to_string() + "|" + e_str.to_string() + "|" +
@@ -296,7 +446,15 @@ pub fn main(w : World) -> Int {
     null_s.length().to_string() + "|" + nul_trunc + ":" + nul_trunc.length().to_string() + "|" +
     empty_b.length().to_string() + "|" + picked.to_string() + "|" + picked_empty.to_string() + "|" +
     alias_rc.to_string() + ":" + orig0.to_string() + "|" + gr + "|" +
-    out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string(),
+    out.length().to_string() + ":" + b0.to_string() + "," + b1.to_string() + "," + b2.to_string() + "|" +
+    d_out[0].to_int().to_string() + "," + d_out[1].to_int().to_string() + "|" +
+    i_sum.to_string() + ":" + i_keys[0].to_string() + "," + i_keys[1].to_string() + "," + i_keys[2].to_string() + "|" +
+    l_sum.to_string() + ":" + l_ts[0].to_string() + "," + l_ts[1].to_string() + "|" +
+    b_sum.to_string() + ":" + b_out[0].to_int().to_string() + "," + b_out[1].to_int().to_string() + "," + b_out[2].to_int().to_string() + "|" +
+    f_n.to_string() + ":" + f_a[0].to_double().to_int().to_string() + "," + f_a[1].to_double().to_int().to_string() + "," + f_b[0].to_double().to_int().to_string() + "," + f_b[1].to_double().to_int().to_string() + "|" +
+    empty_ok.to_string() + "|" +
+    kw_sum.to_string() + ":" + kw_arr[0].to_string() + "," + kw_arr[1].to_string() + "|" +
+    f32_in_ok.to_string() + ":" + f32_out_ok.to_string(),
   )
   0
 }
@@ -387,8 +545,8 @@ fn ffi_read_buf(tag : String) -> Bytes {
   mbt_compat::mbt_ffi_ptr_write_i32(__ffi_out_len, 0L, 0)
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_read_buf(tag.as_cstr(), tag.to_bytes().length(), __ffi_out_len)
   let __ffi_ret_len = mbt_compat::mbt_ffi_ptr_read_i32(__ffi_out_len, 0L)
-  mbt_compat::mbt_ffi_ptr_free(__ffi_out_len)
   let __ffi_ret_bytes = if mbt_compat::mbt_ffi_ptr_is_null(__ffi_ret_ptr) || __ffi_ret_len <= 0 { "".to_bytes() } else { mbt_compat::mbt_ffi_bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len) }
+  mbt_compat::mbt_ffi_ptr_free(__ffi_out_len)
   __ffi_ret_bytes
 }
 
@@ -680,7 +838,10 @@ def main():
         # nul_trunc="ab":2, empty_b_len=0, picked=7025 (7*1000+2*10+5), picked_empty=3000 (3*1000+0+0),
         # alias_rc=22 (same_ptr=0, a_len=2, b_len=2) & orig0=42 (0x2a unchanged!), gr="ok" (not hijacked by shadow.mbt cstr_to_str),
         # out="3:20,4,52" (0x10^4=20, 0x00^4=4, 0x30^4=52)
-        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|ok|3:20,4,52"
+        # d_out: sum=7.0+10=17, r+g+b=2; i_keys: 15,25,35 sum=75; l_ts: 2000000001,-9 sum=1999999992;
+        # b_out: (1+10)=11, (250+10)&255=4, (10+10)=20 sum=35; f32: a=[2.0,4.0], b=[4.0,8.0], n=2; empty_ok=1
+        # kw_arr: [5,7] sum=12; f32_bits: sNaN/neg0/subnormal in_ok=1, out_ok=1
+        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|ok|3:20,4,52|17,2|75:15,25,35|1999999992:2000000001,-9|35:11,4,20|2:2,4,4,8|1|12:5,7|1:1"
         assert e2e_out == expected_e2e, f"CLI E2E C-linked FFI mismatch: {e2e_out!r} != {expected_e2e!r}"
         print(f"[PASS] CLI E2E C-linked FFI execution: {e2e_out}")
 
