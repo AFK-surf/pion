@@ -3478,7 +3478,16 @@ static void test_fs_lstat_kind(void) {
     fputs("x", f);
     fclose(f);
     assert(pion_fs_lstat_kind(file) == 1);
+    assert(pion_cli_is_exec_file(NULL) == 0 && pion_cli_is_exec_file("") == 0);
+    assert(pion_cli_is_exec_file(base) == 0 && pion_cli_is_exec_file(missing) == 0);
+    {
+        char *self_exe = pion_cli_self_exe_path();
+        assert(self_exe && pion_cli_is_exec_file(self_exe) == 1);
+        free(self_exe);
+    }
 #ifndef _WIN32
+    assert(chmod(file, 0644) == 0 && pion_cli_is_exec_file(file) == 0);
+    assert(chmod(file, 0755) == 0 && pion_cli_is_exec_file(file) == 1);
     char link[700], locked[700], hidden[700];
     snprintf(link, sizeof(link), "%s/link", base);
     snprintf(locked, sizeof(locked), "%s/locked", base);

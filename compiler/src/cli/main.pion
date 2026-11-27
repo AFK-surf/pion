@@ -2136,6 +2136,7 @@ fn drv_spawn_ws_worker(
 /// file, 2 directory, 3 symlink / reparse point, 4 other, -1 query error
 /// (permissions, I/O, a bad path) — never mistaken for "missing".
 extern "C" fn c_fs_lstat_kind(path : Ptr) -> Int = "pion_fs_lstat_kind"
+extern "C" fn c_cli_is_exec_file(path : Ptr) -> Int = "pion_cli_is_exec_file"
 
 ///|
 fn drv_lstat_kind(path : String) -> Int {
@@ -11291,6 +11292,157 @@ fn drv_wasm_ns_ident(name : String) -> String {
   sb.to_string()
 }
 
+///|
+/// Checks via OS permissions whether `cand` is an existing regular executable file
+/// (POSIX: `S_ISREG && X_OK`; Windows: existing non-directory file).
+fn drv_is_exec_file(cand : String) -> Bool {
+  cand.length() > 0 && c_cli_is_exec_file(drv_cpath(cand)) != 0
+}
+
+///|
+/// Enumerates all `PATH` candidates for `bin_name` across every `PATH` entry.
+/// On Windows, only `.exe` binaries are considered so extensionless npm POSIX sh
+/// shims (e.g. `%APPDATA%\npm\wasm-opt`) are never selected.
+fn drv_wasm_opt_path_candidates(
+  world : World,
+  bin_name : String,
+  is_win : Bool,
+) -> Array[String] {
+  let out : Array[String] = []
+  let path_env = drv_env_str(world, "PATH")
+  if path_env.length() == 0 {
+    return out
+  }
+  let sep = if is_win || drv_find_substr(path_env, ";", 0) >= 0 {
+    59
+  } else {
+    58
+  }
+  let target_name = if is_win &&
+    !drv_ends_with(bin_name, ".exe") &&
+    !drv_ends_with(bin_name, ".EXE") {
+    bin_name + ".exe"
+  } else {
+    bin_name
+  }
+  let dirs = drv_split_char(path_env, sep)
+  let mut i = 0
+  while i < dirs.length() {
+    let d = dirs[i]
+    if d.length() > 0 {
+      out.push(drv_join_path(d, target_name))
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Resolves the wasm-opt binary for `--release --target wasm32` and `pionc doctor`.
+/// Returns `Ok(bin)` (`Ok("")` when disabled or not found), or `Err(msg)` when an
+/// explicit `PION_WASM_OPT` override is missing or not executable (fail-closed).
+/// Order: `PION_NO_WASM_OPT=1` disables -> `PION_WASM_OPT` override (fail-closed) ->
+/// `PATH` (`wasm-opt`, then `moon-wasm-opt`) -> `$HOME/.moon/bin/moon-wasm-opt`.
+fn drv_resolve_wasm_opt(world : World) -> Result[String, String] {
+  let no_wasm_opt = match env_get(world, "PION_NO_WASM_OPT") {
+    Some(v) => v == "1"
+    None => false
+  }
+  if no_wasm_opt {
+    return Ok("")
+  }
+  let is_win = drv_env_str(world, "OS") == "Windows_NT"
+  let ov = drv_trim_ws(drv_env_str(world, "PION_WASM_OPT"))
+  if ov.length() > 0 {
+    let cands : Array[String] = []
+    if drv_has_path_sep(ov) {
+      if is_win && !drv_ends_with(ov, ".exe") && !drv_ends_with(ov, ".EXE") {
+        cands.push(ov + ".exe")
+      }
+      cands.push(ov)
+    } else {
+      let path_cands = drv_wasm_opt_path_candidates(world, ov, is_win)
+      let mut ci = 0
+      while ci < path_cands.length() {
+        cands.push(path_cands[ci])
+        ci = ci + 1
+      }
+    }
+    let mut i = 0
+    while i < cands.length() {
+      if drv_is_exec_file(cands[i]) {
+        return Ok(cands[i])
+      }
+      i = i + 1
+    }
+    return Err("PION_WASM_OPT=" + ov + ": not found or not executable")
+  }
+
+  // Auto-discovery: enumerate PATH (`wasm-opt` then `moon-wasm-opt`) and `$HOME/.moon/bin` fallback.
+  // Uses OS executable checks (skipping directories, non-executable files, and Windows
+  // extensionless sh shims) and degrades gracefully to raw (`Ok("")`) if none is found.
+  let auto_cands : Array[String] = []
+  let p1 = drv_wasm_opt_path_candidates(world, "wasm-opt", is_win)
+  let mut i = 0
+  while i < p1.length() {
+    auto_cands.push(p1[i])
+    i = i + 1
+  }
+  let p2 = drv_wasm_opt_path_candidates(world, "moon-wasm-opt", is_win)
+  i = 0
+  while i < p2.length() {
+    auto_cands.push(p2[i])
+    i = i + 1
+  }
+  let home0 = drv_env_str(world, "HOME")
+  let home = if home0.length() > 0 {
+    home0
+  } else if is_win {
+    drv_env_str(world, "USERPROFILE")
+  } else {
+    ""
+  }
+  if home.length() > 0 {
+    let moon_bin = drv_join_path(home, ".moon/bin")
+    if is_win {
+      auto_cands.push(drv_join_path(moon_bin, "moon-wasm-opt.exe"))
+    } else {
+      auto_cands.push(drv_join_path(moon_bin, "moon-wasm-opt"))
+    }
+  }
+
+  i = 0
+  while i < auto_cands.length() {
+    if drv_is_exec_file(auto_cands[i]) {
+      return Ok(auto_cands[i])
+    }
+    i = i + 1
+  }
+  Ok("")
+}
+
+///|
+/// Computes a hardened CAS fingerprint for `wasm-opt` incorporating canonical path,
+/// file size, change timestamp, and best-effort `--version` output (hashed with `\n`
+/// separators to avoid Windows drive-letter `:` ambiguity) so different optimizer
+/// binaries or upgraded versions never collide in the CAS.
+fn drv_wasm_opt_cas_tag(world : World, wopt_bin : String) -> String {
+  if wopt_bin.length() == 0 {
+    return "raw"
+  }
+  let canon = drv_cstub_canon_path(world, wopt_bin)
+  let sz = fs_size(world, canon)
+  let chg = c_cli_path_change_ms(drv_cpath(canon))
+  let ver = match proc_exec_capture(world, [canon, "--version"]) {
+    Ok(v) => drv_trim_ws(v)
+    Err(_) => ""
+  }
+  "wopt:" +
+  sha256_hex(
+    canon + "\n" + sz.to_string() + "\n" + chg.to_string() + "\n" + ver,
+  )
+}
+
 fn drv_build_wasm_targets(
   world : World,
   targets : Array[String],
@@ -11310,23 +11462,15 @@ fn drv_build_wasm_targets(
   let trace_cas = drv_env_str(world, "PION_TRACE_CAS") == "1"
   let trace_time = drv_env_str(world, "PION_TRACE_WASM_TIME") == "1"
   let t_wasm_start = if trace_time { clock_now_ms(world) } else { 0L }
-  let no_wasm_opt = match env_get(world, "PION_NO_WASM_OPT") {
-    Some(v) => v == "1"
-    None => false
-  }
-  let wopt_bin = if release && !no_wasm_opt {
-    match proc_exec_capture(world, ["which", "wasm-opt"]) {
-      Ok(found) => drv_trim_ws(found)
-      Err(_) => ""
+  let wopt_bin = if release {
+    match drv_resolve_wasm_opt(world) {
+      Ok(p) => p
+      Err(e) => return Err(e)
     }
   } else {
     ""
   }
-  let wopt_tag = if wopt_bin != "" {
-    "wopt:" + wopt_bin + ":" + fs_size(world, wopt_bin).to_string()
-  } else {
-    "raw"
-  }
+  let wopt_tag = drv_wasm_opt_cas_tag(world, wopt_bin)
 
   let mut pkg_name = "app"
   let mut all_ssa = ""
@@ -21310,7 +21454,10 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
   } else {
     "native"
   }
-  let wasm_opt_path = drv_find_tool_path(world, "wasm-opt")
+  let (wasm_opt_path, wasm_opt_err) = match drv_resolve_wasm_opt(world) {
+    Ok(p) => (p, "")
+    Err(e) => ("", e)
+  }
   let node_path = drv_find_tool_path(world, "node")
   let git_path = drv_find_tool_path(world, "git")
   let cache_dir = drv_resolve_cache_dir(world)
@@ -21371,6 +21518,10 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
     sb.write_string(json_quote(win_abi))
     sb.write_string(",\"wasm_opt\":")
     sb.write_string(json_quote(wasm_opt_path))
+    if wasm_opt_err.length() > 0 {
+      sb.write_string(",\"wasm_opt_error\":")
+      sb.write_string(json_quote(wasm_opt_err))
+    }
     sb.write_string(",\"node\":")
     sb.write_string(json_quote(node_path))
     sb.write_string(",\"git\":")
@@ -21426,7 +21577,13 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
     io_println(
       world,
       "  wasm_opt:  " +
-      (if wasm_opt_path.length() > 0 { wasm_opt_path } else { "(not found)" }),
+      (if wasm_opt_err.length() > 0 {
+        "[ERROR: " + wasm_opt_err + "]"
+      } else if wasm_opt_path.length() > 0 {
+        wasm_opt_path
+      } else {
+        "(not found)"
+      }),
     )
     io_println(
       world,

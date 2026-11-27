@@ -5811,4 +5811,233 @@ console.log("  p82c ABI handshake (" + rtLabel + "): v2 ok + forward v1/missing 
   done
 done
 
+echo "=== Wave 2 PR-E: wasm-opt / moon-wasm-opt / PION_WASM_OPT Discovery, CAS Fingerprint & Doctor ==="
+WOPT_DIR="$TMP_DIR/wopt_discovery"
+WOPT_CAS="$WOPT_DIR/cas"
+WOPT_PATH_BIN="$WOPT_DIR/path_bin"
+WOPT_HOME="$WOPT_DIR/fake_home"
+mkdir -p "$WOPT_CAS" "$WOPT_PATH_BIN" "$WOPT_HOME/.moon/bin" "$WOPT_DIR/pkg/src"
+cat > "$WOPT_DIR/pkg/pion.toml" <<'EOF'
+[package]
+name = "wopt_probe"
+version = "0.1.0"
+EOF
+cat > "$WOPT_DIR/pkg/src/main.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  io_println(world, "wopt_probe_ok")
+  0
+}
+EOF
+
+make_fake_wopt() {
+  _dst="$1"
+  _ver="$2"
+  _log="$3"
+  cat > "$_dst" <<EOF
+#!/bin/sh
+if [ "\${1:-}" = "--version" ]; then
+  echo "$_ver"
+  exit 0
+fi
+IN=""
+OUT=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) OUT="\$2"; shift 2 ;;
+    -*) shift ;;
+    *) IN="\$1"; shift ;;
+  esac
+done
+printf '%s\n' "$_ver" >> "$_log"
+cp "\$IN" "\$OUT"
+EOF
+  chmod +x "$_dst"
+}
+
+WOPT_LOG="$WOPT_DIR/calls.log"
+: > "$WOPT_LOG"
+make_fake_wopt "$WOPT_HOME/.moon/bin/moon-wasm-opt" "moon-wasm-opt-home-v1" "$WOPT_LOG"
+
+# 1. Fallback to $HOME/.moon/bin/moon-wasm-opt when PATH has neither wasm-opt nor moon-wasm-opt
+DOC_HOME=$(HOME="$WOPT_HOME" PATH="$WOPT_PATH_BIN" PION_WASM_OPT="" PION_NO_WASM_OPT="" "$PIONC" doctor --json || true)
+printf '%s' "$DOC_HOME" | grep -q "moon-wasm-opt" || {
+  echo "FAIL: doctor did not discover \$HOME/.moon/bin/moon-wasm-opt: $DOC_HOME" >&2
+  exit 1
+}
+HOME="$WOPT_HOME" PATH="$WOPT_PATH_BIN:/usr/bin:/bin" PION_WASM_OPT="" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_home.wasm" "$WOPT_DIR/pkg" >/dev/null
+grep -q "moon-wasm-opt-home-v1" "$WOPT_LOG" || {
+  echo "FAIL: build --release did not invoke \$HOME/.moon/bin/moon-wasm-opt" >&2
+  exit 1
+}
+
+# 2. PATH moon-wasm-opt overrides $HOME fallback; PATH wasm-opt overrides moon-wasm-opt
+make_fake_wopt "$WOPT_PATH_BIN/moon-wasm-opt" "moon-wasm-opt-path-v1" "$WOPT_LOG"
+DOC_PATH_MOON=$(HOME="$WOPT_HOME" PATH="$WOPT_PATH_BIN" PION_WASM_OPT="" PION_NO_WASM_OPT="" "$PIONC" doctor --json || true)
+printf '%s' "$DOC_PATH_MOON" | grep -q "$WOPT_PATH_BIN/moon-wasm-opt" || {
+  echo "FAIL: doctor did not prefer PATH moon-wasm-opt: $DOC_PATH_MOON" >&2
+  exit 1
+}
+make_fake_wopt "$WOPT_PATH_BIN/wasm-opt" "wasm-opt-path-v1" "$WOPT_LOG"
+DOC_PATH_WOPT=$(HOME="$WOPT_HOME" PATH="$WOPT_PATH_BIN" PION_WASM_OPT="" PION_NO_WASM_OPT="" "$PIONC" doctor --json || true)
+printf '%s' "$DOC_PATH_WOPT" | grep -q "$WOPT_PATH_BIN/wasm-opt" || {
+  echo "FAIL: doctor did not prefer PATH wasm-opt over moon-wasm-opt: $DOC_PATH_WOPT" >&2
+  exit 1
+}
+
+# 3. PION_WASM_OPT override + CAS fingerprint invalidation on version/content change at same path
+WOPT_CUSTOM="$WOPT_DIR/custom_wopt"
+make_fake_wopt "$WOPT_CUSTOM" "custom-wopt-v1" "$WOPT_LOG"
+DOC_CUSTOM=$(PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT="" "$PIONC" doctor --json || true)
+printf '%s' "$DOC_CUSTOM" | grep -q "$WOPT_CUSTOM" || {
+  echo "FAIL: doctor did not reflect PION_WASM_OPT: $DOC_CUSTOM" >&2
+  exit 1
+}
+PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_c1.wasm" "$WOPT_DIR/pkg" >/dev/null
+C1_RUNS=$(grep -c "custom-wopt-v1" "$WOPT_LOG" || true)
+[ "$C1_RUNS" -eq 1 ] || { echo "FAIL: expected 1 invocation of custom-wopt-v1, got $C1_RUNS" >&2; exit 1; }
+# Second build with identical optimizer hits CAS (still 1 invocation)
+PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_c1b.wasm" "$WOPT_DIR/pkg" >/dev/null
+C1B_RUNS=$(grep -c "custom-wopt-v1" "$WOPT_LOG" || true)
+[ "$C1B_RUNS" -eq 1 ] || { echo "FAIL: expected CAS hit for unchanged custom-wopt-v1, got $C1B_RUNS" >&2; exit 1; }
+# Upgrade optimizer in-place (same path, new version) -> must NOT hit old CAS entry!
+make_fake_wopt "$WOPT_CUSTOM" "custom-wopt-v2-upgraded" "$WOPT_LOG"
+PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_c2.wasm" "$WOPT_DIR/pkg" >/dev/null
+C2_RUNS=$(grep -c "custom-wopt-v2-upgraded" "$WOPT_LOG" || true)
+[ "$C2_RUNS" -eq 1 ] || { echo "FAIL: upgraded wasm-opt at same path collided in CAS (runs=$C2_RUNS)" >&2; exit 1; }
+
+# 4. PION_NO_WASM_OPT=1 disables optimization even when PION_WASM_OPT is set
+DOC_OFF=$(PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT=1 "$PIONC" doctor --json || true)
+printf '%s' "$DOC_OFF" | grep -q '"wasm_opt":""' || {
+  echo "FAIL: PION_NO_WASM_OPT=1 did not disable wasm_opt in doctor: $DOC_OFF" >&2
+  exit 1
+}
+PION_WASM_OPT="$WOPT_CUSTOM" PION_NO_WASM_OPT=1 PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_off.wasm" "$WOPT_DIR/pkg" >/dev/null
+C2_AFTER_OFF=$(grep -c "custom-wopt-v2-upgraded" "$WOPT_LOG" || true)
+[ "$C2_AFTER_OFF" -eq 1 ] || { echo "FAIL: PION_NO_WASM_OPT=1 still ran wasm-opt" >&2; exit 1; }
+
+# 5. PION_WASM_OPT pointing to nonexistent or non-executable path must fail-closed (never silently fall back to raw)
+set +e
+ERR_MISS=$(PION_WASM_OPT="/nonexistent/pion-wasm-opt" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_miss.wasm" "$WOPT_DIR/pkg" 2>&1)
+RC_MISS=$?
+set -e
+[ "$RC_MISS" -ne 0 ] || { echo "FAIL: nonexistent PION_WASM_OPT must fail-closed" >&2; exit 1; }
+printf '%s' "$ERR_MISS" | grep -q "PION_WASM_OPT" || {
+  echo "FAIL: nonexistent PION_WASM_OPT error must mention PION_WASM_OPT: $ERR_MISS" >&2
+  exit 1
+}
+DOC_MISS=$(PION_WASM_OPT="/nonexistent/pion-wasm-opt" PION_NO_WASM_OPT="" "$PIONC" doctor --json || true)
+printf '%s' "$DOC_MISS" | grep -q '"wasm_opt":""' || {
+  echo "FAIL: doctor --json must keep wasm_opt=\"\" on PION_WASM_OPT error: $DOC_MISS" >&2
+  exit 1
+}
+printf '%s' "$DOC_MISS" | grep -q '"wasm_opt_error":' || {
+  echo "FAIL: doctor --json must report wasm_opt_error on invalid PION_WASM_OPT: $DOC_MISS" >&2
+  exit 1
+}
+
+# 6. Auto-discovery skips leading wasm-opt/ directory and chmod -x file on PATH
+BAD_DIR1="$WOPT_DIR/bad_path_dir"
+BAD_DIR2="$WOPT_DIR/bad_path_noexec"
+GOOD_DIR="$WOPT_DIR/good_path"
+EMPTY_HOME="$WOPT_DIR/empty_home"
+mkdir -p "$BAD_DIR1/wasm-opt" "$BAD_DIR2" "$GOOD_DIR" "$EMPTY_HOME"
+printf '#!/bin/sh\necho bad\n' > "$BAD_DIR2/wasm-opt"
+chmod -x "$BAD_DIR2/wasm-opt"
+make_fake_wopt "$GOOD_DIR/wasm-opt" "good-fallback-v1" "$WOPT_LOG"
+# 6a. Skips dir + non-exec and hits trailing executable wasm-opt
+HOME="$EMPTY_HOME" PATH="$BAD_DIR1:$BAD_DIR2:$GOOD_DIR:/usr/bin:/bin" PION_WASM_OPT="" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_skip_ok.wasm" "$WOPT_DIR/pkg" >/dev/null 2>&1
+grep -q "good-fallback-v1" "$WOPT_LOG" || {
+  echo "FAIL: auto-discovery did not skip dir/noexec to reach trailing good wasm-opt" >&2
+  exit 1
+}
+# 6b. When only dir + non-exec exist on PATH and no HOME fallback, gracefully degrades to raw with exit 0
+HOME="$EMPTY_HOME" PATH="$BAD_DIR1:$BAD_DIR2:/usr/bin:/bin" PION_WASM_OPT="" PION_NO_WASM_OPT="" PION_CACHE_DIR="$WOPT_CAS" \
+  "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/out_degrade.wasm" "$WOPT_DIR/pkg" >/dev/null 2>&1
+OUT_DEGRADE=$(node "$PION_WASM_RT" "$WOPT_DIR/out_degrade.wasm")
+[ "$OUT_DEGRADE" = "wopt_probe_ok" ] || {
+  echo "FAIL: degraded raw wasm output mismatch: $OUT_DEGRADE" >&2
+  exit 1
+}
+echo "  wasm-opt discovery (PION_WASM_OPT fail-closed / dir+noexec skip / PATH / HOME fallback / CAS version key / doctor): OK"
+
+# 7. Wave 2 PR-E execution regression: cast bit-pattern const folding (-0.0, neg, NaN, subnormal),
+#    non-const cast forwarding, phi jnz/jtbl, nested loop break, forward jump to loop header,
+#    and shadow-stack frame trailing return elision (dev + release on Node)
+cat > "$WOPT_DIR/size_opts_exec.pion" <<'EOF'
+fn cast_bits_const() -> Int64 {
+  let nz : Double = -0.0
+  let neg : Double = -12.5
+  let sub : Double = Double::from_bits(1L)
+  let nan_p : Double = Double::from_bits(0x7FF8_0000_0000_0042L)
+  nz.to_bits() ^ neg.to_bits() ^ sub.to_bits() ^ nan_p.to_bits()
+}
+
+fn cast_bits_dyn(x : Double, f : Float) -> Int64 {
+  let b64 = (x + 1.25).to_bits()
+  let b32 = (f + 0.5f).to_bits().to_int64()
+  b64 ^ (b32 << 1)
+}
+
+fn cfg_phi_jtbl_loops(mode : Int, n : Int) -> Int {
+  let mut acc = 0
+  // Forward jump into loop header via branch + phi
+  let start = if mode == 0 { 1 } else if mode == 1 { 2 } else { 3 }
+  let mut i = start
+  while i < n {
+    let mut j = 0
+    while j < n {
+      let step = match (i + j) % 5 {
+        0 => 1
+        1 => 3
+        2 => 7
+        3 => 11
+        _ => 17
+      }
+      acc = acc + step
+      if acc > 500 {
+        break
+      }
+      j = j + 1
+    }
+    if acc > 500 {
+      break
+    }
+    i = i + 1
+  }
+  acc
+}
+
+fn frame_trailing_ret(a : Int, b : Int) -> Int {
+  let arr = [a, b, a + b, a * b]
+  arr[0] + arr[1] + arr[2] + arr[3]
+}
+
+pub fn main(world : World) -> Int {
+  let c1 = cast_bits_const()
+  let c2 = cast_bits_dyn(-3.5, -1.25f)
+  let c3 = cfg_phi_jtbl_loops(0, 12) + cfg_phi_jtbl_loops(1, 12) + cfg_phi_jtbl_loops(2, 12)
+  let c4 = frame_trailing_ret(7, 9)
+  io_println(world, c1.to_string() + ":" + c2.to_string() + ":" + c3.to_string() + ":" + c4.to_string())
+  0
+}
+EOF
+"$PIONC" build -o "$WOPT_DIR/size_opts_nat" "$WOPT_DIR/size_opts_exec.pion"
+NAT_SO=$("$WOPT_DIR/size_opts_nat")
+PION_NO_WASM_OPT=1 "$PIONC" build --target wasm32 -o "$WOPT_DIR/size_opts_dev.wasm" "$WOPT_DIR/size_opts_exec.pion"
+PION_NO_WASM_OPT=1 "$PIONC" build --release --target wasm32 -o "$WOPT_DIR/size_opts_rel.wasm" "$WOPT_DIR/size_opts_exec.pion"
+WASM_SO_DEV=$(node "$PION_WASM_RT" "$WOPT_DIR/size_opts_dev.wasm")
+WASM_SO_REL=$(node "$PION_WASM_RT" "$WOPT_DIR/size_opts_rel.wasm")
+[ "$NAT_SO" = "$WASM_SO_DEV" ] && [ "$NAT_SO" = "$WASM_SO_REL" ] || {
+  echo "FAIL: size_opts_exec mismatch native='$NAT_SO' dev='$WASM_SO_DEV' rel='$WASM_SO_REL'" >&2
+  exit 1
+}
+echo "  Wave 2 PR-E execution regression (cast bits/CFG/phi/jtbl/frame ret, native==wasm dev==rel): $NAT_SO OK"
+
 echo "p29c_wasm32 E2E: OK"

@@ -302,6 +302,7 @@ int64_t  pion_cli_lpath_change_ms(const char *path);
 char    *pion_cli_lpath_identity(const char *path);
 int32_t  pion_cli_lpath_is_coarse(const char *path);
 int32_t  pion_cli_is_native_exe(const char *path);
+int32_t  pion_cli_is_exec_file(const char *path);
 char    *pion_fs_readlink(const char *path);
 void*    pion_world_fs_list_dir(void *w, void *path_str);
 int32_t  pion_world_fs_remove(void *w, void *path_str);
