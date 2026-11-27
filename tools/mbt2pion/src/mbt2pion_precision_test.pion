@@ -109,7 +109,7 @@ test "Stage B round_qt: single RPC per round, per-file reuse, and E_UNKNOWN_PACK
 test "mutation_summary: pure_map_fields positive and all fail-closed negatives" {
   // Positive: private mbt_compat::OrderedMap field on non-pub(all) non-generic struct,
   // initialized via ordered_map_new(), mutated via index/remove, copied from same struct field, and same-struct spread `Tracker::{ ..self }`.
-  let pos_src = "pub struct Tracker {\n  mut group_reads : mbt_compat::OrderedMap[Int, (Bool, Array[Int])]\n}\n\nfn Tracker::new() -> Tracker {\n  Tracker::{ group_reads: mbt_compat::ordered_map_new() }\n}\n\nfn Tracker::set_group(self : Tracker, id : Int, g : Bool, hs : Array[Int]) -> Unit {\n  self.group_reads[id] = (g, hs)\n}\n\nfn Tracker::clear_group(self : Tracker, id : Int) -> Unit {\n  self.group_reads.remove(id)\n}\n\nfn Tracker::copy_from(self : Tracker, o : Tracker) -> Unit {\n  let _held = Tracker::{ ..self }\n  self.group_reads = o.group_reads\n}\n\nfn Tracker::reads_under(self : Tracker, id : Int, depth : Int) -> Bool {\n  match self.group_reads.get(id) {\n    Some((glass, heads)) => glass || depth > 8 || heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })\n    Option::None => true\n  }\n}\n"
+  let pos_src = "pub struct Tracker {\n  priv mut group_reads : mbt_compat::OrderedMap[Int, (Bool, Array[Int])]\n}\n\nfn Tracker::new() -> Tracker {\n  Tracker::{ group_reads: mbt_compat::ordered_map_new() }\n}\n\nfn Tracker::set_group(self : Tracker, id : Int, g : Bool, hs : Array[Int]) -> Unit {\n  self.group_reads[id] = (g, hs)\n}\n\nfn Tracker::clear_group(self : Tracker, id : Int) -> Unit {\n  self.group_reads.remove(id)\n}\n\nfn Tracker::copy_from(self : Tracker, o : Tracker) -> Unit {\n  let _held = Tracker::{ ..self }\n  self.group_reads = o.group_reads\n}\n\nfn Tracker::reads_under(self : Tracker, id : Int, depth : Int) -> Bool {\n  match self.group_reads.get(id) {\n    Some((glass, heads)) => glass || depth > 8 || heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })\n    Option::None => true\n  }\n}\n"
   let rel = "tracker.pion"
   let heads_off = pos_src.index_of("heads.iter()")
   let qt = parse_pkg_query_types_json(prec_make_qt_json(rel, [(heads_off, heads_off + 5, "Array[Int]")]))
@@ -126,10 +126,13 @@ test "mutation_summary: pure_map_fields positive and all fail-closed negatives" 
   assert_true(!p1.pure_map_fields.contains("S1::m"), "pub(all) struct field must be fail-closed")
   assert_true(match lookup_fn_mutation_summary(p1, "S1::has") { Some(s) => s.unknown, None => false }, "S1::has must fail-closed")
 
-  // Neg 2: pub field on non-pub(all) struct -> external write possible -> fail-closed!
+  // Neg 2: pub field and non-priv field on pub struct -> external write/construct possible in Pion -> fail-closed!
   let neg_pub_field = "pub struct S2 {\n  pub mut m : mbt_compat::OrderedMap[Int, Int]\n}\nfn S2::new() -> S2 { S2::{ m: mbt_compat::ordered_map_new() } }\nfn S2::has(self : S2, k : Int) -> Bool { self.m.contains(k) }\n"
   let p2 = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_pub_field)])
   assert_true(!p2.pure_map_fields.contains("S2::m"), "pub field must be fail-closed")
+  let neg_pub_struct_default_field = "pub struct S2b {\n  mut m : mbt_compat::OrderedMap[Int, Int]\n}\nfn S2b::new() -> S2b { S2b::{ m: mbt_compat::ordered_map_new() } }\nfn S2b::has(self : S2b, k : Int) -> Bool { self.m.contains(k) }\n"
+  let p2b = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_pub_struct_default_field)])
+  assert_true(!p2b.pure_map_fields.contains("S2b::m"), "non-priv field on pub struct must be fail-closed")
 
   // Neg 3: initialized via new_by -> fail-closed!
   let neg_new_by = "pub struct S3 {\n  mut m : mbt_compat::OrderedMap[Int, Int]\n}\nfn S3::new() -> S3 { S3::{ m: OrderedMap::new_by(fn(k) { k }, fn(a, b) { a == b }) } }\nfn S3::has(self : S3, k : Int) -> Bool { self.m.contains(k) }\n"
@@ -274,5 +277,78 @@ test "mutation_summary: canonical hashed mbt_compat OrderedMap recognized, exter
   match lookup_fn_mutation_summary(dot_pkg, "Paint::units") {
     Some(s) => assert_true(!s.unknown, "Paint::units with multiline leading-dot match arms must be pure")
     None => assert_true(false, "missing Paint::units summary")
+  }
+}
+
+test "R2 audit regressions: strict Eq, untyped struct if-value, spread expr, init block, labelled split, hashed MbtJson" {
+  // 1. Strict `lhs_pure && rhs_pure`: `bad + 1 == bad2` where `bad2` has unknown type must fail-closed!
+  let eq_bypass = "struct Bad { xs : Array[Int] }\nimpl Eq for Bad with equal(self, _other) { self.xs.clear(); true }\nfn probe(bad : Bad, bad2 : UnknownExt) -> Bool { bad + 1 == bad2 }\n"
+  let p_eq = collect_pkg_mutation_summary_tokens([lex_moonbit(eq_bypass)])
+  match lookup_fn_mutation_summary(p_eq, "probe") {
+    Some(s) => assert_true(s.unknown || s.mutates_any_array || s.mutated_elem_types.length() > 0, "bad + 1 == bad2 with unknown RHS must not bypass custom Eq")
+    None => assert_true(false, "missing probe summary")
+  }
+
+  // 2. Untyped struct literal with `if` field value: `{ m: if flag { ext } else { ordered_map_new() } }` -> fail-closed!
+  let untyped_if = "struct S8 { m : mbt_compat::OrderedMap[Int, Int] }\nfn mk(flag : Bool, ext : mbt_compat::OrderedMap[Int, Int]) -> S8 {\n  let s : S8 = { m: if flag { ext } else { mbt_compat::ordered_map_new() } }\n  s\n}\nfn S8::has(self : S8, k : Int) -> Bool { self.m.contains(k) }\n"
+  let p_uif = collect_pkg_mutation_summary_tokens([lex_moonbit(untyped_if)])
+  assert_true(!p_uif.pure_map_fields.contains("S8::m"), "untyped struct literal with if-expr field must fail-closed")
+
+  // 3. Compound spread expression `S9::{ ..(foo(); base) }` and top-level `init { g.m = ext }` -> fail-closed!
+  let spread_compound = "struct S9 { x : Int\n  m : mbt_compat::OrderedMap[Int, Int] }\nfn S9::new() -> S9 { S9::{ x: 0, m: mbt_compat::ordered_map_new() } }\nfn S9::bad(self : S9) -> S9 { S9::{ ..(self.x; self), x: 1 } }\n"
+  let p_sc = collect_pkg_mutation_summary_tokens([lex_moonbit(spread_compound)])
+  assert_true(!p_sc.pure_map_fields.contains("S9::m"), "compound spread base must fail-closed")
+  let top_init = "struct S10 { mut m : mbt_compat::OrderedMap[Int, Int] }\nlet g10 : S10 = S10::{ m: mbt_compat::ordered_map_new() }\ninit {\n  g10.m = ext_map()\n}\n"
+  let p_ti = collect_pkg_mutation_summary_tokens([lex_moonbit(top_init)])
+  assert_true(!p_ti.pure_map_fields.contains("S10::m"), "top-level init block write must fail-closed")
+
+  // 4. `rewrite_split_next_at` must reject labelled argument `s.split(sep=",").next()`
+  match rewrite_split_next_at("  let x = s.split(sep=\",\").next()", 28) {
+    Some(r) => assert_true(false, "labelled split arg must not be rewritten, got: " + r)
+    None => ()
+  }
+
+  // 5. `gen_debug_fmt_expr` must handle canonical hashed `Option[mbt_compat__5958c766::MbtJson]`
+  match gen_debug_fmt_expr("opt_j", "Option[mbt_compat__5958c766::MbtJson]", 0) {
+    Some(s) => assert_true(str_has(s, "mbt_compat::mbt_json_debug"), "nested hashed MbtJson must lower to mbt_json_debug: " + s)
+    None => assert_true(false, "gen_debug_fmt_expr must support Option[mbt_compat__<hash>::MbtJson]")
+  }
+
+  // 6. Red-team P1-1: local variable hop `Bad::m -> let tmp = b.m -> Good::{ m: tmp }` must fail-closed!
+  let hop_src = "struct BadHop { mut m : mbt_compat::OrderedMap[Int, Int] }\nstruct GoodHop { m : mbt_compat::OrderedMap[Int, Int] }\nfn BadHop::taint(self : BadHop, ext : mbt_compat::OrderedMap[Int, Int]) -> Unit { self.m = ext }\nfn copy_via_local(b : BadHop) -> GoodHop {\n  let tmp = b.m\n  GoodHop::{ m: tmp }\n}\n"
+  let p_hop = collect_pkg_mutation_summary_tokens([lex_moonbit(hop_src)])
+  assert_true(!p_hop.pure_map_fields.contains("GoodHop::m"), "local binding hop from tainted field must fail-closed")
+
+  // 7. Red-team P1-2: shorthand untyped struct literal `{ m, x }` -> fail-closed!
+  let shorthand_src = "struct PairSh { m : mbt_compat::OrderedMap[Int, Int]\n  x : Int }\nfn make_bad(m : mbt_compat::OrderedMap[Int, Int], x : Int) -> PairSh { { m, x } }\n"
+  let p_sh = collect_pkg_mutation_summary_tokens([lex_moonbit(shorthand_src)])
+  assert_true(!p_sh.pure_map_fields.contains("PairSh::m"), "shorthand untyped struct literal { m, x } must fail-closed")
+
+  // 8. Red-team P1-3: `fn init { ... }` and `test "..." { ... }` writes -> fail-closed!
+  let fn_init_src = "struct BoxInit { mut m : mbt_compat::OrderedMap[Int, Int] }\nlet g_bi : BoxInit = BoxInit::{ m: mbt_compat::ordered_map_new() }\nfn init {\n  g_bi.m = ext_map()\n}\n"
+  let p_fi = collect_pkg_mutation_summary_tokens([lex_moonbit(fn_init_src)])
+  assert_true(!p_fi.pure_map_fields.contains("BoxInit::m"), "fn init block write must fail-closed")
+  let test_blk_src = "struct BoxTest { mut m : mbt_compat::OrderedMap[Int, Int] }\nlet g_bt : BoxTest = BoxTest::{ m: mbt_compat::ordered_map_new() }\ntest \"taint\" {\n  g_bt.m = ext_map()\n}\n"
+  let p_tb = collect_pkg_mutation_summary_tokens([lex_moonbit(test_blk_src)])
+  assert_true(!p_tb.pure_map_fields.contains("BoxTest::m"), "test block write must fail-closed")
+
+  // 9. Red-team P1-4: cross-pkg `.Variant` conflict, external `e.val` bare field fallback, and `evil << 1 == other` -> fail-closed!
+  let ext_var_src = "enum LocalMode { UseNode } derive(Eq)\nstruct Dummy { xs : Array[Int] }\nimpl Eq for Dummy with equal(self, _o) { self.xs.clear(); true }\nfn cmp_ext(ext : dep::ExtMode) -> Bool { ext == .UseNode }\n"
+  let p_ev = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_var_src)])
+  match lookup_fn_mutation_summary(p_ev, "cmp_ext") {
+    Some(s) => assert_true(s.unknown || s.mutates_any_array || s.mutated_elem_types.length() > 0, "ext == .UseNode must not infer local enum")
+    None => assert_true(false, "missing cmp_ext summary")
+  }
+  let bare_fld_src = "struct LocalCell { val : Int }\nstruct Dummy2 { xs : Array[Int] }\nimpl Eq for Dummy2 with equal(self, _o) { self.xs.clear(); true }\nfn cmp_fld(e : dep::ExtCell, other : dep::ExtVal) -> Bool { e.val == other }\n"
+  let p_bf = collect_pkg_mutation_summary_tokens([lex_moonbit(bare_fld_src)])
+  match lookup_fn_mutation_summary(p_bf, "cmp_fld") {
+    Some(s) => assert_true(s.unknown || s.mutates_any_array || s.mutated_elem_types.length() > 0, "e.val on external receiver must not fall back to local bare field type")
+    None => assert_true(false, "missing cmp_fld summary")
+  }
+  let shl_eq_src = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil with equal(self, _o) { self.xs.clear(); true }\nfn cmp_shl(evil : Evil, other : Int) -> Bool { evil << 1 == other }\n"
+  let p_shl = collect_pkg_mutation_summary_tokens([lex_moonbit(shl_eq_src)])
+  match lookup_fn_mutation_summary(p_shl, "cmp_shl") {
+    Some(s) => assert_true(s.unknown || s.mutates_any_array || s.mutated_elem_types.length() > 0, "evil << 1 == other must fail-closed on non-scalar shift LHS")
+    None => assert_true(false, "missing cmp_shl summary")
   }
 }

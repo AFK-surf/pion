@@ -1145,6 +1145,105 @@ pub fn run(xs : Array[Int]) -> Bool {
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
+    (
+        "neg_r2_pub_struct_non_priv_map_field",
+        r'''
+pub struct PubDefaultFieldMap {
+  mut m : Map[Int, Int]
+}
+pub fn PubDefaultFieldMap::new() -> PubDefaultFieldMap {
+  PubDefaultFieldMap::{ m: Map::new() }
+}
+pub fn PubDefaultFieldMap::reset(self : PubDefaultFieldMap) -> Unit {
+  self.m = Map::new()
+}
+pub fn run(b : PubDefaultFieldMap, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_untyped_struct_if_field",
+        r'''
+struct CondMapBox {
+  m : Map[Int, Int]
+}
+fn make_box(flag : Bool, ext : Map[Int, Int]) -> CondMapBox {
+  let s : CondMapBox = { m: if flag { ext } else { Map::new() } }
+  s
+}
+pub fn run(flag : Bool, xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = make_box(flag, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_custom_eq_rhs_add_bypass",
+        r'''
+struct BadEq {
+  xs : Array[Int]
+  n : Int
+}
+impl Eq for BadEq with equal(self, other) {
+  self.xs.clear()
+  self.n == other.n
+}
+fn pick_bad(xs : Array[Int], n : Int) -> BadEq {
+  BadEq::{ xs, n }
+}
+pub fn run(xs : Array[Int]) -> Bool {
+  let a = BadEq::{ xs, n: 1 }
+  xs.iter().any(fn(x) { a == pick_bad(xs, x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_local_hop_tainted_field",
+        r'''
+struct BadHop {
+  mut m : Map[Int, Int]
+}
+struct GoodHop {
+  m : Map[Int, Int]
+}
+fn BadHop::taint(self : BadHop, ext : Map[Int, Int]) -> Unit {
+  self.m = ext
+}
+fn copy_via_local(b : BadHop) -> GoodHop {
+  let tmp = b.m
+  GoodHop::{ m: tmp }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = BadHop::{ m: Map::new() }
+  b.taint(ext)
+  let g = copy_via_local(b)
+  xs.iter().any(fn(x) { g.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_shorthand_untyped_struct_lit",
+        r'''
+struct PairSh {
+  m : Map[Int, Int]
+  x : Int
+}
+fn make_bad(m : Map[Int, Int], x : Int) -> PairSh {
+  { m, x }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let p = make_bad(ext, 1)
+  let _ = p.x
+  xs.iter().any(fn(x) { p.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
 ]
 
 
