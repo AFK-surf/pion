@@ -1319,6 +1319,44 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
+    (
+        "neg_r6_interp_shadow_global_pure_map",
+        r'''
+let g_pure : Map[Int, Int] = Map::new()
+struct InterpGlobShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_glob_shadow(b : InterpGlobShadowBox, ext : Map[Int, Int]) -> Unit {
+  let _ = g_pure.size()
+  let _ = "\{{ let g_pure = ext; b.m = g_pure; 0 }}"
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpGlobShadowBox::{ m: Map::new() }
+  taint_glob_shadow(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r6_interp_for_shadow_local_pure_map",
+        r'''
+struct InterpForShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_for_shadow(b : InterpForShadowBox, ext : Map[Int, Int]) -> Unit {
+  let m : Map[Int, Int] = Map::new()
+  let _ = "\{{ for m in [ext] { b.m = m }; 0 }}"
+  let _ = m
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpForShadowBox::{ m: Map::new() }
+  taint_for_shadow(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
 ]
 
 

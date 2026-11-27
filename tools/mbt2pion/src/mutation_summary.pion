@@ -1871,23 +1871,6 @@ fn ms_prune_pure_map_vars(pure_map_vars : Map[String, Bool], bad : Map[String, B
   }
 }
 
-fn ms_clone_str_map(m : Map[String, String]) -> Map[String, String] {
-  let out : Map[String, String] = Map()
-  for k in m.keys() {
-    match m.get(k) {
-      Some(v) => out[k] = v
-      None => ()
-    }
-  }
-  out
-}
-
-fn ms_remove_str_map_keys(m : Map[String, String], bad : Map[String, Bool]) -> Unit {
-  for nm in bad.keys() {
-    let _ = m.remove(nm)
-  }
-}
-
 ///| Recursively check whether `[s, e)` or any nested string interpolation hole contains `return` or `guard`.
 ///| Fails closed (`true`) when nesting depth exceeds 8.
 fn ms_tokens_have_return_or_guard(tokens : Array[Token], s : Int, e : Int, depth : Int) -> Bool {
@@ -1916,45 +1899,61 @@ fn ms_tokens_have_return_or_guard(tokens : Array[Token], s : Int, e : Int, depth
   false
 }
 
-///| Collect all locally bound, pattern-bound, closure-parameter, and reassigned identifiers in `[s, e)`
-///| (recursing into nested string interpolation holes up to depth 8).
-fn ms_collect_all_bound_idents_in_span(
-  tokens : Array[Token],
-  s : Int,
-  e : Int,
-  out : Map[String, Bool],
-  depth : Int,
-) -> Unit {
-  if depth > 8 {
-    return
-  }
+///| Return `true` if interpolation hole `[s, e)` contains any block, statement separator, assignment,
+///| closure/match arm, or binding keyword (`let`/`for`/`while`/`loop`/`match`/`fn`/`is`/`catch`/`guard`).
+///| When `false`, the hole is guaranteed to be a binding-free, block-free pure expression.
+fn ms_hole_may_bind_or_mutate(tokens : Array[Token], s : Int, e : Int) -> Bool {
   let mut i = s
   while i < e {
     let tk = tokens[i]
     let kk = tk.kind
-    if tk.raw == "let" && (kk == TokenKind::Keyword || kk == TokenKind::Ident) {
-      let mut j = i + 1
-      if j < e && tokens[j].raw == "mut" && (tokens[j].kind == TokenKind::Keyword || tokens[j].kind == TokenKind::Ident) {
-        j = j + 1
-      }
-      if j < e && tokens[j].kind == TokenKind::Ident {
-        out[tokens[j].raw] = true
-      }
+    if kk == TokenKind::LBrace || kk == TokenKind::Semi || kk == TokenKind::FatArrow || kk == TokenKind::AssignOp {
+      return true
     }
-    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
-      let holes = interp_holes(tk.raw)
-      for sub in holes {
-        let sn = sub.length() - 1
-        if sn > 0 {
-          ms_collect_all_bound_idents_in_span(sub, 0, sn, out, depth + 1)
-        }
+    if kk == TokenKind::Eq && !(i > s && ms_is_named_call_arg_eq(tokens, i - 1, s)) {
+      return true
+    }
+    if kk == TokenKind::Keyword || kk == TokenKind::Ident {
+      let r = tk.raw
+      if r == "let" || r == "for" || r == "while" || r == "loop" ||
+      r == "match" || r == "fn" || r == "is" || r == "catch" || r == "guard" {
+        return true
       }
     }
     i = i + 1
   }
-  ms_collect_pattern_bound_idents_in_span_ex(tokens, s, e, out, false)
-  ms_collect_closure_param_names(tokens, s, e, out)
-  ms_collect_reassigned_idents(tokens, s, e, out)
+  false
+}
+
+///| Construct a fail-closed environment for a binding/block interpolation hole:
+///| - empty `hole_pmv` (never inherits outer `pure_map_vars`)
+///| - `hole_vt` marks every outer local, pure global, top-level var, and pure-map-ret fn as `"__AMBIG__"`
+///| - `hole_callables` marks all of those names as shadowed/forbidden so global fallbacks are blocked.
+fn ms_make_fail_closed_hole_env(
+  pkg : PkgMutationSummary,
+  vt : Map[String, String],
+  callables : Map[String, Bool],
+) -> (Map[String, String], Map[String, Bool], Map[String, Bool]) {
+  let hole_vt : Map[String, String] = Map()
+  let hole_pmv : Map[String, Bool] = Map()
+  let hole_callables = ms_clone_bool_map(callables)
+  for k in vt.keys() {
+    hole_vt[k] = "__AMBIG__"
+    hole_callables[k] = true
+  }
+  for k in pkg.pure_map_globals.keys() {
+    hole_vt[k] = "__AMBIG__"
+    hole_callables[k] = true
+  }
+  for k in pkg.top_level_var_types.keys() {
+    hole_vt[k] = "__AMBIG__"
+    hole_callables[k] = true
+  }
+  for k in pkg.pure_map_ret_fns.keys() {
+    hole_vt[k] = "__AMBIG__"
+    hole_callables[k] = true
+  }
+  (hole_vt, hole_pmv, hole_callables)
 }
 
 fn ms_clone_bool_map(m : Map[String, Bool]) -> Map[String, Bool] {
@@ -2338,7 +2337,7 @@ fn ms_scan_span(
       }
     }
 
-    // Class 2: String interpolation `"\{expr}"` — scan holes with shadowed bindings pruned + check Show purity
+    // Class 2: String interpolation `"\{expr}"` — fail-closed env for binding/block holes + check Show purity
     if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
       let holes = interp_holes(tk.raw)
       if holes.length() > 0 && depth + 1 > 8 {
@@ -2347,17 +2346,19 @@ fn ms_scan_span(
         for sub in holes {
           let sn = sub.length() - 1
           if sn > 0 {
-            let hole_vt = ms_clone_str_map(local_var_types)
-            let hole_pmv = ms_clone_bool_map(pure_map_vars)
-            let hole_shadowed : Map[String, Bool] = Map()
-            ms_collect_all_bound_idents_in_span(sub, 0, sn, hole_shadowed, depth + 1)
-            ms_remove_str_map_keys(hole_vt, hole_shadowed)
-            ms_prune_pure_map_vars(hole_pmv, hole_shadowed)
-            ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, hole_vt, hole_pmv, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
-            // Show dispatch: unless the hole expression is proven built-in scalar/String, mark unknown
-            let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, hole_vt)
-            if !ms_is_builtin_scalar_ty(hty) {
-              sum.unknown = true
+            if ms_hole_may_bind_or_mutate(sub, 0, sn) {
+              let (hole_vt, hole_pmv, hole_callables) = ms_make_fail_closed_hole_env(pkg, local_var_types, callables)
+              ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, hole_vt, hole_pmv, hole_callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+              let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, hole_vt)
+              if !ms_is_builtin_scalar_ty(hty) {
+                sum.unknown = true
+              }
+            } else {
+              ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, local_var_types, pure_map_vars, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+              let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, local_var_types)
+              if !ms_is_builtin_scalar_ty(hty) {
+                sum.unknown = true
+              }
             }
           }
         }
@@ -4533,7 +4534,7 @@ fn ms_check_pure_map_field_writes_in_span(
   while i < e {
     let tk = tokens[i]
     let kk = tk.kind
-    // 0. String interpolation holes `\{ ... }` may mutate candidate fields or shadow outer pure bindings
+    // 0. String interpolation holes `\{ ... }` may mutate candidate fields or shadow outer/global bindings
     if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
       let holes = interp_holes(tk.raw)
       if holes.length() > 0 && depth + 1 > 8 {
@@ -4543,15 +4544,16 @@ fn ms_check_pure_map_field_writes_in_span(
       for sub in holes {
         let sn = sub.length() - 1
         if sn > 0 {
-          let hole_vt = ms_clone_str_map(vt)
-          let hole_pmv = ms_clone_bool_map(pmv)
-          let hole_shadowed : Map[String, Bool] = Map()
-          ms_collect_all_bound_idents_in_span(sub, 0, sn, hole_shadowed, depth + 1)
-          ms_remove_str_map_keys(hole_vt, hole_shadowed)
-          ms_prune_pure_map_vars(hole_pmv, hole_shadowed)
-          ms_check_pure_map_field_writes_in_span(
-            pkg, cand_fields, sub, 0, sn, "", None, hole_vt, hole_pmv, callables, active_gen, cand_field_names, removed_out, deps_out, depth + 1,
-          )
+          if ms_hole_may_bind_or_mutate(sub, 0, sn) {
+            let (hole_vt, hole_pmv, hole_callables) = ms_make_fail_closed_hole_env(pkg, vt, callables)
+            ms_check_pure_map_field_writes_in_span(
+              pkg, cand_fields, sub, 0, sn, "", None, hole_vt, hole_pmv, hole_callables, active_gen, cand_field_names, removed_out, deps_out, depth + 1,
+            )
+          } else {
+            ms_check_pure_map_field_writes_in_span(
+              pkg, cand_fields, sub, 0, sn, "", None, vt, pmv, callables, active_gen, cand_field_names, removed_out, deps_out, depth + 1,
+            )
+          }
         }
       }
     }
