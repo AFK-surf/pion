@@ -29,8 +29,9 @@ P98_PID=""
 FP_ASM_PID=""
 CORE_PID=""
 TLS_PID=""
+MSVC_CSTUB_PID=""
 cleanup() {
-  bg_kill "$RT_PID" "$P98_PID" "$FP_ASM_PID" "$CORE_PID" "$TLS_PID"
+  bg_kill "$RT_PID" "$P98_PID" "$FP_ASM_PID" "$CORE_PID" "$TLS_PID" "$MSVC_CSTUB_PID"
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -350,6 +351,290 @@ if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; the
   TLS_PID="$BG_PID"
 fi
 
+# Overlap LLVM clang/clang++ + VS MSVC parallel cstub CAS E2E with the rest of [5/5]
+# so cold MSVC compilation has the full parallel window without extending CI duration.
+cat <<'MSVCEOF' > "$TMP_DIR/run_msvc_cstub_job.sh"
+#!/bin/sh
+set -eu
+TMP_DIR="$1"
+ROOT_DIR="$2"
+PIONC="$3"
+PION_QBE="$4"
+
+VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+VS_PATH_U=""
+VS_VCVARS_POSIX=""
+if [ -x "$VSWHERE" ]; then
+  VS_PATH="$("$VSWHERE" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>/dev/null | tr -d '\r' || true)"
+  if [ -n "$VS_PATH" ]; then
+    VS_PATH_U="$(cygpath -u "$VS_PATH")"
+    if [ -f "$VS_PATH_U/VC/Auxiliary/Build/vcvars64.bat" ]; then
+      VS_VCVARS_POSIX="$VS_PATH_U/VC/Auxiliary/Build/vcvars64.bat"
+    fi
+  fi
+fi
+LLVM_BIN_POSIX=""
+if [ -x "/c/Program Files/LLVM/bin/clang.exe" ] && [ -x "/c/Program Files/LLVM/bin/clang++.exe" ]; then
+  LLVM_BIN_POSIX="/c/Program Files/LLVM/bin"
+elif [ -n "$VS_PATH_U" ] && [ -x "$VS_PATH_U/VC/Tools/Llvm/x64/bin/clang.exe" ] && [ -x "$VS_PATH_U/VC/Tools/Llvm/x64/bin/clang++.exe" ]; then
+  LLVM_BIN_POSIX="$VS_PATH_U/VC/Tools/Llvm/x64/bin"
+fi
+if [ -z "$LLVM_BIN_POSIX" ] || [ -z "$VS_VCVARS_POSIX" ]; then
+  if [ "${CI:-}" = "true" ] || [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "FAIL: Windows CI requires LLVM clang/clang++ and VS vcvars64.bat (llvm_bin=${LLVM_BIN_POSIX:-none} vcvars=${VS_VCVARS_POSIX:-none} vs_path=${VS_PATH_U:-none})" >&2
+    exit 1
+  fi
+  echo "[SKIP] Windows parallel cstub CAS (LLVM clang/clang++ MSVC not installed on this host)"
+  exit 0
+fi
+
+MSVC_CS_WS="$TMP_DIR/win_msvc_cstub_ws"
+MSVC_CS_CAS="$TMP_DIR/cas_win_msvc_cstub"
+mkdir -p "$MSVC_CS_WS/msvc_host/src" "$MSVC_CS_WS/msvc_host/compat" "$MSVC_CS_WS/msvc_host/native" \
+         "$MSVC_CS_WS/msvc_app/src" "$MSVC_CS_CAS"
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/compat/compat_hdr.h"
+#define COMPAT_BASE 100
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/native/native_hdr.h"
+#define NATIVE_BASE 200
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/compat/c1.c"
+#include <stdint.h>
+#include "pion_rt.h"
+#include "compat_hdr.h"
+int32_t msvc_c1(void) { return COMPAT_BASE + 1; }
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/native/m1.cpp"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d11.h>
+#include <vector>
+#include <cstdint>
+#include "compat_hdr.h"
+#include "native_hdr.h"
+extern "C" int32_t msvc_p1(void) {
+  D3D11_VIEWPORT vp = {};
+  vp.Width = (float)(NATIVE_BASE + 10);
+  std::vector<int32_t> v;
+  v.push_back((int32_t)vp.Width);
+  v.push_back(GetCurrentProcessId() != 0 ? 1 : 0);
+  return v[0] + v[1];
+}
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/native/m2.cpp"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d11.h>
+#include <vector>
+#include <cstdint>
+#include "native_hdr.h"
+extern "C" int32_t msvc_p2(void) {
+  std::vector<int32_t> v;
+  v.push_back(NATIVE_BASE);
+  v.push_back(20);
+  v.push_back(2);
+  return v[0] + v[1] + v[2];
+}
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/native/m3.c"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdint.h>
+#include "compat_hdr.h"
+#include "native_hdr.h"
+int32_t msvc_c3(void) {
+  return COMPAT_BASE + NATIVE_BASE + (GetCurrentProcessId() != 0 ? 3 : 0);
+}
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/pion.toml"
+[package]
+name = "msvc_host"
+version = "0.1.0"
+
+[link.windows]
+c_sources = ["compat/c1.c", "native/m1.cpp", "native/m2.cpp", "native/m3.c"]
+cc_flags = ["-O2", "-Icompat", "-Inative", "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"]
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_host/src/lib.pion"
+extern "C" fn msvc_c1() -> Int = "msvc_c1"
+extern "C" fn msvc_p1() -> Int = "msvc_p1"
+extern "C" fn msvc_p2() -> Int = "msvc_p2"
+extern "C" fn msvc_c3() -> Int = "msvc_c3"
+
+pub fn host_sum() -> Int {
+  msvc_c1() + msvc_p1() + msvc_p2() + msvc_c3()
+}
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_app/app_c.c"
+#include <stdint.h>
+int32_t msvc_app_c(void) { return 99; }
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_app/pion.toml"
+[package]
+name = "msvc_app"
+version = "0.1.0"
+
+[dependencies]
+msvc_host = { path = "../msvc_host" }
+
+[link]
+c_sources = ["app_c.c"]
+cc_flags = ["-O2"]
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_app/src/main.pion"
+import "msvc_host"
+
+extern "C" fn msvc_app_c() -> Int = "msvc_app_c"
+
+pub fn msvc_total() -> Int {
+  msvc_host::host_sum() + msvc_app_c()
+}
+
+pub fn main(w : World) -> Int {
+  io_println(w, "msvc_cstub=" + msvc_total().to_string())
+  0
+}
+EOF
+cat <<'EOF' > "$MSVC_CS_WS/msvc_app/src/msvc_test.pion"
+test "msvc_cstub_ok" {
+  debug_assert(msvc_total() == 936, "msvc_cstub_ok")
+}
+EOF
+
+VCVARS_WIN="$(cygpath -w "$VS_VCVARS_POSIX")"
+LLVM_BIN_WIN="$(cygpath -w "$LLVM_BIN_POSIX")"
+RT_DIR_WIN="$(cygpath -w "$ROOT_DIR/runtime")"
+PIONC_WIN="$(cygpath -w "$PIONC")"
+QBE_WIN="$(cygpath -w "$PION_QBE")"
+MSVC_CAS_WIN="$(cygpath -w "$MSVC_CS_CAS")"
+MSVC_APP_WIN="$(cygpath -w "$MSVC_CS_WS/msvc_app")"
+MSVC_EXE1_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_1.exe")"
+MSVC_EXE2_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_2.exe")"
+MSVC_EXE3_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_3.exe")"
+MSVC_EXE4_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_4.exe")"
+MSVC_EXE5_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_5.exe")"
+MSVC_TR1_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_1.trace")"
+MSVC_TR2_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_2.trace")"
+MSVC_TR3_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_3.trace")"
+MSVC_TR4_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_4.trace")"
+MSVC_TR5_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_5.trace")"
+MSVC_TRT_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_test.trace")"
+MSVC_TOUT_WIN="$(cygpath -w "$TMP_DIR/win_msvc_cstub_test.out")"
+CUSTOM_LIB_DIR="$TMP_DIR/custom_win_lib"
+mkdir -p "$CUSTOM_LIB_DIR"
+CUSTOM_LIB_WIN="$(cygpath -w "$CUSTOM_LIB_DIR")"
+MSVC_BAT="$TMP_DIR/run_msvc_cstub.bat"
+cat <<EOF > "$MSVC_BAT"
+@echo off
+echo [MSVC_TIMER] start %TIME%
+call "${VCVARS_WIN}" >nul || exit /b 1
+echo [MSVC_TIMER] after_vcvars %TIME%
+set "ORIG_LIB=%LIB%"
+set "PATH=${LLVM_BIN_WIN};%PATH%"
+set "CC=${LLVM_BIN_WIN}\clang.exe"
+set "CXX=${LLVM_BIN_WIN}\clang++.exe"
+set "PION_WIN_ABI=msvc"
+set "CPATH=${RT_DIR_WIN}"
+set "PION_CAS_TRACE=1"
+set "PION_CACHE_DIR=${MSVC_CAS_WIN}"
+set "PION_QBE=${QBE_WIN}"
+set "PION_RT_LIB="
+"${PIONC_WIN}" build --jobs 2 -o "${MSVC_EXE1_WIN}" "${MSVC_APP_WIN}" 2>"${MSVC_TR1_WIN}" || exit /b 11
+echo [MSVC_TIMER] after_build1 %TIME%
+"${PIONC_WIN}" build --jobs 2 -o "${MSVC_EXE2_WIN}" "${MSVC_APP_WIN}" 2>"${MSVC_TR2_WIN}" || exit /b 12
+echo [MSVC_TIMER] after_build2 %TIME%
+"${PIONC_WIN}" test "${MSVC_APP_WIN}" >"${MSVC_TOUT_WIN}" 2>"${MSVC_TRT_WIN}" || exit /b 13
+echo [MSVC_TIMER] after_test %TIME%
+set "LIB=${CUSTOM_LIB_WIN};%ORIG_LIB%"
+"${PIONC_WIN}" build --jobs 2 -o "${MSVC_EXE3_WIN}" "${MSVC_APP_WIN}" 2>"${MSVC_TR3_WIN}" || exit /b 14
+echo [MSVC_TIMER] after_build3_custom_lib %TIME%
+set "LIB=%ORIG_LIB%"
+set "_LINK_=/NOLOGO"
+"${PIONC_WIN}" build --jobs 2 -o "${MSVC_EXE4_WIN}" "${MSVC_APP_WIN}" 2>"${MSVC_TR4_WIN}" || exit /b 15
+echo [MSVC_TIMER] after_build4_link_env %TIME%
+set "_LINK_="
+set "LIB=%ORIG_LIB%;C:\Program Files\LLVM\lib_winlib_miss_probe"
+"${PIONC_WIN}" build --jobs 2 -o "${MSVC_EXE5_WIN}" "${MSVC_APP_WIN}" 2>"${MSVC_TR5_WIN}" || exit /b 16
+echo [MSVC_TIMER] after_build5_winlib_miss %TIME%
+EOF
+MSVC_BAT_WIN="$(cygpath -w "$MSVC_BAT")"
+MSVC_RC=0
+MSYS_NO_PATHCONV=1 cmd.exe /c "$MSVC_BAT_WIN" || MSVC_RC=$?
+echo "=== [WIN_CSTUB_PAR MSVC] cold build trace ==="
+cat "$TMP_DIR/win_msvc_cstub_1.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] warm build trace ==="
+cat "$TMP_DIR/win_msvc_cstub_2.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] warm test trace ==="
+cat "$TMP_DIR/win_msvc_cstub_test.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] custom LIB build trace ==="
+cat "$TMP_DIR/win_msvc_cstub_3.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] _LINK_ env build trace ==="
+cat "$TMP_DIR/win_msvc_cstub_4.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] switched whitelisted LIB build trace ==="
+cat "$TMP_DIR/win_msvc_cstub_5.trace" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] CAS obj/ ==="
+ls -lh "$MSVC_CS_CAS/obj" 2>/dev/null || true
+echo "=== [WIN_CSTUB_PAR MSVC] CAS bin/ ==="
+ls -lh "$MSVC_CS_CAS/bin" 2>/dev/null || true
+if [ "$MSVC_RC" -ne 0 ]; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC bat exited with rc=$MSVC_RC" >&2
+  cat "$TMP_DIR/win_msvc_cstub_test.out" >&2 2>/dev/null || true
+  exit 1
+fi
+MSVC_OUT1="$("$TMP_DIR/win_msvc_cstub_1.exe" | tr -d '\r')"
+[ "$MSVC_OUT1" = "msvc_cstub=936" ] || { echo "FAIL: WIN_CSTUB_PAR MSVC output mismatch: '$MSVC_OUT1'" >&2; exit 1; }
+MSVC_OUT2="$("$TMP_DIR/win_msvc_cstub_2.exe" | tr -d '\r')"
+[ "$MSVC_OUT2" = "msvc_cstub=936" ] || { echo "FAIL: WIN_CSTUB_PAR MSVC warm output mismatch: '$MSVC_OUT2'" >&2; exit 1; }
+MSVC_OUT3="$("$TMP_DIR/win_msvc_cstub_3.exe" | tr -d '\r')"
+[ "$MSVC_OUT3" = "msvc_cstub=936" ] || { echo "FAIL: WIN_CSTUB_PAR MSVC custom-LIB output mismatch: '$MSVC_OUT3'" >&2; exit 1; }
+MSVC_OUT4="$("$TMP_DIR/win_msvc_cstub_4.exe" | tr -d '\r')"
+[ "$MSVC_OUT4" = "msvc_cstub=936" ] || { echo "FAIL: WIN_CSTUB_PAR MSVC _LINK_-env output mismatch: '$MSVC_OUT4'" >&2; exit 1; }
+MSVC_OUT5="$("$TMP_DIR/win_msvc_cstub_5.exe" | tr -d '\r')"
+[ "$MSVC_OUT5" = "msvc_cstub=936" ] || { echo "FAIL: WIN_CSTUB_PAR MSVC switched-LIB output mismatch: '$MSVC_OUT5'" >&2; exit 1; }
+for _tr in "$TMP_DIR/win_msvc_cstub_1.trace" "$TMP_DIR/win_msvc_cstub_2.trace" "$TMP_DIR/win_msvc_cstub_test.trace"; do
+  if grep -q "(local:" "$_tr"; then
+    echo "FAIL: WIN_CSTUB_PAR MSVC fell back to local in $_tr" >&2
+    exit 1
+  fi
+done
+MSVC_OBJS_1="$(find "$MSVC_CS_CAS/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+if [ "$MSVC_OBJS_1" != "5" ]; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC expected 5 cstub_*.o, got $MSVC_OBJS_1" >&2
+  exit 1
+fi
+MSVC_HITS_2="$(grep -c '\[cas\] cstub=.* HIT ' "$TMP_DIR/win_msvc_cstub_2.trace" || true)"
+if [ "$MSVC_HITS_2" != "5" ] || grep -q '\[cas\] cstub=.* MISS ' "$TMP_DIR/win_msvc_cstub_2.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC warm build expected 5 HIT and 0 MISS (got hits=$MSVC_HITS_2)" >&2
+  exit 1
+fi
+MSVC_HITS_T="$(grep -c '\[cas\] cstub=.* HIT ' "$TMP_DIR/win_msvc_cstub_test.trace" || true)"
+if [ "$MSVC_HITS_T" != "5" ] || grep -q '\[cas\] cstub=.* MISS ' "$TMP_DIR/win_msvc_cstub_test.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC warm test expected 5 HIT and 0 MISS (got hits=$MSVC_HITS_T)" >&2
+  exit 1
+fi
+grep -q '\[cas\] bin=msvc_app MISS' "$TMP_DIR/win_msvc_cstub_1.trace" || { echo "FAIL: WIN_CSTUB_PAR MSVC cold build missing '[cas] bin=msvc_app MISS'" >&2; exit 1; }
+grep -q '\[cas\] bin=msvc_app HIT' "$TMP_DIR/win_msvc_cstub_2.trace" || { echo "FAIL: WIN_CSTUB_PAR MSVC warm build missing '[cas] bin=msvc_app HIT'" >&2; exit 1; }
+if grep -q '\[cas\] bin=msvc_app HIT' "$TMP_DIR/win_msvc_cstub_3.trace" || grep -q '\[cas\] bin=msvc_app MISS' "$TMP_DIR/win_msvc_cstub_3.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC custom LIB must bypass nativebin CAS!" >&2
+  exit 1
+fi
+if grep -q '\[cas\] bin=msvc_app HIT' "$TMP_DIR/win_msvc_cstub_4.trace" || grep -q '\[cas\] bin=msvc_app MISS' "$TMP_DIR/win_msvc_cstub_4.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC _LINK_ env must bypass nativebin CAS!" >&2
+  exit 1
+fi
+grep -q '\[cas\] bin=msvc_app MISS' "$TMP_DIR/win_msvc_cstub_5.trace" || { echo "FAIL: WIN_CSTUB_PAR MSVC switched whitelisted LIB must MISS nativebin CAS!" >&2; exit 1; }
+MSVC_BINS_ALL="$(find "$MSVC_CS_CAS/bin" -maxdepth 1 -name 'msvc_app_*.exe' | wc -l | tr -d ' ')"
+if [ "$MSVC_BINS_ALL" != "2" ]; then
+  echo "FAIL: WIN_CSTUB_PAR MSVC expected 2 msvc_app_*.exe in CAS bin/ (orig LIB + switched LIB), got $MSVC_BINS_ALL" >&2
+  exit 1
+fi
+echo "[PASS] Windows parallel cstub + nativebin CAS (LLVM clang/clang++ MSVC: cold MISS -> warm HIT -> warm test HIT + custom LIB/_LINK_ fail-closed + winlib switch MISS)"
+MSVCEOF
+bg_start "$TMP_DIR/msvc_cstub.log" sh -eu "$TMP_DIR/run_msvc_cstub_job.sh" "$TMP_DIR" "$ROOT_DIR" "$PIONC" "$PION_QBE"
+MSVC_CSTUB_PID="$BG_PID"
+
 for TPKG in examples/text_stats std/json std/http std/regex std/proc std/tls; do
   PKG_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_win test --json $TPKG -> $PKG_JSON"
@@ -557,6 +842,128 @@ WIN_CSTUB_OUT3="$("$TMP_DIR/win_cstub_3.exe" | tr -d '\r')"
 [ "$WIN_CSTUB_OUT3" = "win_cstub=207,half=5" ] || { echo "FAIL: Windows cstub header-edit output mismatch: '$WIN_CSTUB_OUT3'" >&2; exit 1; }
 echo "[PASS] Windows cstub CAS (cold -> warm HIT -> header edit MISS) + extern \"C\" fn value smoke"
 
+# Multi-file parallel (--jobs 2) Windows cstub CAS E2E (< 15s):
+#   1) MSYS2 gcc/g++: par_lib (2 .c + 2 .cpp + par_hdr.h) + par_app (1 .c + test)
+#   2) LLVM clang.exe/clang++.exe + VS2022 MSVC (when installed, e.g. GitHub Actions windows-latest)
+WIN_CSTUB_PAR_WS="$TMP_DIR/win_cstub_par_ws"
+WIN_CSTUB_PAR_CAS="$TMP_DIR/cas_win_cstub_par"
+mkdir -p "$WIN_CSTUB_PAR_WS/par_lib/src" "$WIN_CSTUB_PAR_WS/par_lib/csrc" \
+         "$WIN_CSTUB_PAR_WS/par_app/src" "$WIN_CSTUB_PAR_WS/par_app/csrc" \
+         "$WIN_CSTUB_PAR_CAS"
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/csrc/par_hdr.h"
+#define PAR_BASE 100
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/csrc/c1.c"
+#include <stdint.h>
+#include "par_hdr.h"
+int32_t par_c1(void) { return PAR_BASE + 1; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/csrc/c2.c"
+#include <stdint.h>
+#include "par_hdr.h"
+int32_t par_c2(void) { return PAR_BASE + 2; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/csrc/p1.cpp"
+#include <cstdint>
+#include "par_hdr.h"
+extern "C" int32_t par_p1(void) { return PAR_BASE + 3; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/csrc/p2.cpp"
+#include <cstdint>
+#include "par_hdr.h"
+extern "C" int32_t par_p2(void) { return PAR_BASE + 4; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/pion.toml"
+[package]
+name = "par_lib"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/c1.c", "csrc/c2.c", "csrc/p1.cpp", "csrc/p2.cpp"]
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_lib/src/lib.pion"
+extern "C" fn par_c1() -> Int = "par_c1"
+extern "C" fn par_c2() -> Int = "par_c2"
+extern "C" fn par_p1() -> Int = "par_p1"
+extern "C" fn par_p2() -> Int = "par_p2"
+
+pub fn lib_sum() -> Int {
+  par_c1() + par_c2() + par_p1() + par_p2()
+}
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_app/csrc/app_c.c"
+#include <stdint.h>
+int32_t par_app_c(void) { return 12; }
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_app/pion.toml"
+[package]
+name = "par_app"
+version = "0.1.0"
+
+[dependencies]
+par_lib = { path = "../par_lib" }
+
+[link]
+c_sources = ["csrc/app_c.c"]
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_app/src/main.pion"
+import "par_lib"
+
+extern "C" fn par_app_c() -> Int = "par_app_c"
+
+pub fn par_total() -> Int {
+  par_lib::lib_sum() + par_app_c()
+}
+
+pub fn main(w : World) -> Int {
+  io_println(w, "par_cstub=" + par_total().to_string())
+  0
+}
+EOF
+cat <<'EOF' > "$WIN_CSTUB_PAR_WS/par_app/src/app_test.pion"
+test "par_cstub_ok" {
+  debug_assert(par_total() == 422, "par_cstub_ok")
+}
+EOF
+
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_PAR_CAS" "$PIONC" build --jobs 2 -o "$TMP_DIR/win_cstub_par_1.exe" "$WIN_CSTUB_PAR_WS/par_app" 2>"$TMP_DIR/win_cstub_par_1.trace"
+WIN_PAR_CS_OUT1="$("$TMP_DIR/win_cstub_par_1.exe" | tr -d '\r')"
+[ "$WIN_PAR_CS_OUT1" = "par_cstub=422" ] || { echo "FAIL: WIN_CSTUB_PAR cold output mismatch: '$WIN_PAR_CS_OUT1'" >&2; cat "$TMP_DIR/win_cstub_par_1.trace" >&2; exit 1; }
+if grep -q "(local:" "$TMP_DIR/win_cstub_par_1.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR cold build fell back to local:" >&2
+  cat "$TMP_DIR/win_cstub_par_1.trace" >&2
+  exit 1
+fi
+WIN_PAR_CS_OBJS_1="$(find "$WIN_CSTUB_PAR_CAS/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+if [ "$WIN_PAR_CS_OBJS_1" != "5" ]; then
+  echo "FAIL: WIN_CSTUB_PAR cold expected 5 cstub_*.o, got $WIN_PAR_CS_OBJS_1" >&2
+  cat "$TMP_DIR/win_cstub_par_1.trace" >&2
+  exit 1
+fi
+
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_PAR_CAS" "$PIONC" build --jobs 2 -o "$TMP_DIR/win_cstub_par_2.exe" "$WIN_CSTUB_PAR_WS/par_app" 2>"$TMP_DIR/win_cstub_par_2.trace"
+WIN_PAR_CS_HITS_2="$(grep -c '\[cas\] cstub=.* HIT ' "$TMP_DIR/win_cstub_par_2.trace" || true)"
+if [ "$WIN_PAR_CS_HITS_2" != "5" ] || grep -q '\[cas\] cstub=.* MISS ' "$TMP_DIR/win_cstub_par_2.trace" || grep -q "(local:" "$TMP_DIR/win_cstub_par_2.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR warm build expected 5 HIT and 0 MISS/local (got hits=$WIN_PAR_CS_HITS_2):" >&2
+  cat "$TMP_DIR/win_cstub_par_2.trace" >&2
+  exit 1
+fi
+WIN_PAR_CS_OBJS_2="$(find "$WIN_CSTUB_PAR_CAS/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d ' ')"
+if [ "$WIN_PAR_CS_OBJS_2" != "5" ]; then
+  echo "FAIL: WIN_CSTUB_PAR warm build bloated obj/ ($WIN_PAR_CS_OBJS_1 -> $WIN_PAR_CS_OBJS_2)" >&2
+  cat "$TMP_DIR/win_cstub_par_2.trace" >&2
+  exit 1
+fi
+
+PION_CAS_TRACE=1 PION_CACHE_DIR="$WIN_CSTUB_PAR_CAS" "$PIONC" test --jobs 2 "$WIN_CSTUB_PAR_WS/par_app" > "$TMP_DIR/win_cstub_par_test.out" 2>"$TMP_DIR/win_cstub_par_test.trace"
+WIN_PAR_CS_HITS_T="$(grep -c '\[cas\] cstub=.* HIT ' "$TMP_DIR/win_cstub_par_test.trace" || true)"
+if [ "$WIN_PAR_CS_HITS_T" != "5" ] || grep -q '\[cas\] cstub=.* MISS ' "$TMP_DIR/win_cstub_par_test.trace" || grep -q "(local:" "$TMP_DIR/win_cstub_par_test.trace"; then
+  echo "FAIL: WIN_CSTUB_PAR warm test expected 5 HIT and 0 MISS/local (got hits=$WIN_PAR_CS_HITS_T):" >&2
+  cat "$TMP_DIR/win_cstub_par_test.trace" >&2
+  exit 1
+fi
+echo "[PASS] Windows parallel cstub CAS (MSYS2 --jobs 2: 2 .c + 2 .cpp + app .c, cold -> warm build HIT -> warm test HIT)"
+
 verify_bench() {
   name="$1"
   expected="$2"
@@ -585,6 +992,10 @@ if [ -n "$FP_ASM_PID" ]; then
 fi
 bg_finish "tests/e2e/p98_section_gc/run_e2e.sh" "$P98_PID" "$TMP_DIR/p98.log"
 P98_PID=""
+if [ -n "$MSVC_CSTUB_PID" ]; then
+  bg_finish "WIN_CSTUB_PAR MSVC" "$MSVC_CSTUB_PID" "$TMP_DIR/msvc_cstub.log"
+  MSVC_CSTUB_PID=""
+fi
 
 verify_bench nbody "-0.169075164 -0.169083134"
 verify_bench binarytrees "stretch=262143 long=131071 total=14592688"

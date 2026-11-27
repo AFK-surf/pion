@@ -1167,8 +1167,7 @@ assert "test batch_mix::t6_pass_end ... ok" in ho, ho
 assert "test result: FAILED. 3 passed; 4 failed" in ho, ho
 PYEOF
 
-# (h3) Deterministic fixed 64-test batching (260 tests, filter selects 258 -> 5 units: 64*4 + 2 for ANY --jobs)
-#      plus batch-scoped fallback (70 tests -> 2 batches: 64 + 6; 1 panic in batch 1 -> only fallbacks=6!)
+# (h3) Deterministic interleaved 16-test batching (260 tests, filter selects 258 -> ceil(258/16)=17 units for ANY --jobs)
 CHK="$TMP_DIR/batch_chunk"
 mkdir -p "$CHK/src"
 cat > "$CHK/pion.toml" <<'EOF'
@@ -1200,11 +1199,11 @@ d = json.loads(j1)
 assert d["ok"] is True and d["total"] == 258 and d["passed"] == 258 and d["failed"] == 0, d
 t1 = open(sys.argv[2]).read()
 t4 = open(sys.argv[4]).read()
-assert "units=5 fallbacks=0" in t1, t1
-assert "units=5 fallbacks=0" in t4, t4
+assert "units=17 fallbacks=0" in t1, t1
+assert "units=17 fallbacks=0" in t4, t4
 PYEOF
 
-# (h4) Batch-scoped fallback + --jobs determinism with shared top-level mutable state across 64-test boundary
+# (h4) Interleaved batch-scoped bisection + --jobs determinism with shared state (70 tests -> 5 batches of 14)
 SHD="$TMP_DIR/batch_shard_fb"
 mkdir -p "$SHD/src"
 cat > "$SHD/pion.toml" <<'EOF'
@@ -1223,15 +1222,15 @@ python3 - "$SHD/src/shard_test.pion" <<'PYEOF'
 import sys
 with open(sys.argv[1], "w") as f:
     for i in range(70):
-        # Batch 0 = indices 0..63 (all pass, bumping shared_counter up to 64).
-        # Batch 1 = indices 64..69 (fresh process, counter starts at 1..6; index 68 fails).
+        # num_batches = ceil(70/16) = 5, 14 tests per batch (i % 5 == b).
+        # Batch 0 (i % 5 == 0): 14 tests all pass, bumping shared_counter 1..14.
+        # Batch 3 (i % 5 == 3): i == 68 fails -> bisects 14 -> 7 -> 4 -> fallbacks=4, bisects=4.
         if i == 68:
             f.write(f'test "s_{i:02d}" {{ let _ = bump(); debug_assert(1 == 2, "fail_68") }}\n')
-        elif i >= 64:
-            # In batch 1 (size 6), bump() sees <= 6 (and in isolated fallback, sees 1).
-            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() <= 6, "batch1_{i}") }}\n')
+        elif i % 5 == 0:
+            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() == {i // 5 + 1}, "batch0_{i}") }}\n')
         else:
-            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() == {i + 1}, "batch0_{i}") }}\n')
+            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() <= 14, "batch_{i}") }}\n')
 PYEOF
 CAS_SHD="$TMP_DIR/cas_shd"
 mkdir -p "$CAS_SHD"
@@ -1253,7 +1252,7 @@ assert d["ok"] is False and d["total"] == 70 and d["passed"] == 69 and d["failed
 failed = [t["name"] for t in d["tests"] if not t["ok"]]
 assert failed == ["s_68"], failed
 tr8 = open(os.path.join(td, "shd_j8.trace")).read()
-assert "units=2 fallbacks=6" in tr8, tr8
+assert "units=5 fallbacks=4 bisects=4" in tr8, tr8
 PYEOF
 
 # (h5) Early _Exit(0) adversarial test: t0 calls _Exit(0) before t1 fails ->
@@ -1320,6 +1319,264 @@ for bad in (["-2"], ["-2", "tok"], ["-2", "tok", "-1", "0"], ["-2", "tok", "2", 
     r = subprocess.run([b] + bad, capture_output=True)
     assert r.returncode != 0, f"expected non-zero for {bad}, got 0"
 PYEOF
-echo "(h) batch runner (fixed-64/determinism/token-guard/direct CLI) + panic/SIGABRT/exit42/_Exit(0) isolated fallback -> OK"
+echo "(h) batch runner (interleaved-16/determinism/token-guard/direct CLI) + panic/SIGABRT/exit42/_Exit(0) isolated fallback -> OK"
+
+# (h6) Deterministic interleaved 16-test batching + midpoint bisection (> 4):
+#      (h6a) 64 tests -> 4 batches of 16; in batch 0 (i % 4 == 0), i == 4 (pos 1)
+#            mutates global state and i == 48 (pos 12) asserts clean state:
+#            splitting [0..7] and [8..15] passes both -> units=4, passed=64,
+#            failed=0, fallbacks=0, bisects=2, byte-identical JSON across --jobs 1/2/4/8.
+#      (h6b) 64 tests with real failure at i == 57 (batch 1): 16->8->4 ->
+#            units=4, passed=63, failed=1, fallbacks=4, bisects=4, byte-identical
+#            JSON across --jobs 1/2/4/8.
+#      (h6c) 32 tests -> 2 interleaved batches: index 0 and 1 land in DIFFERENT
+#            batches while index 0 and 2 share batch 0 (units=2, fallbacks=0).
+#      (h6d) 16 tests in 1 batch with failures at both i == 2 and i == 12:
+#            both halves [0..7] and [8..15] fail -> circuit-break straight to
+#            isolated Phase 3 (units=1, fallbacks=16, bisects=2).
+#      (h6e) N=17 boundary (9/8 two batches) with early _Exit(0) at i == 0 and
+#            real failure at i == 4 (both inside batch 0's left half of 4 tests):
+#            non-zero exit, t_00=ok, t_04=FAIL, other 15=ok, --jobs 1 vs 4 identical.
+#      Note: in (h6a)/(h6b), trace `units=4` is checked on warm runs j=2,4,8
+#      because cold run j=1 executes batch 0 inline during Phase 1 build overlap.
+BIS_A="$TMP_DIR/batch_bisect_a"
+mkdir -p "$BIS_A/src"
+cat > "$BIS_A/pion.toml" <<'EOF'
+[package]
+name = "batch_bisect_a"
+version = "0.1.0"
+EOF
+cat > "$BIS_A/src/lib.pion" <<'EOF'
+pub let shared_flag : Array[Int] = [0]
+pub fn set_flag() -> Unit { shared_flag[0] = 1 }
+pub fn get_flag() -> Int { shared_flag[0] }
+EOF
+python3 - "$BIS_A/src/bisect_a_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(64):
+        if i == 4:
+            f.write(f'test "ba_{i:02d}" {{ set_flag(); debug_assert(get_flag() == 1, "set") }}\n')
+        elif i == 48:
+            f.write(f'test "ba_{i:02d}" {{ debug_assert(get_flag() == 0, "no_leak") }}\n')
+        else:
+            f.write(f'test "ba_{i:02d}" {{ debug_assert({i} + 1 == {i + 1}, "ok_{i}") }}\n')
+PYEOF
+CAS_BISA="$TMP_DIR/cas_bisa"
+mkdir -p "$CAS_BISA"
+for J in 1 2 4 8; do
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BISA" "$PIONC" test --jobs "$J" --json "$BIS_A" > "$TMP_DIR/bisa_j${J}.json" 2>"$TMP_DIR/bisa_j${J}.trace"
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "bisa_j1.json")).read()
+for j in (2, 4, 8):
+    jj = open(os.path.join(td, f"bisa_j{j}.json")).read()
+    assert jj == j1, f"(h6a) --jobs {j} JSON differs from --jobs 1"
+d = json.loads(j1)
+assert d["ok"] is True and d["total"] == 64 and d["passed"] == 64 and d["failed"] == 0, d
+# Cold run j=1 executes batch 0 during Phase 1 build overlap; warm runs j=2,4,8 report all 4 units in Phase 2.
+for j in (2, 4, 8):
+    tr = open(os.path.join(td, f"bisa_j{j}.trace")).read()
+    assert "units=4 fallbacks=0 bisects=2" in tr, f"(h6a) --jobs {j} trace mismatch:\n{tr}"
+PYEOF
+
+BIS_B="$TMP_DIR/batch_bisect_b"
+mkdir -p "$BIS_B/src"
+cat > "$BIS_B/pion.toml" <<'EOF'
+[package]
+name = "batch_bisect_b"
+version = "0.1.0"
+EOF
+cat > "$BIS_B/src/lib.pion" <<'EOF'
+pub fn id_b(x : Int) -> Int { x }
+EOF
+python3 - "$BIS_B/src/bisect_b_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(64):
+        if i == 57:
+            f.write(f'test "bb_{i:02d}" {{ debug_assert(id_b(1) == 2, "real_fail_57") }}\n')
+        else:
+            f.write(f'test "bb_{i:02d}" {{ debug_assert(id_b({i}) == {i}, "ok_{i}") }}\n')
+PYEOF
+CAS_BISB="$TMP_DIR/cas_bisb"
+mkdir -p "$CAS_BISB"
+for J in 1 2 4 8; do
+  if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BISB" "$PIONC" test --jobs "$J" --json "$BIS_B" > "$TMP_DIR/bisb_j${J}.json" 2>"$TMP_DIR/bisb_j${J}.trace"; then
+    echo "FAIL: (h6b) --jobs $J unexpectedly exited 0" >&2
+    exit 1
+  fi
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "bisb_j1.json")).read()
+for j in (2, 4, 8):
+    jj = open(os.path.join(td, f"bisb_j{j}.json")).read()
+    assert jj == j1, f"(h6b) --jobs {j} JSON differs from --jobs 1"
+d = json.loads(j1)
+assert d["ok"] is False and d["total"] == 64 and d["passed"] == 63 and d["failed"] == 1, d
+failed = [t["name"] for t in d["tests"] if not t["ok"]]
+assert failed == ["bb_57"], failed
+# Cold run j=1 executes batch 0 during Phase 1 build overlap; warm runs j=2,4,8 report all 4 units in Phase 2.
+for j in (2, 4, 8):
+    tr = open(os.path.join(td, f"bisb_j{j}.trace")).read()
+    assert "units=4 fallbacks=4 bisects=4" in tr, f"(h6b) --jobs {j} trace mismatch:\n{tr}"
+PYEOF
+
+BIS_C="$TMP_DIR/batch_interleave_c"
+mkdir -p "$BIS_C/src"
+cat > "$BIS_C/pion.toml" <<'EOF'
+[package]
+name = "batch_interleave_c"
+version = "0.1.0"
+EOF
+cat > "$BIS_C/src/lib.pion" <<'EOF'
+pub let interleave_tag : Array[Int] = [0]
+pub fn mark_tag() -> Unit { interleave_tag[0] = 1 }
+pub fn read_tag() -> Int { interleave_tag[0] }
+EOF
+python3 - "$BIS_C/src/interleave_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(32):
+        # 32 tests -> 2 interleaved batches: even (0,2,4,...) and odd (1,3,5,...).
+        if i == 0:
+            f.write('test "ic_00" { mark_tag(); debug_assert(read_tag() == 1, "set0") }\n')
+        elif i == 1:
+            f.write('test "ic_01" { debug_assert(read_tag() == 0, "adj_diff_batch") }\n')
+        elif i == 2:
+            f.write('test "ic_02" { debug_assert(read_tag() == 1, "stride_same_batch") }\n')
+        else:
+            f.write(f'test "ic_{i:02d}" {{ debug_assert({i} + 1 == {i + 1}, "ok_{i}") }}\n')
+PYEOF
+CAS_BISC="$TMP_DIR/cas_bisc"
+mkdir -p "$CAS_BISC"
+PION_CACHE_DIR="$CAS_BISC" "$PIONC" test --jobs 1 --json "$BIS_C" > "$TMP_DIR/bisc_cold.json"
+for J in 1 2 4; do
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BISC" "$PIONC" test --jobs "$J" --json "$BIS_C" > "$TMP_DIR/bisc_j${J}.json" 2>"$TMP_DIR/bisc_j${J}.trace"
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "bisc_j1.json")).read()
+for j in (2, 4):
+    jj = open(os.path.join(td, f"bisc_j{j}.json")).read()
+    assert jj == j1, f"(h6c) --jobs {j} JSON differs from --jobs 1"
+d = json.loads(j1)
+assert d["ok"] is True and d["total"] == 32 and d["passed"] == 32 and d["failed"] == 0, d
+for j in (1, 2, 4):
+    tr = open(os.path.join(td, f"bisc_j{j}.trace")).read()
+    assert "units=2 fallbacks=0 bisects=0" in tr, f"(h6c) --jobs {j} trace mismatch:\n{tr}"
+PYEOF
+
+BIS_D="$TMP_DIR/batch_bisect_d"
+mkdir -p "$BIS_D/src"
+cat > "$BIS_D/pion.toml" <<'EOF'
+[package]
+name = "batch_bisect_d"
+version = "0.1.0"
+EOF
+cat > "$BIS_D/src/lib.pion" <<'EOF'
+pub fn id_d(x : Int) -> Int { x }
+EOF
+python3 - "$BIS_D/src/bisect_d_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(16):
+        if i == 2 or i == 12:
+            f.write(f'test "bd_{i:02d}" {{ debug_assert(id_d(1) == 2, "fail_{i}") }}\n')
+        else:
+            f.write(f'test "bd_{i:02d}" {{ debug_assert(id_d({i}) == {i}, "ok_{i}") }}\n')
+PYEOF
+CAS_BISD="$TMP_DIR/cas_bisd"
+mkdir -p "$CAS_BISD"
+if PION_CACHE_DIR="$CAS_BISD" "$PIONC" test --jobs 1 --json "$BIS_D" > "$TMP_DIR/bisd_cold.json" 2>"$TMP_DIR/bisd_cold.trace"; then
+  echo "FAIL: (h6d) cold run unexpectedly exited 0" >&2
+  exit 1
+fi
+for J in 1 2 4; do
+  if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BISD" "$PIONC" test --jobs "$J" --json "$BIS_D" > "$TMP_DIR/bisd_j${J}.json" 2>"$TMP_DIR/bisd_j${J}.trace"; then
+    echo "FAIL: (h6d) --jobs $J unexpectedly exited 0" >&2
+    exit 1
+  fi
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "bisd_j1.json")).read()
+for j in (2, 4):
+    jj = open(os.path.join(td, f"bisd_j{j}.json")).read()
+    assert jj == j1, f"(h6d) --jobs {j} JSON differs from --jobs 1"
+d = json.loads(j1)
+assert d["ok"] is False and d["total"] == 16 and d["passed"] == 14 and d["failed"] == 2, d
+failed = [t["name"] for t in d["tests"] if not t["ok"]]
+assert failed == ["bd_02", "bd_12"], failed
+for j in (1, 2, 4):
+    tr = open(os.path.join(td, f"bisd_j{j}.trace")).read()
+    assert "units=1 fallbacks=16 bisects=2" in tr, f"(h6d) --jobs {j} trace mismatch:\n{tr}"
+PYEOF
+
+BIS_E="$TMP_DIR/batch_bisect_e"
+mkdir -p "$BIS_E/src" "$BIS_E/csrc"
+cat > "$BIS_E/pion.toml" <<'EOF'
+[package]
+name = "batch_bisect_e"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/exit0_e.c"]
+EOF
+cat > "$BIS_E/csrc/exit0_e.c" <<'EOF'
+#include <stdlib.h>
+void p91_bise_exit0(void) { _Exit(0); }
+EOF
+cat > "$BIS_E/src/lib.pion" <<'EOF'
+extern "C" fn p91_bise_exit0() -> Unit
+pub fn bise_exit0() -> Unit { p91_bise_exit0() }
+pub fn id_e(x : Int) -> Int { x }
+EOF
+python3 - "$BIS_E/src/bisect_e_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(17):
+        if i == 0:
+            f.write('test "t_00" { bise_exit0() }\n')
+        elif i == 4:
+            f.write('test "t_04" { debug_assert(id_e(1) == 2, "fail_4") }\n')
+        else:
+            f.write(f'test "t_{i:02d}" {{ debug_assert(id_e({i}) == {i}, "ok_{i}") }}\n')
+PYEOF
+CAS_BISE="$TMP_DIR/cas_bise"
+mkdir -p "$CAS_BISE"
+if PION_CACHE_DIR="$CAS_BISE" "$PIONC" test --jobs 1 --json "$BIS_E" > "$TMP_DIR/bise_cold.json" 2>"$TMP_DIR/bise_cold.trace"; then
+  echo "FAIL: (h6e) cold run unexpectedly exited 0 (false green!)" >&2
+  exit 1
+fi
+for J in 1 4; do
+  if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BISE" "$PIONC" test --jobs "$J" --json "$BIS_E" > "$TMP_DIR/bise_j${J}.json" 2>"$TMP_DIR/bise_j${J}.trace"; then
+    echo "FAIL: (h6e) --jobs $J unexpectedly exited 0 (false green!)" >&2
+    exit 1
+  fi
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "bise_j1.json")).read()
+j4 = open(os.path.join(td, "bise_j4.json")).read()
+assert j4 == j1, f"(h6e) --jobs 4 JSON differs from --jobs 1"
+d = json.loads(j1)
+assert d["ok"] is False and d["total"] == 17 and d["passed"] == 16 and d["failed"] == 1, d
+got = {t["name"]: t["ok"] for t in d["tests"]}
+assert got["t_00"] is True and got["t_04"] is False, got
+failed = [t["name"] for t in d["tests"] if not t["ok"]]
+assert failed == ["t_04"], failed
+for j in (1, 4):
+    tr = open(os.path.join(td, f"bise_j{j}.trace")).read()
+    assert "units=2 fallbacks=4 bisects=2" in tr, f"(h6e) --jobs {j} trace mismatch:\n{tr}"
+PYEOF
+echo "(h6) deterministic interleaved 16-test batching + midpoint bisection (h6a/h6b/h6c/h6d/h6e) -> OK"
 
 echo "PASS: p91_test_runner_cli"
