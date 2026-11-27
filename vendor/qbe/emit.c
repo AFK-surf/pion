@@ -52,7 +52,25 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 			pfx, n, sfx
 		);
 	}
-	if (l->sec) {
+	if (l->sec && !l->secf && !l->thread &&
+	    (strcmp(l->sec, ".rodata") == 0 || strcmp(l->sec, "\".rodata\"") == 0)) {
+		if (T.apple) {
+			fputs(".section __TEXT,__const", f);
+		} else if (T.windows) {
+			if (n[0] != '"' && n[0] != '\0') {
+				if (win_seh)
+					fprintf(f, ".section .rdata$%s,\"dr\",one_only,%s", n, n);
+				else
+					fprintf(f, ".section .rdata$%s,\"dr\"\n.linkonce one_only", n);
+			} else {
+				fputs(".section .rdata,\"dr\"", f);
+			}
+		} else if (n[0] != '"' && n[0] != '\0') {
+			fprintf(f, ".section .rodata.%s,\"a\",%%progbits", n);
+		} else {
+			fputs(".section .rodata", f);
+		}
+	} else if (l->sec) {
 		fprintf(f, ".section %s", l->sec);
 		if (l->secf)
 			fprintf(f, ",%s", l->secf);
