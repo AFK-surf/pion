@@ -464,3 +464,708 @@ test "F6-3a: R6/R7 labeled loop original line:col, top-level let, interp, #cfg, 
   }
   assert_true(kw_exact && kw_unsup, "keyword label `not~:` must report lib.mbt:2:3 and mark fn:probe unsupported")
 }
+
+test "F6-3b: mutation_summary physical_equal, pure derive(Eq), recursive .iter().any, pure String methods, and extern C boundary" {
+  // 1. Bare `physical_equal` is pure read-only, while param/local shadowing stays fail-closed
+  let pe_src =
+  "struct Node { id : Int }\n" +
+  "fn same_ref(a : Node, b : Node) -> Bool {\n" +
+  "  physical_equal(a, b)\n" +
+  "}\n" +
+  "fn shadowed_pe(a : Node, b : Node, physical_equal : (Node, Node) -> Bool) -> Bool {\n" +
+  "  physical_equal(a, b)\n" +
+  "}\n"
+  let pe_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(pe_src)])
+  match lookup_fn_mutation_summary(pe_ms, "same_ref") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "bare physical_equal must be pure")
+    None => assert_true(false, "same_ref summary missing")
+  }
+  match lookup_fn_mutation_summary(pe_ms, "shadowed_pe") {
+    Some(s) => assert_true(s.unknown, "shadowed physical_equal param must fail-closed")
+    None => assert_true(false, "shadowed_pe summary missing")
+  }
+
+  // 2. Pure `derive(Eq)` structs/enums vs custom `impl Eq` / generic / callback / non-pure fields
+  let eq_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) {\n" +
+  "  self.xs.clear()\n" +
+  "  other.xs.length() == 0\n" +
+  "}\n" +
+  "enum NodeKind { XElement; XText(String) } derive(Eq)\n" +
+  "struct Style { color : Int; bold : Bool; kind : NodeKind } derive(Eq)\n" +
+  "struct Cell { style : Style; kind : NodeKind }\n" +
+  "struct WrapEvil { e : Evil } derive(Eq)\n" +
+  "struct HasCb { cb : (Int) -> Bool } derive(Eq)\n" +
+  "struct GenBox[T] { v : T } derive(Eq)\n" +
+  "fn check_pure_eq(c : Array[Cell], i : Int, p : Style) -> Bool {\n" +
+  "  c[i].style == p && c[i].kind == XElement\n" +
+  "}\n" +
+  "fn check_evil_eq(a : WrapEvil, b : WrapEvil) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n" +
+  "fn check_cb_eq(a : HasCb, b : HasCb) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n" +
+  "fn check_gen_eq(a : GenBox[Int], b : GenBox[Int]) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n"
+  let eq_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(eq_src)])
+  match lookup_fn_mutation_summary(eq_ms, "check_pure_eq") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "pure derive(Eq) struct & enum == must be pure")
+    None => assert_true(false, "check_pure_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_evil_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "derive(Eq) wrapping custom impl Eq must propagate mutation / fail-closed")
+    None => assert_true(false, "check_evil_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_cb_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "derive(Eq) with callback field must fail-closed")
+    None => assert_true(false, "check_cb_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_gen_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "generic derive(Eq) must fail-closed")
+    None => assert_true(false, "check_gen_eq summary missing")
+  }
+
+  // 3. Recursive `.iter().any(...)` + `mbt_compat::arr_iter(...).any(...)` + pure String/Option methods
+  let rec_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "struct Graph { heads : Array[Array[Int]]; labels : Array[String] }\n" +
+  "fn Graph::reads_under(self : Graph, id : Int, depth : Int) -> Bool {\n" +
+  "  if depth > 4 { return false }\n" +
+  "  let heads = self.heads[id]\n" +
+  "  let lbl = self.labels[id]\n" +
+  "  if lbl.trim().to_lower().contains(\"ok\") && lbl.starts_with(\"a\") { return true }\n" +
+  "  heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })\n" +
+  "}\n" +
+  "fn Graph::reads_lowered(self : Graph, id : Int, depth : Int) -> Bool {\n" +
+  "  if depth > 4 { return false }\n" +
+  "  let heads = self.heads[id]\n" +
+  "  mbt_compat::arr_iter(heads).any(fn(g) { self.reads_lowered(g, depth + 1) })\n" +
+  "}\n"
+  let rec_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(rec_src)])
+  match lookup_fn_mutation_summary(rec_ms, "Graph::reads_under") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "recursive .iter().any + String::contains must converge pure")
+    None => assert_true(false, "Graph::reads_under summary missing")
+  }
+  match lookup_fn_mutation_summary(rec_ms, "Graph::reads_lowered") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "recursive mbt_compat::arr_iter().any must converge pure")
+    None => assert_true(false, "Graph::reads_lowered summary missing")
+  }
+
+  // 4. `extern "C" fn` must NOT swallow the following pure function body
+  let ext_src =
+  "extern \"C\" fn c_op() -> Unit = \"c_op\"\n" +
+  "fn helper() -> Int { 1 }\n" +
+  "fn call_c_op() -> Unit { c_op() }\n"
+  let ext_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_src)])
+  assert_true(lookup_fn_mutation_summary(ext_ms, "c_op") is None, "extern C fn c_op must not be given a pure body summary")
+  match lookup_fn_mutation_summary(ext_ms, "call_c_op") {
+    Some(s) => assert_true(s.unknown, "calling extern C fn c_op must stay unknown=true fail-closed")
+    None => assert_true(false, "call_c_op summary missing")
+  }
+  match lookup_fn_mutation_summary(ext_ms, "helper") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "helper after extern C fn must parse as pure")
+    None => assert_true(false, "helper summary missing")
+  }
+}
+
+test "F6-3b: empty_target_pkg ABI roundtrip, Buffer(capacity=...), sibling ctors, and lower_error main/nested catch" {
+  let empty_check = fn(_fs : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // 1. Target-filtered empty package emits `empty_target_pkg: true` and placeholder `lib.pion`
+  let wasm_only_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(targets: { \"wasm_helper.mbt\": [\"wasm\"] })",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let empty_res = transpile_package(
+    [SourceFile::{ rel_path: "wasm_helper.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    wasm_only_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(empty_res.blockers == 0, "empty_res blockers: " + (if empty_res.diagnostics.length() > 0 { empty_res.diagnostics[0].code + ": " + empty_res.diagnostics[0].message } else { empty_res.blockers.to_string() }))
+  assert_true(empty_res.abi.empty_target_pkg, "all-target-filtered pkg must set empty_target_pkg=true")
+  assert_eq(empty_res.files.length(), 1)
+  assert_true(empty_res.files[0].rel_path == "lib.pion", "empty target pkg must emit placeholder lib.pion")
+  let empty_pairs : Array[(String, String)] = [(empty_res.files[0].rel_path, empty_res.files[0].content)]
+  let empty_abi_json = render_abi_json(empty_res.abi, empty_pairs)
+  assert_true(str_has(empty_abi_json, "\"empty_target_pkg\":true"), "abi json must record empty_target_pkg:true")
+  assert_true(str_has(empty_abi_json, "\"empty_target\":\"native\""), "abi json must record empty_target:native")
+  let vdiags1 : Array[Diag] = []
+  let parsed1 = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", empty_pairs, Some(empty_abi_json), "native", vdiags1)
+  assert_true(parsed1 is Some(_) && vdiags1.length() == 0, "placeholder lib.pion + empty_target_pkg=true + matching target must verify")
+  // 0-file dep MUST fail closed even with empty_target_pkg=true
+  let zero_abi_json = render_abi_json(empty_res.abi, [])
+  let vdiags2 : Array[Diag] = []
+  let parsed2 = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", [], Some(zero_abi_json), "native", vdiags2)
+  assert_true(parsed2 is None && vdiags2.length() > 0 && vdiags2[0].code == "MBT2PION_DEP_ABI_ERROR", "0-file dep must fail closed even when empty_target_pkg=true")
+  // Target mismatch (`empty_target="native"` consumed by `--target wasm`) MUST fail closed
+  let vdiags_tm : Array[Diag] = []
+  let parsed_tm = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", empty_pairs, Some(empty_abi_json), "wasm", vdiags_tm)
+  assert_true(parsed_tm is None && vdiags_tm.length() > 0 && vdiags_tm[0].code == "MBT2PION_DEP_ABI_ERROR", "empty_target mismatch must fail closed")
+  // Forged non-empty exported enums with empty_target_pkg=true MUST fail closed
+  let forged_abi = PackageAbi::{
+    package_name: "wasm_only",
+    enums: [AbiEnumSchema::{ pkg: "wasm_only", name: "Ghost", can_match: true, can_construct: true, variants: [AbiEnumVariant::{ name: "A", fields: [] }] }],
+    struct_val_fields: [],
+    structs: Some([]),
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    raising_fns: [],
+    ffi_shim_prefix: "",
+    publishable: true,
+    empty_target_pkg: true,
+    empty_target: "native",
+  }
+  let forged_sha = compute_abi_payload_sha256(forged_abi)
+  let forged_lib = "// abi-sha256: " + forged_sha + "\n// placeholder\n"
+  let forged_json = render_abi_json(forged_abi, [("lib.pion", forged_lib)])
+  let vdiags_fg : Array[Diag] = []
+  let parsed_fg = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", [("lib.pion", forged_lib)], Some(forged_json), "native", vdiags_fg)
+  assert_true(parsed_fg is None && vdiags_fg.length() > 0 && vdiags_fg[0].code == "MBT2PION_DEP_ABI_ERROR", "empty_target_pkg=true with forged Ghost::A enum must fail closed")
+  // Normal non-empty-target package with 0 files MUST still fail closed!
+  let norm_abi = empty_package_abi("broken")
+  let norm_abi_json = render_abi_json(norm_abi, [])
+  let vdiags3 : Array[Diag] = []
+  let parsed3 = verify_and_parse_dep_abi("broken", "/tmp/broken", [], Some(norm_abi_json), vdiags3)
+  assert_true(parsed3 is None && vdiags3.length() > 0, "0-file dep without empty_target_pkg=true must fail closed")
+
+  // 2. `Buffer(capacity=...)`, `Buffer(capacity=bump())`, and `Buffer(capacity=-1)`
+  let buf_src =
+  "fn bump() -> Int { 8 }\n" +
+  "pub fn pack(v : BytesView) -> Bytes {\n" +
+  "  let whole = Buffer(capacity=16)\n" +
+  "  let _side = Buffer(capacity=bump())\n" +
+  "  let _neg = Buffer(capacity=-1)\n" +
+  "  whole.write_bytesview(v)\n" +
+  "  whole.write_byte(b'!')\n" +
+  "  whole.to_bytes()\n" +
+  "}\n"
+  let buf_res = transpile_package(
+    [SourceFile::{ rel_path: "buf.mbt", content: buf_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(buf_res.blockers == 0, "buf_res blockers: " + (if buf_res.diagnostics.length() > 0 { buf_res.diagnostics[0].code + ": " + buf_res.diagnostics[0].message } else { buf_res.blockers.to_string() }))
+  let buf_out = buf_res.files[0].content
+  assert_true(
+    str_has(buf_out, "mbt_compat::bytes_buf_new_with_capacity(16)") &&
+    str_has(buf_out, "mbt_compat::bytes_buf_new_with_capacity(bump())") &&
+    str_has(buf_out, "mbt_compat::bytes_buf_new_with_capacity(-1)"),
+    "Buffer(capacity=...) must lower to bytes_buf_new_with_capacity:\n" + buf_out,
+  )
+
+  // 3. Partial tuple sibling match arms & if/else sibling branch enum expected types
+  let sib_src =
+  "pub(all) enum AnchorSide { Above; Below; Left; Right }\n" +
+  "enum Align { Left; Right; Center }\n" +
+  "pub(all) enum HoldRead { Ready; Cancelled }\n" +
+  "enum JobState { Pending; Cancelled }\n" +
+  "pub fn flip(asked : AnchorSide) -> (Int, Int, Int, AnchorSide) {\n" +
+  "  let res = match asked {\n" +
+  "    Below => { let t = 1; (t, 2, 3, Above) }\n" +
+  "    Above => (2, 1, 3, Below)\n" +
+  "    Right => (4, 5, 6, Left)\n" +
+  "    Left => (5, 4, 6, Right)\n" +
+  "  }\n" +
+  "  res\n" +
+  "}\n" +
+  "pub fn pick_hold(cond : Bool) -> HoldRead {\n" +
+  "  let result = if cond { let _ = 1; Ready } else { Cancelled }\n" +
+  "  result\n" +
+  "}\n"
+  let sib_res = transpile_package(
+    [SourceFile::{ rel_path: "sib.mbt", content: sib_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(sib_res.blockers == 0, "sib_res blockers: " + (if sib_res.diagnostics.length() > 0 { sib_res.diagnostics[0].code + ": " + sib_res.diagnostics[0].message } else { sib_res.blockers.to_string() }))
+  let sib_out = sib_res.files[0].content
+  assert_true(str_has(sib_out, "AnchorSide::Left") && str_has(sib_out, "AnchorSide::Right"), "tuple match arms must infer AnchorSide:\n" + sib_out)
+  assert_true(str_has(sib_out, "HoldRead::Cancelled"), "if/else sibling branch must infer HoldRead:\n" + sib_out)
+
+  // 4. `lower_error`: bare `fn main { ... }` and nested controlled core `catch`
+  let err_src =
+  "fn main {\n" +
+  "  let a = Some(@json.parse(\"1\") catch { _ => @json.null() })\n" +
+  "  let b = Some(@string.parse_int(\"42\") catch { _ => -1 })\n" +
+  "  let c = Some(@string.parse_double(\"3.5\") catch { _ => 0.0 })\n" +
+  "  let d = Some(@utf8.decode(b\"hi\") catch { _ => \"\" })\n" +
+  "  let _ = (a, b, c, d)\n" +
+  "}\n"
+  let err_res = transpile_package(
+    [SourceFile::{ rel_path: "main.mbt", content: err_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(err_res.blockers == 0, "err_res blockers: " + (if err_res.diagnostics.length() > 0 { err_res.diagnostics[0].code + ": " + err_res.diagnostics[0].message } else { err_res.blockers.to_string() }))
+  let err_out = err_res.files[0].content
+  assert_true(
+    str_has(err_out, "mbt_compat::mbt_json_parse") &&
+    str_has(err_out, "mbt_compat::str_try_parse_int") &&
+    str_has(err_out, "mbt_compat::str_try_parse_double") &&
+    str_has(err_out, "mbt_compat::utf8_decode_strict"),
+    "bare fn main + nested core catch must lower cleanly:\n" + err_out,
+  )
+}
+
+test "F6-3b: mutation_summary R2 soundness negatives (slice, user replace, cross-pkg enum, impl header)" {
+  let neg_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl @builtin.Eq for Evil with equal(self, other) {\n" +
+  "  self.xs.clear()\n" +
+  "  other.xs.length() == 0\n" +
+  "}\n" +
+  "fn Evil::replace(self : Evil) -> Evil {\n" +
+  "  self\n" +
+  "}\n" +
+  "struct GenEq[T] { v : T }\n" +
+  "impl[T] Eq for GenEq[T] with equal(self, other) {\n" +
+  "  let _ = (self, other)\n" +
+  "  true\n" +
+  "}\n" +
+  "enum NodeKind { XElement; XText(String) } derive(Eq)\n" +
+  "fn eq_arr_slice(a : Array[Evil], b : Array[Evil]) -> Bool {\n" +
+  "  a.slice(0, 1) == b.slice(0, 1)\n" +
+  "}\n" +
+  "fn eq_user_replace(a : Evil, b : Evil) -> Bool {\n" +
+  "  a.replace() == b.replace()\n" +
+  "}\n" +
+  "fn eq_cross_pkg_enum() -> Bool {\n" +
+  "  dep::NodeKind::XElement == dep::NodeKind::XElement\n" +
+  "}\n" +
+  "fn eq_bracket_slice_evil(a : Array[Evil], b : Array[Evil]) -> Bool {\n" +
+  "  a[0:1] == b[0:1]\n" +
+  "}\n" +
+  "fn eq_bracket_slice_int(a : Array[Int], b : Array[Int]) -> Bool {\n" +
+  "  a[0:1] == b[0:1]\n" +
+  "}\n"
+  let neg_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_src)])
+  assert_true(neg_ms.custom_eq_types.contains("Evil"), "qualified `impl @builtin.Eq for Evil` must record custom_eq_types[Evil]")
+  assert_true(neg_ms.custom_eq_types.contains("GenEq"), "generic `impl[T] Eq for GenEq[T]` must record custom_eq_types[GenEq]")
+  match lookup_fn_mutation_summary(neg_ms, "eq_arr_slice") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "Array[Evil]::slice == must propagate Evil::equal mutation")
+    None => assert_true(false, "eq_arr_slice summary missing")
+  }
+  match lookup_fn_mutation_summary(neg_ms, "eq_user_replace") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "Evil::replace() == must propagate Evil::equal mutation")
+    None => assert_true(false, "eq_user_replace summary missing")
+  }
+  match lookup_fn_mutation_summary(neg_ms, "eq_cross_pkg_enum") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "cross-pkg dep::NodeKind::XElement == must fail-closed, not match local NodeKind")
+    None => assert_true(false, "eq_cross_pkg_enum summary missing")
+  }
+  match lookup_fn_mutation_summary(neg_ms, "eq_bracket_slice_evil") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "Array[Evil][0:1] == must not infer Evil as scalar and must propagate mutation")
+    None => assert_true(false, "eq_bracket_slice_evil summary missing")
+  }
+  match lookup_fn_mutation_summary(neg_ms, "eq_bracket_slice_int") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "Array[Int][0:1] == must not mis-infer slice as Int scalar")
+    None => assert_true(false, "eq_bracket_slice_int summary missing")
+  }
+}
+
+test "F6-3b: mutation_summary R3 soundness regressions (generic shadow, top-level physical_equal, Iter/MbtIter, custom Hash)" {
+  // 1. Generic param `K : Eq` shadowing local `enum K derive(Eq)` -> MUST fail-closed!
+  let gen_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "enum K { Plain } derive(Eq)\n" +
+  "fn[K : Eq] same_gen(a : K, b : K) -> Bool { a == b }\n"
+  let gen_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(gen_src)])
+  match lookup_fn_mutation_summary(gen_ms, "same_gen") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "generic param K shadowing enum K must NOT use pure_eq_types")
+    None => assert_true(false, "same_gen summary missing")
+  }
+
+  // 2. Top-level `let physical_equal = ...` and `extern "C" fn physical_equal` -> MUST fail-closed!
+  let pe_let_src =
+  "let physical_equal : (Array[Int], Array[Int]) -> Bool = fn(a, _b) { a.push(9); true }\n" +
+  "fn call_pe_let(a : Array[Int]) -> Bool { physical_equal(a, a) }\n"
+  let pe_let_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(pe_let_src)])
+  match lookup_fn_mutation_summary(pe_let_ms, "call_pe_let") {
+    Some(s) => assert_true(s.unknown, "top-level let physical_equal must fail-closed")
+    None => assert_true(false, "call_pe_let summary missing")
+  }
+  let pe_ext_src =
+  "extern \"C\" fn physical_equal(a : Array[Int], b : Array[Int]) -> Bool = \"c_pe\"\n" +
+  "fn call_pe_ext(a : Array[Int]) -> Bool { physical_equal(a, a) }\n"
+  let pe_ext_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(pe_ext_src)])
+  match lookup_fn_mutation_summary(pe_ext_ms, "call_pe_ext") {
+    Some(s) => assert_true(s.unknown, "top-level extern C fn physical_equal must fail-closed")
+    None => assert_true(false, "call_pe_ext summary missing")
+  }
+
+  // 3. User `struct Iter[T]`, param `it : Iter[T]` / `MbtIter[T]`, `mk(xs).each(...)`, lazy chain `xs.iter().map(...)` -> fail-closed!
+  let iter_src =
+  "struct Iter[T] { xs : Array[T] }\n" +
+  "fn[T] Iter::any(self : Iter[T], _cb : (T) -> Bool) -> Bool { self.xs.clear(); false }\n" +
+  "fn bad_user_iter(it : Iter[Int]) -> Bool { it.any(fn(x) { x > 0 }) }\n"
+  let iter_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(iter_src)])
+  match lookup_fn_mutation_summary(iter_ms, "bad_user_iter") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "user struct Iter::any must NOT be exempted as built-in pure HOF")
+    None => assert_true(false, "bad_user_iter summary missing")
+  }
+  let opaque_iter_src =
+  "fn mk(xs : Array[Int]) -> MbtIter[Int] { mbt_compat::arr_iter(xs) }\n" +
+  "fn bad_param_iter(it : Iter[Int]) -> Bool { it.any(fn(x) { x > 0 }) }\n" +
+  "fn bad_param_mbt_iter(it : MbtIter[Int]) -> Bool { it.any(fn(x) { x > 0 }) }\n" +
+  "fn bad_call_iter(xs : Array[Int]) -> Unit { mk(xs).each(fn(_x) { () }) }\n" +
+  "fn bad_lazy_chain(xs : Array[Int]) -> Bool {\n" +
+  "  let it = xs.iter().map(fn(x) { xs.clear(); x })\n" +
+  "  it.any(fn(x) { x > 0 })\n" +
+  "}\n" +
+  "fn bad_lazy_to_array(xs : Array[Int]) -> Array[Int] {\n" +
+  "  let it = xs.iter().map(fn(x) { xs.clear(); x })\n" +
+  "  it.to_array()\n" +
+  "}\n" +
+  "fn bad_ext_arr(a : dep::Array[Int]) -> Bool { a.any(fn(x) { x > 0 }) }\n" +
+  "fn ok_fresh_iter(xs : Array[Int]) -> Bool { xs.iter().any(fn(x) { x > 0 }) }\n" +
+  "fn ok_fresh_iter_to_array(xs : Array[Int]) -> Array[Int] { xs.iter().to_array() }\n"
+  let opaque_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(opaque_iter_src)])
+  for fn_nm in ["bad_param_iter", "bad_param_mbt_iter", "bad_call_iter", "bad_lazy_chain", "bad_lazy_to_array", "bad_ext_arr"] {
+    match lookup_fn_mutation_summary(opaque_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " opaque/adapted Iter/MbtIter or qualified external container MUST fail-closed")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+  for fn_nm in ["ok_fresh_iter", "ok_fresh_iter_to_array"] {
+    match lookup_fn_mutation_summary(opaque_ms, fn_nm) {
+      Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, fn_nm + " fresh built-in iter must still pass")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 4. Custom `impl Hash for CustomHashKey` mutating array vs pure `Map[String, Int]`
+  let hash_src =
+  "struct CustomHashKey { xs : Array[Int] }\n" +
+  "impl Hash for CustomHashKey with hash_combine(self, _h) { self.xs.clear() }\n" +
+  "fn bad_map_hash(m : Map[CustomHashKey, Int], k : CustomHashKey) -> Bool { m.contains(k) }\n" +
+  "fn ok_map_str(m : Map[String, Int], k : String) -> Bool { m.contains(k) }\n"
+  let hash_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(hash_src)])
+  match lookup_fn_mutation_summary(hash_ms, "bad_map_hash") {
+    Some(s) => assert_true(s.unknown, "Map[CustomHashKey, Int]::contains with custom impl Hash MUST fail-closed")
+    None => assert_true(false, "bad_map_hash summary missing")
+  }
+  match lookup_fn_mutation_summary(hash_ms, "ok_map_str") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "Map[String, Int]::contains must remain pure")
+    None => assert_true(false, "ok_map_str summary missing")
+  }
+}
+
+test "F6-3b: mutation_summary & ABI R5 soundness regressions (ext recv, scalar arith ==, Map UFCS, impl generics, empty_target_pkg)" {
+  // 1. Qualified external `@dep.Iter` / `dep::Iter` must NOT fall back to local pure `Iter::any`
+  let ext_recv_src =
+  "struct Iter { n : Int }\n" +
+  "fn Iter::any(self : Iter, _cb : (Int) -> Bool) -> Bool { self.n > 0 }\n" +
+  "fn bad_dot_ext(it : @dep.Iter) -> Bool { it.any(fn(x) { x > 0 }) }\n" +
+  "fn bad_cc_ext(it : dep::Iter) -> Bool { it.any(fn(x) { x > 0 }) }\n"
+  let ext_recv_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_recv_src)])
+  for fn_nm in ["bad_dot_ext", "bad_cc_ext"] {
+    match lookup_fn_mutation_summary(ext_recv_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " qualified external receiver must fail-closed, not match local Iter::any")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 2. Pure scalar arithmetic adjacent to `==`/`!=` must remain pure even with unrelated `impl Add` + mutating `impl Eq`
+  let scalar_eq_src =
+  "struct Vec2 { x : Int }\n" +
+  "impl Add for Vec2 with add(self, other) { Vec2::{ x: self.x + other.x } }\n" +
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "fn ok_lhs_arith(x : Int) -> Bool { x + 1 == 5 }\n" +
+  "fn ok_rhs_arith(x : Int) -> Bool { 5 != x + 1 }\n"
+  let scalar_eq_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(scalar_eq_src)])
+  for fn_nm in ["ok_lhs_arith", "ok_rhs_arith"] {
+    match lookup_fn_mutation_summary(scalar_eq_ms, fn_nm) {
+      Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, fn_nm + " pure scalar arithmetic with ==/!= must remain pure")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 3. `Map::set(m, k, 1)` and `Map::from_array([(k, 1)])` with custom `impl Hash` must fail-closed
+  let map_ufcs_src =
+  "struct CustomHashKey { xs : Array[Int] }\n" +
+  "impl Hash for CustomHashKey with hash_combine(self, _h) { self.xs.clear() }\n" +
+  "fn bad_map_set(m : Map[CustomHashKey, Int], k : CustomHashKey) -> Unit { Map::set(m, k, 1) }\n" +
+  "fn bad_map_from_array(k : CustomHashKey) -> Map[CustomHashKey, Int] { Map::from_array([(k, 1)]) }\n"
+  let map_ufcs_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(map_ufcs_src)])
+  for fn_nm in ["bad_map_set", "bad_map_from_array"] {
+    match lookup_fn_mutation_summary(map_ufcs_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " with custom impl Hash must fail-closed")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 4. `impl[K : Eq] ... with matches(...)` with same-named local `enum K derive(Eq)` must fail-closed
+  let impl_gen_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "enum K { Plain } derive(Eq)\n" +
+  "struct Box[T] { v : T }\n" +
+  "trait Matcher { matches(Self, Self) -> Bool }\n" +
+  "impl[K : Eq] Matcher for Box[K] with matches(self : Box[K], other : Box[K]) -> Bool { self.v == other.v }\n"
+  let impl_gen_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(impl_gen_src)])
+  match lookup_fn_mutation_summary(impl_gen_ms, "Box::matches") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "impl[K : Eq] method must propagate K into fn_generics and fail-closed on K == K")
+    None => assert_true(false, "Box::matches summary missing")
+  }
+
+  // 5 & 6. Empty target pkg with `ffi_shim_prefix: "review_"` passes; forged code in placeholder `lib.pion` fails closed
+  let empty_check = fn(_fs : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let pref_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(targets: { \"wasm_helper.mbt\": [\"wasm\"] })",
+    ffi_shim_prefix: "review_",
+    header: default_header_meta("native"),
+  }
+  let pref_res = transpile_package(
+    [SourceFile::{ rel_path: "wasm_helper.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    pref_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(pref_res.blockers == 0 && pref_res.abi.empty_target_pkg && pref_res.abi.ffi_shim_prefix == "", "empty target pkg with ffi_shim_prefix must clear exported ffi_shim_prefix")
+  let pref_pairs : Array[(String, String)] = [(pref_res.files[0].rel_path, pref_res.files[0].content)]
+  let pref_abi_json = render_abi_json(pref_res.abi, pref_pairs)
+  let vdiags_pref : Array[Diag] = []
+  let parsed_pref = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", pref_pairs, Some(pref_abi_json), "native", vdiags_pref)
+  assert_true(parsed_pref is Some(_) && vdiags_pref.length() == 0, "empty target pkg published with ffi_shim_prefix must verify cleanly")
+
+  let forged_code_content = pref_res.files[0].content + "pub fn visible() -> Int { 1 }\n"
+  let forged_code_pairs : Array[(String, String)] = [("lib.pion", forged_code_content)]
+  let forged_code_abi = render_abi_json(pref_res.abi, forged_code_pairs)
+  let vdiags_code : Array[Diag] = []
+  let parsed_code = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", forged_code_pairs, Some(forged_code_abi), "native", vdiags_code)
+  assert_true(parsed_code is None && vdiags_code.length() > 0 && vdiags_code[0].code == "MBT2PION_DEP_ABI_ERROR", "empty target pkg lib.pion with non-comment code must fail closed")
+}
+
+test "F6-3b: mutation_summary R6 soundness regressions (ext static call, local OrderedSet::new, pure scalar Map ctor)" {
+  // 1. Cross-package static call `@dep.Iter::any(it, cb)` / `dep::Iter::any(...)` must NOT match local pure `Iter::any`
+  let ext_static_src =
+  "struct Iter { n : Int }\n" +
+  "fn Iter::any(self : Iter, _cb : (Int) -> Bool) -> Bool { self.n > 0 }\n" +
+  "fn bad_ext_static_dot(it : @dep.Iter) -> Bool { @dep.Iter::any(it, fn(x) { x > 0 }) }\n" +
+  "fn bad_ext_static_cc(it : dep::Iter) -> Bool { dep::Iter::any(it, fn(x) { x > 0 }) }\n"
+  let ext_static_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_static_src)])
+  for fn_nm in ["bad_ext_static_dot", "bad_ext_static_cc"] {
+    match lookup_fn_mutation_summary(ext_static_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " cross-package static call must fail-closed, not match local Iter::any")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 2. Local `struct OrderedSet` + `fn OrderedSet::new(xs : Array[Int])` mutating `xs` must NOT be exempted
+  let local_os_src =
+  "struct OrderedSet { tag : Int }\n" +
+  "fn OrderedSet::new(xs : Array[Int]) -> OrderedSet { xs.push(9); OrderedSet::{ tag: 1 } }\n" +
+  "fn call_local_os(xs : Array[Int]) -> OrderedSet { OrderedSet::new(xs) }\n"
+  let local_os_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(local_os_src)])
+  match lookup_fn_mutation_summary(local_os_ms, "call_local_os") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "local OrderedSet::new must propagate Array[Int] mutation")
+    None => assert_true(false, "call_local_os summary missing")
+  }
+
+  // 3. Pure scalar keys in `Map::from_array` / `mbt_compat::ordered_map_from_array` stay pure even with custom `impl Hash`/`impl Eq`; custom key stays fail-closed
+  let map_ctor_src =
+  "struct CustomHashKey { xs : Array[Int] }\n" +
+  "impl Hash for CustomHashKey with hash_combine(self, _h) { self.xs.clear() }\n" +
+  "impl Eq for CustomHashKey with equal(self, _o) { self.xs.clear(); false }\n" +
+  "fn ok_map_int(x : Int) -> Map[Int, Int] { Map::from_array([(x, 1)]) }\n" +
+  "fn ok_map_lit(x : Int) -> OrderedMap[String, Int] { mbt_compat::ordered_map_from_array([(\"a\", x)]) }\n" +
+  "fn bad_map_custom(k : CustomHashKey) -> Map[CustomHashKey, Int] { Map::from_array([(k, 1)]) }\n"
+  let map_ctor_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(map_ctor_src)])
+  for fn_nm in ["ok_map_int", "ok_map_lit"] {
+    match lookup_fn_mutation_summary(map_ctor_ms, fn_nm) {
+      Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, fn_nm + " pure scalar map constructor must remain pure")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+  match lookup_fn_mutation_summary(map_ctor_ms, "bad_map_custom") {
+    Some(s) => assert_true(s.unknown, "Map::from_array with CustomHashKey must remain fail-closed")
+    None => assert_true(false, "bad_map_custom summary missing")
+  }
+
+  // 4. R7: `@builtin.Iter::any`, trait/generic shadowing `OrderedSet`, and `using @dep { type OrderedSet }` must all fail-closed
+  let r7_builtin_src =
+  "struct Iter { n : Int }\n" +
+  "fn Iter::any(self : Iter, _cb : (Int) -> Bool) -> Bool { self.n > 0 }\n" +
+  "fn bad_builtin_prefix(it : @builtin.Iter) -> Bool { @builtin.Iter::any(it, fn(x) { x > 0 }) }\n"
+  let r7_builtin_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r7_builtin_src)])
+  match lookup_fn_mutation_summary(r7_builtin_ms, "bad_builtin_prefix") {
+    Some(s) => assert_true(s.unknown, "@builtin.Iter::any must NOT be exempted by short prefix name")
+    None => assert_true(false, "bad_builtin_prefix summary missing")
+  }
+
+  let r7_trait_gen_src =
+  "trait OrderedSet { new(Array[Int]) -> Self }\n" +
+  "fn bad_trait_os(xs : Array[Int]) -> Unit { let _ = OrderedSet::new(xs) }\n" +
+  "trait Maker { new(Array[Int]) -> Self }\n" +
+  "fn[OrderedSet : Maker] bad_gen_os(xs : Array[Int]) -> OrderedSet { OrderedSet::new(xs) }\n"
+  let r7_trait_gen_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r7_trait_gen_src)])
+  for fn_nm in ["bad_trait_os", "bad_gen_os"] {
+    match lookup_fn_mutation_summary(r7_trait_gen_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown && summary_may_mutate_array(s, "Int"), fn_nm + " shadowed by trait/generic must fail-closed")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  let r7_using_src =
+  "using @dep { type OrderedSet }\n" +
+  "fn bad_using_os(xs : Array[Int]) -> OrderedSet { OrderedSet::new(xs) }\n"
+  let r7_using_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r7_using_src)])
+  match lookup_fn_mutation_summary(r7_using_ms, "bad_using_os") {
+    Some(s) => assert_true(s.unknown, "using @dep { type OrderedSet } must exclude OrderedSet from built-in static exemption")
+    None => assert_true(false, "bad_using_os summary missing")
+  }
+
+  // 5. R8: generic `fn[OrderedSet : Maker]` shadowing local concrete `OrderedSet::new`, local `OrderedSet::clear`, and `using @dep { type Handle }` vs `Other::bump`
+  let r8_gen_shadow_src =
+  "struct OrderedSet { tag : Int }\n" +
+  "fn OrderedSet::new(_xs : Array[Int]) -> OrderedSet { OrderedSet::{ tag: 1 } }\n" +
+  "trait Maker { new(Array[Int]) -> Self }\n" +
+  "fn[OrderedSet : Maker] touch_gen_shadow(xs : Array[Int]) -> Unit { let _ = OrderedSet::new(xs) }\n"
+  let r8_gen_shadow_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r8_gen_shadow_src)])
+  match lookup_fn_mutation_summary(r8_gen_shadow_ms, "touch_gen_shadow") {
+    Some(s) => assert_true(s.unknown, "generic param OrderedSet must fail-closed before pkg.fn_keys lookup of concrete OrderedSet::new")
+    None => assert_true(false, "touch_gen_shadow summary missing")
+  }
+
+  let r8_clear_src =
+  "struct OrderedSet { xs : Array[Int] }\n" +
+  "fn OrderedSet::clear(self : OrderedSet) -> Unit { self.xs.push(9) }\n" +
+  "fn call_clear(b : OrderedSet) -> Unit { b.clear() }\n"
+  let r8_clear_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r8_clear_src)])
+  match lookup_fn_mutation_summary(r8_clear_ms, "call_clear") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "local OrderedSet::clear must propagate Array[Int] mutation via ms_resolve_method_call")
+    None => assert_true(false, "call_clear summary missing")
+  }
+
+  let r8_using_handle_src =
+  "using @dep { type Handle }\n" +
+  "struct Other { n : Int }\n" +
+  "fn Other::bump(self : Other) -> Unit { let _ = self.n }\n" +
+  "fn touch_handle(h : Handle) -> Unit { h.bump() }\n"
+  let r8_using_handle_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r8_using_handle_src)])
+  match lookup_fn_mutation_summary(r8_using_handle_ms, "touch_handle") {
+    Some(s) => assert_true(s.unknown, "using @dep { type Handle } must NOT fall back to local Other::bump via method_overloads")
+    None => assert_true(false, "touch_handle summary missing")
+  }
+
+  // 6. R9: pipe `xs |> OrderedSet::new` under generic `fn[OrderedSet : Maker]` shadowing local pure `OrderedSet::new`
+  let r9_pipe_src =
+  "struct OrderedSet { tag : Int }\n" +
+  "fn OrderedSet::new(_xs : Array[Int]) -> OrderedSet { OrderedSet::{ tag: 1 } }\n" +
+  "trait Maker { new(Array[Int]) -> Self }\n" +
+  "struct Node { n : Int }\n" +
+  "impl Maker for Node with new(xs) { xs.push(9); Node::{ n: 1 } }\n" +
+  "fn[OrderedSet : Maker] touch_pipe(xs : Array[Int], _v : OrderedSet) -> Unit {\n" +
+  "  let _ : OrderedSet = xs |> OrderedSet::new\n" +
+  "}\n" +
+  "pub fn run_pipe(xs : Array[Int]) -> Int? {\n" +
+  "  let _ = OrderedSet::new([])\n" +
+  "  xs.search_by(fn(x) { touch_pipe(xs, Node::{ n: 0 }); x == 1 })\n" +
+  "}\n"
+  let r9_pipe_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(r9_pipe_src)])
+  match lookup_fn_mutation_summary(r9_pipe_ms, "touch_pipe") {
+    Some(s) => assert_true(s.unknown && summary_may_mutate_array(s, "Int"), "pipe xs |> OrderedSet::new under generic OrderedSet must fail-closed")
+    None => assert_true(false, "touch_pipe summary missing")
+  }
+  let r9_pub_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let r9_check = fn(batch : Array[(String, String)]) -> String {
+    if batch.length() > 0 && str_has(batch[0].1, ".search_by(") {
+      let mut sb_line = 1
+      let mut sb_col = 1
+      let mut cur_line = 1
+      for ln in batch[0].1.split("\n") {
+        let idx = ln.index_of(".search_by(")
+        if idx >= 0 {
+          sb_line = cur_line
+          sb_col = idx + 2
+          break
+        }
+        cur_line = cur_line + 1
+      }
+      "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"severity\":\"error\",\"file\":\"" +
+      batch[0].0 + "\",\"line\":" + sb_line.to_string() + ",\"col\":" + sb_col.to_string() +
+      ",\"message\":\"unknown method `search_by` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let r9_res = transpile_package(
+    [SourceFile::{ rel_path: "lib.mbt", content: r9_pipe_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    r9_pub_opts,
+    [],
+    true,
+    r9_check,
+  )
+  let mut has_r9_iter_mut = false
+  let diag_dbg = StringBuilder()
+  for d in r9_res.diagnostics {
+    diag_dbg.write_string(d.code + ":" + d.message + " | ")
+    if d.code == "MBT2PION_ARRAY_ITER_MUTATION" ||
+    (d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "Array::search_by")) {
+      has_r9_iter_mut = true
+    }
+  }
+  assert_true(r9_res.blockers > 0 && has_r9_iter_mut, "publish mode must reject xs.search_by calling generic pipe touch_pipe; blockers=" + r9_res.blockers.to_string() + " diags=" + diag_dbg.to_string())
+}
