@@ -264,7 +264,8 @@ fn rewrite_tuple_mapkey_call_at(ln : String, col : Int, msg : String) -> Option[
   }
   let f = r2.slice(0, re)
   if !(f == "ordered_map_new" || f == "ordered_map_from_array" || f == "ordered_map_new_cap" ||
-    f == "ordered_map_from_array_cap") {
+    f == "ordered_map_from_array_cap" || f == "ordered_set_new" || f == "ordered_set_from_array" ||
+    f == "ordered_set_from_iter") {
     return None
   }
   let needle = "mbt_compat::" + f + "("
@@ -721,6 +722,1660 @@ fn build_method_rewrite_index(src : String, tokens : Array[Token], num_lines : I
   MethodRewriteIndex::{ src, tokens, line_starts, line_first_tok }
 }
 
+///| Scan a `TokenKind::InterpString` token text (`"..."`) and return byte ranges `(expr_start, expr_end)`
+///| relative to `tok_text` for each top-level `\{ ... }` interpolation expression.
+///| Handles nested `{...}`, nested string literals `"..."` (with `\"`, `\\`, and nested `\{...}`),
+///| char literals `'...'`, and `//` comments.
+fn find_interp_expr_spans(tok_text : String) -> Array[(Int, Int)] {
+  let out : Array[(Int, Int)] = []
+  let n = tok_text.length()
+  if n < 2 || tok_text.code_unit_at(0) != 34 {
+    return out
+  }
+  let mut i = 1
+  while i < n - 1 {
+    let ch = tok_text.code_unit_at(i)
+    if ch == 92 {
+      if i + 1 < n - 1 && tok_text.code_unit_at(i + 1) == 123 {
+        let expr_start = i + 2
+        let mut j = expr_start
+        // Track nested string/interp stack: 0 = code brace depth, 1 = inside nested string
+        let str_depths : Array[Int] = []
+        let mut brace_depth = 1
+        let mut in_str = false
+        let mut in_chr = false
+        let mut esc = false
+        while j < n - 1 && brace_depth > 0 {
+          let c = tok_text.code_unit_at(j)
+          if in_str {
+            if esc {
+              esc = false
+              j = j + 1
+            } else if c == 92 {
+              if j + 1 < n - 1 && tok_text.code_unit_at(j + 1) == 123 {
+                // Nested interpolation `\{` inside nested string literal
+                str_depths.push(brace_depth)
+                in_str = false
+                brace_depth = brace_depth + 1
+                j = j + 2
+              } else {
+                esc = true
+                j = j + 1
+              }
+            } else if c == 34 {
+              in_str = false
+              j = j + 1
+            } else {
+              j = j + 1
+            }
+          } else if in_chr {
+            if esc {
+              esc = false
+            } else if c == 92 {
+              esc = true
+            } else if c == 39 {
+              in_chr = false
+            }
+            j = j + 1
+          } else if c == 47 && j + 1 < n - 1 && tok_text.code_unit_at(j + 1) == 47 {
+            j = j + 2
+            while j < n - 1 && tok_text.code_unit_at(j) != 10 {
+              j = j + 1
+            }
+          } else if c == 34 {
+            in_str = true
+            esc = false
+            j = j + 1
+          } else if c == 39 {
+            in_chr = true
+            esc = false
+            j = j + 1
+          } else if c == 123 {
+            brace_depth = brace_depth + 1
+            j = j + 1
+          } else if c == 125 {
+            brace_depth = brace_depth - 1
+            if brace_depth > 0 && str_depths.length() > 0 && str_depths[str_depths.length() - 1] == brace_depth {
+              let _ = str_depths.pop()
+              in_str = true
+              esc = false
+            }
+            if brace_depth == 0 {
+              break
+            }
+            j = j + 1
+          } else {
+            j = j + 1
+          }
+        }
+        if brace_depth == 0 {
+          out.push((expr_start, j))
+          i = j + 1
+        } else {
+          break
+        }
+      } else {
+        i = i + 2
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  out
+}
+
+///| Convert a byte offset in `idx.src` to `(0-based line_idx, 1-based col)`.
+fn line_starts_to_line_col(line_starts : Array[Int], byte_off : Int) -> (Int, Int) {
+  let n = line_starts.length()
+  if n == 0 {
+    return (0, 1)
+  }
+  let mut lo = 0
+  let mut hi = n - 1
+  while lo < hi {
+    let mid = (lo + hi + 1) / 2
+    if line_starts[mid] <= byte_off {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  (lo, byte_off - line_starts[lo] + 1)
+}
+
+///| Find the `TokenKind::InterpString` token covering byte offset `target_b` on line `lidx`
+///| in O(1) amortized time using `idx.line_first_tok` (never scans from token 0).
+fn find_covering_interp_token(idx : MethodRewriteIndex, lidx : Int, target_b : Int) -> Int {
+  let tokens = idx.tokens
+  let n_tok = tokens.length()
+  if lidx < 0 || lidx >= idx.line_first_tok.length() {
+    return -1
+  }
+  let mut ti = idx.line_first_tok[lidx]
+  if ti < 0 {
+    // Line is inside a multiline token starting on an earlier line; walk back to nearest prior line with a token.
+    let mut pl = lidx - 1
+    while pl >= 0 && idx.line_first_tok[pl] < 0 {
+      pl = pl - 1
+    }
+    if pl < 0 {
+      return -1
+    }
+    ti = idx.line_first_tok[pl]
+  } else if ti > 0 && tokens[ti - 1].kind == TokenKind::InterpString &&
+  tokens[ti - 1].start_byte <= target_b && target_b < tokens[ti - 1].end_byte {
+    return ti - 1
+  }
+  while ti < n_tok {
+    let tk = tokens[ti]
+    if tk.start_byte > target_b {
+      break
+    }
+    if tk.kind == TokenKind::InterpString && tk.start_byte <= target_b && target_b < tk.end_byte {
+      return ti
+    }
+    ti = ti + 1
+  }
+  -1
+}
+
+///| Compute a single interpolation-hole byte edit `(abs_s, abs_e, new_sub)` for a missing method call
+///| inside `tokens[interp_ti]` without mutating `lines` (enables same-round batching of disjoint holes).
+fn compute_interp_hole_edit(
+  idx : MethodRewriteIndex,
+  lines : Array[String],
+  lidx : Int,
+  col : Int,
+  interp_ti : Int,
+  method_name : String,
+  helper : String,
+) -> Option[(Int, Int, String)] {
+  if lidx < 0 || lidx >= lines.length() || lidx >= idx.line_starts.length() ||
+  interp_ti < 0 || interp_ti >= idx.tokens.length() {
+    return None
+  }
+  let src = idx.src
+  let line_start_b = idx.line_starts[lidx]
+  let line_end_b = if lidx + 1 < idx.line_starts.length() {
+    idx.line_starts[lidx + 1] - 1
+  } else {
+    src.length()
+  }
+  let raw_target_b = line_start_b + (if col > 0 { col - 1 } else { 0 })
+  let target_b = if raw_target_b > line_end_b { line_end_b } else { raw_target_b }
+  let itok = idx.tokens[interp_ti]
+  if itok.kind != TokenKind::InterpString || target_b < itok.start_byte || target_b >= itok.end_byte {
+    return None
+  }
+  let tok_text = src.slice(itok.start_byte, itok.end_byte)
+  let spans = find_interp_expr_spans(tok_text)
+  if spans.length() == 0 {
+    return None
+  }
+  let rel_target = target_b - itok.start_byte
+  let mut chosen_s = -1
+  let mut chosen_e = -1
+  for sp in spans {
+    let (es, ee) = sp
+    if es <= rel_target && rel_target <= ee {
+      chosen_s = es
+      chosen_e = ee
+      break
+    }
+  }
+  if chosen_s < 0 || chosen_e <= chosen_s {
+    return None
+  }
+  let abs_s = itok.start_byte + chosen_s
+  let abs_e = itok.start_byte + chosen_e
+  let (sub_base_line, sub_base_col) = line_starts_to_line_col(idx.line_starts, abs_s)
+  let (sub_last_line, _sub_last_col) = line_starts_to_line_col(idx.line_starts, abs_e)
+  if sub_base_line < 0 || sub_last_line >= lines.length() || lidx < sub_base_line || lidx > sub_last_line {
+    return None
+  }
+  let sub_src = src.slice(abs_s, abs_e)
+  let sub_lines = sub_src.split("\n")
+  let sub_toks = lex_moonbit(sub_src)
+  let sub_idx = build_method_rewrite_index(sub_src, sub_toks, sub_lines.length())
+  let sub_mut : Map[Int, Bool] = Map()
+  let sub_lidx = lidx - sub_base_line
+  let sub_col = if sub_lidx == 0 {
+    let c = col - sub_base_col + 1
+    if c > 0 { c } else { 1 }
+  } else {
+    col
+  }
+  let (rw_s, _rw_e) = rewrite_method_call_with_index(sub_idx, sub_lines, sub_mut, sub_lidx, sub_col, method_name, helper)
+  if rw_s < 0 {
+    return None
+  }
+  let new_sub = sub_lines.join("\n")
+  if new_sub == sub_src {
+    return None
+  }
+  // Shrink to the minimal changed byte span so multiple disjoint calls inside ONE interpolation
+  // hole (e.g. `\{x.escape() + x.escape() + ...}`) batch cleanly in a single Stage B round.
+  let min_len = if sub_src.length() < new_sub.length() { sub_src.length() } else { new_sub.length() }
+  let mut pfx = 0
+  while pfx < min_len && sub_src.code_unit_at(pfx) == new_sub.code_unit_at(pfx) {
+    pfx = pfx + 1
+  }
+  let mut sfx = 0
+  while pfx + sfx < min_len &&
+  sub_src.code_unit_at(sub_src.length() - 1 - sfx) == new_sub.code_unit_at(new_sub.length() - 1 - sfx) {
+    sfx = sfx + 1
+  }
+  Some((abs_s + pfx, abs_e - sfx, new_sub.slice(pfx, new_sub.length() - sfx)))
+}
+
+///| Rewrite a missing method call inside a known `TokenKind::InterpString` token `interp_ti`.
+fn rewrite_method_call_in_interp_string_tok(
+  idx : MethodRewriteIndex,
+  lines : Array[String],
+  mutated_lines : Map[Int, Bool],
+  lidx : Int,
+  col : Int,
+  interp_ti : Int,
+  method_name : String,
+  helper : String,
+) -> (Int, Int) {
+  match compute_interp_hole_edit(idx, lines, lidx, col, interp_ti, method_name, helper) {
+    None => (-1, -1)
+    Some((abs_s, abs_e, new_sub)) => {
+      let (sub_base_line, _sub_base_col) = line_starts_to_line_col(idx.line_starts, abs_s)
+      let (sub_last_line, _sub_last_col) = line_starts_to_line_col(idx.line_starts, abs_e)
+      let mut chk_l = sub_base_line
+      while chk_l <= sub_last_line {
+        if mutated_lines.contains(chk_l) {
+          return (-1, -1)
+        }
+        chk_l = chk_l + 1
+      }
+      let src = idx.src
+      let first_line_start_b = idx.line_starts[sub_base_line]
+      let last_line_end_b = if sub_last_line + 1 < idx.line_starts.length() {
+        idx.line_starts[sub_last_line + 1] - 1
+      } else {
+        src.length()
+      }
+      let prefix = src.slice(first_line_start_b, abs_s)
+      let suffix = src.slice(abs_e, last_line_end_b)
+      let replacement = prefix + new_sub + suffix
+      let rep_lines = replacement.split("\n")
+      let orig_span = sub_last_line - sub_base_line + 1
+      let mut cl = sub_base_line
+      while cl <= sub_last_line {
+        lines[cl] = ""
+        cl = cl + 1
+      }
+      if rep_lines.length() <= orig_span {
+        let mut ri = 0
+        while ri < rep_lines.length() {
+          lines[sub_base_line + ri] = rep_lines[ri]
+          ri = ri + 1
+        }
+      } else {
+        lines[sub_base_line] = replacement
+      }
+      mark_mutated_span(mutated_lines, sub_base_line, sub_last_line)
+      (sub_base_line, sub_last_line)
+    }
+  }
+}
+
+///| Find enclosing top-level `fn` header start and body token range `(fn_kw_ti, body_s, body_e)` containing `pos_ti`,
+///| or `(-1, -1, -1)`.
+fn find_enclosing_top_fn_header_and_body(tokens : Array[Token], pos_ti : Int) -> (Int, Int, Int) {
+  let n = tokens.length() - 1
+  let mut i = 0
+  let mut depth = 0
+  let mut last_top_fn = -1
+  while i < n {
+    let tk = tokens[i]
+    if depth == 0 && tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+      last_top_fn = i
+    }
+    if tk.kind == TokenKind::LBrace {
+      if depth == 0 {
+        let rb = find_matching_delim(tokens, i)
+        if rb > i && pos_ti > i && pos_ti < rb {
+          return (last_top_fn, i + 1, rb)
+        }
+        if rb > i {
+          last_top_fn = -1
+          i = rb + 1
+          continue
+        }
+      }
+      depth = depth + 1
+    } else if tk.kind == TokenKind::RBrace {
+      if depth > 0 { depth = depth - 1 }
+    }
+    i = i + 1
+  }
+  (-1, -1, -1)
+}
+
+///| True iff `tokens[s_in ..= e_in]` (stripping balanced outer parens) is a directly constructed fresh array:
+///| bare `[...]` literal, or direct call to `Array::new`/`Array::make`/`Array::makei` or
+///| `mbt_compat::arr_make`/`mbt_compat::arr_makei`. Never allows arbitrary user calls like `pass(xs)`.
+fn is_fresh_array_expr(tokens : Array[Token], s_in : Int, e_in : Int) -> Bool {
+  let mut s = s_in
+  let mut e = e_in
+  while s < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e {
+    s = s + 1
+    e = e - 1
+  }
+  if s > e {
+    return false
+  }
+  if tokens[s].kind == TokenKind::LBracket && find_matching_delim(tokens, s) == e {
+    return true
+  }
+  if s + 3 <= e && tokens[e].kind == TokenKind::RParen && tokens[s + 1].kind == TokenKind::ColonColon {
+    let is_std_arr = tokens[s].kind == TokenKind::UpperIdent && tokens[s].raw == "Array" &&
+    (tokens[s + 2].raw == "new" || tokens[s + 2].raw == "make" || tokens[s + 2].raw == "makei")
+    let is_compat_arr = tokens[s].kind == TokenKind::Ident && tokens[s].raw == "mbt_compat" &&
+    (tokens[s + 2].raw == "arr_make" || tokens[s + 2].raw == "arr_makei")
+    if is_std_arr || is_compat_arr {
+      let mut lp = s + 3
+      if lp < e && tokens[lp].kind == TokenKind::LBracket {
+        let rb = find_matching_delim(tokens, lp)
+        if rb > lp && rb < e {
+          lp = rb + 1
+        }
+      }
+      if lp < e && tokens[lp].kind == TokenKind::LParen && find_matching_delim(tokens, lp) == e {
+        return true
+      }
+    }
+  }
+  false
+}
+
+///| Strict read-only / view-returning `Array` methods that cannot structurally mutate or alias `self` as `Array[T]`.
+fn is_array_view_safe_read_method(name : String) -> Bool {
+  name == "length" || name == "is_empty" || name == "get" || name == "first" ||
+  name == "last" || name == "contains" || name == "as_view" || name == "view"
+}
+
+///| Mathematically sound fresh-non-escaping local/rvalue allowlist for implicit `Array[T]` -> `mbt_compat::arr_view(<expr>)`:
+///| 1. Direct fresh array rvalue: `[...]` or `Array::{new,make,makei}(...)` / `mbt_compat::arr_make{,i}(...)`.
+///| 2. Local immutable `let xs` (not `let mut`, not param/global/field) in the enclosing top-level `fn` where:
+///|    (a) `xs` is declared once with a fresh array initializer (no external `Array[T]` alias possible);
+///|    (b) every occurrence of `xs` in the function body is outside any closure/nested `fn` and outside `InterpString`;
+///|    (c) every non-declaration use of `xs` is strictly one of: the target argument token itself,
+///|        `mbt_compat::arr_view(xs)`, indexing `xs[...]`, a read-only method in `is_array_view_safe_read_method`,
+///|        or `for ... in xs`. Any aliasing (`let ys = xs`), escape (`pass(xs)`, `read_after(xs, xs)`, `return xs`),
+///|        closure capture, or structural mutation (`push`/`pop`/...) is rejected fail-closed.
+fn array_view_arg_is_safe(
+  tokens : Array[Token],
+  lp_ti : Int,
+  _rp_ti : Int,
+  val_s_ti : Int,
+  ae_ti : Int,
+) -> Bool {
+  let mut s = val_s_ti
+  let mut e = ae_ti
+  while s < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e {
+    s = s + 1
+    e = e - 1
+  }
+  if s > e {
+    return false
+  }
+  // 1. Direct fresh rvalue expression
+  if is_fresh_array_expr(tokens, s, e) {
+    return true
+  }
+  // 2. Local immutable `let` identifier with fresh initializer, zero aliasing/escaping, zero structural mutation
+  if !(s == e && tokens[s].kind == TokenKind::Ident) {
+    return false
+  }
+  let var_name = tokens[s].raw
+  let (fn_kw_ti, fn_s, fn_e) = find_enclosing_top_fn_header_and_body(tokens, lp_ti)
+  if fn_kw_ti < 0 || fn_s < 0 || fn_e <= fn_s {
+    return false
+  }
+  // Reject if `var_name` is a function parameter
+  let mut hi = fn_kw_ti + 1
+  while hi < fn_s - 1 {
+    if tokens[hi].kind == TokenKind::Ident && tokens[hi].raw == var_name &&
+    hi + 1 < fn_s - 1 && (tokens[hi + 1].kind == TokenKind::Colon || tokens[hi + 1].kind == TokenKind::Tilde) {
+      return false
+    }
+    hi = hi + 1
+  }
+  // Single pass over enclosing fn body: locate unique `let xs = <fresh>` and validate every use of `xs`
+  let mut decl_name_ti = -1
+  let mut decl_depth = -1
+  let mut decl_in_scope = false
+  let mut brace_depth = 0
+  let mut in_closure_until = -1
+  let mut bi = fn_s
+  while bi < fn_e {
+    let tk = tokens[bi]
+    if tk.kind == TokenKind::LBrace {
+      brace_depth = brace_depth + 1
+    } else if tk.kind == TokenKind::RBrace {
+      if brace_depth > 0 { brace_depth = brace_depth - 1 }
+      if decl_name_ti >= 0 && bi < s && brace_depth < decl_depth {
+        decl_in_scope = false
+      }
+    }
+    // Track closure / nested fn bodies
+    if tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+      let mut ci = bi + 1
+      let mut cd = 0
+      while ci < fn_e {
+        let ck = tokens[ci].kind
+        if ck == TokenKind::LParen || ck == TokenKind::LBracket { cd = cd + 1 }
+        else if ck == TokenKind::RParen || ck == TokenKind::RBracket { if cd > 0 { cd = cd - 1 } }
+        else if cd == 0 && ck == TokenKind::LBrace {
+          let crb = find_matching_delim(tokens, ci)
+          if crb > in_closure_until {
+            in_closure_until = crb
+          }
+          break
+        }
+        ci = ci + 1
+      }
+    }
+    // Reject if `var_name` appears inside any interpolation string in the function
+    if (tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline) &&
+    type_mentions_ident(tk.raw, var_name) {
+      return false
+    }
+    if tk.kind == TokenKind::Ident && tk.raw == var_name {
+      // Skip field access `.xs` and qualified path `::xs`
+      if bi > fn_s && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon) {
+        bi = bi + 1
+        continue
+      }
+      // Skip named argument label `xs=...` inside a call
+      if bi > fn_s && bi + 1 < fn_e && tokens[bi + 1].kind == TokenKind::Eq &&
+      (tokens[bi - 1].kind == TokenKind::LParen || tokens[bi - 1].kind == TokenKind::Comma) {
+        bi = bi + 1
+        continue
+      }
+      // Check if this is a `let [mut] xs` declaration
+      let is_let_mut = bi >= fn_s + 2 && tokens[bi - 1].kind == TokenKind::Keyword && tokens[bi - 1].raw == "mut" &&
+      tokens[bi - 2].kind == TokenKind::Keyword && tokens[bi - 2].raw == "let"
+      let is_let_immut = bi >= fn_s + 1 && tokens[bi - 1].kind == TokenKind::Keyword && tokens[bi - 1].raw == "let"
+      if is_let_mut {
+        return false
+      }
+      if is_let_immut {
+        if decl_name_ti >= 0 || bi <= in_closure_until || bi >= s {
+          return false
+        }
+        // Scan optional `: <Type>` to `=`
+        let mut eq_ti = bi + 1
+        let mut td = 0
+        while eq_ti < fn_e {
+          let ek = tokens[eq_ti].kind
+          if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { td = td + 1 }
+          else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if td > 0 { td = td - 1 } }
+          else if td == 0 && ek == TokenKind::Eq { break }
+          else if td == 0 && (ek == TokenKind::Semi || (eq_ti > bi + 1 && tokens[eq_ti].newline_before)) {
+            return false
+          }
+          eq_ti = eq_ti + 1
+        }
+        if eq_ti >= fn_e || tokens[eq_ti].kind != TokenKind::Eq || eq_ti + 1 >= fn_e {
+          return false
+        }
+        let init_s = eq_ti + 1
+        let mut init_e = init_s
+        let mut id = 0
+        let mut ii = init_s
+        while ii < fn_e {
+          let ik = tokens[ii].kind
+          if id == 0 && ii > init_s && (tokens[ii].newline_before || ik == TokenKind::Semi || ik == TokenKind::RBrace) {
+            break
+          }
+          if ik == TokenKind::LParen || ik == TokenKind::LBracket || ik == TokenKind::LBrace { id = id + 1 }
+          else if ik == TokenKind::RParen || ik == TokenKind::RBracket || ik == TokenKind::RBrace {
+            if id == 0 { break }
+            id = id - 1
+          }
+          init_e = ii
+          ii = ii + 1
+        }
+        if id != 0 || !is_fresh_array_expr(tokens, init_s, init_e) {
+          return false
+        }
+        decl_name_ti = bi
+        decl_depth = brace_depth
+        decl_in_scope = true
+        bi = bi + 1
+        continue
+      }
+      // Every non-declaration use of `xs` MUST be outside closures and strictly in the safe allowlist!
+      if bi <= in_closure_until {
+        return false
+      }
+      let is_target_arg = bi == s
+      let is_arr_view_wrap = bi >= fn_s + 4 && bi + 1 < fn_e &&
+      tokens[bi - 4].raw == "mbt_compat" && tokens[bi - 3].kind == TokenKind::ColonColon &&
+      tokens[bi - 2].raw == "arr_view" && tokens[bi - 1].kind == TokenKind::LParen &&
+      tokens[bi + 1].kind == TokenKind::RParen
+      let is_indexing = bi + 1 < fn_e && tokens[bi + 1].kind == TokenKind::LBracket
+      let is_safe_method = bi + 3 < fn_e && tokens[bi + 1].kind == TokenKind::Dot &&
+      tokens[bi + 3].kind == TokenKind::LParen && is_array_view_safe_read_method(tokens[bi + 2].raw)
+      let is_for_in_source = bi > fn_s && bi + 1 < fn_e &&
+      tokens[bi - 1].kind == TokenKind::Keyword && tokens[bi - 1].raw == "in" &&
+      tokens[bi + 1].kind == TokenKind::LBrace
+      if !is_target_arg && !is_arr_view_wrap && !is_indexing && !is_safe_method && !is_for_in_source {
+        return false
+      }
+    }
+    bi = bi + 1
+  }
+  decl_name_ti >= 0 && decl_in_scope
+}
+
+///| True iff token immediately before `(` can end a callee expression (excludes grouping `(xs)`).
+fn prev_tok_is_callable_head(tokens : Array[Token], lp_ti : Int) -> Bool {
+  if lp_ti <= 0 {
+    return false
+  }
+  let pk = tokens[lp_ti - 1].kind
+  pk == TokenKind::Ident || pk == TokenKind::UpperIdent ||
+  pk == TokenKind::RParen || pk == TokenKind::RBracket
+}
+
+///| Extract the short callee identifier from `... in call to `<callee>`` (last segment after `.` / `::`).
+fn extract_call_mismatch_callee(msg : String) -> String {
+  let needle = "in call to `"
+  let idx = msg.index_of(needle)
+  if idx < 0 {
+    return ""
+  }
+  let rest = msg.slice(idx + needle.length(), msg.length())
+  let bt = rest.index_of("`")
+  if bt <= 0 {
+    return ""
+  }
+  let full = rest.slice(0, bt)
+  let mut start = 0
+  let mut k = 0
+  while k < full.length() {
+    let c = full.code_unit_at(k)
+    if c == 46 {
+      start = k + 1
+    } else if c == 58 && k + 1 < full.length() && full.code_unit_at(k + 1) == 58 {
+      start = k + 2
+      k = k + 1
+    }
+    k = k + 1
+  }
+  full.slice(start, full.length())
+}
+
+///| Rewrite an `Array[T]` argument to `mbt_compat::arr_view(<arg>)` when a call expects `ArrayView[T]`.
+fn rewrite_array_to_view_arg_with_index(
+  idx : MethodRewriteIndex,
+  lines : Array[String],
+  mutated_lines : Map[Int, Bool],
+  lidx : Int,
+  col : Int,
+  msg : String,
+) -> (Int, Int) {
+  if lidx < 0 || lidx >= lines.length() || lidx >= idx.line_starts.length() {
+    return (-1, -1)
+  }
+  let mut arg_num = 0
+  if msg.starts_with("argument ") {
+    let rest = msg.slice(9, msg.length())
+    let sp = rest.index_of(" ")
+    if sp > 0 {
+      let ns = rest.slice(0, sp)
+      let mut parsed_n = 0
+      let mut ok = true
+      let mut k = 0
+      while k < ns.length() {
+        let c = ns.code_unit_at(k)
+        if c >= 48 && c <= 57 {
+          parsed_n = parsed_n * 10 + (c - 48)
+        } else {
+          ok = false
+          break
+        }
+        k = k + 1
+      }
+      if ok && parsed_n >= 1 {
+        arg_num = parsed_n
+      }
+    }
+  }
+  let want_callee = extract_call_mismatch_callee(msg)
+  let src = idx.src
+  let tokens = idx.tokens
+  let n_tok = tokens.length()
+  let line_start_b = idx.line_starts[lidx]
+  let target_b = line_start_b + (if col > 0 { col - 1 } else { 0 })
+  // Find the innermost enclosing callable `(` with STRICT containment (`ti.start < target_b < rp.start`),
+  // preferring a call whose preceding token matches `want_callee` (skipping `take((xs))` and inner `make(7)`).
+  let mut match_lp = -1
+  let mut match_rp = -1
+  let mut match_span = 100000000
+  let mut any_lp = -1
+  let mut any_rp = -1
+  let mut any_span = 100000000
+  let mut ti = 0
+  while ti < n_tok {
+    if tokens[ti].start_byte >= target_b {
+      break
+    }
+    if tokens[ti].kind == TokenKind::LParen && prev_tok_is_callable_head(tokens, ti) {
+      let rp = find_matching_delim(tokens, ti)
+      if rp > ti && rp < n_tok && tokens[rp].kind == TokenKind::RParen &&
+      tokens[ti].start_byte < target_b && target_b < tokens[rp].start_byte {
+        let span = tokens[rp].end_byte - tokens[ti].start_byte
+        if want_callee.length() > 0 && tokens[ti - 1].raw == want_callee {
+          if span < match_span {
+            match_span = span
+            match_lp = ti
+            match_rp = rp
+          }
+        }
+        if span < any_span {
+          any_span = span
+          any_lp = ti
+          any_rp = rp
+        }
+      }
+    }
+    ti = ti + 1
+  }
+  let mut lp_ti = if match_lp >= 0 { match_lp } else { any_lp }
+  let mut rp_ti = if match_lp >= 0 { match_rp } else { any_rp }
+  if lp_ti < 0 {
+    // Fallback when `col` points at the callee name before `(` on `lidx`: prefer matching `want_callee`.
+    let target_line = lidx + 1
+    let mut best_m_dist = 1000000
+    let mut best_a_dist = 1000000
+    let mut ti2 = if idx.line_first_tok[lidx] >= 0 { idx.line_first_tok[lidx] } else { 0 }
+    while ti2 < n_tok && tokens[ti2].line == target_line {
+      if tokens[ti2].kind == TokenKind::LParen && prev_tok_is_callable_head(tokens, ti2) {
+        let rp = find_matching_delim(tokens, ti2)
+        if rp > ti2 && rp < n_tok && tokens[rp].kind == TokenKind::RParen {
+          let dist = if tokens[ti2].col >= col { tokens[ti2].col - col } else { col - tokens[ti2].col }
+          if want_callee.length() > 0 && tokens[ti2 - 1].raw == want_callee && dist < best_m_dist {
+            best_m_dist = dist
+            match_lp = ti2
+            match_rp = rp
+          }
+          if dist < best_a_dist {
+            best_a_dist = dist
+            any_lp = ti2
+            any_rp = rp
+          }
+        }
+      }
+      ti2 = ti2 + 1
+    }
+    lp_ti = if match_lp >= 0 { match_lp } else { any_lp }
+    rp_ti = if match_lp >= 0 { match_rp } else { any_rp }
+  }
+  if lp_ti < 0 || rp_ti <= lp_ti {
+    return (-1, -1)
+  }
+  // Split top-level arguments inside `(lp_ti + 1 .. rp_ti)` by depth-0 Comma.
+  let arg_spans : Array[(Int, Int)] = []
+  let mut depth = 0
+  let mut seg_start = lp_ti + 1
+  let mut ai = lp_ti + 1
+  while ai < rp_ti {
+    match tokens[ai].kind {
+      TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth = depth + 1
+      TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace =>
+      if depth > 0 { depth = depth - 1 }
+      TokenKind::Comma =>
+      if depth == 0 {
+        if seg_start < ai {
+          arg_spans.push((seg_start, ai - 1))
+        }
+        seg_start = ai + 1
+      }
+      _ => ()
+    }
+    ai = ai + 1
+  }
+  if seg_start < rp_ti {
+    arg_spans.push((seg_start, rp_ti - 1))
+  }
+  // Prefer the argument span containing `target_b` (handles reordered named args `foo(b=1, a=xs)` and `take(xs~, a=8)`),
+  // falling back to 1-based `arg_num` only when `target_b` is outside all argument spans (e.g. pointing at callee).
+  let mut chosen_idx = -1
+  let mut si = 0
+  while si < arg_spans.length() {
+    let (s_ti, e_ti) = arg_spans[si]
+    if tokens[s_ti].start_byte <= target_b && target_b <= tokens[e_ti].end_byte {
+      chosen_idx = si
+      break
+    }
+    si = si + 1
+  }
+  if chosen_idx < 0 && arg_num >= 1 && arg_num <= arg_spans.length() {
+    chosen_idx = arg_num - 1
+  }
+  if chosen_idx < 0 || chosen_idx >= arg_spans.length() {
+    return (-1, -1)
+  }
+  let (as_ti, ae_ti) = arg_spans[chosen_idx]
+  // Handle labeled `name=val` or punned `name~` arguments.
+  let mut val_s_ti = as_ti
+  let mut is_pun = false
+  if as_ti + 1 <= ae_ti && tokens[as_ti].kind == TokenKind::Ident && tokens[as_ti + 1].kind == TokenKind::Eq {
+    val_s_ti = as_ti + 2
+  } else if as_ti + 1 == ae_ti && tokens[as_ti].kind == TokenKind::Ident && tokens[as_ti + 1].kind == TokenKind::Tilde {
+    is_pun = true
+  }
+  if val_s_ti > ae_ti {
+    return (-1, -1)
+  }
+  // P1-2: Fail-closed if the underlying array may undergo structural mutation (push/pop/resize/...)
+  if !array_view_arg_is_safe(tokens, lp_ti, rp_ti, val_s_ti, if is_pun { as_ti } else { ae_ti }) {
+    return (-1, -1)
+  }
+  let start_line = tokens[val_s_ti].line - 1
+  let end_line = tokens[ae_ti].line - 1
+  if start_line < 0 || end_line < start_line || end_line >= lines.length() {
+    return (-1, -1)
+  }
+  let mut chk_l = start_line
+  while chk_l <= end_line {
+    if mutated_lines.contains(chk_l) {
+      return (-1, -1)
+    }
+    chk_l = chk_l + 1
+  }
+  let rep_expr = if is_pun {
+    tokens[as_ti].raw + "=mbt_compat::arr_view(" + tokens[as_ti].raw + ")"
+  } else {
+    let raw_arg = src.slice(tokens[val_s_ti].start_byte, tokens[ae_ti].end_byte)
+    if raw_arg.starts_with("mbt_compat::arr_view(") {
+      return (-1, -1)
+    }
+    "mbt_compat::arr_view(" + raw_arg + ")"
+  }
+  let first_line_start_b = idx.line_starts[start_line]
+  let last_line_end_b = if end_line + 1 < idx.line_starts.length() {
+    idx.line_starts[end_line + 1] - 1
+  } else {
+    src.length()
+  }
+  let prefix = src.slice(first_line_start_b, tokens[val_s_ti].start_byte)
+  let suffix = src.slice(tokens[ae_ti].end_byte, last_line_end_b)
+  let replacement = prefix + rep_expr + suffix
+  let rep_lines = replacement.split("\n")
+  let orig_span = end_line - start_line + 1
+  let mut cl = start_line
+  while cl <= end_line {
+    lines[cl] = ""
+    cl = cl + 1
+  }
+  if rep_lines.length() <= orig_span {
+    let mut ri = 0
+    while ri < rep_lines.length() {
+      lines[start_line + ri] = rep_lines[ri]
+      ri = ri + 1
+    }
+  } else {
+    lines[start_line] = replacement
+  }
+  mark_mutated_span(mutated_lines, start_line, end_line)
+  (start_line, end_line)
+}
+
+///| True iff the last line of `s` contains an unquoted `//` line comment (so appending `, ` or `)` requires `\n`).
+fn ends_with_line_comment(s : String) -> Bool {
+  let n = s.length()
+  let mut start = n
+  while start > 0 && s.code_unit_at(start - 1) != 10 {
+    start = start - 1
+  }
+  let mut i = start
+  let mut in_s = false
+  let mut in_c = false
+  let mut esc = false
+  while i < n {
+    let ch = s.code_unit_at(i)
+    if in_s {
+      if esc { esc = false }
+      else if ch == 92 { esc = true }
+      else if ch == 34 { in_s = false }
+    } else if in_c {
+      if esc { esc = false }
+      else if ch == 92 { esc = true }
+      else if ch == 39 { in_c = false }
+    } else if ch == 34 {
+      in_s = true
+    } else if ch == 39 {
+      in_c = true
+    } else if ch == 47 && i + 1 < n && s.code_unit_at(i + 1) == 47 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Token-based index assignment / read rewriter supporting multiline index keys `m[k1 +\n k2] = v`,
+///| multiline RHS values, and `#alias("_[_]=_")` / `#alias("_[_]")` / `op_set` / `op_get`.
+fn rewrite_index_op_with_index(
+  idx : MethodRewriteIndex,
+  lines : Array[String],
+  mutated_lines : Map[Int, Bool],
+  lidx : Int,
+  col : Int,
+  idx_set_method : String,
+  idx_get_method : String,
+) -> (Int, Int) {
+  if lidx < 0 || lidx >= lines.length() || lidx >= idx.line_first_tok.length() {
+    return (-1, -1)
+  }
+  let start_ti = idx.line_first_tok[lidx]
+  if start_ti < 0 {
+    return (-1, -1)
+  }
+  let src = idx.src
+  let tokens = idx.tokens
+  let n_tok = tokens.length()
+  let target_line = lidx + 1
+  // Pick the `[` on `target_line` nearest to `col` that matches either `[...] = ...` (if `idx_set_method` non-empty)
+  // or `[...]` (if `idx_get_method` non-empty).
+  let mut best_lb_ti = -1
+  let mut best_rb_ti = -1
+  let mut best_is_assign = false
+  let mut best_dist = 1000000
+  let mut ti = start_ti
+  while ti < n_tok && tokens[ti].line == target_line {
+    if tokens[ti].kind == TokenKind::LBracket {
+      let rb = find_matching_delim(tokens, ti)
+      if rb > ti && rb < n_tok && tokens[rb].kind == TokenKind::RBracket {
+        let is_assign = rb + 1 < n_tok && tokens[rb + 1].kind == TokenKind::Eq
+        let eligible = (is_assign && idx_set_method.length() > 0) || (!is_assign && idx_get_method.length() > 0)
+        if eligible {
+          let dist = if tokens[ti].col >= col { tokens[ti].col - col } else { col - tokens[ti].col }
+          if dist < best_dist {
+            best_dist = dist
+            best_lb_ti = ti
+            best_rb_ti = rb
+            best_is_assign = is_assign
+          }
+        }
+      }
+    }
+    ti = ti + 1
+  }
+  if best_lb_ti < 0 || best_rb_ti <= best_lb_ti {
+    return (-1, -1)
+  }
+  let k_expr = src.slice(tokens[best_lb_ti].end_byte, tokens[best_rb_ti].start_byte).trim()
+  let k_sep = if ends_with_line_comment(k_expr) { "\n" } else { "" }
+  if !best_is_assign {
+    let start_line = tokens[best_lb_ti].line - 1
+    let end_line = tokens[best_rb_ti].line - 1
+    if start_line < 0 || end_line < start_line || end_line >= lines.length() {
+      return (-1, -1)
+    }
+    let mut chk_l = start_line
+    while chk_l <= end_line {
+      if mutated_lines.contains(chk_l) {
+        return (-1, -1)
+      }
+      chk_l = chk_l + 1
+    }
+    let first_line_start_b = idx.line_starts[start_line]
+    let last_line_end_b = if end_line + 1 < idx.line_starts.length() {
+      idx.line_starts[end_line + 1] - 1
+    } else {
+      src.length()
+    }
+    let prefix = src.slice(first_line_start_b, tokens[best_lb_ti].start_byte)
+    let suffix = src.slice(tokens[best_rb_ti].end_byte, last_line_end_b)
+    let replacement = prefix + "." + idx_get_method + "(" + k_expr + k_sep + ")" + suffix
+    let rep_lines = replacement.split("\n")
+    let orig_span = end_line - start_line + 1
+    let mut cl = start_line
+    while cl <= end_line {
+      lines[cl] = ""
+      cl = cl + 1
+    }
+    if rep_lines.length() <= orig_span {
+      let mut ri = 0
+      while ri < rep_lines.length() {
+        lines[start_line + ri] = rep_lines[ri]
+        ri = ri + 1
+      }
+    } else {
+      lines[start_line] = replacement
+    }
+    mark_mutated_span(mutated_lines, start_line, end_line)
+    return (start_line, end_line)
+  }
+  // Index assignment `<recv>[<k>] = <rhs>`: find end of `<rhs>` across lines using tokens.
+  let eq_ti = best_rb_ti + 1
+  if eq_ti + 1 >= n_tok {
+    return (-1, -1)
+  }
+  let mut rhs_end_ti = eq_ti
+  let mut depth = 0
+  let mut ri = eq_ti + 1
+  while ri < n_tok {
+    let tk = tokens[ri]
+    if tk.kind == TokenKind::Eof {
+      break
+    }
+    if depth == 0 && ri > eq_ti + 1 && tk.newline_before {
+      let pk = tokens[ri - 1].kind
+      let same_multiline_str = (pk == TokenKind::RawMultiline || pk == TokenKind::InterpMultiline) &&
+      (tk.kind == TokenKind::RawMultiline || tk.kind == TokenKind::InterpMultiline)
+      let prev_cont = pk == TokenKind::Plus || pk == TokenKind::Minus || pk == TokenKind::Star ||
+      pk == TokenKind::Slash || pk == TokenKind::Percent || pk == TokenKind::AmpAmp ||
+      pk == TokenKind::PipePipe || pk == TokenKind::Pipe || pk == TokenKind::Amp ||
+      pk == TokenKind::Caret || pk == TokenKind::Eq || pk == TokenKind::EqEq ||
+      pk == TokenKind::BangEq || pk == TokenKind::Lt || pk == TokenKind::LtEq ||
+      pk == TokenKind::Gt || pk == TokenKind::GtEq || pk == TokenKind::Dot ||
+      pk == TokenKind::ColonColon || pk == TokenKind::FatArrow || pk == TokenKind::Arrow ||
+      pk == TokenKind::PipeGt
+      // Never treat a newline-leading `-` as binary continuation (could be unary `-2` on the next statement).
+      let cur_cont = tk.kind == TokenKind::Dot || tk.kind == TokenKind::Plus ||
+      tk.kind == TokenKind::Star || tk.kind == TokenKind::Slash || tk.kind == TokenKind::Percent ||
+      tk.kind == TokenKind::AmpAmp || tk.kind == TokenKind::PipePipe || tk.kind == TokenKind::PipeGt ||
+      (tk.kind == TokenKind::Keyword && tk.raw == "else")
+      if !same_multiline_str && !prev_cont && !cur_cont {
+        break
+      }
+    }
+    match tk.kind {
+      TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+        depth = depth + 1
+        rhs_end_ti = ri
+      }
+      TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+        if depth == 0 {
+          break
+        }
+        depth = depth - 1
+        rhs_end_ti = ri
+      }
+      TokenKind::Semi | TokenKind::Comma => {
+        if depth == 0 {
+          break
+        }
+        rhs_end_ti = ri
+      }
+      _ => rhs_end_ti = ri
+    }
+    ri = ri + 1
+  }
+  if depth != 0 || rhs_end_ti <= eq_ti {
+    return (-1, -1)
+  }
+  let start_line = tokens[best_lb_ti].line - 1
+  let end_line = tokens[rhs_end_ti].line - 1
+  if start_line < 0 || end_line < start_line || end_line >= lines.length() {
+    return (-1, -1)
+  }
+  let mut chk_l = start_line
+  while chk_l <= end_line {
+    if mutated_lines.contains(chk_l) {
+      return (-1, -1)
+    }
+    chk_l = chk_l + 1
+  }
+  let rhs_is_multiline_lit = tokens[rhs_end_ti].kind == TokenKind::RawMultiline ||
+  tokens[rhs_end_ti].kind == TokenKind::InterpMultiline
+  let mut all_multiline_str = rhs_is_multiline_lit
+  if all_multiline_str {
+    let mut mk = eq_ti + 1
+    while mk <= rhs_end_ti {
+      if tokens[mk].kind != TokenKind::RawMultiline && tokens[mk].kind != TokenKind::InterpMultiline {
+        all_multiline_str = false
+        break
+      }
+      mk = mk + 1
+    }
+  }
+  let v_expr = if all_multiline_str {
+    let ml_parts : Array[String] = []
+    let mut mk = eq_ti + 1
+    while mk <= rhs_end_ti {
+      ml_parts.push(tokens[mk].raw)
+      mk = mk + 1
+    }
+    ml_parts.join("\n")
+  } else if rhs_is_multiline_lit {
+    src.slice(tokens[eq_ti + 1].start_byte, tokens[rhs_end_ti].end_byte)
+  } else {
+    src.slice(tokens[eq_ti + 1].start_byte, tokens[rhs_end_ti].end_byte).trim()
+  }
+  let v_sep = if ends_with_line_comment(v_expr) || rhs_is_multiline_lit { "\n" } else { "" }
+  let first_line_start_b = idx.line_starts[start_line]
+  let last_line_end_b = if end_line + 1 < idx.line_starts.length() {
+    idx.line_starts[end_line + 1] - 1
+  } else {
+    src.length()
+  }
+  let prefix = src.slice(first_line_start_b, tokens[best_lb_ti].start_byte)
+  let suffix = src.slice(tokens[rhs_end_ti].end_byte, last_line_end_b)
+  let replacement = prefix + "." + idx_set_method + "(" + k_expr + k_sep + ", " + v_expr + v_sep + ")" + suffix
+  let rep_lines = replacement.split("\n")
+  let orig_span = end_line - start_line + 1
+  let mut cl = start_line
+  while cl <= end_line {
+    lines[cl] = ""
+    cl = cl + 1
+  }
+  if rep_lines.length() <= orig_span {
+    let mut rli = 0
+    while rli < rep_lines.length() {
+      lines[start_line + rli] = rep_lines[rli]
+      rli = rli + 1
+    }
+  } else {
+    lines[start_line] = replacement
+  }
+  mark_mutated_span(mutated_lines, start_line, end_line)
+  (start_line, end_line)
+}
+
+///| A tuple-typed argument observed at a call site: either named (`label != ""`) or positional (`pos`).
+struct CallTupleArg {
+  pos : Int
+  label : String
+}
+
+///| Request to relax redundant `MbtHash`/`MapKey` bounds on a local generic function `fn_name`,
+///| scoped strictly to pure `OrderedMap`/`OrderedSet` key type parameters matched by exact label/position.
+struct BoundRelaxReq {
+  fn_name : String
+  tuple_args : Array[CallTupleArg]
+}
+
+///| Inspect the call to `req_fn(...)` near `(lidx, col)` and return all arguments that are visibly
+///| tuple literals `(a, b)` or expressions whose queried type mentions a tuple, preserving named labels.
+fn find_tuple_args_at_call(
+  idx : MethodRewriteIndex,
+  lidx : Int,
+  col : Int,
+  req_fn : String,
+  qfi_opt : Option[QtFileIndex],
+) -> Array[CallTupleArg] {
+  let out : Array[CallTupleArg] = []
+  if lidx < 0 || lidx >= idx.line_first_tok.length() {
+    return out
+  }
+  let short_fn = {
+    let cc = req_fn.index_of("::")
+    if cc >= 0 { req_fn.slice(cc + 2, req_fn.length()) } else { req_fn }
+  }
+  let tokens = idx.tokens
+  let n_tok = tokens.length()
+  let target_line = lidx + 1
+  let mut lp_ti = -1
+  let mut best_dist = 1000000
+  let mut ti = if idx.line_first_tok[lidx] >= 0 { idx.line_first_tok[lidx] } else { 0 }
+  while ti + 1 < n_tok && tokens[ti].line == target_line {
+    if tokens[ti].raw == short_fn && tokens[ti + 1].kind == TokenKind::LParen {
+      let dist = if tokens[ti].col >= col { tokens[ti].col - col } else { col - tokens[ti].col }
+      if dist < best_dist {
+        best_dist = dist
+        lp_ti = ti + 1
+      }
+    }
+    ti = ti + 1
+  }
+  if lp_ti < 0 {
+    return out
+  }
+  let rp_ti = find_matching_delim(tokens, lp_ti)
+  if rp_ti <= lp_ti || rp_ti >= n_tok {
+    return out
+  }
+  let arg_spans : Array[(Int, Int)] = []
+  let mut depth = 0
+  let mut seg_s = lp_ti + 1
+  let mut ai = lp_ti + 1
+  while ai < rp_ti {
+    match tokens[ai].kind {
+      TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth = depth + 1
+      TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace =>
+      if depth > 0 { depth = depth - 1 }
+      TokenKind::Comma =>
+      if depth == 0 {
+        if seg_s < ai { arg_spans.push((seg_s, ai - 1)) }
+        seg_s = ai + 1
+      }
+      _ => ()
+    }
+    ai = ai + 1
+  }
+  if seg_s < rp_ti {
+    arg_spans.push((seg_s, rp_ti - 1))
+  }
+  let mut pos_idx = 0
+  let mut idx_a = 0
+  while idx_a < arg_spans.length() {
+    let (raw_s, raw_e) = arg_spans[idx_a]
+    let mut lbl = ""
+    let mut s_ti = raw_s
+    let mut e_ti = raw_e
+    if raw_s + 2 <= raw_e && tokens[raw_s].kind == TokenKind::Ident && tokens[raw_s + 1].kind == TokenKind::Eq {
+      lbl = tokens[raw_s].raw
+      s_ti = raw_s + 2
+    } else if raw_s + 1 == raw_e && tokens[raw_s].kind == TokenKind::Ident && tokens[raw_s + 1].kind == TokenKind::Tilde {
+      lbl = tokens[raw_s].raw
+      e_ti = raw_s
+    }
+    let mut is_tuple_arg = false
+    // 1. Direct tuple literal `(a, b, ...)`
+    if tokens[s_ti].kind == TokenKind::LParen && find_matching_delim(tokens, s_ti) == e_ti {
+      let mut k = s_ti + 1
+      let mut d = 0
+      while k < e_ti {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && kk == TokenKind::Comma { is_tuple_arg = true; break }
+        k = k + 1
+      }
+    }
+    // 2. Queried type from `qfi` is a direct tuple or an OrderedMap/OrderedSet with a tuple KEY (never tuple value)
+    if !is_tuple_arg {
+      match qfi_opt {
+        Some(qfi) =>
+        match qt_lookup_expr_span_ty(qfi, idx.src, tokens[s_ti].start_byte, tokens[e_ti].end_byte, false) {
+          Some(ty) =>
+          if queried_ty_has_tuple_key(ty) {
+            is_tuple_arg = true
+          }
+          None => ()
+        }
+        None => ()
+      }
+    }
+    if is_tuple_arg {
+      out.push(CallTupleArg::{ pos: if lbl.length() == 0 { pos_idx } else { -1 }, label: lbl })
+    }
+    if lbl.length() == 0 {
+      pos_idx = pos_idx + 1
+    }
+    idx_a = idx_a + 1
+  }
+  out
+}
+
+///| True iff `ty` is a direct tuple `(A, B, ...)` or an `OrderedMap[K, V]` / `OrderedSet[K]`
+///| whose FIRST type argument (key `K`) is a tuple `(A, B, ...)` — never fooled by tuple values `OrderedMap[String, (Int, Int)]`.
+fn queried_ty_has_tuple_key(ty : String) -> Bool {
+  let t = ty.trim()
+  if t.starts_with("(") && t.ends_with(")") && str_has(t, ",") {
+    return true
+  }
+  let mut rest = ""
+  let mut is_map = false
+  let om_idx = t.index_of("OrderedMap[")
+  let os_idx = t.index_of("OrderedSet[")
+  if om_idx >= 0 && t.ends_with("]") {
+    rest = t.slice(om_idx + 11, t.length() - 1)
+    is_map = true
+  } else if os_idx >= 0 && t.ends_with("]") {
+    rest = t.slice(os_idx + 11, t.length() - 1)
+  } else {
+    return false
+  }
+  let key_ty = if !is_map {
+    rest.trim()
+  } else {
+    let mut d = 0
+    let mut comma = -1
+    let mut i = 0
+    while i < rest.length() {
+      let c = rest.code_unit_at(i)
+      if c == 40 || c == 91 || c == 123 { d = d + 1 }
+      else if c == 41 || c == 93 || c == 125 { if d > 0 { d = d - 1 } }
+      else if d == 0 && c == 44 { comma = i; break }
+      i = i + 1
+    }
+    if comma <= 0 { "" } else { rest.slice(0, comma).trim() }
+  }
+  key_ty.starts_with("(") && key_ty.ends_with(")") && str_has(key_ty, ",")
+}
+
+///| True iff `pty` is `OrderedMap[tp, V]` (with `tp` NOT appearing in `V`) or `OrderedSet[tp]`.
+fn type_is_ordered_collection_keyed_by(pty : String, tp : String) -> Bool {
+  let t = pty.trim()
+  let mut rest = ""
+  let mut is_map = false
+  if t.starts_with("mbt_compat::OrderedMap[") && t.ends_with("]") {
+    rest = t.slice(23, t.length() - 1)
+    is_map = true
+  } else if t.starts_with("OrderedMap[") && t.ends_with("]") {
+    rest = t.slice(11, t.length() - 1)
+    is_map = true
+  } else if t.starts_with("mbt_compat::OrderedSet[") && t.ends_with("]") {
+    rest = t.slice(23, t.length() - 1)
+  } else if t.starts_with("OrderedSet[") && t.ends_with("]") {
+    rest = t.slice(11, t.length() - 1)
+  } else {
+    return false
+  }
+  if !is_map {
+    return rest.trim() == tp
+  }
+  // Split `K, V` at depth 0
+  let mut d = 0
+  let mut comma = -1
+  let mut i = 0
+  while i < rest.length() {
+    let c = rest.code_unit_at(i)
+    if c == 40 || c == 91 || c == 123 { d = d + 1 }
+    else if c == 41 || c == 93 || c == 125 { if d > 0 { d = d - 1 } }
+    else if d == 0 && c == 44 { comma = i; break }
+    i = i + 1
+  }
+  if comma <= 0 {
+    return false
+  }
+  let k_ty = rest.slice(0, comma).trim()
+  let v_ty = rest.slice(comma + 1, rest.length()).trim()
+  k_ty == tp && !type_mentions_ident(v_ty, tp)
+}
+
+///| Strip redundant `mbt_compat::MbtHash` / `mbt_compat::MapKey` bounds from a single generic param string
+///| (e.g. `K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey` -> `K : Eq`, or `K : mbt_compat::MapKey` -> `K`).
+fn strip_hash_mapkey_bounds_from_param(param : String) -> String {
+  let cidx = param.index_of(":")
+  if cidx < 0 {
+    return param.trim()
+  }
+  let lhs = param.slice(0, cidx).trim()
+  let rhs = param.slice(cidx + 1, param.length()).trim()
+  let parts = rhs.split("+")
+  let kept : Array[String] = []
+  for p in parts {
+    let pt = p.trim()
+    if pt.length() > 0 && pt != "mbt_compat::MbtHash" && pt != "mbt_compat::MapKey" &&
+    pt != "MbtHash" && pt != "MapKey" {
+      kept.push(pt)
+    }
+  }
+  if kept.length() == 0 {
+    lhs
+  } else {
+    lhs + " : " + kept.join(" + ")
+  }
+}
+
+///| Extract the bare generic parameter name before `:` from `K : Bound1 + Bound2`.
+fn generic_param_name_of(param : String) -> String {
+  let cidx = param.index_of(":")
+  if cidx < 0 { param.trim() } else { param.slice(0, cidx).trim() }
+}
+
+///| True iff `ty_str` contains identifier `ident` as a whole word.
+fn type_mentions_ident(ty_str : String, ident : String) -> Bool {
+  let n = ty_str.length()
+  let m = ident.length()
+  if m == 0 || m > n {
+    return false
+  }
+  let mut i = 0
+  while i + m <= n {
+    if ty_str.slice(i, i + m) == ident {
+      let left_ok = i == 0 || !is_alnum(ty_str.code_unit_at(i - 1))
+      let right_ok = i + m == n || !is_alnum(ty_str.code_unit_at(i + m))
+      if left_ok && right_ok {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Recursively scan `toks[s_idx .. e_idx)` (including `InterpString` / `InterpMultiline` `\{...}` holes)
+///| for hash-collection ctors, `.hash()` / `Hash::hash` / `mbt_hash`, or calls to bounded local fns/methods.
+fn body_tokens_block_bound_relax(
+  toks : Array[Token],
+  s_idx : Int,
+  e_idx : Int,
+  fn_name : String,
+  all_bounded_fns : Map[String, Bool],
+  all_bounded_methods : Map[String, Bool],
+) -> Bool {
+  let mut ti = s_idx
+  while ti < e_idx {
+    let tk = toks[ti]
+    let r = tk.raw
+    if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline {
+      for hole in extract_interp_holes_with_pos(r, 1, 1) {
+        let htoks = lex_moonbit(hole.0)
+        if body_tokens_block_bound_relax(htoks, 0, htoks.length() - 1, fn_name, all_bounded_fns, all_bounded_methods) {
+          return true
+        }
+      }
+      ti = ti + 1
+      continue
+    }
+    if r == "ordered_map_new" || r == "ordered_map_new_cap" ||
+    r == "ordered_map_from_array" || r == "ordered_map_from_array_cap" ||
+    r == "ordered_map_from_iter" || r == "ordered_set_new" ||
+    r == "ordered_set_from_array" || r == "ordered_set_from_iter" ||
+    r == "hash_combine" || r == "key_hash" || r == "key_eq" || r == "mbt_hash" {
+      return true
+    }
+    if (r == "OrderedMap" || r == "OrderedSet") && ti + 2 < e_idx &&
+    toks[ti + 1].kind == TokenKind::ColonColon {
+      let m = toks[ti + 2].raw
+      if m == "new" || m == "new_cap" || m == "from_array" || m == "from_iter" {
+        return true
+      }
+    }
+    // Reject any `.hash(` or `Hash::hash` in body
+    if tk.kind == TokenKind::Dot && ti + 2 < e_idx &&
+    toks[ti + 2].kind == TokenKind::LParen {
+      let dm = toks[ti + 1].raw
+      if dm == "hash" || dm == "hash_combine" || dm == "key_hash" || dm == "key_eq" ||
+      dm == "mbt_hash" || all_bounded_methods.contains(dm) {
+        return true
+      }
+    }
+    if r == "Hash" && ti + 2 < e_idx && toks[ti + 1].kind == TokenKind::ColonColon &&
+    toks[ti + 2].raw == "hash" {
+      return true
+    }
+    // Transitive call to another local `MbtHash`/`MapKey`-bounded free fn or `Type::method`
+    if tk.kind == TokenKind::Ident && r != fn_name && all_bounded_fns.contains(r) &&
+    ti + 1 < e_idx && toks[ti + 1].kind == TokenKind::LParen &&
+    !(ti > s_idx && toks[ti - 1].kind == TokenKind::Dot) {
+      return true
+    }
+    if tk.kind == TokenKind::UpperIdent && ti + 3 < e_idx &&
+    toks[ti + 1].kind == TokenKind::ColonColon && toks[ti + 2].kind == TokenKind::Ident &&
+    toks[ti + 3].kind == TokenKind::LParen {
+      let qual = r + "::" + toks[ti + 2].raw
+      if qual != fn_name && all_bounded_fns.contains(qual) {
+        return true
+      }
+    }
+    ti = ti + 1
+  }
+  false
+}
+
+///| Relax redundant `mbt_compat::MbtHash` / `mbt_compat::MapKey` bounds strictly for local generic
+///| functions whose matched type parameter `tp` appears ONLY as the key type of `OrderedMap[tp, ...]`
+///| or `OrderedSet[tp]` (never as a bare value parameter), matched by exact named label or positional-only index,
+///| and whose body (including interpolation holes) never constructs a hash collection, hashes keys, or calls another bounded local fn/method.
+fn relax_redundant_fn_tuple_bounds(
+  files : Array[GeneratedFile],
+  pkg_fns : Map[String, StageBPkgFn],
+  reqs : Array[BoundRelaxReq],
+) -> (Array[GeneratedFile], Array[String]) {
+  if reqs.length() == 0 {
+    return (files, [])
+  }
+  let all_bounded_fns : Map[String, Bool] = Map()
+  let all_bounded_methods : Map[String, Bool] = Map()
+  let fn_bounded_tps : Map[String, Array[String]] = Map()
+  let fn_param_pairs : Map[String, Array[(String, String, Bool)]] = Map()
+  for f in files {
+    let toks = lex_moonbit(f.content)
+    let n = toks.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let tk = toks[i]
+      if tk.kind == TokenKind::LBrace { depth = depth + 1 }
+      else if tk.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 } }
+      else if depth == 0 && tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+        let mut ni = i + 1
+        let mut gen_lb = -1
+        let mut gen_rb = -1
+        if ni < n && toks[ni].kind == TokenKind::LBracket {
+          gen_lb = ni
+          gen_rb = find_matching_delim(toks, ni)
+          ni = gen_rb + 1
+        }
+        let mut fname = ""
+        let mut short_m = ""
+        let mut after_name = ni + 1
+        if ni < n && toks[ni].kind == TokenKind::Ident {
+          fname = toks[ni].raw
+        } else if ni + 2 < n && toks[ni].kind == TokenKind::UpperIdent &&
+        toks[ni + 1].kind == TokenKind::ColonColon && toks[ni + 2].kind == TokenKind::Ident {
+          fname = toks[ni].raw + "::" + toks[ni + 2].raw
+          short_m = toks[ni + 2].raw
+          after_name = ni + 3
+        }
+        if gen_lb < 0 && after_name < n && toks[after_name].kind == TokenKind::LBracket {
+          gen_lb = after_name
+          gen_rb = find_matching_delim(toks, after_name)
+          after_name = gen_rb + 1
+        }
+        if fname.length() > 0 && gen_lb >= 0 && gen_rb > gen_lb {
+          let inner = f.content.slice(toks[gen_lb].end_byte, toks[gen_rb].start_byte)
+          if str_has(inner, "MbtHash") || str_has(inner, "MapKey") {
+            all_bounded_fns[fname] = true
+            if short_m.length() > 0 {
+              all_bounded_methods[short_m] = true
+            }
+            let btps : Array[String] = []
+            for p in inner.split(",") {
+              if str_has(p, "MbtHash") || str_has(p, "MapKey") {
+                btps.push(generic_param_name_of(p))
+              }
+            }
+            fn_bounded_tps[fname] = btps
+            if after_name < n && toks[after_name].kind == TokenKind::LParen {
+              let cp = find_matching_delim(toks, after_name)
+              let pairs : Array[(String, String, Bool)] = []
+              let mut pi = after_name + 1
+              let mut pd = 0
+              let mut seg_s = pi
+              while pi <= cp {
+                let is_end = pi == cp || (pd == 0 && toks[pi].kind == TokenKind::Comma)
+                if !is_end {
+                  let pk = toks[pi].kind
+                  if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+                  else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+                } else {
+                  if seg_s < pi {
+                    let seg_str = f.content.slice(toks[seg_s].start_byte, toks[pi - 1].end_byte).trim()
+                    let cpos = seg_str.index_of(":")
+                    if cpos > 0 {
+                      let pn = seg_str.slice(0, cpos).trim()
+                      let is_lbl = pn.ends_with("~")
+                      let pn_clean = if is_lbl { pn.slice(0, pn.length() - 1).trim() } else { pn }
+                      let pt = seg_str.slice(cpos + 1, seg_str.length()).trim()
+                      pairs.push((pn_clean, pt, is_lbl))
+                    }
+                  }
+                  seg_s = pi + 1
+                }
+                pi = pi + 1
+              }
+              fn_param_pairs[fname] = pairs
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  let safe_fn_tps : Map[String, Map[String, Bool]] = Map()
+  for req in reqs {
+    let fn_name = req.fn_name
+    let btps = match fn_bounded_tps.get(fn_name) {
+      Some(xs) => xs
+      None => continue
+    }
+    let pfn = match pkg_fns.get(fn_name) {
+      Some(p) => p
+      None => continue
+    }
+    let ppairs = match fn_param_pairs.get(fn_name) {
+      Some(ps) => ps
+      None => []
+    }
+    let pos_params : Array[(String, String)] = []
+    for pp in ppairs {
+      if !pp.2 {
+        pos_params.push((pp.0, pp.1))
+      }
+    }
+    // 1. Strictly match call-site tuple args by exact named label or positional-only index (skipping labeled `a~` params).
+    let cand_tps : Map[String, Bool] = Map()
+    for ta in req.tuple_args {
+      if ta.label.length() > 0 {
+        for pp in ppairs {
+          if pp.0 == ta.label {
+            for tp in btps {
+              if type_mentions_ident(pp.1, tp) {
+                cand_tps[tp] = true
+              }
+            }
+          }
+        }
+      } else if ta.pos >= 0 && ta.pos < pos_params.length() {
+        let pty = pos_params[ta.pos].1
+        for tp in btps {
+          if type_mentions_ident(pty, tp) {
+            cand_tps[tp] = true
+          }
+        }
+      }
+    }
+    if cand_tps.length() == 0 {
+      continue
+    }
+    // 2. Scan body (including `InterpString` / `InterpMultiline` holes) for hash ctors, `.hash()` / `Hash::hash`, or bounded calls.
+    if body_tokens_block_bound_relax(pfn.tokens, pfn.body_s, pfn.body_e, fn_name, all_bounded_fns, all_bounded_methods) {
+      continue
+    }
+    // 3. Strictly allow relaxing `tp` ONLY when `tp` appears exclusively as the key type of
+    //    `OrderedMap[tp, ...]` or `OrderedSet[tp]` in the function signature (never a bare `k : tp`).
+    let approved : Map[String, Bool] = match safe_fn_tps.get(fn_name) {
+      Some(m) => m
+      None => Map()
+    }
+    for tp in cand_tps.keys() {
+      let mut saw_ordered_key = false
+      let mut only_ordered_key = true
+      for pp in ppairs {
+        if type_mentions_ident(pp.1, tp) {
+          if type_is_ordered_collection_keyed_by(pp.1, tp) {
+            saw_ordered_key = true
+          } else {
+            only_ordered_key = false
+            break
+          }
+        }
+      }
+      if saw_ordered_key && only_ordered_key {
+        approved[tp] = true
+      }
+    }
+    if approved.length() > 0 {
+      safe_fn_tps[fn_name] = approved
+    }
+  }
+  if safe_fn_tps.length() == 0 {
+    return (files, [])
+  }
+  let out_files : Array[GeneratedFile] = []
+  let changed_rels : Array[String] = []
+  for f in files {
+    let toks = lex_moonbit(f.content)
+    let n = toks.length() - 1
+    let edits : Array[(Int, Int, String)] = []
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let tk = toks[i]
+      if tk.kind == TokenKind::LBrace {
+        depth = depth + 1
+      } else if tk.kind == TokenKind::RBrace {
+        if depth > 0 { depth = depth - 1 }
+      } else if depth == 0 && tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+        let mut ni = i + 1
+        let mut gen_lb = -1
+        let mut gen_rb = -1
+        if ni < n && toks[ni].kind == TokenKind::LBracket {
+          gen_lb = ni
+          gen_rb = find_matching_delim(toks, ni)
+          ni = gen_rb + 1
+        }
+        let mut fname = ""
+        let mut after_name = ni + 1
+        if ni < n && toks[ni].kind == TokenKind::Ident {
+          fname = toks[ni].raw
+        } else if ni + 2 < n && toks[ni].kind == TokenKind::UpperIdent &&
+        toks[ni + 1].kind == TokenKind::ColonColon && toks[ni + 2].kind == TokenKind::Ident {
+          fname = toks[ni].raw + "::" + toks[ni + 2].raw
+          after_name = ni + 3
+        }
+        if gen_lb < 0 && after_name < n && toks[after_name].kind == TokenKind::LBracket {
+          gen_lb = after_name
+          gen_rb = find_matching_delim(toks, after_name)
+        }
+        if fname.length() > 0 && gen_lb >= 0 && gen_rb > gen_lb {
+          match safe_fn_tps.get(fname) {
+            Some(target_tps) => {
+              let inner = f.content.slice(toks[gen_lb].end_byte, toks[gen_rb].start_byte)
+              if str_has(inner, "MbtHash") || str_has(inner, "MapKey") {
+                let parts = inner.split(",")
+                let new_parts : Array[String] = []
+                for p in parts {
+                  let pname = generic_param_name_of(p)
+                  if target_tps.contains(pname) {
+                    new_parts.push(strip_hash_mapkey_bounds_from_param(p))
+                  } else {
+                    new_parts.push(p.trim())
+                  }
+                }
+                let new_inner = new_parts.join(", ")
+                if new_inner != inner {
+                  edits.push((toks[gen_lb].end_byte, toks[gen_rb].start_byte, new_inner))
+                }
+              }
+            }
+            None => ()
+          }
+        }
+      }
+      i = i + 1
+    }
+    if edits.length() > 0 {
+      let sb = StringBuilder()
+      let mut last = 0
+      for ed in edits {
+        sb.write_string(f.content.slice(last, ed.0))
+        sb.write_string(ed.2)
+        last = ed.1
+      }
+      sb.write_string(f.content.slice(last, f.content.length()))
+      out_files.push(GeneratedFile::{
+        rel_path: f.rel_path,
+        content: sb.to_string(),
+        source_file: f.source_file,
+        anchors: f.anchors,
+      })
+      changed_rels.push(f.rel_path)
+    } else {
+      out_files.push(f)
+    }
+  }
+  (out_files, changed_rels)
+}
+
 ///| Rewrite a missing method call at `(lidx, col)` -> `helper(recv, args)` using a cached
 ///| `MethodRewriteIndex` (O(1) per call instead of re-lexing the file).
 ///| Skips rewriting (returning `(-1, -1)`) if any line in `[recv_start_line ..= close_end_line]`
@@ -737,11 +2392,25 @@ fn rewrite_method_call_with_index(
   if lidx < 0 || lidx >= lines.length() || lidx >= idx.line_first_tok.length() {
     return (-1, -1)
   }
+  let src = idx.src
+  let line_start_b = idx.line_starts[lidx]
+  let line_end_b = if lidx + 1 < idx.line_starts.length() {
+    idx.line_starts[lidx + 1] - 1
+  } else {
+    src.length()
+  }
+  let raw_target_b = line_start_b + (if col > 0 { col - 1 } else { 0 })
+  let target_b = if raw_target_b > line_end_b { line_end_b } else { raw_target_b }
+  // If `target_b` falls strictly inside a `TokenKind::InterpString`, dispatch ONLY to that interpolation
+  // string (never touching outside tokens on the same line); otherwise NEVER fall back to an unrelated interp.
+  let interp_ti = find_covering_interp_token(idx, lidx, target_b)
+  if interp_ti >= 0 {
+    return rewrite_method_call_in_interp_string_tok(idx, lines, mutated_lines, lidx, col, interp_ti, method_name, helper)
+  }
   let start_ti = idx.line_first_tok[lidx]
   if start_ti < 0 {
     return (-1, -1)
   }
-  let src = idx.src
   let tokens = idx.tokens
   let n_tok = tokens.length()
   let target_line = lidx + 1
@@ -2268,6 +3937,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     let mut changed = false
     let changed_rels : Array[String] = []
     let next_files : Array[GeneratedFile] = []
+    let pending_bound_relax_reqs : Array[BoundRelaxReq] = []
     for f in cur_files {
       let lines = f.content.split("\n")
       let mut used_idents_opt : Option[Map[String, Bool]] = None
@@ -2283,6 +3953,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
         }
       }
       let mutated_lines : Map[Int, Bool] = Map()
+      let line_interp_edits : Map[Int, Array[(Int, Int, String)]] = Map()
       let mut method_rw_idx_opt : Option[MethodRewriteIndex] = None
       let get_method_rw_idx = fn() -> MethodRewriteIndex {
         match method_rw_idx_opt {
@@ -2362,17 +4033,45 @@ pub fn run_stage_b_with_ops_deps_and_qt(
           }
         }
 
-        // 0b. Tuple keys (`Map[(A, B), V]`): Pion has no trait impls on tuple types, so a `MapKey`-bound
-        //     constructor called with a pair / triple key becomes its `_pair` / `_triple` form (component-wise
-        //     `MapKey`; components without one still fail here).
-        if !line_mutated && str_has(d.message, "does not implement trait `mbt_compat::MapKey` required by `") {
-          match rewrite_tuple_mapkey_call_at(ln, d.col, d.message) {
-            Some(new_ln) => {
-              lines[lidx] = new_ln
-              file_changed = true
-              line_mutated = true
+        // 0b. Tuple keys (`Map[(A, B), V]` / `Set[(A, B)]`): Pion has no trait impls on tuple types, so a
+        //     `MapKey`-bound constructor called with a pair / triple key becomes its `_pair` / `_triple` form
+        //     (component-wise `MapKey`; components without one still fail here).
+        //     Also relax redundant `MbtHash`/`MapKey` bounds on local generic functions whose body never
+        //     constructs a new `OrderedMap`/`OrderedSet` or calls hash/key_eq directly.
+        if !line_mutated && (str_has(d.message, "does not implement trait `mbt_compat::MapKey` required by `") ||
+          str_has(d.message, "does not implement trait `mbt_compat::MbtHash` required by `")) {
+          let mut handled_tuple_key = false
+          if str_has(d.message, "does not implement trait `mbt_compat::MapKey` required by `") {
+            match rewrite_tuple_mapkey_call_at(ln, d.col, d.message) {
+              Some(new_ln) => {
+                lines[lidx] = new_ln
+                file_changed = true
+                line_mutated = true
+                handled_tuple_key = true
+              }
+              None => ()
             }
-            None => ()
+          }
+          if !handled_tuple_key {
+            let tp = "type `"
+            let ti = d.message.index_of(tp)
+            if ti >= 0 {
+              let rest_t = d.message.slice(ti + tp.length(), d.message.length())
+              let te = rest_t.index_of("` does not implement")
+              if te > 0 && tuple_type_arity(rest_t.slice(0, te)) >= 2 {
+                let rp = "required by `"
+                let ri = d.message.index_of(rp)
+                if ri >= 0 {
+                  let r2 = d.message.slice(ri + rp.length(), d.message.length())
+                  let re = r2.index_of("`")
+                  if re > 0 {
+                    let req_fn = r2.slice(0, re)
+                    let targs = find_tuple_args_at_call(get_method_rw_idx(), lidx, d.col, req_fn, get_file_qfi())
+                    pending_bound_relax_reqs.push(BoundRelaxReq::{ fn_name: req_fn, tuple_args: targs })
+                  }
+                }
+              }
+            }
           }
         }
 
@@ -2528,21 +4227,69 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                     file_changed = true
                     line_mutated = true
                   } else {
-                    let (rw_s, _rw_e) = rewrite_method_call_with_index(get_method_rw_idx(), lines, mutated_lines, lidx, d.col, mname, helper)
-                    if rw_s >= 0 {
-                      file_changed = true
-                      line_mutated = true
-                      if helper == "mbt_compat::str_compare" {
-                        drift_ledger.push(DriftEntry::{
-                          category: "string_compare",
-                          file: f.rel_path,
-                          line: d.line,
-                          col: d.col,
-                          expr: mname,
-                          resolution: helper,
-                          status: "resolved",
-                          detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
-                        })
+                    let rw_idx = get_method_rw_idx()
+                    let lstart_b = rw_idx.line_starts[lidx]
+                    let lend_b = if lidx + 1 < rw_idx.line_starts.length() { rw_idx.line_starts[lidx + 1] - 1 } else { rw_idx.src.length() }
+                    let raw_tb = lstart_b + (if d.col > 0 { d.col - 1 } else { 0 })
+                    let tb = if raw_tb > lend_b { lend_b } else { raw_tb }
+                    let cov_interp = find_covering_interp_token(rw_idx, lidx, tb)
+                    let mut batched_interp = false
+                    if cov_interp >= 0 {
+                      match compute_interp_hole_edit(rw_idx, lines, lidx, d.col, cov_interp, mname, helper) {
+                        Some((abs_s, abs_e, new_sub)) => {
+                          let (sbl, _sbc) = line_starts_to_line_col(rw_idx.line_starts, abs_s)
+                          let (sll, _slc) = line_starts_to_line_col(rw_idx.line_starts, abs_e)
+                          if sbl == lidx && sll == lidx {
+                            let existing = match line_interp_edits.get(lidx) {
+                              Some(arr) => arr
+                              None => []
+                            }
+                            let mut overlaps = false
+                            for prev_ed in existing {
+                              if !(abs_e <= prev_ed.0 || abs_s >= prev_ed.1) {
+                                overlaps = true
+                                break
+                              }
+                            }
+                            if !overlaps {
+                              existing.push((abs_s, abs_e, new_sub))
+                              line_interp_edits[lidx] = existing
+                              batched_interp = true
+                              if helper == "mbt_compat::str_compare" {
+                                drift_ledger.push(DriftEntry::{
+                                  category: "string_compare",
+                                  file: f.rel_path,
+                                  line: d.line,
+                                  col: d.col,
+                                  expr: mname,
+                                  resolution: helper,
+                                  status: "resolved",
+                                  detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
+                                })
+                              }
+                            }
+                          }
+                        }
+                        None => ()
+                      }
+                    }
+                    if !batched_interp {
+                      let (rw_s, _rw_e) = rewrite_method_call_with_index(rw_idx, lines, mutated_lines, lidx, d.col, mname, helper)
+                      if rw_s >= 0 {
+                        file_changed = true
+                        line_mutated = true
+                        if helper == "mbt_compat::str_compare" {
+                          drift_ledger.push(DriftEntry::{
+                            category: "string_compare",
+                            file: f.rel_path,
+                            line: d.line,
+                            col: d.col,
+                            expr: mname,
+                            resolution: helper,
+                            status: "resolved",
+                            detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
+                          })
+                        }
                       }
                     }
                   }
@@ -2737,6 +4484,16 @@ pub fn run_stage_b_with_ops_deps_and_qt(
               None => ()
             }
           }
+          // 2a-view. Implicit `Array[T]` -> `ArrayView[T]` call argument wrapping (`mbt_compat::arr_view(arg)`).
+          if !line_mutated && str_has(d.message, "type mismatch in call to `") &&
+          d.found.starts_with("Array[") &&
+          (d.expected.starts_with("ArrayView[") || d.expected.starts_with("mbt_compat::ArrayView[")) {
+            let (rw_s, _rw_e) = rewrite_array_to_view_arg_with_index(get_method_rw_idx(), lines, mutated_lines, lidx, d.col, d.message)
+            if rw_s >= 0 {
+              file_changed = true
+              line_mutated = true
+            }
+          }
           // 2b. Tuple struct numeric field access `<expr>.0` -> `<expr>._0` (lexer-backed; never touches string literals; handles `.0.1`)
           // Only trigger on `struct \`S\` has no field \`N\`` / `unknown field \`N\` on struct \`S\``, NEVER on
           // `cannot access field \`N\` on \`T\`` (which is emitted for non-struct / tuple / stale-typed receivers!).
@@ -2802,19 +4559,28 @@ pub fn run_stage_b_with_ops_deps_and_qt(
             }
           }
           // 2c. OrderedMap/ArrayView/ArrayBuf index assignment `<recv>[<k>] = <v>` -> `<recv>.set(<k>, <v>)`,
-          //     or custom user type defining `op_set` -> `<recv>.op_set(<k>, <v>)` (supports multiline `<v>`, fail-closed otherwise).
+          //     or custom user type defining `#alias("_[_]=_")` / `op_set` / `#alias("_[_]")` / `op_get`
+          //     (supports multiline `<k>` and multiline `<v>`, fail-closed otherwise).
           let mut idx_set_method = ""
+          let mut idx_get_method = ""
           if !line_mutated && (str_has(d.message, "cannot assign to indexed type `") || str_has(d.message, "cannot index into type `")) {
             if str_has(d.message, "OrderedMap[") || str_has(d.message, "ArrayView[") || str_has(d.message, "ArrayBuf[") {
               idx_set_method = "set"
-            } else if str_has(d.message, "cannot assign to indexed type `") {
-              let p_idx = d.message.index_of("cannot assign to indexed type `")
+            } else {
+              let is_assign_diag = str_has(d.message, "cannot assign to indexed type `")
+              let p_idx = if is_assign_diag {
+                d.message.index_of("cannot assign to indexed type `")
+              } else {
+                d.message.index_of("cannot index into type `")
+              }
+              let p_len = if is_assign_diag { 31 } else { 24 }
               if p_idx >= 0 {
-                let r_ty = d.message.slice(p_idx + 31, d.message.length())
+                let r_ty = d.message.slice(p_idx + p_len, d.message.length())
                 let end_bt = r_ty.index_of("`")
                 if end_bt > 0 {
                   let raw_t = r_ty.slice(0, end_bt)
                   let base_t = strip_type_args_sym(raw_t)
+                  let is_qualified = base_t.index_of("::") >= 0
                   let pkg_fns = match round_pkg_fns {
                     Some(m) => m
                     None => {
@@ -2825,166 +4591,42 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                       m
                     }
                   }
-                  if pkg_fns.contains(base_t + "::op_set") {
-                    idx_set_method = "op_set"
+                  // Never fall back to short type name for cross-package qualified types (`ext::Grid`):
+                  // a local `Grid`'s `#alias` / `op_set` / `op_get` must never pollute another package's type.
+                  if is_assign_diag {
+                    match op_lookup.get(base_t + "|#alias_op_set") {
+                      Some(m) => idx_set_method = m
+                      None =>
+                      if !is_qualified && pkg_fns.contains(base_t + "::op_set") {
+                        idx_set_method = "op_set"
+                      }
+                    }
                   } else {
-                    let cc = base_t.index_of("::")
-                    if cc >= 0 && pkg_fns.contains(base_t.slice(cc + 2, base_t.length()) + "::op_set") {
-                      idx_set_method = "op_set"
+                    match op_lookup.get(base_t + "|#alias_op_get") {
+                      Some(m) => idx_get_method = m
+                      None =>
+                      if !is_qualified && pkg_fns.contains(base_t + "::op_get") {
+                        idx_get_method = "op_get"
+                      }
                     }
                   }
                 }
               }
             }
           }
-          if !line_mutated && idx_set_method.length() > 0 {
-            let cur_ln = lines[lidx]
-            let target_0 = if d.col > 0 { d.col - 1 } else { 0 }
-            // Find `[` near target_0 that is followed by matching `] = `
-            let mut best_lb = -1
-            let mut best_rb = -1
-            let mut best_eq = -1
-            let mut best_dist = 1000000
-            let mut pos = 0
-            while pos < cur_ln.length() {
-              if cur_ln.code_unit_at(pos) == 91 {
-                let mut depth = 1
-                let mut j = pos + 1
-                while j < cur_ln.length() && depth > 0 {
-                  let ch = cur_ln.code_unit_at(j)
-                  if ch == 91 { depth = depth + 1 }
-                  else if ch == 93 { depth = depth - 1 }
-                  j = j + 1
-                }
-                if depth == 0 {
-                  let rb = j - 1
-                  let mut eq_p = rb + 1
-                  while eq_p < cur_ln.length() && (cur_ln.code_unit_at(eq_p) == 32 || cur_ln.code_unit_at(eq_p) == 9) {
-                    eq_p = eq_p + 1
-                  }
-                  if eq_p < cur_ln.length() && cur_ln.code_unit_at(eq_p) == 61 &&
-                  !(eq_p + 1 < cur_ln.length() && cur_ln.code_unit_at(eq_p + 1) == 61) {
-                    let dist = if pos >= target_0 { pos - target_0 } else { target_0 - pos }
-                    if dist < best_dist {
-                      best_dist = dist
-                      best_lb = pos
-                      best_rb = rb
-                      best_eq = eq_p
-                    }
-                  }
-                }
-              }
-              pos = pos + 1
-            }
-            if best_lb > 0 && best_rb > best_lb && best_eq > best_rb {
-              let k_expr = cur_ln.slice(best_lb + 1, best_rb).trim()
-              let mut v_end = cur_ln.length()
-              // Strip trailing comment or `;`, and track bracket/brace/paren depth across lines
-              let mut vi = best_eq + 1
-              let mut vd = 0
-              let mut in_s = false
-              let mut esc = false
-              while vi < cur_ln.length() {
-                let ch = cur_ln.code_unit_at(vi)
-                if in_s {
-                  if esc { esc = false }
-                  else if ch == 92 { esc = true }
-                  else if ch == 34 { in_s = false }
-                } else if ch == 34 {
-                  in_s = true
-                } else if ch == 40 || ch == 91 || ch == 123 {
-                  vd = vd + 1
-                } else if ch == 41 || ch == 93 || ch == 125 {
-                  if vd == 0 { v_end = vi; break }
-                  vd = vd - 1
-                } else if vd == 0 && ch == 59 {
-                  v_end = vi
-                  break
-                } else if vd == 0 && ch == 47 && vi + 1 < cur_ln.length() && cur_ln.code_unit_at(vi + 1) == 47 {
-                  v_end = vi
-                  break
-                }
-                vi = vi + 1
-              }
-              if vd == 0 {
-                let v_expr = cur_ln.slice(best_eq + 1, v_end).trim()
-                let tail = cur_ln.slice(v_end, cur_ln.length())
-                lines[lidx] = cur_ln.slice(0, best_lb) + "." + idx_set_method + "(" + k_expr + ", " + v_expr + ")" + tail
-                file_changed = true
-                line_mutated = true
-              } else {
-                // Multiline RHS (e.g. `self.groups[id] = Group::{\n ... \n}` or `m[0] = ({\n let x = 5\n x\n}) + // next term\n 2`):
-                // scan forward until `vd == 0`, then continue to end of the statement on that line (and any trailing-operator continuation lines)!
-                // Distinguish true statement terminators (`;` or unbalanced `)`/`]`/`}`) from line comments (`//`), so trailing `//` after `+` still continues!
-                let mut end_l = lidx + 1
-                let mut end_c = -1
-                while end_l < lines.length() {
-                  let sl = lines[end_l]
-                  let mut sc = 0
-                  let mut sin_s = false
-                  let mut sesc = false
-                  let mut stopped_stmt = false
-                  let mut raw_end = sl.length()
-                  while sc < sl.length() {
-                    let ch = sl.code_unit_at(sc)
-                    if sin_s {
-                      if sesc { sesc = false }
-                      else if ch == 92 { sesc = true }
-                      else if ch == 34 { sin_s = false }
-                    } else if ch == 34 {
-                      sin_s = true
-                    } else if ch == 47 && sc + 1 < sl.length() && sl.code_unit_at(sc + 1) == 47 {
-                      raw_end = sc
-                      break
-                    } else if ch == 40 || ch == 91 || ch == 123 {
-                      vd = vd + 1
-                    } else if ch == 41 || ch == 93 || ch == 125 {
-                      if vd == 0 {
-                        raw_end = sc
-                        stopped_stmt = true
-                        break
-                      }
-                      vd = vd - 1
-                    } else if vd == 0 && ch == 59 {
-                      raw_end = sc
-                      stopped_stmt = true
-                      break
-                    }
-                    sc = sc + 1
-                  }
-                  if vd == 0 {
-                    let mut trim_end = raw_end
-                    while trim_end > 0 && (sl.code_unit_at(trim_end - 1) == 32 || sl.code_unit_at(trim_end - 1) == 9) {
-                      trim_end = trim_end - 1
-                    }
-                    let prefix_t = sl.slice(0, trim_end).trim()
-                    let continues = !stopped_stmt && (
-                      prefix_t.ends_with("+") || prefix_t.ends_with("-") || prefix_t.ends_with("*") ||
-                      prefix_t.ends_with("/") || prefix_t.ends_with("%") || prefix_t.ends_with("&&") ||
-                      prefix_t.ends_with("||") || prefix_t.ends_with("|") || prefix_t.ends_with("&") ||
-                      prefix_t.ends_with("^")
-                    )
-                    if !continues {
-                      end_c = trim_end
-                      break
-                    }
-                  }
-                  end_l = end_l + 1
-                }
-                if vd == 0 && end_l < lines.length() && end_c > 0 {
-                  let first_v = cur_ln.slice(best_eq + 1, cur_ln.length()).trim()
-                  lines[lidx] = cur_ln.slice(0, best_lb) + "." + idx_set_method + "(" + k_expr + ", " + first_v
-                  let eln = lines[end_l]
-                  lines[end_l] = eln.slice(0, end_c) + ")" + eln.slice(end_c, eln.length())
-                  let mut ml = lidx
-                  while ml <= end_l {
-                    mutated_lines[ml] = true
-                    ml = ml + 1
-                  }
-                  file_changed = true
-                  line_mutated = true
-                }
-              }
+          if !line_mutated && (idx_set_method.length() > 0 || idx_get_method.length() > 0) {
+            let (rw_s, _rw_e) = rewrite_index_op_with_index(
+              get_method_rw_idx(),
+              lines,
+              mutated_lines,
+              lidx,
+              d.col,
+              idx_set_method,
+              idx_get_method,
+            )
+            if rw_s >= 0 {
+              file_changed = true
+              line_mutated = true
             }
           }
           // 3. Live order-preserving cursor `while` loop for `OrderedMap`, `String`, `ArrayView`, & `Bytes` `for ... in` (Wave M1.2 A.6):
@@ -3602,6 +5244,47 @@ pub fn run_stage_b_with_ops_deps_and_qt(
           mutated_lines[lidx] = true
         }
       }
+      // Apply batched non-overlapping single-line interpolation hole edits in reverse byte order.
+      if line_interp_edits.length() > 0 {
+        let rw_idx = get_method_rw_idx()
+        for elidx in line_interp_edits.keys() {
+          if !mutated_lines.contains(elidx) {
+            match line_interp_edits.get(elidx) {
+              Some(eds) =>
+              if eds.length() > 0 {
+                // Sort descending by `abs_s` (insertion sort)
+                let sorted : Array[(Int, Int, String)] = []
+                for ed in eds {
+                  sorted.push(ed)
+                }
+                let mut si = 1
+                while si < sorted.length() {
+                  let cur = sorted[si]
+                  let mut sj = si - 1
+                  while sj >= 0 && sorted[sj].0 < cur.0 {
+                    sorted[sj + 1] = sorted[sj]
+                    sj = sj - 1
+                  }
+                  sorted[sj + 1] = cur
+                  si = si + 1
+                }
+                let lstart = rw_idx.line_starts[elidx]
+                let mut cur_line = lines[elidx]
+                for ed in sorted {
+                  let rel_s = ed.0 - lstart
+                  let rel_e = ed.1 - lstart
+                  if rel_s >= 0 && rel_e >= rel_s && rel_e <= cur_line.length() {
+                    cur_line = cur_line.slice(0, rel_s) + ed.2 + cur_line.slice(rel_e, cur_line.length())
+                    file_changed = true
+                  }
+                }
+                lines[elidx] = cur_line
+              }
+              None => ()
+            }
+          }
+        }
+      }
       if file_changed {
         changed = true
         changed_rels.push(f.rel_path)
@@ -3624,7 +5307,30 @@ pub fn run_stage_b_with_ops_deps_and_qt(
         next_files.push(f)
       }
     }
-    cur_files = next_files
+    if pending_bound_relax_reqs.length() > 0 {
+      let pkg_fns = match round_pkg_fns {
+        Some(m) => m
+        None => {
+          stage_b_perf_stats[3] = stage_b_perf_stats[3] + 1
+          let _ = get_all_round_tokens()
+          let m = collect_stage_b_pkg_fns_cached(cur_files, round_file_tokens)
+          round_pkg_fns = Some(m)
+          m
+        }
+      }
+      let (relaxed_files, relaxed_rels) = relax_redundant_fn_tuple_bounds(next_files, pkg_fns, pending_bound_relax_reqs)
+      if relaxed_rels.length() > 0 {
+        cur_files = relaxed_files
+        changed = true
+        for rr in relaxed_rels {
+          changed_rels.push(rr)
+        }
+      } else {
+        cur_files = next_files
+      }
+    } else {
+      cur_files = next_files
+    }
     let changed_rel_set : Map[String, Bool] = Map()
     for rel in changed_rels {
       changed_rel_set[rel] = true

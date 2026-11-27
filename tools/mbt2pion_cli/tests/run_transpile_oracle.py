@@ -106,6 +106,7 @@ CASES = {
     "transpile_mid_tier": ("ok", 14),
     "transpile_upper_tier": ("ok", 34),
     "wave_m2_d1": ("ok", 13),
+    "interp_index_compat": ("ok", 16),
 }
 
 MOON_TRAPS = {
@@ -2003,6 +2004,135 @@ pub fn d1_float_and_bytes_compat() -> (Bool, Bool, String, String, Int, Int, Int
   let b_ok = b_four[0] == b'\xAB' && b_four[3] == b'\xAB'
   (nan_ok, b_ok, fu_sb.to_string(), ru_sb.to_string(), b_neg.length(), b_zero.length(), b_four.length(), b_four[0].to_int(), b_four[3].to_int())
 }
+
+pub struct P2Grid {
+  cells : Array[Int]
+}
+
+#alias("_[_]=_")
+pub fn P2Grid::put(self : P2Grid, i : Int, v : Int) -> Unit {
+  self.cells[i] = v
+}
+
+#alias("_[_]")
+pub fn P2Grid::at(self : P2Grid, i : Int) -> Int {
+  self.cells[i]
+}
+
+pub fn p2_interp_methods(said : String, m : Map[String, String]) -> String {
+  let a = "t=\{said.trim(chars=" \n\r\t").escape()}"
+  let b = "v=\{match m.get("k").unwrap() { "ok" => "yes"; _ => "no" }}"
+  "\{a}|\{b}"
+}
+
+pub fn p2_alias_and_multiline_idx() -> (Int, Int) {
+  let g = P2Grid::{ cells: [1, 2, 3, 4] }
+  let k1 = 1
+  let k2 = 1
+  g[k1 +
+    k2] = 99
+  let m : Map[String, Int] = {}
+  m["ab" +
+    "cd"] = 77
+  (g[2], m.get("abcd").unwrap())
+}
+
+pub fn p2_json_index_key() -> Json {
+  let o : Map[String, Json] = {}
+  o["flag"] = Json::boolean(true)
+  Json::object(o)
+}
+
+pub fn p2_println_trailing_comma(tag : String) -> Unit {
+  println(
+    "T p2_println=" + tag,
+  )
+}
+
+pub(all) struct P2Holder {
+  tup : (Int, Int, Int, Int, Int)
+}
+
+pub fn p2_irrefutable_tuple(opt : Option[(Int, Int, Int, Int, Int)], h : P2Holder) -> (Int, Int) {
+  let a = match opt {
+    Some((_, at, _, ey, _)) => at + ey
+    None => 0
+  }
+  let b = match h {
+    { tup: (_, x, _, y, _) } => x * 10 + y
+  }
+  (a, b)
+}
+
+pub fn p2_bytes_from_array_ints() -> (Int, Int, Int, Int) {
+  let bs = Bytes::from_array([0x1b, b'[', 0, 255])
+  (bs.length(), bs[0].to_int(), bs[1].to_int(), bs[3].to_int())
+}
+
+fn p2_sum_view(v : ArrayView[Int]) -> Int {
+  let mut s = 0
+  for i = 0; i < v.length(); i = i + 1 {
+    s = s + v[i]
+  }
+  s
+}
+
+fn[K : Hash + Eq, V] p2_count_map_keys(m : Map[K, V]) -> Int {
+  m.keys().iter().count()
+}
+
+pub fn p2_compat_and_generics() -> (Int, Int, Int, Int, Int, Int, Int) {
+  let m : Map[(Int, String), Int] = {}
+  m[(1, "a")] = 10
+  m[(2, "b")] = 20
+  let mlen = m.length()
+  let mcnt = p2_count_map_keys(m)
+
+  let last_some = [3, 5, 8].iter().iter().last().unwrap()
+  let empty : Array[Int] = []
+  let last_none = match empty.iter().iter().last() {
+    Some(v) => v
+    None => -1
+  }
+
+  let sp = Set::from_array([(1, true), (2, false), (1, true)])
+  let st = Set::from_array([(1, "x", true), (2, "y", false), (1, "x", true)])
+  let xs = [4, 5, 6]
+  let vsum = p2_sum_view(xs)
+  (mlen, mcnt, last_some, last_none, sp.length(), st.length(), vsum)
+}
+
+pub fn p2_multiline_str_idx() -> (String, String) {
+  let m : Map[String, String] = {}
+  m["raw"] =
+    #|line1
+    #|line2  
+  let n = 2
+  m["interp"] =
+    $|line1
+    $|line\{n}
+  (m.get("raw").unwrap(), m.get("interp").unwrap())
+}
+
+fn p2_id_view(v : ArrayView[Int]) -> ArrayView[Int] {
+  v
+}
+
+pub fn p2_live_array_view_and_repr() -> (Int, Int, String) {
+  let xs = [7]
+  let v = p2_id_view(xs)
+  xs[0] = 23
+  let seen1 = v[0]
+  let levels = Array::makei(4, fn(i) { i * 10 })
+  let mut loop_sum = 0
+  for l in levels {
+    loop_sum = loop_sum + l
+  }
+  let seen2 = p2_sum_view(levels) + loop_sum
+  let opt : Int? = Option::Some(7)
+  let r = "\{repr("a\"b")}|\{repr('a')}|\{repr(42)}|\{repr(opt)}|\{repr([1, 2])}"
+  (seen1, seen2, r)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -2619,6 +2749,42 @@ fn main {
     check("d1.op_rhs_struct_lit", rl == 9)
     check("d1.op_neg_block_once", rb == 17 && rcnt == 1 && rnb == 27)
     check("d1.op_neg_if_match", rif == 17 && rmat == 17)
+  } else if kase == "interp_index_compat" {
+    let im : Map[String, String] = { "k": "ok" }
+    let s_interp = @m12.p2_interp_methods("  hi\n\t ", im)
+    let (g2, m77) = @m12.p2_alias_and_multiline_idx()
+    let j = @m12.p2_json_index_key()
+    let j_ok = match j {
+      Object(obj) =>
+        match obj.get("flag") {
+          Some(True) => true
+          _ => false
+        }
+      _ => false
+    }
+    @m12.p2_println_trailing_comma("ok")
+    let (t1, t2) = @m12.p2_irrefutable_tuple(Some((1, 10, 2, 20, 3)), @m12.P2Holder::{ tup: (0, 4, 0, 7, 0) })
+    let (blen, b0, b1, b3) = @m12.p2_bytes_from_array_ints()
+    let (mlen, mcnt, lsome, lnone, splen, stlen, vsum) = @m12.p2_compat_and_generics()
+    let (live1, live2, repr_s) = @m12.p2_live_array_view_and_repr()
+    let (ml_raw, ml_interp) = @m12.p2_multiline_str_idx()
+    trace("p2", "\{s_interp};\{g2},\{m77};\{j_ok};\{t1},\{t2};\{blen}:\{b0}:\{b1}:\{b3};\{mlen}:\{mcnt}:\{lsome}:\{lnone}:\{splen}:\{stlen}:\{vsum};\{live1}:\{live2}:\{repr_s};\{ml_raw.length()}:\{ml_interp.length()}")
+    check("p2.interp_methods", s_interp == "t=\"hi\"|v=yes")
+    check("p2.alias_op_set_get", g2 == 99)
+    check("p2.multiline_idx_assign", m77 == 77)
+    check("p2.json_index_key", j_ok)
+    check("p2.irrefutable_tuple_opt", t1 == 30)
+    check("p2.irrefutable_tuple_struct", t2 == 47)
+    check("p2.bytes_from_array", blen == 4 && b0 == 27 && b1 == 91 && b3 == 255)
+    check("p2.ordered_map_length", mlen == 2)
+    check("p2.generic_map_tuple_keys", mcnt == 2)
+    check("p2.iter_iter_last", lsome == 8 && lnone == -1)
+    check("p2.tuple_set_from_array", splen == 2 && stlen == 2)
+    check("p2.array_to_view_arg", vsum == 15)
+    check("p2.live_array_view_shared", live1 == 23 && live2 == 120)
+    check("p2.repr_interp", repr_s.length() > 0)
+    check("p2.multiline_raw_idx", ml_raw == "line1\nline2  ")
+    check("p2.multiline_interp_idx", ml_interp == "line1\nline2")
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3252,6 +3418,38 @@ pub fn main(w : World) -> Int {
     check(w, "d1.op_rhs_struct_lit", rl == 9)
     check(w, "d1.op_neg_block_once", rb == 17 && rcnt == 1 && rnb == 27)
     check(w, "d1.op_neg_if_match", rif == 17 && rmat == 17)
+  } else if kase == "interp_index_compat" {
+    let im : mbt_compat::OrderedMap[String, String] = mbt_compat::ordered_map_from_array([("k", "ok")])
+    let s_interp = m12::p2_interp_methods("  hi\n\t ", im)
+    let (g2, m77) = m12::p2_alias_and_multiline_idx()
+    let j = m12::p2_json_index_key()
+    let j_ok = match j {
+      mbt_compat::MbtJson::Object(obj) => obj.get("flag") == Some(mbt_compat::MbtJson::True)
+      _ => false
+    }
+    m12::p2_println_trailing_comma("ok")
+    let (t1, t2) = m12::p2_irrefutable_tuple(Some((1, 10, 2, 20, 3)), m12::P2Holder::{ tup: (0, 4, 0, 7, 0) })
+    let (blen, b0, b1, b3) = m12::p2_bytes_from_array_ints()
+    let (mlen, mcnt, lsome, lnone, splen, stlen, vsum) = m12::p2_compat_and_generics()
+    let (live1, live2, repr_s) = m12::p2_live_array_view_and_repr()
+    let (ml_raw, ml_interp) = m12::p2_multiline_str_idx()
+    trace(w, "p2", s_interp + ";" + g2.to_string() + "," + m77.to_string() + ";" + j_ok.to_string() + ";" + t1.to_string() + "," + t2.to_string() + ";" + blen.to_string() + ":" + b0.to_string() + ":" + b1.to_string() + ":" + b3.to_string() + ";" + mlen.to_string() + ":" + mcnt.to_string() + ":" + lsome.to_string() + ":" + lnone.to_string() + ":" + splen.to_string() + ":" + stlen.to_string() + ":" + vsum.to_string() + ";" + live1.to_string() + ":" + live2.to_string() + ":" + repr_s + ";" + ml_raw.length().to_string() + ":" + ml_interp.length().to_string())
+    check(w, "p2.interp_methods", s_interp == "t=\"hi\"|v=yes")
+    check(w, "p2.alias_op_set_get", g2 == 99)
+    check(w, "p2.multiline_idx_assign", m77 == 77)
+    check(w, "p2.json_index_key", j_ok)
+    check(w, "p2.irrefutable_tuple_opt", t1 == 30)
+    check(w, "p2.irrefutable_tuple_struct", t2 == 47)
+    check(w, "p2.bytes_from_array", blen == 4 && b0 == 27 && b1 == 91 && b3 == 255)
+    check(w, "p2.ordered_map_length", mlen == 2)
+    check(w, "p2.generic_map_tuple_keys", mcnt == 2)
+    check(w, "p2.iter_iter_last", lsome == 8 && lnone == -1)
+    check(w, "p2.tuple_set_from_array", splen == 2 && stlen == 2)
+    check(w, "p2.array_to_view_arg", vsum == 15)
+    check(w, "p2.live_array_view_shared", live1 == 23 && live2 == 120)
+    check(w, "p2.repr_interp", repr_s.length() > 0)
+    check(w, "p2.multiline_raw_idx", ml_raw == "line1\nline2  ")
+    check(w, "p2.multiline_interp_idx", ml_interp == "line1\nline2")
   } else {
     panic("abort: unknown case " + kase)
   }
