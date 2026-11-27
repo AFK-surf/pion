@@ -19802,3 +19802,174 @@ test "qbe_mono_tparam_capture_and_poly_rec_eq" {
   assert_eq(r1 == r3, false)
   assert_eq(r1 == r4, false)
 }
+
+///|
+trait DeferredKeyTrait {
+  fn dkey_id(self) -> Int
+}
+
+///|
+impl DeferredKeyTrait for Int {
+  fn dkey_id(self) -> Int {
+    self
+  }
+}
+
+///|
+struct DeferredBox[K, V] {
+  keys : Array[K]
+  vals : Array[V]
+}
+
+///|
+fn deferred_make_box[K : DeferredKeyTrait, V]() -> DeferredBox[K, V] {
+  DeferredBox::{ keys: [], vals: [] }
+}
+
+///|
+fn DeferredBox::put[K, V](self : DeferredBox[K, V], k : K, v : V) -> Unit {
+  self.keys.push(k)
+  self.vals.push(v)
+}
+
+///|
+fn DeferredBox::get_opt[K, V](self : DeferredBox[K, V], k : K) -> Option[V] {
+  let _ = k
+  if self.vals.length() > 0 { Some(self.vals[0]) } else { None }
+}
+
+///|
+test "deferred_infer_eblock_and_generic_call_qbe_and_wasm32" {
+  // 1. Runtime execution of EBlock empty array + closure read-before-push
+  let n = 4
+  let adv = { let _ = n; [] }
+  let push_one = fn(x : Double) -> Unit {
+    if adv.length() > 0 {
+      adv[0] = adv[0] + x * 0.125
+    }
+    adv.push(x)
+  }
+  push_one(4.0)
+  push_one(8.0)
+  assert_eq(adv.length(), 2)
+  assert_eq(adv[0], 5.0)
+  assert_eq(adv[1], 8.0)
+
+  // 2. Runtime execution of deferred generic call (full inference + expected-type refinement)
+  let b1 = deferred_make_box()
+  b1.put(7, "hello")
+  assert_eq(b1.keys.length(), 1)
+  assert_eq(b1.vals[0], "hello")
+
+  let b2 = deferred_make_box()
+  let empty_v : Option[String] = b2.get_opt(1)
+  assert_eq(empty_v is None, true)
+  b2.put(1, "world")
+  match b2.get_opt(1) {
+    Some(s) => assert_eq(s, "world")
+    None => assert_true(false, "expected Some(world)")
+  }
+
+  // 3. Cross-package 3-hop chain (pkg_a -> pkg_b -> pkg_c): QBE SSA + Wasm32 binary
+  let pkg_a_src =
+    #|pub trait KeyTrait {
+    #|  fn key_id(self) -> Int
+    #|}
+    #|impl KeyTrait for Int {
+    #|  fn key_id(self) -> Int { self }
+    #|}
+    #|pub struct MyBox[K, V] {
+    #|  keys : Array[K]
+    #|  vals : Array[V]
+    #|}
+    #|pub fn make_box[K : KeyTrait, V]() -> MyBox[K, V] {
+    #|  let k0 : Array[K] = []
+    #|  let v0 : Array[V] = []
+    #|  MyBox::{ keys: k0, vals: v0 }
+    #|}
+    #|pub fn MyBox::put[K : KeyTrait, V](self : MyBox[K, V], k : K, v : V) -> Unit {
+    #|  let _ = k.key_id()
+    #|  self.keys.push(k)
+    #|  self.vals.push(v)
+    #|}
+    #|pub fn MyBox::get_opt[K, V](self : MyBox[K, V], k : K) -> Option[V] {
+    #|  let _ = k
+    #|  if self.vals.length() > 0 { Some(self.vals[0]) } else { None }
+    #|}
+  let cr_a = check_source_files_full("pkg_a", ["a.pion"], [pkg_a_src])
+  assert_true(cr_a.diagnostics.length() == 0, check_result_to_json(cr_a.diagnostics))
+  let imp_a = ImportedPkg::{ name: "pkg_a", tc: cr_a.tc }
+
+  let pkg_b_src =
+    #|import "pkg_a"
+    #|pub fn use_box() -> String {
+    #|  let m = pkg_a::make_box()
+    #|  let _ : Option[String] = m.get_opt(1)
+    #|  m.put(1, "cross_pkg_ok")
+    #|  match m.get_opt(1) {
+    #|    Some(s) => s
+    #|    None => ""
+    #|  }
+    #|}
+    #|pub fn use_eblock(n : Int) -> Double {
+    #|  let adv = { let _ = n; [] }
+    #|  let push_one = fn(x : Double) -> Unit {
+    #|    if adv.length() > 0 {
+    #|      adv[0] = adv[0] + x * 0.125
+    #|    }
+    #|    adv.push(x)
+    #|  }
+    #|  push_one(4.0)
+    #|  push_one(8.0)
+    #|  adv[0]
+    #|}
+  let cr_b = check_source_files_with_imports_mapped(
+    "pkg_b",
+    ["b.pion"],
+    [pkg_b_src],
+    [imp_a],
+    ["pkg_a"],
+    ["pkg_a"],
+    false,
+    false,
+  )
+  assert_true(cr_b.diagnostics.length() == 0, check_result_to_json(cr_b.diagnostics))
+  let imp_b = ImportedPkg::{ name: "pkg_b", tc: cr_b.tc }
+
+  let pkg_c_src =
+    #|import "pkg_b"
+    #|pub fn main() -> Int {
+    #|  let s = pkg_b::use_box()
+    #|  let d = pkg_b::use_eblock(3)
+    #|  s.length() + d.to_int()
+    #|}
+  let cr_c = check_source_files_with_imports_mapped(
+    "pkg_c",
+    ["c.pion"],
+    [pkg_c_src],
+    [imp_b],
+    ["pkg_b"],
+    ["pkg_b"],
+    false,
+    false,
+  )
+  assert_true(cr_c.diagnostics.length() == 0, check_result_to_json(cr_c.diagnostics))
+
+  // Emit QBE SSA (native) and Wasm32 binary for pkg_c (transitively monomorphizing pkg_b -> pkg_a)
+  let qbe_res = emit_qbe_package_with_tc_target(cr_c.pkg, cr_c.tc, false, "amd64_sysv")
+  assert_true(qbe_res.ssa.length() > 0, "native QBE SSA emitted")
+  assert_true(!str_contains(qbe_res.ssa, "<error>"), "native QBE SSA must not contain <error>")
+  assert_true(!str_contains(qbe_res.ssa, "qual="), "native QBE SSA must not contain unresolved qual=")
+  let wasm_ssa = emit_qbe_package_with_tc_target(cr_c.pkg, cr_c.tc, false, "wasm32").ssa
+  assert_true(wasm_ssa.length() > 0, "wasm32 QBE SSA emitted")
+  assert_true(!str_contains(wasm_ssa, "<error>"), "wasm32 QBE SSA must not contain <error>")
+  let wasm_bin = emit_wasm_from_ssa(wasm_ssa)
+  assert_true(
+    wasm_bin.length() >= 8 &&
+      wasm_bin[0].to_int() == 0x00 &&
+      wasm_bin[1].to_int() == 0x61 &&
+      wasm_bin[2].to_int() == 0x73 &&
+      wasm_bin[3].to_int() == 0x6D,
+    "valid wasm32 module emitted",
+  )
+}

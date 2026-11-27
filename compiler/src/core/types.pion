@@ -746,6 +746,15 @@ pub struct TypeChecker {
   dot_variant_resolve : Map[String, String]
   /// `span_key`s of such `let`s whose element type is still unknown.
   infer_pending : Map[String, Bool]
+  /// Initializer expressions of pending generic `let` bindings for deferred
+  /// relay refinement (`tc_refine_fn_values`) once concrete type args are known.
+  infer_pending_inits : Map[String, Expr]
+  /// Generic calls that left one or more type parameters unbound at check time;
+  /// verified fail-closed after all deferred refinements complete.
+  pending_gcalls : Array[PendingGCall]
+  /// Span key of an `EIdent` currently allowed to read an `infer_pending`
+  /// binding without a concrete expected type (method or index receiver only).
+  mut allow_pending_ident_span : String
   /// Argument types of the `push` / `set` just checked on a collection with an
   /// unknown element type (consumed by the enclosing method call).
   infer_hit : Array[Ty]
@@ -9294,8 +9303,12 @@ fn check_stmts_ex(
     let exp = if is_last { expected } else { None }
     match stmts[i] {
       SLet(name, is_mut, TyMissing(tsp), init, sp) =>
-        if name != "_" && infer_empty_kind(init) != 0 {
-          let hint = infer_let_hint(env, stmts, i, name, expected, tail_used)
+        if name != "_" {
+          let hint = if infer_empty_kind(init) != 0 {
+            infer_let_hint(env, stmts, i, name, expected, tail_used)
+          } else {
+            None
+          }
           last_ty = check_let(tc, env, name, is_mut, TyMissing(tsp), init, sp, hint)
           if tc.infer_pending.contains(span_key(sp)) {
             pending_keys.push(span_key(sp))
@@ -9315,6 +9328,7 @@ fn check_stmts_ex(
   while pi < pending_keys.length() {
     if tc.infer_pending.contains(pending_keys[pi]) {
       tc.infer_pending.remove(pending_keys[pi])
+      tc.infer_pending_inits.remove(pending_keys[pi])
       match pending_lets[pi] {
         SLet(name, _, _, init, sp) => infer_missing_type_err(tc, name, init, sp)
         _ => ()
@@ -9478,6 +9492,260 @@ fn map_init_shape_err(tc : TypeChecker, arg : Expr, got : Ty) -> Ty {
 }
 
 ///|
+struct PendingGCall {
+  span : Span
+  fn_name : String
+  callee_key : String
+  type_params : Array[String]
+  sig_required : Array[Bool]
+  masked_by_arg : Array[Bool]
+}
+
+///|
+fn tc_has_err_since(tc : TypeChecker, mark : Int) -> Bool {
+  tc.diagnostics.length() > mark
+}
+
+///|
+fn tc_tp_has_bound(decl : FnDecl, tp : String) -> Bool {
+  let mut i = 0
+  while i < decl.type_bounds.length() {
+    if decl.type_bounds[i].param == tp && decl.type_bounds[i].traits.length() > 0 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn tc_params_mention_tp(param_tys : Array[Ty], start : Int, tp : String) -> Bool {
+  let mut i = start
+  while i < param_tys.length() {
+    if ty_mentions_tparam(param_tys[i], tp) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn tc_callee_body_uses_tp(tc : TypeChecker, callee_key : String, tp : String) -> Bool {
+  if callee_key == "" {
+    return false
+  }
+  if eq_tparams_has(tc, callee_key, tp) {
+    return true
+  }
+  match tc.map_key_obligations.get(callee_key) {
+    Some(arr) => {
+      let mut i = 0
+      while i < arr.length() {
+        if ty_mentions_tparam(arr[i], tp) {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  match tc.eq_trait_obligations.get(callee_key) {
+    Some(arr) => {
+      let mut i = 0
+      while i < arr.length() {
+        if ty_mentions_tparam(arr[i].target_ty, tp) {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  match tc.op_tparams.get(callee_key) {
+    Some(arr) => {
+      let suffix = ":" + tp
+      let slen = suffix.length()
+      let mut i = 0
+      while i < arr.length() {
+        let alen = arr[i].length()
+        if alen >= slen && slice_str(arr[i], alen - slen, alen) == suffix {
+          return true
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  false
+}
+
+///|
+fn tc_record_pending_gcall(
+  tc : TypeChecker,
+  decl : FnDecl,
+  fn_name : String,
+  param_tys : Array[Ty],
+  param_start : Int,
+  ret_ty : Ty,
+  subst : Map[String, Ty],
+  arg_unres_tparams : Array[String],
+  sp : Span,
+) -> Unit {
+  if decl.type_params.length() == 0 || !tc_subst_has_unbound(decl.type_params, subst) {
+    return
+  }
+  let sig_req : Array[Bool] = []
+  let masked : Array[Bool] = []
+  let mut k = 0
+  while k < decl.type_params.length() {
+    let tp = decl.type_params[k]
+    let is_req = tc_tp_has_bound(decl, tp) ||
+      ty_mentions_tparam(ret_ty, tp) ||
+      tc_params_mention_tp(param_tys, param_start, tp)
+    sig_req.push(is_req)
+    masked.push(str_arr_contains(arg_unres_tparams, tp))
+    k = k + 1
+  }
+  tc.pending_gcalls.push(PendingGCall::{
+    span: sp,
+    fn_name: fn_name,
+    callee_key: span_key(decl.span),
+    type_params: decl.type_params,
+    sig_required: sig_req,
+    masked_by_arg: masked,
+  })
+}
+
+///|
+fn tc_subst_has_unbound(type_params : Array[String], subst : Map[String, Ty]) -> Bool {
+  let mut k = 0
+  while k < type_params.length() {
+    match subst.get(type_params[k]) {
+      Some(t) => if ty_has_unresolved(t) { return true }
+      None => return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///|
+fn tc_mark_gcall_err(tc : TypeChecker, e : Expr) -> Unit {
+  match e {
+    ECall(_, _, sp) | EMethodCall(_, _, _, sp) =>
+      tc.let_infer.set(span_key(sp) + "#gcall_err", TError)
+    EBlock(stmts, _) =>
+      if stmts.length() > 0 {
+        match stmts[stmts.length() - 1] {
+          SExpr(tail, _) => tc_mark_gcall_err(tc, tail)
+          _ => ()
+        }
+      }
+    EIf(_, then_stmts, else_opt, _) => {
+      if then_stmts.length() > 0 {
+        match then_stmts[then_stmts.length() - 1] {
+          SExpr(tail, _) => tc_mark_gcall_err(tc, tail)
+          _ => ()
+        }
+      }
+      match else_opt {
+        Some(el) => tc_mark_gcall_err(tc, el)
+        None => ()
+      }
+    }
+    EMatch(_, arms, _) => {
+      let mut i = 0
+      while i < arms.length() {
+        tc_mark_gcall_err(tc, arms[i].body)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn resolve_pending_gcalls(tc : TypeChecker) -> Unit {
+  let mut i = 0
+  while i < tc.pending_gcalls.length() {
+    let pg = tc.pending_gcalls[i]
+    let sk = span_key(pg.span)
+    if !tc.let_infer.contains(sk + "#gcall_err") {
+      match tc.let_infer.get(sk + "#gcall") {
+        Some(TTuple(targs)) => {
+          let missing : Array[String] = []
+          let mut k = 0
+          while k < pg.type_params.length() {
+            let is_unres = if k < targs.length() {
+              ty_has_unresolved(targs[k])
+            } else {
+              true
+            }
+            if is_unres {
+              let tp = pg.type_params[k]
+              let is_masked = k < pg.masked_by_arg.length() && pg.masked_by_arg[k]
+              let is_req = (k < pg.sig_required.length() && pg.sig_required[k]) ||
+                tc_callee_body_uses_tp(tc, pg.callee_key, tp)
+              if !is_masked && is_req {
+                missing.push(tp)
+              }
+            }
+            k = k + 1
+          }
+          if missing.length() > 0 {
+            tc.let_infer.set(sk + "#gcall_err", TError)
+            let mstr = join_strs(missing, ", ")
+            tc_err(
+              tc,
+              pg.span,
+              "E_MISSING_TYPE",
+              "cannot infer type parameter(s) `" + mstr + "` in call to `" + pg.fn_name + "`",
+              "concrete type(s) for `" + mstr + "`",
+              "unresolved",
+              "add a type annotation to the binding or context so `" + mstr + "` can be inferred",
+            )
+          }
+        }
+        _ => ()
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn ty_is_pending_generic(t : Ty) -> Bool {
+  match t {
+    TStruct(_, args) | TEnum(_, args) => args.length() > 0 && ty_has_unresolved(t)
+    TOption(_) | TArray(_) | TFixedArray(_) | TImmArray(_) | TMap(_, _) =>
+      ty_has_unresolved(t)
+    _ => false
+  }
+}
+
+///|
+fn infer_arr_pending(tc : TypeChecker, env : Env, name : String) -> Bool {
+  match env_lookup(env, name) {
+    Some(b) =>
+      match b.ty {
+        TArray(_) =>
+          b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span))
+        _ => false
+      }
+    None => false
+  }
+}
+
+///|
+fn expr_is_pending_arr_index(tc : TypeChecker, env : Env, e : Expr) -> Bool {
+  match e {
+    EIndex(EIdent(aname, _), _, _) => infer_arr_pending(tc, env, aname)
+    _ => false
+  }
+}
+
+///|
 /// 1 for an empty array initializer (`[]`, `Array::new()`, `Array::with_capacity(n)`),
 /// 2 for an empty map (`Map([])`, `Map()`, `Map::new()`, `Map::with_capacity(n)`),
 /// 3 for an untyped `None` (`None`, `Option::None`), 0 otherwise.
@@ -9502,6 +9770,15 @@ fn infer_empty_kind(init : Expr) -> Int {
     ECall(EPath("ImmArray", "new", _), args, _) => if args.length() == 0 { 4 } else { 0 }
     EIdent("None", _) => 3
     EPath("Option", "None", _) => 3
+    EBlock(stmts, _) =>
+      if stmts.length() > 0 {
+        match stmts[stmts.length() - 1] {
+          SExpr(tail, _) => infer_empty_kind(tail)
+          _ => 0
+        }
+      } else {
+        0
+      }
     _ => 0
   }
 }
@@ -9686,6 +9963,17 @@ fn infer_missing_type_err(
       "Option[?]",
       "annotate it (`let " + name + " : Option[T] = None`), or assign/pass/return it as `Option[T]` in the same block",
     )
+  } else if kind == 0 {
+    tc_mark_gcall_err(tc, init)
+    tc_err(
+      tc,
+      sp,
+      "E_MISSING_TYPE",
+      "cannot infer type arguments for `" + name + "`",
+      "concrete generic type",
+      "unresolved type arguments",
+      "annotate it (`let " + name + " : Type[...] = ...`), or use `" + name + "` in the same block",
+    )
   } else {
     tc_err(
       tc,
@@ -9728,6 +10016,7 @@ fn infer_refine_call(
       } else {
         TError
       }
+    TStruct(_, _) | TEnum(_, _) => if hit.length() == 1 { hit[0] } else { TError }
     _ => TError
   }
   match obj {
@@ -9764,6 +10053,13 @@ fn infer_refine_binding(tc : TypeChecker, env : Env, name : String, new_ty : Ty)
           if tc.record_types {
             qt_refine_let(tc, env, b.decl_span, b.init_span, new_ty)
           }
+          match tc.infer_pending_inits.get(key) {
+            Some(init_expr) => {
+              tc.infer_pending_inits.remove(key)
+              tc_refine_fn_values(tc, env, init_expr, new_ty, "in let binding `" + name + "`")
+            }
+            None => ()
+          }
         }
         return
       }
@@ -9792,6 +10088,16 @@ fn ty_contains_never(t : Ty) -> Bool {
     TNever => true
     TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) => ty_contains_never(e)
     TMap(k, v) => ty_contains_never(k) || ty_contains_never(v)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ty_contains_never(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
     _ => false
   }
 }
@@ -10261,7 +10567,9 @@ fn check_let(
     Some(_) => ann_opt
     None => hint
   }
+  let init_diag_mark = tc.diagnostics.length()
   let init_ty = check_expr(tc, env, init, exp)
+  let init_had_err = tc_has_err_since(tc, init_diag_mark)
   let mut final_ty = match ann_opt {
     Some(ann) => {
       if !ty_compat(ann, init_ty) {
@@ -10300,6 +10608,9 @@ fn check_let(
               TArray(TError)
             }
           }
+        } else if !init_had_err && ty_is_pending_generic(final_ty) {
+          tc.infer_pending.set(span_key(sp), true)
+          tc.infer_pending_inits.set(span_key(sp), init)
         }
       }
     Some(_) => ()
@@ -10915,6 +11226,7 @@ fn check_stmt(
               }
               let is_pending = b.decl_span.line > 0 &&
                 tc.infer_pending.contains(span_key(b.decl_span))
+              let a_err_mark = tc.diagnostics.length()
               let rty = check_expr(tc, env, rhs, if is_pending { None } else { Some(b.ty) })
               if !ty_compat(b.ty, rty) {
                 tc_err(
@@ -10928,6 +11240,28 @@ fn check_stmt(
                 )
               } else if is_pending {
                 infer_refine_binding(tc, env, name, rty)
+                let dk = span_key(b.decl_span)
+                if tc.infer_pending.contains(dk) {
+                  tc.infer_pending.remove(dk)
+                  match tc.infer_pending_inits.get(dk) {
+                    Some(init_expr) => {
+                      tc.infer_pending_inits.remove(dk)
+                      tc_mark_gcall_err(tc, init_expr)
+                    }
+                    None => ()
+                  }
+                  if tc.diagnostics.length() == a_err_mark {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_MISSING_TYPE",
+                      "cannot assign unresolved value to `" + name + "` before its type is known",
+                      "concrete type",
+                      ty_to_string(rty),
+                      "add an explicit type annotation to `let mut " + name + "` or assign a concrete value first",
+                    )
+                  }
+                }
               }
             }
             None => {
@@ -10936,10 +11270,86 @@ fn check_stmt(
               env_define(env, name, rty, true)
             }
           }
-        EIndex(EIdent(mname, _), kexpr, _) if infer_map_pending(tc, env, mname) => {
+        EIndex(EIdent(mname, _), kexpr, lsp) if infer_map_pending(tc, env, mname) => {
+          let a_err_mark = tc.diagnostics.length()
           let kty = check_expr(tc, env, kexpr, None)
           let rty = check_expr(tc, env, rhs, None)
           infer_refine_binding(tc, env, mname, TMap(kty, rty))
+          if infer_map_pending(tc, env, mname) {
+            match env_lookup(env, mname) {
+              Some(b) => {
+                let dk = span_key(b.decl_span)
+                tc.infer_pending.remove(dk)
+                match tc.infer_pending_inits.get(dk) {
+                  Some(init_expr) => {
+                    tc.infer_pending_inits.remove(dk)
+                    tc_mark_gcall_err(tc, init_expr)
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+            if tc.diagnostics.length() == a_err_mark {
+              tc_err(
+                tc,
+                lsp,
+                "E_MISSING_TYPE",
+                "cannot infer key/value types of `" + mname + "` from unresolved index assignment",
+                "concrete key and value types",
+                ty_to_string(TMap(kty, rty)),
+                "add an explicit type annotation to `let " + mname + "` or assign concrete key/value types first",
+              )
+            }
+          }
+        }
+        EIndex(EIdent(aname, _), idx, lsp) if infer_arr_pending(tc, env, aname) => {
+          let a_err_mark = tc.diagnostics.length()
+          let ity = check_expr(tc, env, idx, Some(TInt))
+          if !ty_compat(TInt, ity) {
+            tc_err(
+              tc,
+              lsp,
+              "E_TYPE_MISMATCH",
+              "array index must be `Int`",
+              "Int",
+              ty_to_string(ity),
+              "use an `Int` index",
+            )
+          }
+          let rty = check_expr(tc, env, rhs, None)
+          if infer_arr_pending(tc, env, aname) &&
+            !ty_has_unresolved(rty) &&
+            !ty_contains_never(rty) {
+            infer_refine_binding(tc, env, aname, TArray(rty))
+          }
+          if infer_arr_pending(tc, env, aname) {
+            match env_lookup(env, aname) {
+              Some(b) => {
+                let dk = span_key(b.decl_span)
+                tc.infer_pending.remove(dk)
+                match tc.infer_pending_inits.get(dk) {
+                  Some(init_expr) => {
+                    tc.infer_pending_inits.remove(dk)
+                    tc_mark_gcall_err(tc, init_expr)
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+            if tc.diagnostics.length() == a_err_mark {
+              tc_err(
+                tc,
+                lsp,
+                "E_MISSING_TYPE",
+                "cannot infer element type of `" + aname + "` from unresolved index assignment",
+                "concrete element type",
+                ty_to_string(rty),
+                "add an explicit type annotation to `let " + aname + "` or push/assign a concrete element first",
+              )
+            }
+          }
         }
         EField(obj, fname, lsp) => {
           let lty = check_field_assign_target(tc, env, obj, fname, lsp)
@@ -12689,7 +13099,7 @@ fn qt_refine_let(
     None => ()
   }
   if init_sp.line > 0 {
-    let tags : Array[String] = ["EArrayLit", "ECall", "EIdent", "EPath"]
+    let tags : Array[String] = ["EArrayLit", "ECall", "EIdent", "EPath", "EBlock"]
     let mut ti = 0
     while ti < tags.length() {
       let ek = span_key(init_sp) + "#" + tags[ti]
@@ -17248,6 +17658,8 @@ fn check_fn_call(
   sp : Span,
   target : String,
 ) -> Ty {
+  let call_diag_mark = tc.diagnostics.length()
+  let arg_unres_tparams : Array[String] = []
   let subst : Map[String, Ty] = Map([])
   match expected {
     Some(exp_ty) => unify_tparams(finfo.ret_ty, exp_ty, subst)
@@ -17563,6 +17975,16 @@ fn check_fn_call(
         if track_cl_retry {
           tc.closure_retry_depth = tc.closure_retry_depth - 1
         }
+        if ty_has_unresolved(eff_aty) && infer_empty_kind(resolved_args[i]) == 0 {
+          let mut utk = 0
+          while utk < finfo.decl.type_params.length() {
+            let utp = finfo.decl.type_params[utk]
+            if ty_mentions_tparam(finfo.param_tys[i], utp) && !str_arr_contains(arg_unres_tparams, utp) {
+              arg_unres_tparams.push(utp)
+            }
+            utk = utk + 1
+          }
+        }
         let pty = subst_ty(finfo.param_tys[i], subst)
         if !into_errored &&
           (!ty_compat(pty, eff_aty) ||
@@ -17625,8 +18047,22 @@ fn check_fn_call(
   // A generic call that may relay fn values (`tc_refine_relay`), with the
   // instantiation its arguments fixed.
   tc_record_gcall(tc, finfo.decl, subst, sp)
-  if fn_statically_diverges(finfo) {
+  let diverges = fn_statically_diverges(finfo)
+  if diverges {
     tc.never_calls.set(span_key(sp), true)
+  }
+  if !diverges && !tc_has_err_since(tc, call_diag_mark) {
+    tc_record_pending_gcall(
+      tc,
+      finfo.decl,
+      finfo.decl.name,
+      finfo.param_tys,
+      0,
+      finfo.ret_ty,
+      subst,
+      arg_unres_tparams,
+      sp,
+    )
   }
   // A type param no argument fixed is unresolved, never the callee's own
   // `TParam` leaking into the caller (`pass(second)` before `T` is known).
@@ -19437,6 +19873,8 @@ fn check_method_call(
       let key = sname + "::" + method_name
       match tc.methods.get(key) {
         Some(minfo) => {
+          let call_diag_mark = tc.diagnostics.length()
+          let arg_unres_tparams : Array[String] = []
           let subst : Map[String, Ty] = Map([])
           if minfo.param_tys.length() > 0 {
             unify_tparams(minfo.param_tys[0], recv_ty, subst)
@@ -19786,6 +20224,16 @@ fn check_method_call(
                       }
                     }
                   }
+                  if ty_has_unresolved(eff_aty) && infer_empty_kind(resolved_args[i]) == 0 {
+                    let mut utk = 0
+                    while utk < minfo.decl.type_params.length() {
+                      let utp = minfo.decl.type_params[utk]
+                      if ty_mentions_tparam(minfo.param_tys[p_idx], utp) && !str_arr_contains(arg_unres_tparams, utp) {
+                        arg_unres_tparams.push(utp)
+                      }
+                      utk = utk + 1
+                    }
+                  }
                   unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
                 }
                 if track_cl_retry {
@@ -19832,7 +20280,8 @@ fn check_method_call(
           )
           tc_check_type_bounds(tc, env, minfo.decl, subst, sp, minfo.is_imported)
           tc.resolved_method_calls.set(span_key(sp), sname + "::" + method_name)
-          if fn_statically_diverges(minfo) {
+          let mdiverges = fn_statically_diverges(minfo)
+          if mdiverges {
             tc.never_calls.set(span_key(sp), true)
           }
           let mtarget = tc_qualify_local_name(tc, sname) + "::" + method_name
@@ -19846,6 +20295,25 @@ fn check_method_call(
           if minfo.decl.type_params.length() > 0 {
             tc_record_gcall(tc, minfo.decl, subst, sp)
             tc.let_infer.set(span_key(sp) + "#gmeth", TStruct(sname, []))
+            if !mdiverges && !tc_has_err_since(tc, call_diag_mark) {
+              tc_record_pending_gcall(
+                tc,
+                minfo.decl,
+                key,
+                minfo.param_tys,
+                1,
+                minfo.ret_ty,
+                subst,
+                arg_unres_tparams,
+                sp,
+              )
+            }
+          }
+          if ty_has_unresolved(recv_ty) && minfo.param_tys.length() > 0 {
+            let refined_recv = subst_ty_mask_unbound(minfo.param_tys[0], minfo.decl.type_params, subst)
+            if !ty_has_unresolved(refined_recv) && !ty_contains_never(refined_recv) {
+              tc.infer_hit.push(refined_recv)
+            }
           }
           let mret = subst_ty_mask_unbound(minfo.ret_ty, minfo.decl.type_params, subst)
           if tc.record_types {
@@ -20487,7 +20955,14 @@ fn check_binary_chain(
             op != ">" &&
             op != ">="
           let lhs_exp : Option[Ty] = if is_arith_or_bit { cur_exp } else { None }
-          if (op == "==" || op == "!=") && expr_needs_rhs_ty_hint(lhs) {
+          let lhs_needs_rhs = ((op == "==" || op == "!=") && expr_needs_rhs_ty_hint(lhs)) ||
+            (is_arith_or_bit &&
+              (match lhs_exp {
+                Some(_) => false
+                None => true
+              }) &&
+              expr_is_pending_arr_index(tc, env, lhs))
+          if lhs_needs_rhs {
             frames.push(CheckBinaryFrame::{
               state: 2,
               op: op,
@@ -21235,6 +21710,27 @@ fn check_expr_inner(
                   return exp_ty
                 }
               None => ()
+            }
+            if span_key(sp) != tc.allow_pending_ident_span {
+              let dk = span_key(b.decl_span)
+              tc.infer_pending.remove(dk)
+              match tc.infer_pending_inits.get(dk) {
+                Some(init_expr) => {
+                  tc.infer_pending_inits.remove(dk)
+                  tc_mark_gcall_err(tc, init_expr)
+                }
+                None => ()
+              }
+              tc_err(
+                tc,
+                sp,
+                "E_MISSING_TYPE",
+                "cannot use `" + name + "` before its type is known",
+                "concrete type",
+                ty_to_string(b.ty),
+                "add an explicit type annotation to `let " + name + "` or refine it via a method call or typed context first",
+              )
+              return TError
             }
             if tc.record_types && ty_has_error(b.ty) {
               qt_add_pending_ref(tc, b.decl_span, span_key(sp) + "#EIdent")
@@ -23661,9 +24157,28 @@ fn check_expr_inner(
       }
     }
     EMethodCall(obj, method_name, args, sp) => {
+      let mut pending_recv_name = ""
+      let mut pending_recv_key = ""
+      let saved_allow = tc.allow_pending_ident_span
+      match obj {
+        EIdent(oname, osp) => {
+          tc.allow_pending_ident_span = span_key(osp)
+          match env_lookup(env, oname) {
+            Some(b) =>
+              if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
+                pending_recv_name = oname
+                pending_recv_key = span_key(b.decl_span)
+              }
+            None => ()
+          }
+        }
+        _ => ()
+      }
       let oty = check_expr(tc, env, obj, None)
+      tc.allow_pending_ident_span = saved_allow
       tc.infer_hit.clear()
-      let m_diag_before = if tc.record_types { tc.diagnostics.length() } else { 0 }
+      let m_err_mark = tc.diagnostics.length()
+      let m_diag_before = if tc.record_types { m_err_mark } else { 0 }
       if tc.record_types {
         tc.qt_last_call_key = ""
         tc.qt_last_call_cand = None
@@ -23727,6 +24242,40 @@ fn check_expr_inner(
         }
       }
       infer_refine_call(tc, env, obj, oty, method_name)
+      if pending_recv_key != "" && tc.infer_pending.contains(pending_recv_key) {
+        let is_builtin_collection_query = match oty {
+          TArray(_) | TFixedArray(_) | TImmArray(_) | TMap(_, _) =>
+            args.length() == 0 &&
+              (method_name == "length" || method_name == "is_empty" || method_name == "clear")
+          TOption(_) =>
+            args.length() == 0 &&
+              (method_name == "is_none" || method_name == "is_some")
+          _ => false
+        }
+        if !is_builtin_collection_query {
+          tc.infer_pending.remove(pending_recv_key)
+          match tc.infer_pending_inits.get(pending_recv_key) {
+            Some(init_expr) => {
+              tc.infer_pending_inits.remove(pending_recv_key)
+              tc_mark_gcall_err(tc, init_expr)
+            }
+            None => ()
+          }
+          tc.let_infer.set(span_key(sp) + "#gcall_err", TError)
+          if tc.diagnostics.length() == m_err_mark {
+            tc_err(
+              tc,
+              sp,
+              "E_MISSING_TYPE",
+              "cannot call method `" + method_name + "` on `" + pending_recv_name + "` before its type is known",
+              "concrete receiver type",
+              ty_to_string(oty),
+              "add an explicit type annotation to `let " + pending_recv_name + "` or refine it via a full-inference call first",
+            )
+          }
+          return TError
+        }
+      }
       let mut recv_mut = false
       match oty {
         TError => ()
@@ -23767,7 +24316,64 @@ fn check_expr_inner(
       rty
     }
     EIndex(obj, idx, sp) => {
+      let mut pending_arr_name = ""
+      let saved_allow = tc.allow_pending_ident_span
+      match obj {
+        EIdent(oname, osp) =>
+          if infer_arr_pending(tc, env, oname) {
+            pending_arr_name = oname
+            tc.allow_pending_ident_span = span_key(osp)
+          }
+        _ => ()
+      }
       let oty = check_expr(tc, env, obj, None)
+      tc.allow_pending_ident_span = saved_allow
+      if pending_arr_name != "" {
+        let ity = check_expr(tc, env, idx, Some(TInt))
+        if !ty_compat(TInt, ity) {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "array index must be `Int`",
+            "Int",
+            ty_to_string(ity),
+            "use an `Int` index",
+          )
+        }
+        match expected {
+          Some(et) =>
+            if !ty_has_unresolved(et) && !ty_contains_never(et) {
+              infer_refine_binding(tc, env, pending_arr_name, TArray(et))
+              return et
+            }
+          None => ()
+        }
+        match env_lookup(env, pending_arr_name) {
+          Some(b) => {
+            let dk = span_key(b.decl_span)
+            tc.infer_pending.remove(dk)
+            match tc.infer_pending_inits.get(dk) {
+              Some(init_expr) => {
+                tc.infer_pending_inits.remove(dk)
+                tc_mark_gcall_err(tc, init_expr)
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
+        tc_err(
+          tc,
+          sp,
+          "E_MISSING_TYPE",
+          "cannot index into `" + pending_arr_name + "` before its element type is known",
+          "concrete element type",
+          "Array[?]",
+          "add a type annotation to `let " + pending_arr_name + "` or push an element first",
+        )
+        return TError
+      }
       match oty {
         TError => {
           let _ = check_expr(tc, env, idx, None)
@@ -23853,7 +24459,7 @@ fn check_expr_inner(
         }
       }
       let first_ty = check_expr(tc, env, elems[0], exp_elem)
-      let target_elem = match exp_elem {
+      let mut target_elem = match exp_elem {
         Some(TDynTrait(tn)) => TDynTrait(tn)
         _ => first_ty
       }
@@ -23870,6 +24476,15 @@ fn check_expr_inner(
             ty_to_string(ety),
             "ensure all array elements have type `" + ty_to_string(target_elem) + "`",
           )
+        } else if ty_has_unresolved(target_elem) &&
+          !ty_has_unresolved(ety) &&
+          !ty_contains_never(ety) {
+          target_elem = ety
+          let mut k = 0
+          while k < i {
+            tc_refine_fn_values(tc, env, elems[k], target_elem, "in array literal")
+            k = k + 1
+          }
         }
         i = i + 1
       }
@@ -25146,6 +25761,9 @@ fn check_package_with_imports_mapped_plan_qt(
     closure_infer: Map([]),
     dot_variant_resolve: Map([]),
     infer_pending: Map([]),
+    infer_pending_inits: Map([]),
+    pending_gcalls: [],
+    allow_pending_ident_span: "",
     infer_hit: [],
     expr_tys: Map([]),
     call_targets: Map([]),
@@ -27027,6 +27645,7 @@ fn check_package_with_imports_mapped_plan_qt(
     }
   }
 
+  resolve_pending_gcalls(tc)
   resolve_eq_uses(tc)
   // Verify that generic built-in `impl Eq` bodies do not compare unbounded type parameters.
   fi = 0

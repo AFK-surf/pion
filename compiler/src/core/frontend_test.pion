@@ -16425,3 +16425,394 @@ test "issue60_nested_closure_check_cache_linear_and_sound" {
   assert_true(cr_unres.diagnostics.length() == 0, check_result_to_json(cr_unres.diagnostics))
 }
 
+///|
+test "deferred_infer_eblock_and_generic_call_fail_closed" {
+  // 1. EBlock empty array + closure read-before-push
+  let eblock_ok =
+  #|fn repro_eblock_arr(n : Int) -> Double {
+  #|  let adv = { let _ = n; [] }
+  #|  let push_one = fn(x : Double) -> Unit {
+  #|    if adv.length() > 0 {
+  #|      adv[0] = adv[0] + x * 0.125
+  #|    }
+  #|    adv.push(x)
+  #|  }
+  #|  push_one(4.0)
+  #|  push_one(8.0)
+  #|  adv[0]
+  #|}
+  let cr1 = check_source_files("eblock_ok", ["eblock_ok.pion"], [eblock_ok])
+  assert_true(cr1.diagnostics.length() == 0, check_result_to_json(cr1.diagnostics))
+
+  // 2. Unused EBlock empty array must fail with E_MISSING_TYPE
+  let eblock_unused =
+  #|fn bad_eblock_arr(n : Int) -> Int {
+  #|  let adv = { let _ = n; [] }
+  #|  adv.length()
+  #|}
+  let cr2 = check_source_files("eblock_unused", ["eblock_unused.pion"], [eblock_unused])
+  assert_true(
+    cr2.diagnostics.length() >= 1 && cr2.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected E_MISSING_TYPE for unused EBlock empty array, got: " + check_result_to_json(cr2.diagnostics),
+  )
+
+  // 3. Deferred generic zero-arg constructor: full inference, trait-bound check, and fail-closed
+  let box_defs =
+  #|trait KeyTrait {
+  #|  fn key_id(self) -> Int
+  #|}
+  #|impl KeyTrait for Int {
+  #|  fn key_id(self) -> Int { self }
+  #|}
+  #|struct MyBox[K, V] {
+  #|  keys : Array[K]
+  #|  vals : Array[V]
+  #|}
+  #|fn make_box[K : KeyTrait, V]() -> MyBox[K, V] {
+  #|  MyBox::{ keys: [], vals: [] }
+  #|}
+  #|fn MyBox::put[K, V](self : MyBox[K, V], k : K, v : V) -> Unit {
+  #|  self.keys.push(k)
+  #|  self.vals.push(v)
+  #|}
+  #|fn MyBox::get_opt[K, V](self : MyBox[K, V], k : K) -> Option[V] {
+  #|  let _ = k
+  #|  if self.vals.length() > 0 { Some(self.vals[0]) } else { None }
+  #|}
+  #|fn MyBox::set_val[K, V](self : MyBox[K, V], v : V) -> Unit {
+  #|  self.vals.push(v)
+  #|}
+  #|fn MyBox::len[K, V](self : MyBox[K, V]) -> Int {
+  #|  self.keys.length()
+  #|}
+  #|
+
+  // 3a & 3b: full inference, built-in collection 0-arg queries before refinement, and expected-type refinement
+  let box_ok = box_defs +
+  #|fn test_ok() -> Int {
+  #|  let m = make_box()
+  #|  m.put(1, "hi")
+  #|  let xs = []
+  #|  let _ = xs.is_empty()
+  #|  xs.push(1)
+  #|  let mp = Map()
+  #|  let n0 = mp.length()
+  #|  mp.set(1, "a")
+  #|  let m3 = make_box()
+  #|  let _v : Option[String] = m3.get_opt(1)
+  #|  m3.put(3, "typed")
+  #|  m.len() + n0 + xs.length() + m3.len()
+  #|}
+  let cr3a = check_source_files("box_ok", ["box_ok.pion"], [box_ok])
+  assert_true(cr3a.diagnostics.length() == 0, check_result_to_json(cr3a.diagnostics))
+
+  // Bounded method with unbound V must emit E_MISSING_TYPE (never bypass V : KeyTrait)
+  let box_bound_meth = box_defs +
+  #|fn MyBox::inspect_val[K, V : KeyTrait](self : MyBox[K, V], k : K) -> Int {
+  #|  let _ = k
+  #|  if self.vals.length() > 0 { self.vals[0].key_id() } else { 0 }
+  #|}
+  #|fn test_bound_meth() -> Int {
+  #|  let m = make_box()
+  #|  let x = m.inspect_val(1)
+  #|  m.put(1, "not_a_key")
+  #|  x
+  #|}
+  let cr_bm = check_source_files("box_bm", ["box_bm.pion"], [box_bound_meth])
+  let mut saw_bm_err = false
+  let mut p0i = 0
+  while p0i < cr_bm.diagnostics.length() {
+    if cr_bm.diagnostics[p0i].code == "E_MISSING_TYPE" {
+      saw_bm_err = true
+    }
+    p0i = p0i + 1
+  }
+  assert_true(
+    saw_bm_err,
+    "expected E_MISSING_TYPE for m.inspect_val(1) with unbound V : KeyTrait, got: " + check_result_to_json(cr_bm.diagnostics),
+  )
+
+  // Unannotated get_opt on pending binding must emit E_MISSING_TYPE (never leak Option[TError])
+  let box_untyped_ret = box_defs +
+  #|fn test_untyped_ret() -> Int {
+  #|  let b2 = make_box()
+  #|  let empty_v = b2.get_opt(1)
+  #|  b2.put(1, "world")
+  #|  let bogus : Int = match empty_v {
+  #|    Some(s) => s
+  #|    None => 0
+  #|  }
+  #|  bogus
+  #|}
+  let cr_ur = check_source_files("box_ur", ["box_ur.pion"], [box_untyped_ret])
+  let mut saw_ur_err = false
+  p0i = 0
+  while p0i < cr_ur.diagnostics.length() {
+    if cr_ur.diagnostics[p0i].code == "E_MISSING_TYPE" {
+      saw_ur_err = true
+    }
+    p0i = p0i + 1
+  }
+  assert_true(
+    saw_ur_err,
+    "expected E_MISSING_TYPE for unannotated b2.get_opt(1), got: " + check_result_to_json(cr_ur.diagnostics),
+  )
+
+  // Unrelated free type param U must not be masked by arg xs : Array[T]
+  let extra_tp_src = box_defs +
+  #|fn drop_with_extra[T, U : KeyTrait](xs : Array[T]) -> Unit {
+  #|  let _ = xs.length()
+  #|}
+  #|fn drop_with_extra_ret[T, U](xs : Array[T]) -> Option[U] {
+  #|  let _ = xs.length()
+  #|  None
+  #|}
+  #|fn test_extra_tp() -> Unit {
+  #|  let xs : Array[Int] = []
+  #|  drop_with_extra(xs)
+  #|  let _ = drop_with_extra_ret(xs)
+  #|}
+  let cr_ext = check_source_files("extra_tp", ["extra_tp.pion"], [extra_tp_src])
+  let mut ext_u_errs = 0
+  p0i = 0
+  while p0i < cr_ext.diagnostics.length() {
+    if cr_ext.diagnostics[p0i].code == "E_MISSING_TYPE" &&
+      str_contains(cr_ext.diagnostics[p0i].message, "`U`") {
+      ext_u_errs = ext_u_errs + 1
+    }
+    p0i = p0i + 1
+  }
+  assert_true(
+    ext_u_errs == 2,
+    "expected 2 E_MISSING_TYPE diagnostics mentioning `U`, got: " + check_result_to_json(cr_ext.diagnostics),
+  )
+
+  // Unconstrained phantom type param passes, bounded phantom rejects with E_MISSING_TYPE
+  let phantom_ok_src = box_defs +
+  #|fn phantom_tp[K](x : Int) -> Int { x + 1 }
+  #|fn test_phantom_ok() -> Int { phantom_tp(41) }
+  let cr_ph_ok = check_source_files("phantom_ok", ["phantom_ok.pion"], [phantom_ok_src])
+  assert_true(cr_ph_ok.diagnostics.length() == 0, check_result_to_json(cr_ph_ok.diagnostics))
+
+  let phantom_bad_src = box_defs +
+  #|fn bounded_phantom[K : KeyTrait](x : Int) -> Int { x + 1 }
+  #|fn test_phantom_bad() -> Int { bounded_phantom(41) }
+  let cr_ph_bad = check_source_files("phantom_bad", ["phantom_bad.pion"], [phantom_bad_src])
+  assert_true(
+    cr_ph_bad.diagnostics.length() == 1 && cr_ph_bad.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected E_MISSING_TYPE for bounded_phantom, got: " + check_result_to_json(cr_ph_bad.diagnostics),
+  )
+
+  // Pending binding must never escape as an untyped value (alias, field, call arg, array elem, closure capture, untyped index)
+  let escape_cases : Array[String] = [
+    box_defs + "fn f() -> Unit { let m = make_box(); let _m2 = m; m.put(1, 2.5) }",
+    box_defs + "fn f() -> Unit { let m = make_box(); let _k0 = m.keys; m.put(1, 2.5) }",
+    box_defs + "fn f() -> Unit { let m = make_box(); m.keys.push(\"str\"); m.put(1, 2.5) }",
+    box_defs + "fn ident[T](x : T) -> T { x }\nfn f() -> Unit { let m = make_box(); let _m2 = ident(m); m.put(1, 2.5) }",
+    box_defs + "fn f() -> Unit { let m = make_box(); let _arr = [m]; m.put(1, 2.5) }",
+    "fn f(n : Int) -> Unit { let xs = { let _ = n; [] }; let _ys = xs; xs.push(1) }",
+    box_defs + "fn dup[T](x : T) -> (T, T) { (x, x) }\nfn f() -> Unit { let m = make_box(); let _w = dup(m.vals); m.put(1, 2.5) }",
+    box_defs + "fn f() -> Unit { let m = make_box(); let _g = fn() -> String { m.keys[0] }; m.put(1, 2.5) }",
+    "fn f(n : Int) -> Unit { let adv = { let _ = n; [] }; let _x = adv[0]; adv.push(1.0) }",
+    box_defs + "fn MyBox::keys_of[K, V](self : MyBox[K, V]) -> Array[K] { self.keys }\nfn f() -> Unit { let m = make_box(); let k0 = m.keys_of(); k0.push(\"x\"); m.put(1, 2.5) }",
+    box_defs + "fn MyBox::me[K, V](self : MyBox[K, V]) -> MyBox[K, V] { self }\nfn f() -> Unit { let m = make_box(); let m2 = m.me(); m2.put(\"s\", 1); m.put(1, 2.5) }",
+    box_defs + "fn MyBox::vals_of[K, V](self : MyBox[K, V]) -> Array[V] { self.vals }\nfn f() -> Unit { let m = make_box(); let v0 = m.vals_of(); m.put(1, 2.5); let _s : String = v0[0] }",
+    box_defs + "fn MyBox::add_key[K, V](self : MyBox[K, V], k : K) -> Unit { self.keys.push(k) }\nfn f() -> Unit { let m = make_box(); m.add_key(\"s\"); m.put(1, 2.5) }",
+    box_defs + "impl KeyTrait for String { fn key_id(self) -> Int { self.length() } }\nfn MyBox::keys_of[K, V](self : MyBox[K, V]) -> Array[K] { self.keys }\nfn f() -> Unit { let m = make_box(); let _k : Array[Int] = m.keys_of(); m.put(\"hello\", 1.5) }",
+    box_defs + "fn MyBox::vals_of[K, V](self : MyBox[K, V]) -> Array[V] { self.vals }\nfn f() -> Unit { let m = make_box(); let _v : Array[String] = m.vals_of(); m.put(1, 2.5) }",
+    box_defs + "fn f() -> Unit { let m = make_box(); let _ = m.len(); m.put(1, 2.5) }",
+    "fn f() -> Unit { let m = Map(); m[1] = None; m.set(\"a\", Some(1)) }",
+    "fn f() -> Unit { let adv = []; adv[0] = None; adv.push(1.0) }",
+  ]
+  let mut eci = 0
+  while eci < escape_cases.length() {
+    let cr_esc = check_source_files("esc_" + eci.to_string(), ["esc.pion"], [escape_cases[eci]])
+    let mut saw_esc_err = false
+    let mut ej = 0
+    while ej < cr_esc.diagnostics.length() {
+      if cr_esc.diagnostics[ej].code == "E_MISSING_TYPE" {
+        saw_esc_err = true
+      }
+      ej = ej + 1
+    }
+    assert_true(
+      saw_esc_err,
+      "escape case " + eci.to_string() + " must fail closed with E_MISSING_TYPE, got: " + check_result_to_json(cr_esc.diagnostics),
+    )
+    eci = eci + 1
+  }
+
+  // Typed index refines pending array to String, so subsequent Double push is E_TYPE_MISMATCH
+  let typed_idx_bad =
+  #|fn f(n : Int) -> Unit {
+  #|  let adv = { let _ = n; [] }
+  #|  let _x : String = adv[0]
+  #|  adv.push(1.0)
+  #|}
+  let cr_tidx = check_source_files("tidx_bad", ["tidx_bad.pion"], [typed_idx_bad])
+  assert_true(
+    cr_tidx.diagnostics.length() >= 1 && cr_tidx.diagnostics[0].code == "E_TYPE_MISMATCH",
+    "expected E_TYPE_MISMATCH when typed index conflicts with push, got: " + check_result_to_json(cr_tidx.diagnostics),
+  )
+
+  // Deferred inference for generic Option return (`let o = none_of(); let v : Option[Int] = o`)
+  let opt_gen_src =
+  #|fn none_of[T]() -> Option[T] { None }
+  #|fn f() -> Option[Int] {
+  #|  let o = none_of()
+  #|  let v : Option[Int] = o
+  #|  v
+  #|}
+  let cr_og = check_source_files("opt_gen", ["opt_gen.pion"], [opt_gen_src])
+  assert_true(cr_og.diagnostics.length() == 0, check_result_to_json(cr_og.diagnostics))
+
+  // Unused EIf generic call reports a single E_MISSING_TYPE without branch duplicates
+  let if_unused_src = box_defs +
+  #|fn f(c : Bool) -> Unit {
+  #|  let m = if c { make_box() } else { make_box() }
+  #|  let _ = m.len()
+  #|}
+  let cr_ifu = check_source_files("if_unused", ["if_unused.pion"], [if_unused_src])
+  assert_true(
+    cr_ifu.diagnostics.length() == 1 && cr_ifu.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected single E_MISSING_TYPE for unused EIf generic call, got: " + check_result_to_json(cr_ifu.diagnostics),
+  )
+
+  // Leading-None array literal refines element type from subsequent concrete elements
+  let arr_none_ok =
+  #|fn f() -> Int {
+  #|  let xs = [None, Some(1), Some(2)]
+  #|  xs.length()
+  #|}
+  let cr_ano = check_source_files("arr_none_ok", ["arr_none_ok.pion"], [arr_none_ok])
+  assert_true(cr_ano.diagnostics.length() == 0, check_result_to_json(cr_ano.diagnostics))
+
+  let arr_none_bad =
+  #|fn f() -> Int {
+  #|  let xs = [None, Some(1), Some("bad")]
+  #|  xs.length()
+  #|}
+  let cr_anb = check_source_files("arr_none_bad", ["arr_none_bad.pion"], [arr_none_bad])
+  assert_true(
+    cr_anb.diagnostics.length() >= 1 && cr_anb.diagnostics[0].code == "E_TYPE_MISMATCH",
+    "expected E_TYPE_MISMATCH for [None, Some(1), Some(\"bad\")], got: " + check_result_to_json(cr_anb.diagnostics),
+  )
+
+  // 3c: expected-type use site triggers E_TRAIT_NOT_IMPLEMENTED at make_box()
+  let box_bound_err = box_defs +
+  #|fn test_bound_err() -> Unit {
+  #|  let outer : MyBox[Int, MyBox[(Int, Int), Bool]] = make_box()
+  #|  let m = make_box()
+  #|  outer.put(1, m)
+  #|}
+  let cr3c = check_source_files("box_bound", ["box_bound.pion"], [box_bound_err])
+  let mut saw_trait_err = false
+  let mut di = 0
+  while di < cr3c.diagnostics.length() {
+    if cr3c.diagnostics[di].code == "E_TRAIT_NOT_IMPLEMENTED" {
+      saw_trait_err = true
+    }
+    di = di + 1
+  }
+  assert_true(
+    saw_trait_err,
+    "expected E_TRAIT_NOT_IMPLEMENTED for (Int, Int) : KeyTrait, got: " + check_result_to_json(cr3c.diagnostics),
+  )
+
+  // 3d: fail-closed E_MISSING_TYPE for unused let, let _, chained call, and partial-only let
+  let box_unused = box_defs +
+  #|fn test_unused() -> Unit {
+  #|  let m = make_box()
+  #|  let _ = m.len()
+  #|}
+  let cr3d1 = check_source_files("box_unused", ["box_unused.pion"], [box_unused])
+  assert_true(
+    cr3d1.diagnostics.length() == 1 && cr3d1.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected single E_MISSING_TYPE for unused let m = make_box(), got: " + check_result_to_json(cr3d1.diagnostics),
+  )
+
+  let box_discard = box_defs +
+  #|fn test_discard() -> Unit {
+  #|  let _ = make_box()
+  #|}
+  let cr3d2 = check_source_files("box_discard", ["box_discard.pion"], [box_discard])
+  assert_true(
+    cr3d2.diagnostics.length() == 1 && cr3d2.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected single E_MISSING_TYPE for let _ = make_box(), got: " + check_result_to_json(cr3d2.diagnostics),
+  )
+
+  let box_chain = box_defs +
+  #|fn test_chain() -> Int {
+  #|  make_box().len()
+  #|}
+  let cr3d3 = check_source_files("box_chain", ["box_chain.pion"], [box_chain])
+  assert_true(
+    cr3d3.diagnostics.length() == 1 && cr3d3.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected single E_MISSING_TYPE for make_box().len(), got: " + check_result_to_json(cr3d3.diagnostics),
+  )
+
+  let box_partial_only = box_defs +
+  #|fn test_partial_only() -> Unit {
+  #|  let m = make_box()
+  #|  let _ = m.get_opt(1)
+  #|}
+  let cr3d4 = check_source_files("box_partial_only", ["box_partial_only.pion"], [box_partial_only])
+  assert_true(
+    cr3d4.diagnostics.length() >= 1 && cr3d4.diagnostics[0].code == "E_MISSING_TYPE",
+    "expected E_MISSING_TYPE for unresolved let m = make_box(); m.get_opt(1), got: " + check_result_to_json(cr3d4.diagnostics),
+  )
+
+  // 3e: Cross-package trait bound rejection at pkg_a::make_box()
+  let pkg_a_src =
+  #|pub trait KeyTrait {
+  #|  fn key_id(self) -> Int
+  #|}
+  #|impl KeyTrait for Int {
+  #|  fn key_id(self) -> Int { self }
+  #|}
+  #|pub struct MyBox[K, V] {
+  #|  keys : Array[K]
+  #|  vals : Array[V]
+  #|}
+  #|pub fn make_box[K : KeyTrait, V]() -> MyBox[K, V] {
+  #|  MyBox::{ keys: [], vals: [] }
+  #|}
+  #|pub fn MyBox::put[K, V](self : MyBox[K, V], k : K, v : V) -> Unit {
+  #|  self.keys.push(k)
+  #|  self.vals.push(v)
+  #|}
+  let cr_a = check_source_files_full("pkg_a", ["a.pion"], [pkg_a_src])
+  assert_true(cr_a.diagnostics.length() == 0, check_result_to_json(cr_a.diagnostics))
+  let imp_a = ImportedPkg::{ name: "pkg_a", tc: cr_a.tc }
+  let pkg_b_bad =
+  #|import "pkg_a"
+  #|pub fn bad() -> Unit {
+  #|  let outer : pkg_a::MyBox[Int, pkg_a::MyBox[(Int, Int), Bool]] = pkg_a::make_box()
+  #|  let m = pkg_a::make_box()
+  #|  outer.put(1, m)
+  #|}
+  let cr_b_bad = check_source_files_with_imports_mapped(
+    "pkg_b",
+    ["b.pion"],
+    [pkg_b_bad],
+    [imp_a],
+    ["pkg_a"],
+    ["pkg_a"],
+    false,
+    false,
+  )
+  let mut saw_xpkg_trait_err = false
+  di = 0
+  while di < cr_b_bad.diagnostics.length() {
+    if cr_b_bad.diagnostics[di].code == "E_TRAIT_NOT_IMPLEMENTED" &&
+      cr_b_bad.diagnostics[di].line == 4 {
+      saw_xpkg_trait_err = true
+    }
+    di = di + 1
+  }
+  assert_true(
+    saw_xpkg_trait_err,
+    "expected cross-pkg E_TRAIT_NOT_IMPLEMENTED at line 4 (`pkg_a::make_box()`), got: " + check_result_to_json(cr_b_bad.diagnostics),
+  )
+}
+
