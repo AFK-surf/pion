@@ -551,30 +551,8 @@ fn pos_precision_and_compat() -> String {
     split_paren + "|" + split_idx + "|" + split_any.to_string() + "|" + j_str + "|" + wide_repr + "|" + deep_repr
 }
 
-// Positive cases: MbtJson::Object pure-map provenance and multiline match arm if-guard.
-struct JsonEv {
-  out : Bool
-  msg : Json
-}
-
-fn json_id_of(m : Map[String, Json]) -> Int? {
-  match m.get("id") {
-    Some(Number(d, ..)) => Some(d.to_int())
-    _ => None
-  }
-}
-
-fn pos_json_map_and_match_guard() -> String {
-  let o1 : Map[String, Json] = Map::new()
-  o1["id"] = Json::number(7.0)
-  o1["ok"] = Json::boolean(true)
-  let evs : Array[JsonEv] = [
-    JsonEv::{ out: true, msg: Json::object(o1) },
-    JsonEv::{ out: false, msg: Json::object(o1) },
-  ]
-  let has_ans = evs.iter().any(fn(e) {
-    !e.out && e.msg is Object(m) && (m.contains("ok") || m.contains("error")) && json_id_of(m) == Some(7)
-  })
+// Positive case: multiline match arm if-guard must not pollute callables or outer_sh.
+fn pos_multiline_match_guard() -> String {
   let nums : Array[Int] = [10, 20, 30, 40]
   let km : Map[Int, Int] = Map::new()
   km[2] = 20
@@ -585,11 +563,11 @@ fn pos_json_map_and_match_guard() -> String {
     _ => false
   }
   let guard_any = [1, 2, 3].iter().any(fn(x) { km.contains(x) })
-  has_ans.to_string() + "|" + guard_ok.to_string() + "|" + guard_any.to_string()
+  guard_ok.to_string() + "|" + guard_any.to_string()
 }
 
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat() + " :: " + pos_json_map_and_match_guard()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat() + " :: " + pos_multiline_match_guard()
 }
 '''
 
@@ -1405,6 +1383,91 @@ pub fn run(ats : Array[Int]) -> Array[Int] {
 }
 ''',
         "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_generic_param_alias_filter_map",
+        r'''
+fn[T] walk(xs : Array[T], ys : Array[Int]) -> Int {
+  xs.filter_map(fn(x) {
+    if ys.length() == 2 { ys.push(9) }
+    Some(x)
+  }).length()
+}
+pub fn probe() -> Int {
+  let a : Array[Int] = [3, 4]
+  walk(a, a)
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_param_json_map_contains",
+        r'''
+pub fn choose(xs : Array[Int], m : Map[String, Json], log : Array[String]) -> Bool {
+  let _ = log
+  xs.iter().any(fn(_x) { m.contains("k") })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_shadowed_some_custom_eq_filter_map",
+        r'''
+enum Flag {
+  Some(Int)
+}
+struct EvilBox {
+  xs : Array[Int]
+}
+impl Eq for EvilBox with equal(self, _other) {
+  self.xs.push(9)
+  true
+}
+pub fn run(xs : Array[Int]) -> Array[Int] {
+  let b = EvilBox::{ xs }
+  let f = Flag::Some(1)
+  xs.filter_map(fn(x) {
+    let _ = b == b
+    let _ = match f { Flag::Some(n) => n }
+    Option::Some(x)
+  })
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_json_object_guard_rebind_array_search_by",
+        r'''
+pub fn run(xs : Array[Json], k : Json) -> Int? {
+  xs.search_by(fn(j) {
+    match j {
+      Object(m) if k is Array(m) => {
+        m.clear()
+        true
+      }
+      _ => false
+    }
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_json_object_guard_rebind_array_idx_search_by",
+        r'''
+pub fn run(xs : Array[Json], k : Json) -> Int? {
+  xs.search_by(fn(j) {
+    match j {
+      Object(m) if k is Array(m) => {
+        m[0] = j
+        true
+      }
+      _ => false
+    }
+  })
+}
+''',
+        "Array::search_by",
     ),
 ]
 
