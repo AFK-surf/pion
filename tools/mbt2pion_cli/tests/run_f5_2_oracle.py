@@ -204,6 +204,12 @@ pub extern "C" fn ffi_xform_f32(a : FixedArray[Float], b : FixedArray[Float32]) 
 
 #borrow(arr)
 pub extern "C" fn ffi_check_empty_f64(arr : FixedArray[Double]) -> Int = "demo_check_empty_f64"
+
+#borrow(val)
+pub extern "C" fn ffi_kw_val(val : FixedArray[Int]) -> Int = "demo_kw_val"
+
+#borrow(bits)
+pub extern "C" fn ffi_f32_bits(bits : FixedArray[Float]) -> Int = "demo_f32_bits"
 '''
 
 FFI_SHADOW_MBT = r'''
@@ -347,6 +353,27 @@ int32_t pion_demo_xform_f32(float *a_ptr, int32_t a_len, float *b_ptr, int32_t b
 int32_t pion_demo_check_empty_f64(double *arr_ptr, int32_t arr_len) {
   return (arr_len == 0 && arr_ptr == NULL) ? 1 : 0;
 }
+
+int32_t pion_demo_kw_val(int32_t *val_ptr, int32_t val_len) {
+  int32_t s = 0;
+  for (int32_t i = 0; i < val_len; i++) {
+    val_ptr[i] += 1;
+    s += val_ptr[i];
+  }
+  return s;
+}
+
+int32_t pion_demo_f32_bits(float *bits_ptr, int32_t bits_len) {
+  if (bits_len < 3 || bits_ptr == NULL) return 0;
+  uint32_t b0 = 0, b1 = 0, b2 = 0;
+  memcpy(&b0, &bits_ptr[0], 4);
+  memcpy(&b1, &bits_ptr[1], 4);
+  memcpy(&b2, &bits_ptr[2], 4);
+  int32_t ok = (b0 == 0x7f800001u && b1 == 0x80000000u && b2 == 0x00000001u) ? 1 : 0;
+  uint32_t out0 = 0x7f800003u;
+  memcpy(&bits_ptr[0], &out0, 4);
+  return ok;
+}
 '''
 
 FFI_E2E_MAIN_PION = r'''
@@ -400,6 +427,18 @@ pub fn main(w : World) -> Int {
   let f_n = ffi_xform_f32(f_a, f_b)
   let empty_f64 : FixedArray[Double] = FixedArray::make(0, 0.0)
   let empty_ok = ffi_check_empty_f64(empty_f64)
+  let kw_arr : FixedArray[Int] = FixedArray::make(2, 0)
+  kw_arr[0] = 4
+  kw_arr[1] = 6
+  let kw_sum = ffi_kw_val(kw_arr)
+  let f32_raw : FixedArray[Float] = FixedArray::make(3, 0.0.to_float())
+  f32_raw[0] = Float::from_bits(0x7f800001)
+  f32_raw[1] = Float::from_bits(0x80000000U.reinterpret_as_int())
+  f32_raw[2] = Float::from_bits(0x00000001)
+  let f32_in_ok = ffi_f32_bits(f32_raw)
+  let f32_out_ok = if f32_raw[0].to_bits() == 0x7f800003 &&
+    f32_raw[1].to_bits() == 0x80000000U.reinterpret_as_int() &&
+    f32_raw[2].to_bits() == 0x00000001 { 1 } else { 0 }
   io_println(
     w,
     sc.to_string() + "|" + s.to_string() + "|" + u.to_string() + "|" + e_str.to_string() + "|" +
@@ -413,7 +452,9 @@ pub fn main(w : World) -> Int {
     l_sum.to_string() + ":" + l_ts[0].to_string() + "," + l_ts[1].to_string() + "|" +
     b_sum.to_string() + ":" + b_out[0].to_int().to_string() + "," + b_out[1].to_int().to_string() + "," + b_out[2].to_int().to_string() + "|" +
     f_n.to_string() + ":" + f_a[0].to_double().to_int().to_string() + "," + f_a[1].to_double().to_int().to_string() + "," + f_b[0].to_double().to_int().to_string() + "," + f_b[1].to_double().to_int().to_string() + "|" +
-    empty_ok.to_string(),
+    empty_ok.to_string() + "|" +
+    kw_sum.to_string() + ":" + kw_arr[0].to_string() + "," + kw_arr[1].to_string() + "|" +
+    f32_in_ok.to_string() + ":" + f32_out_ok.to_string(),
   )
   0
 }
@@ -504,8 +545,8 @@ fn ffi_read_buf(tag : String) -> Bytes {
   mbt_compat::mbt_ffi_ptr_write_i32(__ffi_out_len, 0L, 0)
   let __ffi_ret_ptr = __mbt_c_ffi_ffi_read_buf(tag.as_cstr(), tag.to_bytes().length(), __ffi_out_len)
   let __ffi_ret_len = mbt_compat::mbt_ffi_ptr_read_i32(__ffi_out_len, 0L)
-  mbt_compat::mbt_ffi_ptr_free(__ffi_out_len)
   let __ffi_ret_bytes = if mbt_compat::mbt_ffi_ptr_is_null(__ffi_ret_ptr) || __ffi_ret_len <= 0 { "".to_bytes() } else { mbt_compat::mbt_ffi_bytes_from_ptr(__ffi_ret_ptr, __ffi_ret_len) }
+  mbt_compat::mbt_ffi_ptr_free(__ffi_out_len)
   __ffi_ret_bytes
 }
 
@@ -799,7 +840,8 @@ def main():
         # out="3:20,4,52" (0x10^4=20, 0x00^4=4, 0x30^4=52)
         # d_out: sum=7.0+10=17, r+g+b=2; i_keys: 15,25,35 sum=75; l_ts: 2000000001,-9 sum=1999999992;
         # b_out: (1+10)=11, (250+10)&255=4, (10+10)=20 sum=35; f32: a=[2.0,4.0], b=[4.0,8.0], n=2; empty_ok=1
-        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|ok|3:20,4,52|17,2|75:15,25,35|1999999992:2000000001,-9|35:11,4,20|2:2,4,4,8|1"
+        # kw_arr: [5,7] sum=12; f32_bits: sNaN/neg0/subnormal in_ok=1, out_ok=1
+        expected_e2e = "42|504|1113|5|403|0|pion-scheme|0|ab:2|0|7025|3000|22:42|ok|3:20,4,52|17,2|75:15,25,35|1999999992:2000000001,-9|35:11,4,20|2:2,4,4,8|1|12:5,7|1:1"
         assert e2e_out == expected_e2e, f"CLI E2E C-linked FFI mismatch: {e2e_out!r} != {expected_e2e!r}"
         print(f"[PASS] CLI E2E C-linked FFI execution: {e2e_out}")
 
