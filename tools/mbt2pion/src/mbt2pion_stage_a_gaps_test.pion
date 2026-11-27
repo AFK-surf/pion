@@ -27,7 +27,7 @@ test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::rem
     header: default_header_meta("native"),
   }
 
-  // 1. Cross-package verified `--dep` ABI v2 struct with static constructor `@optpkg.Options::default()`
+  // 1. Cross-package verified `--dep` ABI v2 struct + `pionc doc --json` fn signature for `@optpkg.Options::default()`
   let dep_src = SourceFile::{
     rel_path: "opts.mbt",
     content: "pub(all) struct Options {\n  fonts : Int\n  font_family : String\n}\npub fn Options::default() -> Options {\n  { fonts: 0, font_family: \"\" }\n}\n",
@@ -35,13 +35,14 @@ test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::rem
   }
   let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
   assert_true(dep_res.blockers == 0, "dep optpkg transpiles cleanly")
+  let optpkg_doc = "{\"packages\":[{\"name\":\"optpkg\",\"items\":[{\"kind\":\"fn\",\"name\":\"Options::default\",\"sig\":\"pub fn Options::default() -> Options\"}]}]}"
 
   let user_src = SourceFile::{
     rel_path: "use_opts.mbt",
     content: "pub fn make_opts(fonts : Int, own : String) -> @optpkg.Options {\n  { ..@optpkg.Options::default(), fonts, font_family: own }\n}\n",
     is_test: false,
   }
-  let user_res = transpile_package_with_abis([user_src], empty_api_map(), default_recipes(), [], [], [], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let user_res = transpile_package_with_abis([user_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
   assert_true(user_res.blockers == 0, "cross-pkg static ctor struct update has 0 blockers")
   let mut user_out = ""
   for f in user_res.files {
@@ -50,6 +51,40 @@ test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::rem
     }
   }
   assert_true(str_has(user_out, "optpkg::Options::{"), "cross-pkg static ctor resolves to optpkg::Options::")
+
+  // 1b. Fail-closed: cross-pkg unknown static method `@optpkg.Options::nonexistent()` MUST fail closed
+  let bad_method_src = SourceFile::{
+    rel_path: "bad_method.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@optpkg.Options::nonexistent(), fonts: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_method_res = transpile_package_with_abis([bad_method_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_method = false
+  for d in bad_method_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_method = true
+    }
+  }
+  assert_true(saw_ambig_method, "cross-pkg unknown static method must fail closed")
+
+  // 1c. Local static method returning a DIFFERENT struct (`A::make_b() -> B`) MUST resolve to `B::` (never `A::`)
+  let diff_ret_src = SourceFile::{
+    rel_path: "diff_ret.mbt",
+    content: "pub struct A {\n  x : Int\n  a : Int\n}\n" +
+    "pub struct B {\n  x : Int\n  b : Int\n}\n" +
+    "pub fn A::make_b() -> B {\n  { x: 1, b: 9 }\n}\n" +
+    "pub fn run() -> Int {\n  let v = { ..A::make_b(), x: 2 }\n  v.x + v.b\n}\n",
+    is_test: false,
+  }
+  let diff_ret_res = transpile_package([diff_ret_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(diff_ret_res.blockers == 0, "A::make_b() -> B struct update has 0 blockers")
+  let mut diff_ret_out = ""
+  for f in diff_ret_res.files {
+    if f.rel_path == "diff_ret.pion" {
+      diff_ret_out = f.content
+    }
+  }
+  assert_true(str_has(diff_ret_out, "B::{ ..A::make_b(), x: 2 }"), "A::make_b() -> B resolves to B::, never A::")
 
   // 2. Fail-closed: unknown package static ctor without `--dep` ABI MUST emit MBT2PION_AMBIGUOUS_STRUCT_UPDATE
   let bad_unk_src = SourceFile::{
@@ -72,7 +107,7 @@ test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::rem
     content: "pub fn f() -> Int {\n  let o = { ..@optpkg.Options::default(), nonexistent: 1 }\n  let _ = o\n  0\n}\n",
     is_test: false,
   }
-  let bad_fld_res = transpile_package_with_abis([bad_fld_src], empty_api_map(), default_recipes(), [], [], [], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let bad_fld_res = transpile_package_with_abis([bad_fld_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
   let mut saw_ambig_fld = false
   for d in bad_fld_res.diagnostics {
     if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
@@ -238,4 +273,15 @@ test "stage_a_gaps: top-level let closure try/catch and stdlib raising call with
     d_raise,
   )
   assert_true(d_raise.length() >= 1, "top-level let closure with uncaught raise must fail closed")
+
+  // 5. Fail-closed: top-level `let` closure whose default parameter contains `try`/`catch`
+  let src_def_param = "let bad_def = fn(x? : Int = try @json.parse(\"1\") catch { _ => 0 }) { x }\n"
+  let d_def_param : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_def.mbt", content: src_def_param, is_test: false }],
+    cfg,
+    env,
+    d_def_param,
+  )
+  assert_true(d_def_param.length() >= 1, "top-level let closure default param with try/catch must fail closed")
 }
