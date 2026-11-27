@@ -1,0 +1,254 @@
+///| Wave F6-4a unit tests:
+///| 1. `__AMBIG__` local/pattern bindings fall back to `qfi_opt` byte-span types instead of short-circuiting.
+///| 2. Simple single-ident `for x in arr` element type inference (positive) + rebinding/shadowing/callable (negative).
+///| 3. `String` view methods (`exact_view`/`view`/`view_from`/`as_view`) -> `StrView` + shadowed `struct Str` negative.
+///| 4. `mbt_compat::ordered_map_*` / `ordered_set_*` read-only purity + `ordered_map_get` type inference + custom Eq/Hash negative.
+///| 5. Stage B Round 1+ lazy `round_qt` refresh with accurate post-Round-0 byte offsets + zero extra calls when unneeded.
+///| 6. `Array[Double/Float/UInt/UInt64/Byte/Char]::sort()` & `FixedArray` Stage B lowering + `mutation_summary` soundness.
+///| 7. `lower_capacity.pion` `xs.search_by(fn(x) { xs.shrink_to_fit(); true })` fail-closed negative.
+
+fn f64a_make_qt_json(rel : String, entries : Array[(Int, Int, String)]) -> String {
+  let parts : Array[String] = []
+  for e in entries {
+    parts.push("{\"start_byte\":" + e.0.to_string() + ",\"end_byte\":" + e.1.to_string() + ",\"ty\":\"" + e.2 + "\"}")
+  }
+  "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/" + rel + "\",\"expr_tys\":[" + parts.join(",") + "],\"call_targets\":[]}]}"
+}
+
+test "F6-4a: __AMBIG__ pattern bindings fall back to qfi_opt (match destructure & for-in enum Eq)" {
+  let src = "enum Pref { Light\n Dark } derive(Eq)\n\nstruct Custom { id : Int }\nimpl Eq for Custom {\n  fn op_eq(self : Custom, other : Custom) -> Bool { self.id == other.id }\n}\n\nfn check_match(opt : Option[(Int, Array[Int])]) -> Bool {\n  match opt {\n    Some((glass, heads)) => heads.iter().any(fn(h) { h == glass })\n    None => false\n  }\n}\n\nfn check_pref(prefs : Array[Pref], target : Pref) -> Bool {\n  for p in prefs {\n    if p == target {\n      return true\n    }\n  }\n  false\n}\n"
+  let rel = "main.pion"
+  let heads_off = src.index_of("heads.iter()")
+  let glass_off = src.index_of("h == glass") + 5
+  let h_off = src.index_of("h == glass")
+  let p_off = src.index_of("if p == target") + 3
+  assert_true(heads_off > 0 && glass_off > 0 && h_off > 0 && p_off > 0, "locate test spans")
+
+  let qt_json = f64a_make_qt_json(rel, [
+    (heads_off, heads_off + 5, "Array[Int]"),
+    (glass_off, glass_off + 5, "Int"),
+    (h_off, h_off + 1, "Int"),
+    (p_off, p_off + 1, "Pref"),
+  ])
+  let qt = parse_pkg_query_types_json(qt_json)
+  assert_true(qt.ok, "qt json must parse")
+
+  // With qfi_opt: `heads` and `glass` are marked __AMBIG__ by pattern binding, yet qfi_opt resolves them!
+  let pkg_qt = collect_pkg_mutation_summary([lex_moonbit(src)], [rel], [src], qt, Map(), Map())
+  match lookup_fn_mutation_summary(pkg_qt, "check_match") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "match destructure heads/glass resolved via qfi_opt")
+    None => assert_true(false, "check_match summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg_qt, "check_pref") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "for p in prefs resolved cleanly")
+    None => assert_true(false, "check_pref summary must exist")
+  }
+
+  // Without qfi_opt: match destructure `heads` stays __AMBIG__ and MUST fail closed (`unknown == true`)!
+  let pkg_noqt = collect_pkg_mutation_summary([lex_moonbit(src)], [rel], [src], empty_pkg_query_types(), Map(), Map())
+  match lookup_fn_mutation_summary(pkg_noqt, "check_match") {
+    Some(s) => assert_true(s.unknown, "without qfi_opt, pattern-bound heads must stay fail-closed")
+    None => assert_true(false, "check_match summary must exist without qt")
+  }
+}
+
+test "F6-4a: simple for-in element inference positive & rebinding/shadowing/callable negative" {
+  let src = "enum Kind { A\n B } derive(Eq)\n\nstruct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\n\nfn pure_for(ks : Array[Kind], t : Kind) -> Bool {\n  for k in ks {\n    if k == t { return true }\n  }\n  false\n}\n\nfn rebound_for(ks : Array[Kind], es : Array[Evil], t : Kind) -> Bool {\n  for x in ks {\n    if x == t { return true }\n  }\n  for x in es {\n    if x == es[0] { return true }\n  }\n  false\n}\n\nfn shadowed_let_for(ks : Array[Kind], t : Kind) -> Bool {\n  let x = Evil::{ xs: [] }\n  for x in ks {\n    if x == t { return true }\n  }\n  x == x\n}\n\nfn callable_for(fs : Array[() -> Unit]) -> Unit {\n  for f in fs {\n    f()\n  }\n}\n\nfn f() -> Unit {\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "pure_for") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "single-binding for k in Array[Kind] infers Kind without qfi_opt")
+    None => assert_true(false, "pure_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "rebound_for") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "rebound for x across two loops must fail-closed or report mutation")
+    None => assert_true(false, "rebound_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "shadowed_let_for") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "let x shadowed by for x must fail-closed or report mutation")
+    None => assert_true(false, "shadowed_let_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "callable_for") {
+    Some(s) => assert_true(s.unknown, "for f in Array[() -> Unit] must remain in callables and fail-closed even with top-level pure fn f")
+    None => assert_true(false, "callable_for summary must exist")
+  }
+}
+
+test "F6-4a: String view methods (exact_view/view/view_from/as_view) positive & shadowed struct Str negative" {
+  let pos_src = "fn slice_name(rest : String, i : Int) -> String {\n  rest.exact_view(start=i + 3).to_owned()\n}\n\nfn slice_view(rest : String) -> String {\n  rest.view().to_owned()\n}\n\nfn slice_as_view(rest : String) -> String {\n  rest.as_view().to_owned()\n}\n"
+  let pkg_pos = collect_pkg_mutation_summary_tokens([lex_moonbit(pos_src)])
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_name") { Some(s) => !s.unknown, None => false }, "rest.exact_view(...).to_owned() must be pure")
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_view") { Some(s) => !s.unknown, None => false }, "rest.view().to_owned() must be pure")
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_as_view") { Some(s) => !s.unknown, None => false }, "rest.as_view().to_owned() must be pure")
+
+  // Negative: user-defined struct Str with custom exact_view returning something unknown -> must fail closed!
+  let neg_src = "struct Str { s : String }\nfn Str::exact_view(self : Str) -> String { self.s }\nfn call_user_str(x : Str) -> String {\n  x.exact_view().to_owned()\n}\nstruct String { xs : Array[Int] }\nfn String::exact_view(self : String) -> String { self.xs.clear(); self }\nfn String::to_owned(self : String) -> String { self }\nfn call_shadowed_string(x : String) -> String {\n  x.exact_view().to_owned()\n}\n"
+  let pkg_neg = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_src)])
+  assert_true(
+    match lookup_fn_mutation_summary(pkg_neg, "call_shadowed_string") { Some(s) => summary_may_mutate_array(s, "Int") || s.unknown, None => false },
+    "shadowed String::exact_view must not be treated as pure builtin StrView",
+  )
+}
+
+test "F6-4a: mbt_compat ordered_map/ordered_set read-only purity & custom Eq/Hash negative" {
+  let src = "struct BadKey { xs : Array[Int] }\nimpl Eq for BadKey {\n  fn op_eq(self : BadKey, other : BadKey) -> Bool { self.xs.clear(); true }\n}\nimpl Hash for BadKey {\n  fn hash(self : BadKey) -> Int { self.xs.clear(); 0 }\n}\n\nfn pure_omap(m : OrderedMap[Int, String], s : OrderedSet[String]) -> Bool {\n  let n = mbt_compat::ordered_map_len(m)\n  let e = mbt_compat::ordered_map_is_empty(m)\n  let sl = mbt_compat::ordered_set_len(s)\n  let se = mbt_compat::ordered_set_is_empty(s)\n  let has_k = mbt_compat::ordered_map_contains(m, 1)\n  let got = mbt_compat::ordered_map_get(m, 1)\n  let has_s = mbt_compat::ordered_set_contains(s, \"a\")\n  n >= 0 && !e && sl >= 0 && !se && has_k && got.is_some() && has_s\n}\n\nfn bad_omap(m : OrderedMap[BadKey, Int], k : BadKey) -> Bool {\n  mbt_compat::ordered_map_contains(m, k)\n}\n\nfn bad_omap_get(m : OrderedMap[BadKey, Int], k : BadKey) -> Option[Int] {\n  mbt_compat::ordered_map_get(m, k)\n}\n\nfn bad_oset(s : OrderedSet[BadKey], k : BadKey) -> Bool {\n  mbt_compat::ordered_set_contains(s, k)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  assert_true(match lookup_fn_mutation_summary(pkg, "pure_omap") { Some(s) => !s.unknown && !s.mutates_any_array, None => false }, "ordered_map/ordered_set read-only ops with pure keys must be pure")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_omap") { Some(s) => s.unknown, None => false }, "ordered_map_contains with custom Eq/Hash key must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_omap_get") { Some(s) => s.unknown, None => false }, "ordered_map_get with custom Eq/Hash key must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_oset") { Some(s) => s.unknown, None => false }, "ordered_set_contains with custom Eq/Hash key must fail-closed")
+}
+
+test "F6-4a: Stage B Round 1+ refreshes round_qt with updated byte offsets" {
+  // Round 0 rewrites line 1 (`a.is_empty()` -> `mbt_compat::arr_is_empty(a)`), shifting byte offsets of line 2!
+  // Round 1 diagnoses `match opt { Some((g, heads)) => heads.iter().any(...) }` where `heads` is `__AMBIG__`
+  // and needs the refreshed Round 1 `round_qt` with the shifted byte offsets to allow `heads.iter()`.
+  let rel = "main.pion"
+  let init_src = "fn run(a : Array[Int], opt : Option[(Int, Array[Int])]) -> Bool {\n  let _e = a.is_empty()\n  match opt {\n    Some((g, heads)) => heads.iter().any(fn(h) { h == g })\n    None => false\n  }\n}\n"
+  let qt_calls : Array[Int] = [0]
+  let check_fn = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    if str_has(cur, "a.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":13,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else if str_has(cur, "heads.iter()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":4,\"col\":28,\"message\":\"unknown method `iter` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let qt_cb = fn(batch : Array[(String, String)]) -> String {
+    qt_calls[0] = qt_calls[0] + 1
+    let cur = batch[0].1
+    let heads_off = cur.index_of("heads.iter()")
+    let g_off = cur.index_of("h == g") + 5
+    let h_off = cur.index_of("h == g")
+    let diag_str = if str_has(cur, "a.is_empty()") {
+      "[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":13,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]"
+    } else {
+      "[]"
+    }
+    "{\"id\":1,\"ok\":true,\"diagnostics\":" + diag_str + ",\"types\":[{\"file\":\"src/main.pion\",\"expr_tys\":[{\"start_byte\":" +
+    heads_off.to_string() + ",\"end_byte\":" + (heads_off + 5).to_string() + ",\"ty\":\"Array[Int]\"},{\"start_byte\":" +
+    g_off.to_string() + ",\"end_byte\":" + (g_off + 1).to_string() + ",\"ty\":\"Int\"},{\"start_byte\":" +
+    h_off.to_string() + ",\"end_byte\":" + (h_off + 1).to_string() + ",\"ty\":\"Int\"}],\"call_targets\":[]}]}"
+  }
+  let files = [GeneratedFile::{ rel_path: rel, content: init_src, source_file: "main.mbt", anchors: [] }]
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let (out_files, _iters, _hist, _out_qt) = run_stage_b_with_ops_deps_and_qt(
+    files,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn,
+    Some(qt_cb),
+    empty_pkg_query_types(),
+    diags,
+    ledger,
+  )
+  assert_true(diags.length() == 0, "Round 1 refreshed round_qt must allow heads.iter() with 0 errors")
+  assert_true(str_has(out_files[0].content, "mbt_compat::arr_iter(heads)"), "heads.iter() must be lowered in Round 1")
+  assert_true(qt_calls[0] == 2, "query_types_cb must run once in Round 0 and once lazily in Round 1")
+
+  // Verify Round 1+ makes 0 extra query_types_cb calls when no gate needs qt.
+  let qt_calls2 : Array[Int] = [0]
+  let simple_src = "fn f(a : Array[Int], b : Array[Int]) -> Bool {\n  a.is_empty() && b.is_empty()\n}\n"
+  let check_fn2 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    if str_has(cur, "a.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":5,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else if str_has(cur, "b.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":35,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let qt_cb2 = fn(_batch : Array[(String, String)]) -> String {
+    qt_calls2[0] = qt_calls2[0] + 1
+    "{\"diagnostics\":[],\"query_types\":[]}"
+  }
+  let files2 = [GeneratedFile::{ rel_path: rel, content: simple_src, source_file: "main.mbt", anchors: [] }]
+  let diags2 : Array[Diag] = []
+  let ledger2 : Array[DriftEntry] = []
+  let (_out2, _it2, _h2, _q2) = run_stage_b_with_ops_deps_and_qt(
+    files2,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn2,
+    Some(qt_cb2),
+    empty_pkg_query_types(),
+    diags2,
+    ledger2,
+  )
+  assert_true(qt_calls2[0] == 0, "packages not hitting qt gates must make 0 query_types_cb calls across rounds")
+}
+
+test "F6-4a: Array[Double/Float/UInt/UInt64/Byte/Char]::sort() & FixedArray Stage B lowering + mutation_summary" {
+  // 1. Lookup helpers for FixedArray[Double/Float/UInt/UInt64/Byte/Char]::sort
+  assert_true(lookup_missing_method_helper("FixedArray[Double]", "sort") == Some("mbt_compat::fixed_array_sort_double"), "FixedArray[Double]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Float]", "sort") == Some("mbt_compat::fixed_array_sort_float"), "FixedArray[Float]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[UInt]", "sort") == Some("mbt_compat::fixed_array_sort_uint"), "FixedArray[UInt]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[UInt64]", "sort") == Some("mbt_compat::fixed_array_sort_uint64"), "FixedArray[UInt64]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Byte]", "sort") == Some("mbt_compat::fixed_array_sort_byte"), "FixedArray[Byte]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Char]", "sort") == Some("mbt_compat::fixed_array_sort_char"), "FixedArray[Char]::sort")
+
+  // 2. End-to-end Stage B lowering for Array[Double]::sort() and FixedArray[Double]::sort()
+  let rel = "src/main.pion"
+  let src = "fn do_sorts(xs : Array[Double], fa : FixedArray[Double]) -> Unit {\n  xs.sort()\n  fa.sort()\n}\n"
+  let check_fn = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let ds : Array[String] = []
+    if str_has(cur, "xs.sort()") {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":6,\"found\":\"Array[Double]\",\"expected\":\"Array[Int], Array[Int64], or Array[String]\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    if str_has(cur, "fa.sort()") {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":3,\"col\":6,\"message\":\"unknown method `sort` on type `FixedArray[Double]`\"}")
+    }
+    "{\"diagnostics\":[" + ds.join(",") + "]}"
+  }
+  let files = [GeneratedFile::{ rel_path: rel, content: src, source_file: "main.mbt", anchors: [] }]
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let (out_files, _iters, _hist, _out_qt) = run_stage_b_with_ops_deps_and_qt(
+    files,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn,
+    None,
+    empty_pkg_query_types(),
+    diags,
+    ledger,
+  )
+  assert_true(diags.length() == 0, "Array[Double]::sort and FixedArray[Double]::sort lower with 0 errors")
+  assert_true(str_has(out_files[0].content, "mbt_compat::arr_sort_double(xs)"), "Array[Double]::sort lowered")
+  assert_true(str_has(out_files[0].content, "mbt_compat::fixed_array_sort_double(fa)"), "FixedArray[Double]::sort lowered")
+
+  // 3. mutation_summary must mark arr_sort_double / fixed_array_sort_double as mutating Array[Double]
+  let mut_src = "fn sort_d(xs : Array[Double]) -> Unit {\n  mbt_compat::arr_sort_double(xs)\n}\nfn sort_fd(fa : FixedArray[Double]) -> Unit {\n  mbt_compat::fixed_array_sort_double(fa)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(mut_src)])
+  match lookup_fn_mutation_summary(pkg, "sort_d") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Double") && !summary_may_mutate_array(s, "Int"), "arr_sort_double mutates Double array")
+    None => assert_true(false, "sort_d summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "sort_fd") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Double") && !summary_may_mutate_array(s, "Int"), "fixed_array_sort_double mutates Double array")
+    None => assert_true(false, "sort_fd summary must exist")
+  }
+}
+
+test "F6-4a: lower_capacity catches shrink_to_fit inside xs.search_by inline closure" {
+  let bad_src = "fn do_shrink(a : Array[Int]) -> Unit {\n  a.shrink_to_fit()\n}\n\nfn bad_search(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { do_shrink(xs); x > 0 })\n}\n"
+  let toks = lex_moonbit(bad_src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  let base = collect_shrink_pkg_tokens([toks])
+  let sp = collect_shrink_pkg_tokens_with_summary([toks], [], [], empty_pkg_query_types(), ms)
+  let mut shrink_i = -1
+  for idx, tk in toks {
+    if tk.raw == "shrink_to_fit" { shrink_i = idx }
+  }
+  assert_true(shrink_i > 0, "locate shrink_to_fit")
+  assert_true(sp.iterated_tails.contains("xs"), "search_by inline closure calling shrink_to_fit helper must taint xs in iterated_tails")
+  let (why, _allowed) = shrink_snapshot_hazard_with_summary(toks, shrink_i, base, sp, ms, bad_src, None)
+  assert_true(why.length() > 0, "shrink_to_fit reached from xs.search_by closure must fail closed")
+}
