@@ -320,6 +320,95 @@ fn ms_ty_is_pure_map_key(
   true
 }
 
+///| True iff all keys inserted by `Map::from_array`/`Map::of`/`OrderedMap`/`OrderedSet` constructor
+///| call `(lp..rp)` are proven pure under `ms_ty_is_pure_map_key`.
+fn ms_infer_map_ctor_keys_pure(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  lp : Int,
+  rp : Int,
+  is_pair_entries : Bool,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  local_var_types : Map[String, String],
+  active_generics : Map[String, Bool],
+) -> Bool {
+  let cargs = ms_split_call_args(tokens, lp, rp)
+  if cargs.length() == 0 {
+    return true
+  }
+  if cargs.length() != 1 {
+    return false
+  }
+  let a0_s = cargs[0].0
+  let a0_e = cargs[0].1
+  if a0_s >= a0_e {
+    return false
+  }
+  // Case 1: Array literal `[e1, e2, ...]`
+  if tokens[a0_s].kind == TokenKind::LBracket && tokens[a0_e - 1].kind == TokenKind::RBracket &&
+  find_matching_delim(tokens, a0_s) == a0_e - 1 {
+    let elems = ms_split_call_args(tokens, a0_s, a0_e - 1)
+    if elems.length() == 0 {
+      return true
+    }
+    for el in elems {
+      let es = el.0
+      let ee = el.1
+      if es >= ee {
+        return false
+      }
+      if is_pair_entries {
+        if tokens[es].kind == TokenKind::LParen && tokens[ee - 1].kind == TokenKind::RParen &&
+        find_matching_delim(tokens, es) == ee - 1 {
+          let pair_parts = ms_split_call_args(tokens, es, ee - 1)
+          if pair_parts.length() != 2 || pair_parts[0].0 >= pair_parts[0].1 {
+            return false
+          }
+          let k_ty = ms_infer_expr_ty(pkg, tokens, pair_parts[0].1 - 1, content, qfi_opt, local_var_types)
+          if !ms_ty_is_pure_map_key(k_ty, pkg, active_generics) {
+            return false
+          }
+        } else {
+          let el_ty = ms_infer_expr_ty(pkg, tokens, ee - 1, content, qfi_opt, local_var_types).trim()
+          if !(el_ty.starts_with("(") && el_ty.ends_with(")")) {
+            return false
+          }
+          let parts = qt_split_top_level_type_args(el_ty.slice(1, el_ty.length() - 1))
+          if parts.length() != 2 || !ms_ty_is_pure_map_key(parts[0], pkg, active_generics) {
+            return false
+          }
+        }
+      } else {
+        let el_ty = ms_infer_expr_ty(pkg, tokens, ee - 1, content, qfi_opt, local_var_types)
+        if !ms_ty_is_pure_map_key(el_ty, pkg, active_generics) {
+          return false
+        }
+      }
+    }
+    return true
+  }
+  // Case 2: Non-literal expression of typed Array/FixedArray/ArrayView
+  let arg_ty = ms_infer_expr_ty(pkg, tokens, a0_e - 1, content, qfi_opt, local_var_types)
+  if ms_is_qualified_external_ty(arg_ty) {
+    return false
+  }
+  let elem = ms_extract_array_elem_ty(arg_ty).trim()
+  if elem.length() == 0 {
+    return false
+  }
+  if is_pair_entries {
+    if elem.starts_with("(") && elem.ends_with(")") {
+      let parts = qt_split_top_level_type_args(elem.slice(1, elem.length() - 1))
+      if parts.length() == 2 {
+        return ms_ty_is_pure_map_key(parts[0], pkg, active_generics)
+      }
+    }
+    return false
+  }
+  ms_ty_is_pure_map_key(elem, pkg, active_generics)
+}
+
 ///| True iff the expression ending at `recv_end` is a freshly constructed built-in container iterator
 ///| with no intermediate lazy adapters (`.map`/`.filter`/etc.):
 ///| - Form A: `<base>.iter()` where `<base>` is a proven unshadowed built-in container
@@ -1763,7 +1852,21 @@ fn ms_scan_span(
           // Qualified call `Q::name(args...)`
           let q = if i >= s + 2 { tokens[i - 2].raw } else { "" }
           let name = tk.raw
-          if q == "mbt_compat" {
+          let has_pkg_prefix = i >= s + 3 &&
+          (tokens[i - 3].kind == TokenKind::Dot || tokens[i - 3].kind == TokenKind::ColonColon)
+          let pkg_prefix = if has_pkg_prefix && i >= s + 4 { tokens[i - 4].raw } else { "" }
+          let is_external_pkg_prefix = has_pkg_prefix && pkg_prefix != "builtin" && pkg_prefix != "@builtin"
+          let is_builtin_q_unshadowed = !is_external_pkg_prefix &&
+          !pkg.declared_types.contains(q) && !pkg.fn_keys.contains(q + "::" + name)
+          if is_external_pkg_prefix {
+            if is_ctor_name(name) {
+              // Qualified enum constructor `dep::Enum::Variant(...)`
+              ()
+            } else {
+              // Cross-package static call `@dep.Iter::any(...)` / `dep::Foo::bar(...)` -> fail-closed!
+              sum.unknown = true
+            }
+          } else if q == "mbt_compat" {
             if ms_is_mbt_compat_arr_mutating(name) {
               if ms_is_shrink_method(name) {
                 sum.reaches_shrink = true
@@ -1810,14 +1913,16 @@ fn ms_scan_span(
             } else if name == "ordered_map_new" || name == "ordered_set_new" {
               ()
             } else if name == "ordered_map_from_array" || name == "ordered_set_from_array" {
-              if pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==") {
+              let is_pairs = name == "ordered_map_from_array"
+              if (pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==")) &&
+              !ms_infer_map_ctor_keys_pure(pkg, tokens, lp, rp, is_pairs, content, qfi_opt, local_var_types, active_generics) {
                 sum.unknown = true
               }
             } else {
               // Unknown `mbt_compat::*` helper -> fail-closed
               sum.unknown = true
             }
-          } else if q == "Array" || q == "FixedArray" || q == "ArrayBuf" || q == "ArrayView" {
+          } else if is_builtin_q_unshadowed && (q == "Array" || q == "FixedArray" || q == "ArrayBuf" || q == "ArrayView") {
             // Class 7: UFCS `Array::push(xs, v)` / `FixedArray::set(xs, 0, v)` / `FixedArray::makei(...)` etc.
             if ms_is_array_mutating_method(name) {
               if ms_is_shrink_method(name) {
@@ -1850,11 +1955,13 @@ fn ms_scan_span(
             } else {
               sum.unknown = true
             }
-          } else if q == "Map" || q == "OrderedMap" || q == "OrderedSet" {
+          } else if is_builtin_q_unshadowed && (q == "Map" || q == "OrderedMap" || q == "OrderedSet") {
             if name == "new" {
               ()
             } else if name == "from_array" || name == "of" {
-              if pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==") {
+              let is_pairs = q != "OrderedSet"
+              if (pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==")) &&
+              !ms_infer_map_ctor_keys_pure(pkg, tokens, lp, rp, is_pairs, content, qfi_opt, local_var_types, active_generics) {
                 sum.unknown = true
               }
             } else if ms_is_array_mutating_method(name) {
@@ -1881,7 +1988,7 @@ fn ms_scan_span(
             } else {
               sum.unknown = true
             }
-          } else if q == "Option" || q == "Result" {
+          } else if is_builtin_q_unshadowed && (q == "Option" || q == "Result") {
             if name == "map" || name == "map_or" || name == "bind" || name == "map_err" {
               let cargs = ms_split_call_args(tokens, lp, rp)
               if cargs.length() >= 2 {
@@ -1897,7 +2004,7 @@ fn ms_scan_span(
             } else {
               sum.unknown = true
             }
-          } else if q == "Bytes" {
+          } else if is_builtin_q_unshadowed && q == "Bytes" {
             if name == "makei" {
               let cargs = ms_split_call_args(tokens, lp, rp)
               if cargs.length() >= 2 {
@@ -1912,7 +2019,7 @@ fn ms_scan_span(
             } else {
               sum.unknown = true
             }
-          } else if ms_is_pure_static_method(q, name) {
+          } else if is_builtin_q_unshadowed && ms_is_pure_static_method(q, name) {
             ()
           } else if is_ctor_name(name) {
             // Qualified enum constructor `Enum::Variant(...)`
