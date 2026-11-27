@@ -887,3 +887,101 @@ test "F6-3b: mutation_summary R3 soundness regressions (generic shadow, top-leve
     None => assert_true(false, "ok_map_str summary missing")
   }
 }
+
+test "F6-3b: mutation_summary & ABI R5 soundness regressions (ext recv, scalar arith ==, Map UFCS, impl generics, empty_target_pkg)" {
+  // 1. Qualified external `@dep.Iter` / `dep::Iter` must NOT fall back to local pure `Iter::any`
+  let ext_recv_src =
+  "struct Iter { n : Int }\n" +
+  "fn Iter::any(self : Iter, _cb : (Int) -> Bool) -> Bool { self.n > 0 }\n" +
+  "fn bad_dot_ext(it : @dep.Iter) -> Bool { it.any(fn(x) { x > 0 }) }\n" +
+  "fn bad_cc_ext(it : dep::Iter) -> Bool { it.any(fn(x) { x > 0 }) }\n"
+  let ext_recv_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_recv_src)])
+  for fn_nm in ["bad_dot_ext", "bad_cc_ext"] {
+    match lookup_fn_mutation_summary(ext_recv_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " qualified external receiver must fail-closed, not match local Iter::any")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 2. Pure scalar arithmetic adjacent to `==`/`!=` must remain pure even with unrelated `impl Add` + mutating `impl Eq`
+  let scalar_eq_src =
+  "struct Vec2 { x : Int }\n" +
+  "impl Add for Vec2 with add(self, other) { Vec2::{ x: self.x + other.x } }\n" +
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "fn ok_lhs_arith(x : Int) -> Bool { x + 1 == 5 }\n" +
+  "fn ok_rhs_arith(x : Int) -> Bool { 5 != x + 1 }\n"
+  let scalar_eq_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(scalar_eq_src)])
+  for fn_nm in ["ok_lhs_arith", "ok_rhs_arith"] {
+    match lookup_fn_mutation_summary(scalar_eq_ms, fn_nm) {
+      Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, fn_nm + " pure scalar arithmetic with ==/!= must remain pure")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 3. `Map::set(m, k, 1)` and `Map::from_array([(k, 1)])` with custom `impl Hash` must fail-closed
+  let map_ufcs_src =
+  "struct CustomHashKey { xs : Array[Int] }\n" +
+  "impl Hash for CustomHashKey with hash_combine(self, _h) { self.xs.clear() }\n" +
+  "fn bad_map_set(m : Map[CustomHashKey, Int], k : CustomHashKey) -> Unit { Map::set(m, k, 1) }\n" +
+  "fn bad_map_from_array(k : CustomHashKey) -> Map[CustomHashKey, Int] { Map::from_array([(k, 1)]) }\n"
+  let map_ufcs_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(map_ufcs_src)])
+  for fn_nm in ["bad_map_set", "bad_map_from_array"] {
+    match lookup_fn_mutation_summary(map_ufcs_ms, fn_nm) {
+      Some(s) => assert_true(s.unknown, fn_nm + " with custom impl Hash must fail-closed")
+      None => assert_true(false, fn_nm + " summary missing")
+    }
+  }
+
+  // 4. `impl[K : Eq] ... with matches(...)` with same-named local `enum K derive(Eq)` must fail-closed
+  let impl_gen_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "enum K { Plain } derive(Eq)\n" +
+  "struct Box[T] { v : T }\n" +
+  "trait Matcher { matches(Self, Self) -> Bool }\n" +
+  "impl[K : Eq] Matcher for Box[K] with matches(self : Box[K], other : Box[K]) -> Bool { self.v == other.v }\n"
+  let impl_gen_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(impl_gen_src)])
+  match lookup_fn_mutation_summary(impl_gen_ms, "Box::matches") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "impl[K : Eq] method must propagate K into fn_generics and fail-closed on K == K")
+    None => assert_true(false, "Box::matches summary missing")
+  }
+
+  // 5 & 6. Empty target pkg with `ffi_shim_prefix: "review_"` passes; forged code in placeholder `lib.pion` fails closed
+  let empty_check = fn(_fs : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let pref_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(targets: { \"wasm_helper.mbt\": [\"wasm\"] })",
+    ffi_shim_prefix: "review_",
+    header: default_header_meta("native"),
+  }
+  let pref_res = transpile_package(
+    [SourceFile::{ rel_path: "wasm_helper.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    pref_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(pref_res.blockers == 0 && pref_res.abi.empty_target_pkg && pref_res.abi.ffi_shim_prefix == "", "empty target pkg with ffi_shim_prefix must clear exported ffi_shim_prefix")
+  let pref_pairs : Array[(String, String)] = [(pref_res.files[0].rel_path, pref_res.files[0].content)]
+  let pref_abi_json = render_abi_json(pref_res.abi, pref_pairs)
+  let vdiags_pref : Array[Diag] = []
+  let parsed_pref = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", pref_pairs, Some(pref_abi_json), "native", vdiags_pref)
+  assert_true(parsed_pref is Some(_) && vdiags_pref.length() == 0, "empty target pkg published with ffi_shim_prefix must verify cleanly")
+
+  let forged_code_content = pref_res.files[0].content + "pub fn visible() -> Int { 1 }\n"
+  let forged_code_pairs : Array[(String, String)] = [("lib.pion", forged_code_content)]
+  let forged_code_abi = render_abi_json(pref_res.abi, forged_code_pairs)
+  let vdiags_code : Array[Diag] = []
+  let parsed_code = verify_and_parse_dep_abi_for_target("wasm_only", "/tmp/wasm_only", forged_code_pairs, Some(forged_code_abi), "native", vdiags_code)
+  assert_true(parsed_code is None && vdiags_code.length() > 0 && vdiags_code[0].code == "MBT2PION_DEP_ABI_ERROR", "empty target pkg lib.pion with non-comment code must fail closed")
+}

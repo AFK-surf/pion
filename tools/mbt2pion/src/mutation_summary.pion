@@ -1477,19 +1477,29 @@ fn ms_scan_span(
       } else {
         ms_is_builtin_scalar_ty(lhs_ty) && ms_is_builtin_scalar_ty(rhs_ty)
       }
-      // Guard `==`/`!=` operands adjacent to custom arithmetic/binary operators (`a + b == c` or `a == b + c`)
+      // Guard `==`/`!=` operands adjacent to custom arithmetic/binary operators (`a + b == c` or `a == b + c`),
+      // preserving pure scalar arithmetic (e.g. `x + 1 == 5` when both sides of `+` are built-in scalars).
       if is_pure_scalar_op && (op_sym == "==" || op_sym == "!=") {
         let lhs_start = receiver_path_start_token(tokens, i - 1)
         if lhs_start > s {
-          let prev_op = ms_is_token_binop(tokens[lhs_start - 1])
+          let prev_op_i = lhs_start - 1
+          let prev_op = ms_is_token_binop(tokens[prev_op_i])
           if prev_op.length() > 0 && prev_op != "==" && prev_op != "!=" && pkg.custom_ops.contains(prev_op) {
-            is_pure_scalar_op = false
+            let prev_lhs_ty = if prev_op_i > s { ms_infer_expr_ty(pkg, tokens, prev_op_i - 1, content, qfi_opt, local_var_types) } else { "" }
+            if !(ms_is_builtin_scalar_ty(prev_lhs_ty) && ms_is_builtin_scalar_ty(lhs_ty)) {
+              is_pure_scalar_op = false
+            }
           }
         }
         if rhs_end >= i + 1 && rhs_end + 1 < e {
-          let next_op = ms_is_token_binop(tokens[rhs_end + 1])
+          let next_op_i = rhs_end + 1
+          let next_op = ms_is_token_binop(tokens[next_op_i])
           if next_op.length() > 0 && next_op != "==" && next_op != "!=" && pkg.custom_ops.contains(next_op) {
-            is_pure_scalar_op = false
+            let next_rhs_end = if next_op_i + 1 < e { ms_postfix_expr_end(tokens, next_op_i + 1, e) } else { -1 }
+            let next_rhs_ty = if next_rhs_end >= next_op_i + 1 { ms_infer_expr_ty(pkg, tokens, next_rhs_end, content, qfi_opt, local_var_types) } else { "" }
+            if !(ms_is_builtin_scalar_ty(rhs_ty) && ms_is_builtin_scalar_ty(next_rhs_ty)) {
+              is_pure_scalar_op = false
+            }
           }
         }
       }
@@ -1660,7 +1670,7 @@ fn ms_scan_span(
             } else if recv_head.length() > 0 {
               // User-defined or external type method named `clear`/`push`/`set`/...:
               // resolve via method call so `reaches_shrink` / `unknown` propagate!
-              ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+              ms_resolve_method_call(pkg, m, recv_ty, recv_head, sum, callees_out, collect_edges)
             } else {
               // Unknown receiver type: fail-closed on both mutation and unknown!
               if ms_is_shrink_method(m) {
@@ -1691,7 +1701,7 @@ fn ms_scan_span(
                 // Opaque/adapted `Iter`/`MbtIter` (param, local, field, call result, lazy chain) -> fail-closed!
                 sum.unknown = true
               } else {
-                ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+                ms_resolve_method_call(pkg, m, recv_ty, recv_head, sum, callees_out, collect_edges)
               }
             } else {
               let cargs = ms_split_call_args(tokens, lp, rp)
@@ -1719,10 +1729,12 @@ fn ms_scan_span(
                 sum.unknown = true
               }
             } else {
-              ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+              ms_resolve_method_call(pkg, m, recv_ty, recv_head, sum, callees_out, collect_edges)
             }
           } else if ms_is_derive_method(m) {
-            if ms_is_builtin_scalar_ty(recv_ty) ||
+            if ms_is_qualified_external_ty(recv_ty) {
+              sum.unknown = true
+            } else if ms_is_builtin_scalar_ty(recv_ty) ||
             (m == "equal" && ms_ty_is_pure_eq(recv_ty, pkg.pure_eq_types, active_generics) && !pkg.fn_keys.contains(recv_head + "::" + m)) {
               ()
             } else if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
@@ -1745,7 +1757,7 @@ fn ms_scan_span(
               }
             }
           } else {
-            ms_resolve_method_call(pkg, m, recv_head, sum, callees_out, collect_edges)
+            ms_resolve_method_call(pkg, m, recv_ty, recv_head, sum, callees_out, collect_edges)
           }
         } else if prev_cc {
           // Qualified call `Q::name(args...)`
@@ -1795,8 +1807,12 @@ fn ms_scan_span(
                 let last_a = cargs[cargs.length() - 1]
                 ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, callables, active_generics, elem, sum, callees_out, collect_edges, depth + 1)
               }
-            } else if name == "ordered_map_new" || name == "ordered_map_from_array" || name == "ordered_set_new" || name == "ordered_set_from_array" {
+            } else if name == "ordered_map_new" || name == "ordered_set_new" {
               ()
+            } else if name == "ordered_map_from_array" || name == "ordered_set_from_array" {
+              if pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==") {
+                sum.unknown = true
+              }
             } else {
               // Unknown `mbt_compat::*` helper -> fail-closed
               sum.unknown = true
@@ -1834,9 +1850,13 @@ fn ms_scan_span(
             } else {
               sum.unknown = true
             }
-          } else if q == "Map" || q == "OrderedMap" {
-            if name == "new" || name == "from_array" || name == "of" {
+          } else if q == "Map" || q == "OrderedMap" || q == "OrderedSet" {
+            if name == "new" {
               ()
+            } else if name == "from_array" || name == "of" {
+              if pkg.custom_ops.contains("hash") || pkg.custom_ops.contains("==") {
+                sum.unknown = true
+              }
             } else if ms_is_array_mutating_method(name) {
               let cargs = ms_split_call_args(tokens, lp, rp)
               let a0_ty = if cargs.length() >= 1 {
@@ -1847,8 +1867,16 @@ fn ms_scan_span(
               if a0_ty.length() == 0 {
                 sum.mutates_any_array = true
                 sum.unknown = true
-              } else if str_has(a0_ty, "Array") || ms_extract_nested_array_elem_ty(a0_ty).length() > 0 {
-                ms_record_array_mutation(sum, ms_extract_nested_array_elem_ty(a0_ty), active_generics, pkg.declared_types)
+              } else {
+                if name != "clear" {
+                  let kty = ms_extract_map_key_ty(a0_ty)
+                  if !ms_ty_is_pure_map_key(kty, pkg, active_generics) {
+                    sum.unknown = true
+                  }
+                }
+                if str_has(a0_ty, "Array") || ms_extract_nested_array_elem_ty(a0_ty).length() > 0 {
+                  ms_record_array_mutation(sum, ms_extract_nested_array_elem_ty(a0_ty), active_generics, pkg.declared_types)
+                }
               }
             } else {
               sum.unknown = true
@@ -1971,11 +1999,16 @@ fn ms_add_call_effect(
 fn ms_resolve_method_call(
   pkg : PkgMutationSummary,
   m : String,
+  recv_ty : String,
   recv_head : String,
   sum : FnMutationSummary,
   callees_out : Array[String],
   collect_edges : Bool,
 ) -> Unit {
+  if ms_is_qualified_external_ty(recv_ty) {
+    sum.unknown = true
+    return
+  }
   if recv_head.length() == 0 {
     // Unknown receiver type (could be external, generic, or `dyn`) -> strictly fail-closed!
     sum.unknown = true
@@ -2464,10 +2497,15 @@ pub fn collect_pkg_mutation_summary(
         let mut target_ty = ""
         let mut saw_for = false
         let mut with_i = -1
+        let impl_generics : Map[String, Bool] = Map()
         while o < n && ts[o].kind != TokenKind::LBrace {
           if ts[o].kind == TokenKind::LBracket {
-            let cb = find_matching_delim(ts, o)
-            o = if cb > o { cb + 1 } else { o + 1 }
+            if !saw_for && trait_nm.length() == 0 {
+              o = ms_parse_generic_params(ts, o, impl_generics) + 1
+            } else {
+              let cb = find_matching_delim(ts, o)
+              o = if cb > o { cb + 1 } else { o + 1 }
+            }
             continue
           }
           if ts[o].raw == "with" && with_i < 0 {
@@ -2498,6 +2536,16 @@ pub fn collect_pkg_mutation_summary(
           let (next_i, decl_opt) = ms_parse_fn_decl(pkg, ts, with_i, n, fi, target_ty)
           match decl_opt {
             Some(dc) => {
+              if impl_generics.length() > 0 {
+                let fg = match pkg.fn_generics.get(dc.key) {
+                  Some(m) => m
+                  None => Map()
+                }
+                for gk in impl_generics.keys() {
+                  fg[gk] = true
+                }
+                pkg.fn_generics[dc.key] = fg
+              }
               decls.push(dc)
               for sym in op_syms {
                 ms_add_op_impl_fn(pkg, sym, dc.key)
@@ -2527,6 +2575,16 @@ pub fn collect_pkg_mutation_summary(
               let (next_k, decl_opt) = ms_parse_fn_decl(pkg, ts, k, close, fi, target_ty)
               match decl_opt {
                 Some(dc) => {
+                  if impl_generics.length() > 0 {
+                    let fg = match pkg.fn_generics.get(dc.key) {
+                      Some(m) => m
+                      None => Map()
+                    }
+                    for gk in impl_generics.keys() {
+                      fg[gk] = true
+                    }
+                    pkg.fn_generics[dc.key] = fg
+                  }
                   parsed_any = true
                   decls.push(dc)
                   for sym in op_syms {
