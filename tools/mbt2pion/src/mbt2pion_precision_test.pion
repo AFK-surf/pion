@@ -46,6 +46,7 @@ test "Stage B round_qt: single RPC per round, per-file reuse, and E_UNKNOWN_PACK
   }
   let qt_cb = fn(batch : Array[(String, String)]) -> String {
     qt_calls[0] = qt_calls[0] + 1
+    let gen = qt_calls[0]
     let mut first = true
     let sb = StringBuilder()
     sb.write_string("{\"id\":1,\"ok\":true,\"diagnostics\":")
@@ -54,8 +55,18 @@ test "Stage B round_qt: single RPC per round, per-file reuse, and E_UNKNOWN_PACK
     for f in batch {
       if !first { sb.write_string(",") }
       first = false
-      sb.write_string("{\"file\":\"src/" + f.0 + "\",\"expr_tys\":[],\"call_targets\":[]}")
+      let tag_ty = if f.0 == "a.pion" && str_has(f.1, "mbt_compat::arr_iter") {
+        "Bool"
+      } else if f.0 == "a.pion" {
+        "Array[Int]"
+      } else {
+        "String"
+      }
+      sb.write_string(
+        "{\"file\":\"src/" + f.0 + "\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":2,\"ty\":\"" + tag_ty + "\",\"ty_canon\":\"" + tag_ty + "\"}],\"call_targets\":[]}",
+      )
     }
+    let _ = gen
     sb.write_string("]}")
     sb.to_string()
   }
@@ -65,7 +76,7 @@ test "Stage B round_qt: single RPC per round, per-file reuse, and E_UNKNOWN_PACK
   ]
   let diags : Array[Diag] = []
   let ledger : Array[DriftEntry] = []
-  let (out_files, _iters, _hist, _out_qt) = run_stage_b_with_ops_deps_and_qt(
+  let (out_files, _iters, _hist, out_qt) = run_stage_b_with_ops_deps_and_qt(
     files,
     ApiMap::{ symbols: [], pkg_aliases: Map() },
     Map(),
@@ -80,6 +91,73 @@ test "Stage B round_qt: single RPC per round, per-file reuse, and E_UNKNOWN_PACK
   assert_true(str_has(out_files[0].content, "mbt_compat::arr_iter(xs)"), "a.pion iter lowered")
   assert_true(str_has(out_files[1].content, "mbt_compat::arr_iter(ys)"), "b.pion iter lowered")
   assert_true(qt_calls[0] <= 2, "at most 1 qt RPC per round with capacity work, got " + qt_calls[0].to_string())
+  // Round 1 mutated a.pion & b.pion after the last qt RPC, so qt_snap_dirty is true and out_qt must fail closed (not return stale expr_tys).
+  assert_true(!out_qt.ok, "out_qt must be invalidated when final round mutated files after last qt RPC")
+  // Case 1b: initial_qt with non-empty expr_tys for an unchanged file is retained without extra qt RPC.
+  let qt_calls_reuse : Array[Int] = [0]
+  let check_clean = fn(_batch : Array[(String, String)]) -> String { "{\"diagnostics\":[]}" }
+  let qt_never = fn(_batch : Array[(String, String)]) -> String {
+    qt_calls_reuse[0] = qt_calls_reuse[0] + 1
+    "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[]}"
+  }
+  let init_qt = parse_pkg_query_types_json(prec_make_qt_json(rel_b, [(0, 2, "Array[String]")]))
+  let diags_r : Array[Diag] = []
+  let ledger_r : Array[DriftEntry] = []
+  let (_f_r, _i_r, _h_r, out_qt_r) = run_stage_b_with_ops_deps_and_qt(
+    [GeneratedFile::{ rel_path: rel_b, content: "fn ok_b() -> Int { 1 }\n", source_file: "b.mbt", anchors: [] }],
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_clean,
+    Some(qt_never),
+    init_qt,
+    diags_r,
+    ledger_r,
+  )
+  assert_true(qt_calls_reuse[0] == 0, "unchanged package with valid initial_qt must not issue extra qt RPC")
+  assert_true(out_qt_r.ok, "unchanged package must return cached initial_qt")
+  match out_qt_r.files.get(rel_b) {
+    Some(fb) => assert_true(fb.exprs.length() == 1 && fb.exprs[0].ty == "Array[String]", "unchanged file must retain cached initial_qt expr_tys")
+    None => assert_true(false, "out_qt_r must retain b.pion")
+  }
+  // Case 1c: changed file a.pion triggers qt refresh and updates its expr_tys when a subsequent clean round sees no edits.
+  let qt_refresh_calls : Array[Int] = [0]
+  let check_once = fn(batch : Array[(String, String)]) -> String {
+    if str_has(batch[0].1, ".is_empty()") {
+      let off = batch[0].1.index_of(".is_empty()")
+      let (ln, col) = byte_offset_to_line_col(batch[0].1, off + 1)
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/a.pion\",\"line\":" + ln.to_string() + ",\"col\":" + col.to_string() + ",\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else {
+      // Emit a benign non-rewritable capacity-triggering diag? No, clean check returns 0 diags.
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let qt_refresh = fn(batch : Array[(String, String)]) -> String {
+    qt_refresh_calls[0] = qt_refresh_calls[0] + 1
+    let a_ty = if str_has(batch[0].1, ".is_empty()") { "OldA" } else { "NewA" }
+    "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":2,\"ty\":\"" + a_ty + "\",\"ty_canon\":\"" + a_ty + "\"}],\"call_targets\":[]},{\"file\":\"src/b.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":2,\"ty\":\"KeptB\",\"ty_canon\":\"KeptB\"}],\"call_targets\":[]}]}"
+  }
+  let init_qt_ab = parse_pkg_query_types_json(
+    "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/a.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":2,\"ty\":\"OldA\",\"ty_canon\":\"OldA\"}],\"call_targets\":[]},{\"file\":\"src/b.pion\",\"expr_tys\":[{\"start_byte\":0,\"end_byte\":2,\"ty\":\"KeptB\",\"ty_canon\":\"KeptB\"}],\"call_targets\":[]}]}",
+  )
+  let diags_c : Array[Diag] = []
+  let ledger_c : Array[DriftEntry] = []
+  let (out_c, _ic, _hc, out_qt_c) = run_stage_b_with_ops_deps_and_qt(
+    [
+      GeneratedFile::{ rel_path: rel_a, content: "fn fa(xs : Array[Int]) -> Bool { xs.is_empty() }\n", source_file: "a.mbt", anchors: [] },
+      GeneratedFile::{ rel_path: rel_b, content: "fn fb() -> Int { 1 }\n", source_file: "b.mbt", anchors: [] },
+    ],
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_once,
+    Some(qt_refresh),
+    init_qt_ab,
+    diags_c,
+    ledger_c,
+  )
+  assert_true(diags_c.length() == 0 && !str_has(out_c[0].content, ".is_empty()"), "a.pion is_empty lowered: " + out_c[0].content)
+  assert_true(!out_qt_c.ok, "mutated a.pion invalidates initial_qt so stale OldA expr_tys are never returned")
 
   // Case 2: E_UNKNOWN_PACKAGE guard prevents repeated qt refresh loops when an external package is missing.
   let qt_calls_unk : Array[Int] = [0]
@@ -314,17 +392,17 @@ test "R2 audit regressions: strict Eq, untyped struct if-value, spread expr, ini
     None => assert_true(false, "gen_debug_fmt_expr must support Option[mbt_compat__<hash>::MbtJson]")
   }
 
-  // 6. Red-team P1-1: local variable hop `Bad::m -> let tmp = b.m -> Good::{ m: tmp }` must fail-closed!
+  // 6. Local variable hop `Bad::m -> let tmp = b.m -> Good::{ m: tmp }` must fail-closed!
   let hop_src = "struct BadHop { mut m : mbt_compat::OrderedMap[Int, Int] }\nstruct GoodHop { m : mbt_compat::OrderedMap[Int, Int] }\nfn BadHop::taint(self : BadHop, ext : mbt_compat::OrderedMap[Int, Int]) -> Unit { self.m = ext }\nfn copy_via_local(b : BadHop) -> GoodHop {\n  let tmp = b.m\n  GoodHop::{ m: tmp }\n}\n"
   let p_hop = collect_pkg_mutation_summary_tokens([lex_moonbit(hop_src)])
   assert_true(!p_hop.pure_map_fields.contains("GoodHop::m"), "local binding hop from tainted field must fail-closed")
 
-  // 7. Red-team P1-2: shorthand untyped struct literal `{ m, x }` -> fail-closed!
+  // 7. Untyped struct literal shorthand `{ m, x }` -> fail-closed!
   let shorthand_src = "struct PairSh { m : mbt_compat::OrderedMap[Int, Int]\n  x : Int }\nfn make_bad(m : mbt_compat::OrderedMap[Int, Int], x : Int) -> PairSh { { m, x } }\n"
   let p_sh = collect_pkg_mutation_summary_tokens([lex_moonbit(shorthand_src)])
   assert_true(!p_sh.pure_map_fields.contains("PairSh::m"), "shorthand untyped struct literal { m, x } must fail-closed")
 
-  // 8. Red-team P1-3: `fn init { ... }` and `test "..." { ... }` writes -> fail-closed!
+  // 8. Top-level `fn init { ... }` and `test "..." { ... }` writes -> fail-closed!
   let fn_init_src = "struct BoxInit { mut m : mbt_compat::OrderedMap[Int, Int] }\nlet g_bi : BoxInit = BoxInit::{ m: mbt_compat::ordered_map_new() }\nfn init {\n  g_bi.m = ext_map()\n}\n"
   let p_fi = collect_pkg_mutation_summary_tokens([lex_moonbit(fn_init_src)])
   assert_true(!p_fi.pure_map_fields.contains("BoxInit::m"), "fn init block write must fail-closed")
@@ -332,7 +410,7 @@ test "R2 audit regressions: strict Eq, untyped struct if-value, spread expr, ini
   let p_tb = collect_pkg_mutation_summary_tokens([lex_moonbit(test_blk_src)])
   assert_true(!p_tb.pure_map_fields.contains("BoxTest::m"), "test block write must fail-closed")
 
-  // 9. Red-team P1-4: cross-pkg `.Variant` conflict, external `e.val` bare field fallback, and `evil << 1 == other` -> fail-closed!
+  // 9. Strict Eq/Neq pure operands: cross-pkg `.Variant` conflict, external `e.val` bare field fallback, and `evil << 1 == other` -> fail-closed!
   let ext_var_src = "enum LocalMode { UseNode } derive(Eq)\nstruct Dummy { xs : Array[Int] }\nimpl Eq for Dummy with equal(self, _o) { self.xs.clear(); true }\nfn cmp_ext(ext : dep::ExtMode) -> Bool { ext == .UseNode }\n"
   let p_ev = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_var_src)])
   match lookup_fn_mutation_summary(p_ev, "cmp_ext") {
@@ -351,4 +429,56 @@ test "R2 audit regressions: strict Eq, untyped struct if-value, spread expr, ini
     Some(s) => assert_true(s.unknown || s.mutates_any_array || s.mutated_elem_types.length() > 0, "evil << 1 == other must fail-closed on non-scalar shift LHS")
     None => assert_true(false, "missing cmp_shl summary")
   }
+}
+
+test "R3 regressions: interpolation holes, split().next() receivers, and debug_inspect unpruned lowering" {
+  // 1a. Field write inside string interpolation `\{ { b.m = ext; 1 } }` must revoke pure_map_fields
+  let interp_field_write = "struct InterpBox { mut m : mbt_compat::OrderedMap[Int, Int] }\nfn InterpBox::new() -> InterpBox { InterpBox::{ m: mbt_compat::ordered_map_new() } }\nfn taint_in_interp(b : InterpBox, ext : mbt_compat::OrderedMap[Int, Int]) -> Unit {\n  let _ = \"\\{ { b.m = ext; 1 } }\"\n}\nfn InterpBox::has(self : InterpBox, k : Int) -> Bool { self.m.contains(k) }\n"
+  let p_ifw = collect_pkg_mutation_summary_tokens([lex_moonbit(interp_field_write)])
+  assert_true(!p_ifw.pure_map_fields.contains("InterpBox::m"), "interpolation b.m = ext must revoke pure_map_fields")
+  assert_true(match lookup_fn_mutation_summary(p_ifw, "InterpBox::has") { Some(s) => s.unknown, None => false }, "InterpBox::has must fail-closed after interp write")
+
+  // 1b. Read-only interpolation referencing a pure map field must preserve pure_map_fields
+  let interp_field_ro = "struct InterpRoBox { m : mbt_compat::OrderedMap[Int, Int] }\nfn InterpRoBox::new() -> InterpRoBox { InterpRoBox::{ m: mbt_compat::ordered_map_new() } }\nfn InterpRoBox::fmt(self : InterpRoBox, k : Int) -> String {\n  \"has=\\{self.m.contains(k)}\"\n}\n"
+  let p_iro = collect_pkg_mutation_summary_tokens([lex_moonbit(interp_field_ro)])
+  assert_true(p_iro.pure_map_fields.contains("InterpRoBox::m"), "read-only interpolation must keep pure_map_fields")
+
+  // 1c. Local `let mut m` reassigned inside string interpolation must revoke pure_map_vars
+  let interp_var_reassign = "fn bad_interp_var(ext : mbt_compat::OrderedMap[Int, Int], k : Int) -> Bool {\n  let mut m : mbt_compat::OrderedMap[Int, Int] = mbt_compat::ordered_map_new()\n  let _ = \"\\{ { m = ext; 1 } }\"\n  m.contains(k)\n}\n"
+  let p_ivr = collect_pkg_mutation_summary_tokens([lex_moonbit(interp_var_reassign)])
+  assert_true(match lookup_fn_mutation_summary(p_ivr, "bad_interp_var") { Some(s) => s.unknown, None => false }, "interpolation m = ext must revoke pure_map_vars")
+
+  // 1d. Early `return ext` inside string interpolation must revoke pure_map_ret_fns
+  let interp_ret = "fn sneaky_ret(ext : mbt_compat::OrderedMap[Int, Int]) -> mbt_compat::OrderedMap[Int, Int] {\n  let _ = \"\\{ { return ext; 1 } }\"\n  mbt_compat::ordered_map_new()\n}\n"
+  let p_iret = collect_pkg_mutation_summary_tokens([lex_moonbit(interp_ret)])
+  assert_true(!p_iret.pure_map_ret_fns.contains("sneaky_ret"), "return inside interpolation must revoke pure_map_ret_fns")
+
+  // 2. `debug_inspect` vs `Repr` lowering for MbtJson (unpruned vs pruned)
+  match gen_debug_fmt_expr_ex("j", "mbt_compat::MbtJson", 0, false) {
+    Some(s) => assert_true(s == "mbt_compat::mbt_json_debug(j)", "Repr lowers to mbt_json_debug: " + s)
+    None => assert_true(false, "expected Some for Repr MbtJson")
+  }
+  match gen_debug_fmt_expr_ex("j", "mbt_compat::MbtJson", 0, true) {
+    Some(s) => assert_true(s == "mbt_compat::mbt_json_debug_unpruned(j)", "debug_inspect lowers to mbt_json_debug_unpruned: " + s)
+    None => assert_true(false, "expected Some for debug_inspect MbtJson")
+  }
+  match gen_debug_fmt_expr_ex("opt_j", "Option[mbt_compat__5958c766::MbtJson]", 0, true) {
+    Some(s) => assert_true(str_has(s, "mbt_compat::mbt_json_debug_unpruned"), "debug_inspect Option[hashed MbtJson] propagates unpruned: " + s)
+    None => assert_true(false, "expected Some for debug_inspect Option[hashed MbtJson]")
+  }
+  assert_true(ms_is_mbt_compat_pure_ro("mbt_json_debug_unpruned"), "mbt_json_debug_unpruned must be pure RO")
+
+  // 3. `rewrite_split_next_at` on static qualified, chained, string-literal, parenthesized, and indexed receivers
+  let check_rw = fn(line : String, expect_substr : String, label : String) -> Unit {
+    let col = line.index_of(".next()") + 2
+    match rewrite_split_next_at(line, col) {
+      Some(out) => assert_true(str_has(out, expect_substr), label + ": expected `" + expect_substr + "`, got `" + out + "`")
+      None => assert_true(false, label + ": expected rewrite, got None for `" + line + "`")
+    }
+  }
+  check_rw("  let a = Word::get().split(\":\").next()", "mbt_compat::str_split_first(Word::get(), \":\")", "static qualified receiver")
+  check_rw("  let b = Word::get().trim().split(\":\").next()", "mbt_compat::str_split_first(Word::get().trim(), \":\")", "chained static receiver")
+  check_rw("  let c = \"a:b\".split(\":\").next()", "mbt_compat::str_split_first(\"a:b\", \":\")", "string literal receiver")
+  check_rw("  let d = (s + \":z\").split(\":\").next()", "mbt_compat::str_split_first((s + \":z\"), \":\")", "parenthesized receiver")
+  check_rw("  let e = arr[0].split(\":\").next()", "mbt_compat::str_split_first(arr[0], \":\")", "indexed receiver")
 }

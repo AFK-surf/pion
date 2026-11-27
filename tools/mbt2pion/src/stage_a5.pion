@@ -1736,20 +1736,24 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 0b. Stage A `debug_inspect` placeholder `mbt_compat::__mbt_debug_fmt(expr)` -> `(expr).mbt_debug_probe()`
+    // 0b. Stage A `Repr` / `debug_inspect` placeholders:
+    //     `mbt_compat::__mbt_debug_fmt(expr)` -> `(expr).mbt_debug_probe()` (depth-pruned, max_depth=16)
+    //     `mbt_compat::__mbt_debug_inspect_fmt(expr)` -> `(expr).mbt_debug_inspect_probe()` (unpruned, max_depth=None)
     if !slice_only_pass && t.kind == TokenKind::Ident && t.raw == "mbt_compat" && i + 3 < n &&
     tokens[i + 1].kind == TokenKind::ColonColon &&
-    tokens[i + 2].raw == "__mbt_debug_fmt" &&
+    (tokens[i + 2].raw == "__mbt_debug_fmt" || tokens[i + 2].raw == "__mbt_debug_inspect_fmt") &&
     tokens[i + 3].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 3)
       if close_p > i + 4 && !safe_offsets.contains(base_offset + tokens[i + 2].start_byte) {
+        let is_inspect = tokens[i + 2].raw == "__mbt_debug_inspect_fmt"
+        let pkind = if is_inspect { "mbt_debug_inspect_probe" } else { "mbt_debug_probe" }
         let arg_expr = content.slice(tokens[i + 4].start_byte, tokens[close_p - 1].end_byte).trim()
         let start_b = t.start_byte
         let end_b = tokens[close_p].end_byte
         sites.push(ProbeSite::{
           probe_id: "",
           file: file,
-          probe_kind: "mbt_debug_probe",
+          probe_kind: pkind,
           start_byte: start_b,
           end_byte: end_b,
           op_byte: base_offset + tokens[i + 2].start_byte,
@@ -1765,7 +1769,7 @@ fn instrument_probes_for_file_with_safe(
           rhs_u64: 0UL,
           rhs_overflow: false,
         })
-        edits.push((start_b, end_b, "(" + arg_expr + ").mbt_debug_probe()"))
+        edits.push((start_b, end_b, "(" + arg_expr + ")." + pkind + "()"))
         covered_end = end_b
         i = close_p + 1
         continue
@@ -2309,6 +2313,10 @@ fn is_simple_ident_expr(expr : String) -> Bool {
 ///| Recursively synthesize MoonBit `Debug`-compatible formatting expression for `expr : ty`.
 ///| Returns `None` for unsupported user structs/enums/unknown types (caller fails closed).
 fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String] {
+  gen_debug_fmt_expr_ex(expr, ty, depth, false)
+}
+
+fn gen_debug_fmt_expr_ex(expr : String, ty : String, depth : Int, unpruned : Bool) -> Option[String] {
   let t = ty.trim()
   if t == "String" {
     return Some("mbt_compat::debug_string(" + expr + ")")
@@ -2327,6 +2335,9 @@ fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String]
   }
   let t_clean = qt_strip_pkg_hash(t)
   if t_clean == "mbt_compat::MbtJson" || t_clean == "MbtJson" {
+    if unpruned {
+      return Some("mbt_compat::mbt_json_debug_unpruned(" + expr + ")")
+    }
     return Some("mbt_compat::mbt_json_debug(" + expr + ")")
   }
   if t == "Unit" {
@@ -2335,7 +2346,7 @@ fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String]
   if t.starts_with("Option[") && t.ends_with("]") {
     let inner = t.slice(7, t.length() - 1).trim()
     let ov = "__mbt_dbg_o_" + depth.to_string()
-    match gen_debug_fmt_expr(ov, inner, depth + 1) {
+    match gen_debug_fmt_expr_ex(ov, inner, depth + 1, unpruned) {
       Some(ifmt) =>
       return Some("match (" + expr + ") { Some(" + ov + ") => \"Some(\" + (" + ifmt + ") + \")\", None => \"None\" }")
       None => return None
@@ -2346,7 +2357,7 @@ fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String]
     let av = "__mbt_dbg_a_" + depth.to_string()
     let iv = "__mbt_dbg_i_" + depth.to_string()
     let sbv = "__mbt_dbg_sb_" + depth.to_string()
-    match gen_debug_fmt_expr(av + "[" + iv + "]", inner, depth + 1) {
+    match gen_debug_fmt_expr_ex(av + "[" + iv + "]", inner, depth + 1, unpruned) {
       Some(efmt) =>
       return Some(
         "{ let " + av + " = " + expr + "; let " + sbv + " = StringBuilder(); " + sbv + ".write_string(\"[\"); let mut " + iv + " = 0; while " + iv + " < " + av + ".length() { if " + iv + " > 0 { " + sbv + ".write_string(\", \") }; " + sbv + ".write_string(" + efmt + "); " + iv + " = " + iv + " + 1 }; " + sbv + ".write_string(\"]\"); " + sbv + ".to_string() }",
@@ -2362,7 +2373,7 @@ fn gen_debug_fmt_expr(expr : String, ty : String, depth : Int) -> Option[String]
       sb.write_string("{ let " + tv + " = " + expr + "; \"(\"")
       let mut k = 0
       while k < elems.length() {
-        match gen_debug_fmt_expr(tv + "." + k.to_string(), elems[k], depth * 10 + k + 1) {
+        match gen_debug_fmt_expr_ex(tv + "." + k.to_string(), elems[k], depth * 10 + k + 1, unpruned) {
           Some(efmt) => {
             if k > 0 { sb.write_string(" + \", \"") }
             sb.write_string(" + (" + efmt + ")")
@@ -2815,8 +2826,9 @@ fn rewrite_for_probe_hygienic(
     return Some("\"\"")
   }
 
-  if site.probe_kind == "mbt_debug_probe" {
-    match gen_debug_fmt_expr(site.lhs_expr, resolved_type, 0) {
+  if site.probe_kind == "mbt_debug_probe" || site.probe_kind == "mbt_debug_inspect_probe" {
+    let is_inspect = site.probe_kind == "mbt_debug_inspect_probe"
+    match gen_debug_fmt_expr_ex(site.lhs_expr, resolved_type, 0, is_inspect) {
       Some(fmt_expr) => {
         drift_ledger.push(DriftEntry::{
           category: "debug_inspect",
@@ -3470,10 +3482,12 @@ pub fn has_probe_residual(content : String) -> Bool {
       r.starts_with("mbt_slice_borrow_probe") ||
       r.starts_with("mbt_ufcs_probe") ||
       r.starts_with("mbt_debug_probe") ||
+      r.starts_with("mbt_debug_inspect_probe") ||
       r == "__mbt_slice_owned" ||
       r == "__mbt_slice_borrow" ||
       r == "__mbt_ufcs_dispatch" ||
       r == "__mbt_debug_fmt" ||
+      r == "__mbt_debug_inspect_fmt" ||
       (i > 0 && toks[i - 1].kind == TokenKind::Dot && i + 1 < tn && toks[i + 1].kind == TokenKind::LParen &&
         (r == "mbt_arrpat_len_probe" || r.starts_with("mbt_arrpat_len_probe__") ||
           r == "mbt_match_scrut_probe" || r.starts_with("mbt_match_scrut_probe__") ||

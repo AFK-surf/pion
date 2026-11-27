@@ -480,11 +480,20 @@ enum CtxTag {
   PathNode
 } derive(Eq)
 
+struct Word {
+  raw : String
+}
+
+fn Word::get() -> String {
+  "  hello:world  "
+}
+
 fn pos_precision_and_compat() -> String {
   let box = PureMapBox::new()
   box.set_group(1, false, [2])
   box.set_group(2, true, [])
   let map_field_ok = box.reads_under(1, 0)
+  let ro_interp = "ro=\{box.reads_under(1, 0)}"
 
   let words : Array[String] = ["gamma", "beta"]
   let top_set_ok = words.iter().any(fn(w) { top_pure_set.contains(w) })
@@ -503,13 +512,43 @@ fn pos_precision_and_compat() -> String {
     Some(v) => v.to_owned()
     None => "none"
   }
+  let split_static = match Word::get().split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_chain = match Word::get().trim().split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let base_s = "left"
+  let split_paren = match (base_s + ":z").split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let arr_s = ["k0:v0", "k1:v1"]
+  let split_idx = match arr_s[0].split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
   let split_any = "foo bar baz".split(" ").any(fn(v) { v.to_owned() == "bar" })
 
   let j = Json::string("k:\{match true { true => "yes"; false => "no" }}")
   let j_str = j.stringify()
 
-  map_field_ok.to_string() + "|" + top_set_ok.to_string() + "|" + ret_map_ok.to_string() + "|" +
-    ctx_ok.to_string() + "|" + split_first + "|" + split_empty + "|" + split_any.to_string() + "|" + j_str
+  let wide_obj : Map[String, Json] = Map::new()
+  wide_obj["short_arr"] = Json::array([Json::null(), Json::boolean(true)])
+  wide_obj["long_val"] = Json::string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  let wide_repr = Repr(Json::object(wide_obj)).to_string()
+
+  let mut deep_j = Json::null()
+  for i = 0; i < 20; i = i + 1 {
+    deep_j = Json::array([deep_j])
+  }
+  let deep_repr = Repr(deep_j).to_string()
+
+  map_field_ok.to_string() + "|" + ro_interp + "|" + top_set_ok.to_string() + "|" + ret_map_ok.to_string() + "|" +
+    ctx_ok.to_string() + "|" + split_first + "|" + split_empty + "|" + split_static + "|" + split_chain + "|" +
+    split_paren + "|" + split_idx + "|" + split_any.to_string() + "|" + j_str + "|" + wide_repr + "|" + deep_repr
 }
 
 pub fn run_all() -> String {
@@ -1244,6 +1283,23 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
+    (
+        "neg_r3_interp_field_write",
+        r'''
+struct InterpTaintBox {
+  mut m : Map[Int, Int]
+}
+fn taint_in_interp(b : InterpTaintBox, ext : Map[Int, Int]) -> Unit {
+  let _ = "\{{ b.m = ext; 1 }}"
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpTaintBox::{ m: Map::new() }
+  taint_in_interp(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
 ]
 
 
@@ -1567,6 +1623,84 @@ def main():
         run_cmd([pionc, "check", et_dep_pkg], cwd=REPO_ROOT)
         run_cmd([pionc, "check", et_app_pkg], cwd=REPO_ROOT)
         print("[E2E PASS] empty_target_pkg publish + downstream --dep + pionc check OK")
+
+        # 8. E2E: `--with-tests --mode publish` + `pionc test` for `debug_inspect` on
+        #    30-Null wide `Json::Array` and 20-deep nested `Json::Array` (cross-checked with `moon test`)
+        di_mod = os.path.join(tmp, "di_mod")
+        di_src = os.path.join(di_mod, "src")
+        di_pkg = os.path.join(tmp, "di_pkg")
+        di_out = os.path.join(di_pkg, "src")
+        os.makedirs(di_src, exist_ok=True)
+        os.makedirs(di_out, exist_ok=True)
+        with open(os.path.join(di_mod, "moon.mod"), "w") as f:
+            f.write('name = "test/di"\n')
+        with open(os.path.join(di_src, "moon.pkg"), "w") as f:
+            f.write("")
+        with open(os.path.join(di_src, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        with open(os.path.join(di_src, "lib.mbt"), "w") as f:
+            f.write(
+                "pub fn make_wide_nulls() -> Json {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(Json::null())\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  Json::array(xs)\n"
+                "}\n"
+                "pub fn make_deep_arr() -> Json {\n"
+                "  let mut v = Json::null()\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 20 {\n"
+                "    v = Json::array([v])\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  v\n"
+                "}\n"
+            )
+        wide_expected = "Array(\n  [\n" + ("    Null,\n" * 30) + "  ],\n)"
+        # In MoonBit core/debug, single-element bracket_seq_lines / comma_seq_lines
+        # keep a single-line child on one line (unpruned in debug_inspect).
+        deep_expected = ("Array([" * 20) + "Null" + ("])" * 20)
+        def mbt_multiline_str(s: str) -> str:
+            return "\n".join("    #|" + line for line in s.split("\n"))
+        with open(os.path.join(di_src, "lib_test.mbt"), "w") as f:
+            f.write(
+                'test "debug_inspect wide and deep json" {\n'
+                '  debug_inspect(\n'
+                '    make_wide_nulls(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_deep_arr(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(deep_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '}\n'
+            )
+        run_cmd([moon, "test"], cwd=di_mod)
+        with open(os.path.join(di_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "di_pkg"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        run_cmd([
+            cli_bin,
+            "--src", di_src,
+            "--out", di_out,
+            "--with-tests",
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        run_cmd([pionc, "test", di_pkg], cwd=REPO_ROOT)
+        print("[E2E PASS] debug_inspect wide 30-Null + 20-deep Json::Array: moon test == pionc test OK")
 
     print(f"[PASS] Wave F6-3a/3b 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases + empty_target_pkg E2E: ALL OK")
 
