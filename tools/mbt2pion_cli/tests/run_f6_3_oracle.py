@@ -445,8 +445,75 @@ fn pos_f6_4a_mid_closure_local_map() -> String {
   s1 + "|" + s2 + "|" + s3 + "|" + s4 + "|" + s5 + "|" + s6 + "|" + s7
 }
 
+struct PureMapBox {
+  group_reads : Map[Int, (Bool, Array[Int])]
+}
+
+fn PureMapBox::new() -> PureMapBox {
+  PureMapBox::{ group_reads: Map::new() }
+}
+
+fn PureMapBox::set_group(self : PureMapBox, id : Int, g : Bool, hs : Array[Int]) -> Unit {
+  self.group_reads[id] = (g, hs)
+}
+
+fn PureMapBox::reads_under(self : PureMapBox, id : Int, depth : Int) -> Bool {
+  match self.group_reads.get(id) {
+    Some((glass, heads)) =>
+      glass || depth > 8 || heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })
+    None => false
+  }
+}
+
+let top_pure_set : Set[String] = Set::from_array(["alpha", "beta"])
+
+fn make_pure_key_map(keys : Array[Int]) -> Map[Int, Bool] {
+  let out : Map[Int, Bool] = Map::new()
+  for k in keys {
+    out[k] = true
+  }
+  out
+}
+
+enum CtxTag {
+  UseNode
+  PathNode
+} derive(Eq)
+
+fn pos_precision_and_compat() -> String {
+  let box = PureMapBox::new()
+  box.set_group(1, false, [2])
+  box.set_group(2, true, [])
+  let map_field_ok = box.reads_under(1, 0)
+
+  let words : Array[String] = ["gamma", "beta"]
+  let top_set_ok = words.iter().any(fn(w) { top_pure_set.contains(w) })
+
+  let km = make_pure_key_map([10, 20])
+  let ret_map_ok = [5, 20].iter().any(fn(k) { km.contains(k) })
+
+  let check_ctx = fn(ce : CtxTag?) -> Bool { ce == Some(UseNode) }
+  let ctx_ok = [None, Some(PathNode), Some(UseNode)].iter().any(fn(c) { check_ctx(c) })
+
+  let split_first = match "a::b::c".split("::").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_empty = match "".split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_any = "foo bar baz".split(" ").any(fn(v) { v.to_owned() == "bar" })
+
+  let j = Json::string("k:\{match true { true => "yes"; false => "no" }}")
+  let j_str = j.stringify()
+
+  map_field_ok.to_string() + "|" + top_set_ok.to_string() + "|" + ret_map_ok.to_string() + "|" +
+    ctx_ok.to_string() + "|" + split_first + "|" + split_empty + "|" + split_any.to_string() + "|" + j_str
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat()
 }
 '''
 
@@ -1000,6 +1067,83 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Int? {
 }
 ''',
         "Array::search_by",
+    ),
+    (
+        "neg_pub_all_struct_map_field",
+        r'''
+pub(all) struct ExtMapBox {
+  m : Map[Int, Int]
+}
+pub fn run(b : ExtMapBox, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_pub_all_mut_field_map",
+        r'''
+pub(all) struct PubAllMutMapBox {
+  mut m : Map[Int, Int]
+}
+pub fn PubAllMutMapBox::new() -> PubAllMutMapBox {
+  PubAllMutMapBox::{ m: Map::new() }
+}
+pub fn PubAllMutMapBox::clear_ref(self : PubAllMutMapBox) -> Unit {
+  self.m = Map::new()
+}
+pub fn run(b : PubAllMutMapBox, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_field_assigned_from_param",
+        r'''
+struct ParamFieldBox {
+  mut m : Map[Int, Int]
+}
+fn ParamFieldBox::set_m(self : ParamFieldBox, ext : Map[Int, Int]) -> Unit {
+  self.m = ext
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = ParamFieldBox::{ m: Map::new() }
+  b.set_m(ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_struct_spread_external_override",
+        r'''
+struct SpreadBox {
+  x : Int
+  m : Map[Int, Int]
+}
+fn SpreadBox::replace(self : SpreadBox, ext : Map[Int, Int]) -> SpreadBox {
+  { ..self, m: ext }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = SpreadBox::{ x: 0, m: Map::new() }.replace(ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_top_level_ref_map_param",
+        r'''
+let g_map : Ref[Map[Int, Int]] = Ref::new(Map::new())
+pub fn set_g(ext : Map[Int, Int]) -> Unit {
+  g_map.val = ext
+}
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { g_map.val.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
 ]
 
