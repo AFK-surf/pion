@@ -782,6 +782,38 @@ pub fn run(xs : Array[Int]) -> Int {
 ''',
         "MBT2PION_BORROWED_ARRAY_SLICE",
     ),
+    (
+        "neg_r9_generic_pipe_shadow_ordered_set",
+        r'''
+struct OrderedSet {
+  tag : Int
+}
+fn OrderedSet::new(_xs : Array[Int]) -> OrderedSet {
+  OrderedSet::{ tag: 1 }
+}
+trait Maker {
+  new(Array[Int]) -> Self
+}
+struct Node {
+  n : Int
+}
+impl Maker for Node with new(xs) {
+  xs.push(9)
+  Node::{ n: 1 }
+}
+fn[OrderedSet : Maker] touch_pipe(xs : Array[Int], _v : OrderedSet) -> Unit {
+  let _ : OrderedSet = xs |> OrderedSet::new
+}
+pub fn run_pipe(xs : Array[Int]) -> Int? {
+  let _ = OrderedSet::new([])
+  xs.search_by(fn(x) {
+    touch_pipe(xs, Node::{ n: 0 })
+    x == 1
+  })
+}
+''',
+        "Array::search_by",
+    ),
 ]
 
 
