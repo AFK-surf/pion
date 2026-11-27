@@ -107,6 +107,8 @@ CASES = {
     "transpile_upper_tier": ("ok", 34),
     "wave_m2_d1": ("ok", 13),
     "interp_index_compat": ("ok", 16),
+    "method_args_ctor_compat": ("ok", 17),
+    "str_repeat_neg_abort": ("panic:abort", 0),
 }
 
 MOON_TRAPS = {
@@ -2133,6 +2135,206 @@ pub fn p2_live_array_view_and_repr() -> (Int, Int, String) {
   let r = "\{repr("a\"b")}|\{repr('a')}|\{repr(42)}|\{repr(opt)}|\{repr([1, 2])}"
   (seen1, seen2, r)
 }
+
+pub(all) struct P3Builder {
+  base : Int
+}
+
+pub fn P3Builder::step(
+  self : P3Builder,
+  place~ : Int,
+  near_foot? : Bool = false,
+  reused? : Int = 10,
+) -> P3Builder {
+  let bonus = if near_foot { 100 } else { 0 }
+  P3Builder::{ base: self.base + place + bonus + reused }
+}
+
+pub fn p3_method_opt_args(place : Int, near_foot? : Bool, reused : Int?) -> Int {
+  let b = P3Builder::{ base: 1 }
+  let res = b
+    .step(
+      place~,
+      near_foot?,
+      reused?=reused,
+    )
+    .step(
+      place~,
+      near_foot?,
+    )
+  res.base
+}
+
+pub fn p3_as_pat(f : () -> Int?, g : Int?) -> (Int, Int) {
+  let hit_a : Int? = match f() {
+    Option::Some(_) as hit => hit
+    Option::None => Option::None
+  }
+  let a = match hit_a {
+    Option::Some(v) => v
+    Option::None => -1
+  }
+  let hit_b : Int? = match g {
+    Option::Some(x) as hit if x > 5 => hit
+    _ => Option::None
+  }
+  let b = match hit_b {
+    Option::Some(v) => v
+    Option::None => -2
+  }
+  (a, b)
+}
+
+enum Scope {
+  Text
+  Box(Int)
+}
+
+fn Scope::score(self : Scope) -> Int {
+  match self {
+    Scope::Text => 11
+    Box(n) => n * 2
+  }
+}
+
+pub fn p3_priv_scope() -> Int {
+  let s : Scope = Scope::Text
+  let b : Scope = Scope::Box(7)
+  s.score() + b.score()
+}
+
+struct P3Tie {
+  key : Int
+  tag : Int
+}
+
+impl Eq for P3Tie with equal(self, other) {
+  self.key == other.key
+}
+
+impl Compare for P3Tie with compare(self, other) {
+  self.key.compare(other.key)
+}
+
+pub fn p3_cmp_tie() -> (Int, Int) {
+  let a : P3Tie = { key: 5, tag: 101 }
+  let b : P3Tie = { key: 5, tag: 202 }
+  (@cmp.maximum(a, b).tag, @cmp.minimum(a, b).tag)
+}
+
+pub fn p3_tuple_hash() -> Bool {
+  let h2a = Hash::hash((1, "a"))
+  let h2b = Hash::hash((1, "a"))
+  let h2c = Hash::hash((2, "a"))
+  let h3a = Hash::hash((1, "a", true))
+  let h3b = Hash::hash((1, "a", true))
+  let h3c = Hash::hash((1, "a", false))
+  h2a == h2b && h2a != h2c && h3a == h3b && h3a != h3c
+}
+
+pub fn p3_as_pat_typed(opt : Option[Int], res : Result[Int, String], flag : Bool) -> (Int, Int) {
+  let o_out : Option[Int] = match opt {
+    Option::None as hit => hit
+    Option::Some(v) => Option::Some(v + 1)
+  }
+  let r_out : Result[Int, String] = match res {
+    Result::Ok(v) as hit if flag && v > 0 => hit
+    Result::Err(e) as hit => hit
+    Result::Ok(_) => Result::Err("neg")
+  }
+  let a = match o_out {
+    Option::Some(v) => v
+    Option::None => -10
+  }
+  let b = match r_out {
+    Result::Ok(v) => v
+    Result::Err(e) => if e == "neg" { -20 } else { -30 }
+  }
+  (a, b)
+}
+
+pub fn p3_str_repeat_neg() -> String {
+  "".repeat(-1)
+}
+
+enum P3Choice {
+  Hit(Array[Int], Int)
+  Miss
+}
+
+pub fn p3_as_pat_identity() -> (Bool, Bool) {
+  let v = P3Choice::Hit([1, 2], 7)
+  let id_unguarded = match v {
+    P3Choice::Hit(_, _) as whole => physical_equal(v, whole)
+    P3Choice::Miss => false
+  }
+  let id_guarded = match v {
+    P3Choice::Hit(_, n) as whole if n == 7 && physical_equal(v, whole) => physical_equal(v, whole)
+    _ => false
+  }
+  (id_unguarded, id_guarded)
+}
+
+pub fn p3_iter2_and_rev_iter_ro(xs : Array[Int]) -> (Int, Int, Int, Int, Bool) {
+  let mut s_each = 0
+  xs.iter2().each(fn(i, x) { s_each = s_each + i * 100 + x })
+  let mut s_for2 = 0
+  for i, x in xs.iter2() {
+    s_for2 = s_for2 + i * 100 + x
+  }
+  let mut s_rev = 0
+  for x in xs.rev_iter() {
+    s_rev = s_rev * 100 + x
+  }
+  let m : Map[String, Int] = { "a": 1, "bb": 2 }
+  let mut s_map_each = 0
+  m.iter2().each(fn(k, v) { s_map_each = s_map_each + k.length() * 10 + v })
+  let has_big = xs.rev_iter().any(fn(v) { v > 25 })
+  (s_each, s_for2, s_rev, s_map_each, has_big)
+}
+
+fn p3_make_iter(limit : Int) -> Iter[Int] {
+  let mut i = 0
+  Iter::new(fn() {
+    if i < limit {
+      let v = i
+      i = i + 1
+      Option::Some(v * 3)
+    } else {
+      Option::None
+    }
+  })
+}
+
+pub fn p3_stdlib_compat() -> (Int, Int, String, String, Bool, Bool, Int, Int, Bool) {
+  let it_sum = p3_make_iter(4).fold(init=0, fn(acc, x) { acc + x })
+  let xs = [10, 20, 30]
+  let mut idx_sum = 0
+  for p in xs.iter2().to_array() {
+    idx_sum = idx_sum + p.0 * 100 + p.1
+  }
+  let rev_xs = xs.rev_iter().collect()
+  let rev_sum = rev_xs[0] * 100 + rev_xs[1] * 10 + rev_xs[2]
+  let emoji = "a😀b"
+  let s_rev = emoji.rev()
+  let s_rep = "xy".repeat(3) + "|" + "xy".repeat(0)
+  let ccu_ok = emoji.contains_code_unit(0xD83D) &&
+    emoji.contains_code_unit(0xDE00) &&
+    emoji.contains_code_unit(97) &&
+    !emoji.contains_code_unit(99) &&
+    "".is_empty() &&
+    !emoji.is_empty()
+  let rev_chars = emoji.rev_iter().collect()
+  let rev_it_ok = rev_chars.length() == 3 && rev_chars[0] == 'b' && rev_chars[1] == '😀' && rev_chars[2] == 'a'
+  let flat = [[1, 2], [], [3, 4]].flatten()
+  let flat_sum = flat[0] + flat[1] + flat[2] + flat[3]
+  let cmp_code = 'a'.compare('b') * 100 + @cmp.maximum(3, 9) * 10 + @cmp.minimum(4, 2)
+  let m1 : Map[String, Int] = { "a": 1, "b": 2 }
+  let m2 : Map[String, Int] = { "b": 2, "a": 1 }
+  let m_iter2 = m1.iter2().to_array()
+  let map_ok = m1 == m2 && m_iter2.length() == 2 && m_iter2[0].0 == "a"
+  (it_sum + idx_sum, rev_sum, s_rev, s_rep, ccu_ok, rev_it_ok, flat_sum, cmp_code, map_ok)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -2785,6 +2987,40 @@ fn main {
     check("p2.repr_interp", repr_s.length() > 0)
     check("p2.multiline_raw_idx", ml_raw == "line1\nline2  ")
     check("p2.multiline_interp_idx", ml_interp == "line1\nline2")
+  } else if kase == "method_args_ctor_compat" {
+    let m1 = @m12.p3_method_opt_args(5, near_foot=true, Option::Some(20))
+    let m2 = @m12.p3_method_opt_args(5, Option::None)
+    let (as1, as2) = @m12.p3_as_pat(fn() { Option::Some(42) }, Option::Some(9))
+    let (as3, as4) = @m12.p3_as_pat(fn() { Option::None }, Option::Some(3))
+    let sc = @m12.p3_priv_scope()
+    let (s1, s2, srev, srep, ccu, revit, fsum, ccode, mok) = @m12.p3_stdlib_compat()
+    let (tie_max, tie_min) = @m12.p3_cmp_tie()
+    let th_ok = @m12.p3_tuple_hash()
+    let (ta1, tb1) = @m12.p3_as_pat_typed(Option::None, Result::Ok(7), true)
+    let (ta2, tb2) = @m12.p3_as_pat_typed(Option::Some(4), Result::Err("bad"), false)
+    let (id1, id2) = @m12.p3_as_pat_identity()
+    let (ie, if2, irev, im, iany) = @m12.p3_iter2_and_rev_iter_ro([10, 20, 30])
+    trace("p3", "\{m1}:\{m2};\{as1},\{as2},\{as3},\{as4};\{sc};\{s1}:\{s2}:\{srev}:\{srep}:\{ccu}:\{revit}:\{fsum}:\{ccode}:\{mok};\{tie_max}:\{tie_min}:\{th_ok}:\{ta1},\{tb1},\{ta2},\{tb2};\{id1}:\{id2};\{ie}:\{if2}:\{irev}:\{im}:\{iany}")
+    check("p3.method_opt_args_some", m1 == 241)
+    check("p3.method_opt_args_none", m2 == 31)
+    check("p3.as_pat_hit", as1 == 42 && as2 == 9)
+    check("p3.as_pat_miss", as3 == -1 && as4 == -2)
+    check("p3.priv_scope", sc == 25)
+    check("p3.iter_and_iter2", s1 == 378 && s2 == 3210)
+    check("p3.str_rev_and_repeat", srev == "b😀a" && srep == "xyxyxy|")
+    check("p3.str_ccu_and_empty", ccu)
+    check("p3.str_rev_iter", revit)
+    check("p3.flatten_and_cmp", fsum == 10 && ccode == -8)
+    check("p3.map_eq_and_iter2", mok)
+    check("p3.cmp_tie_break", tie_max == 202 && tie_min == 101)
+    check("p3.tuple_hash", th_ok)
+    check("p3.as_pat_typed_none_ok_err", ta1 == -10 && tb1 == 7 && ta2 == 5 && tb2 == -30)
+    check("p3.as_pat_identity", id1 && id2)
+    check("p3.iter2_each_and_for", ie == 360 && if2 == 360 && im == 33)
+    check("p3.rev_iter_for_and_any", irev == 302010 && iany)
+  } else if kase == "str_repeat_neg_abort" {
+    trace("str_repeat_neg", "before")
+    let _ = @m12.p3_str_repeat_neg()
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3450,6 +3686,40 @@ pub fn main(w : World) -> Int {
     check(w, "p2.repr_interp", repr_s.length() > 0)
     check(w, "p2.multiline_raw_idx", ml_raw == "line1\nline2  ")
     check(w, "p2.multiline_interp_idx", ml_interp == "line1\nline2")
+  } else if kase == "method_args_ctor_compat" {
+    let m1 = m12::p3_method_opt_args(5, near_foot=true, Some(20))
+    let m2 = m12::p3_method_opt_args(5, None)
+    let (as1, as2) = m12::p3_as_pat(fn() { Some(42) }, Some(9))
+    let (as3, as4) = m12::p3_as_pat(fn() { None }, Some(3))
+    let sc = m12::p3_priv_scope()
+    let (s1, s2, srev, srep, ccu, revit, fsum, ccode, mok) = m12::p3_stdlib_compat()
+    let (tie_max, tie_min) = m12::p3_cmp_tie()
+    let th_ok = m12::p3_tuple_hash()
+    let (ta1, tb1) = m12::p3_as_pat_typed(None, Ok(7), true)
+    let (ta2, tb2) = m12::p3_as_pat_typed(Some(4), Err("bad"), false)
+    let (id1, id2) = m12::p3_as_pat_identity()
+    let (ie, if2, irev, im, iany) = m12::p3_iter2_and_rev_iter_ro([10, 20, 30])
+    trace(w, "p3", m1.to_string() + ":" + m2.to_string() + ";" + as1.to_string() + "," + as2.to_string() + "," + as3.to_string() + "," + as4.to_string() + ";" + sc.to_string() + ";" + s1.to_string() + ":" + s2.to_string() + ":" + srev + ":" + srep + ":" + ccu.to_string() + ":" + revit.to_string() + ":" + fsum.to_string() + ":" + ccode.to_string() + ":" + mok.to_string() + ";" + tie_max.to_string() + ":" + tie_min.to_string() + ":" + th_ok.to_string() + ":" + ta1.to_string() + "," + tb1.to_string() + "," + ta2.to_string() + "," + tb2.to_string() + ";" + id1.to_string() + ":" + id2.to_string() + ";" + ie.to_string() + ":" + if2.to_string() + ":" + irev.to_string() + ":" + im.to_string() + ":" + iany.to_string())
+    check(w, "p3.method_opt_args_some", m1 == 241)
+    check(w, "p3.method_opt_args_none", m2 == 31)
+    check(w, "p3.as_pat_hit", as1 == 42 && as2 == 9)
+    check(w, "p3.as_pat_miss", as3 == -1 && as4 == -2)
+    check(w, "p3.priv_scope", sc == 25)
+    check(w, "p3.iter_and_iter2", s1 == 378 && s2 == 3210)
+    check(w, "p3.str_rev_and_repeat", srev == "b😀a" && srep == "xyxyxy|")
+    check(w, "p3.str_ccu_and_empty", ccu)
+    check(w, "p3.str_rev_iter", revit)
+    check(w, "p3.flatten_and_cmp", fsum == 10 && ccode == -8)
+    check(w, "p3.map_eq_and_iter2", mok)
+    check(w, "p3.cmp_tie_break", tie_max == 202 && tie_min == 101)
+    check(w, "p3.tuple_hash", th_ok)
+    check(w, "p3.as_pat_typed_none_ok_err", ta1 == -10 && tb1 == 7 && ta2 == 5 && tb2 == -30)
+    check(w, "p3.as_pat_identity", id1 && id2)
+    check(w, "p3.iter2_each_and_for", ie == 360 && if2 == 360 && im == 33)
+    check(w, "p3.rev_iter_for_and_any", irev == 302010 && iany)
+  } else if kase == "str_repeat_neg_abort" {
+    trace(w, "str_repeat_neg", "before")
+    let _ = m12::p3_str_repeat_neg()
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -3654,7 +3924,7 @@ def prepare(env):
     )
     write_file(
         os.path.join(env.moon_dir, "m12", "moon.pkg"),
-        'import {\n  "moonbitlang/core/encoding/utf8",\n  "moonbitlang/core/json",\n  "moonbitlang/core/string",\n}\n',
+        'import {\n  "moonbitlang/core/cmp",\n  "moonbitlang/core/encoding/utf8",\n  "moonbitlang/core/json",\n  "moonbitlang/core/string",\n}\n',
     )
     # MoonBit 0.1.20261126 removed `x |> f(a, _, b)` partial-application syntax;
     # keep the legacy placeholder-pipe forms in `m12_mbt_src` so `mbt2pion` still
