@@ -402,10 +402,47 @@ fn pos_f6_4a_mid_closure_local_map() -> String {
     }
     xs.search_by(fn(x) { m_outer.contains(x) })
   }
+  let mid_expr_blk_sb = fn() -> Int? {
+    let tmp = {
+      let m_outer : Map[Int, Int] = ext
+      m_outer
+    }
+    let _ = tmp.size()
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let mid_expr_blk_sb_other = fn() -> Int? {
+    let tmp = {
+      let other : Map[Int, Int] = ext
+      other
+    }
+    let _ = tmp.size()
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let xs_one : Array[Int] = [1]
+  let mid_expr_blk_any = fn() -> Int {
+    let tmp = {
+      let m_outer : Map[Int, Int] = ext
+      m_outer
+    }
+    let _ = tmp.size()
+    if xs_one.iter().any(fn(x) { m_outer.contains(x) }) { 1 } else { 0 }
+  }
+  let mid_expr_blk_any_other = fn() -> Int {
+    let tmp = {
+      let other : Map[Int, Int] = ext
+      other
+    }
+    let _ = tmp.size()
+    if xs_one.iter().any(fn(x) { m_outer.contains(x) }) { 1 } else { 0 }
+  }
   let s1 = match mid_local() { Some(i) => i.to_string(); None => "none" }
   let s2 = match mid_post() { Some(i) => i.to_string(); None => "none" }
   let s3 = match mid_closed_blk(true) { Some(i) => i.to_string(); None => "none" }
-  s1 + "|" + s2 + "|" + s3
+  let s4 = match mid_expr_blk_sb() { Some(i) => i.to_string(); None => "none" }
+  let s5 = match mid_expr_blk_sb_other() { Some(i) => i.to_string(); None => "none" }
+  let s6 = mid_expr_blk_any().to_string()
+  let s7 = mid_expr_blk_any_other().to_string()
+  s1 + "|" + s2 + "|" + s3 + "|" + s4 + "|" + s5 + "|" + s6 + "|" + s7
 }
 
 pub fn run_all() -> String {
