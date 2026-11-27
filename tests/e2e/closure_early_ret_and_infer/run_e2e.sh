@@ -177,6 +177,54 @@ fn check_float_clo(cond : Bool) -> Float {
   invoke(f)
 }
 
+struct Acc {
+  base : Int
+}
+
+fn Acc::add_step(self : Acc, x : Int) -> Int {
+  self.base + x
+}
+
+fn run_fix_once[T](init : T, f : (T) -> T) -> T {
+  f(init)
+}
+
+fn run_fix_opt[T](f : (Option[T]) -> T) -> T {
+  let first = f(None)
+  f(Some(first))
+}
+
+fn check_nested_fix_cache_e2e() -> Int {
+  let acc = Acc::{ base: 3 }
+  run_fix_opt(fn(p0) {
+    let base0 = match p0 {
+      None => 1
+      Some(v) => v
+    }
+    let arr : Array[Int] = [base0]
+    let m : Map[String, Int] = Map([("k", base0)])
+    let mid = run_fix_opt(fn(p1) {
+      let base1 = match p1 {
+        None => arr[0]
+        Some(v) => v + 1
+      }
+      let inner = run_fix_opt(fn(p2) {
+        let base2 = match p2 {
+          None => base1
+          Some(v) => v + acc.add_step(base0)
+        }
+        let mv = match m.get("k") {
+          Some(x) => x
+          None => 0
+        }
+        base2 + mv
+      })
+      inner + arr.length()
+    })
+    run_fix_once(mid, fn(z) { z + acc.add_step(0) })
+  })
+}
+
 pub fn main(w : World) -> Unit {
   let u = check_unit_pat(true) * 100 + check_unit_pat(false)
   let c1 = wrap_computed(
@@ -206,17 +254,19 @@ pub fn main(w : World) -> Unit {
   let o3 = check_opt_niche_var_clo(false) + "/" + check_opt_niche_var_clo(true)
   let d = check_double_clo(true) + check_double_clo(false)
   let fl = (check_float_clo(true) + check_float_clo(false)).to_double()
+  let nf = check_nested_fix_cache_e2e()
   let out = "u=" + u.to_string() +
     " c1=" + c1.item.0.to_string() + ":" + c1.item.1.to_string() +
     " c2=" + c2.item.0.to_string() + ":" + c2.item.1.to_string() +
     " r=" + r1.to_string() + ":" + r2.to_string() + ":" + r3.to_string() +
     " o=" + o1 + "|" + o2 + "|" + o3 +
-    " f=" + d.to_string() + ":" + fl.to_string()
+    " f=" + d.to_string() + ":" + fl.to_string() +
+    " nf=" + nf.to_string()
   io_println(w, out)
 }
 EOF
 
-EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4"
+EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4 nf=145"
 
 "$PIONC" build -o "$TMP_DIR/app_dev" "$TMP_DIR/main.pion"
 "$PIONC" build --release -o "$TMP_DIR/app_rel" "$TMP_DIR/main.pion"
