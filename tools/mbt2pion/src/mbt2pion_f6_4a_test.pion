@@ -252,3 +252,125 @@ test "F6-4a: lower_capacity catches shrink_to_fit inside xs.search_by inline clo
   let (why, _allowed) = shrink_snapshot_hazard_with_summary(toks, shrink_i, base, sp, ms, bad_src, None)
   assert_true(why.length() > 0, "shrink_to_fit reached from xs.search_by closure must fail closed")
 }
+
+test "F6-4a R2 P1-1: top-level binding shadowing & local struct Array shadowing fail closed" {
+  // (a) Top-level `let x : Evil` shadowed inside `for x in ks` must NOT pollute outer `x == x`!
+  let src_top = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\nlet x : Evil = Evil::{ xs: [] }\nfn f(ks : Array[Int]) -> Bool {\n  for x in ks {\n    let _ = x\n  }\n  x == x\n}\n"
+  let rel = "main.pion"
+  // Without qfi_opt: must fail closed (`unknown == true` or mutates Int array)
+  let pkg_noqt = collect_pkg_mutation_summary([lex_moonbit(src_top)], [rel], [src_top], empty_pkg_query_types(), Map(), Map())
+  match lookup_fn_mutation_summary(pkg_noqt, "f") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "top-level x shadowed by for x must fail-closed without qfi_opt")
+    None => assert_true(false, "f summary must exist without qfi_opt")
+  }
+  // With qfi_opt (inner `x` is Int, outer `x == x` is Evil): outer `x == x` MUST still catch Evil!
+  let inner_x_off = src_top.index_of("let _ = x") + 8
+  let outer_x1_off = src_top.index_of("x == x")
+  let outer_x2_off = outer_x1_off + 5
+  let qt_json = f64a_make_qt_json(rel, [
+    (inner_x_off, inner_x_off + 1, "Int"),
+    (outer_x1_off, outer_x1_off + 1, "Evil"),
+    (outer_x2_off, outer_x2_off + 1, "Evil"),
+  ])
+  let qt = parse_pkg_query_types_json(qt_json)
+  assert_true(qt.ok, "top-level shadow qt json must parse")
+  let pkg_qt = collect_pkg_mutation_summary([lex_moonbit(src_top)], [rel], [src_top], qt, Map(), Map())
+  match lookup_fn_mutation_summary(pkg_qt, "f") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "outer x == x with qfi_opt must catch Evil Eq mutation")
+    None => assert_true(false, "f summary must exist with qfi_opt")
+  }
+
+  // (b) Local `struct Array[T]` shadowing builtin `Array[T]` in `for x in xs` must fail closed!
+  let src_arr = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\nstruct Array[T] { v : T }\nfn scan_shadowed(xs : Array[Int]) -> Bool {\n  for x in xs {\n    if x == x { return true }\n  }\n  false\n}\n"
+  let pkg_arr = collect_pkg_mutation_summary_tokens([lex_moonbit(src_arr)])
+  match lookup_fn_mutation_summary(pkg_arr, "scan_shadowed") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "shadowed local struct Array[T] in for-in must fail closed")
+    None => assert_true(false, "scan_shadowed summary must exist")
+  }
+}
+
+test "F6-4a R2 P1-2: same-line multiple .sort() disambiguates receiver & column accurately" {
+  // Case 1: `a.sort(); b.sort()` with `a : Array[Float]`, `b : Array[Double]`, `d.found == ""` + `qfi_opt`
+  let rel = "main.pion"
+  let src1 = "fn both(a : Array[Float], b : Array[Double]) -> Unit {\n  a.sort(); b.sort()\n}\n"
+  let check1 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let line2 = cur.split("\n")[1]
+    let ds : Array[String] = []
+    let a_pos = line2.index_of("a.sort()")
+    if a_pos >= 0 {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (a_pos + 1).to_string() + ",\"found\":\"\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    let b_pos = line2.index_of("b.sort()")
+    if b_pos >= 0 {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (b_pos + 1).to_string() + ",\"found\":\"\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    "{\"diagnostics\":[" + ds.join(",") + "]}"
+  }
+  let qt1 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let entries : Array[String] = []
+    let a_off = cur.index_of("a.sort()")
+    if a_off >= 0 {
+      entries.push("{\"start_byte\":" + a_off.to_string() + ",\"end_byte\":" + (a_off + 8).to_string() + ",\"op_byte\":" + (a_off + 2).to_string() + ",\"ty\":\"Unit\",\"receiver_ty\":\"Array[Float]\"}")
+    }
+    let b_off = cur.index_of("b.sort()")
+    if b_off >= 0 {
+      entries.push("{\"start_byte\":" + b_off.to_string() + ",\"end_byte\":" + (b_off + 8).to_string() + ",\"op_byte\":" + (b_off + 2).to_string() + ",\"ty\":\"Unit\",\"receiver_ty\":\"Array[Double]\"}")
+    }
+    "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/main.pion\",\"expr_tys\":[" + entries.join(",") + "],\"call_targets\":[]}]}"
+  }
+  let files1 = [GeneratedFile::{ rel_path: rel, content: src1, source_file: "main.mbt", anchors: [] }]
+  let diags1 : Array[Diag] = []
+  let ledger1 : Array[DriftEntry] = []
+  let (out1, _it1, _h1, _q1) = run_stage_b_with_ops_deps_and_qt(
+    files1,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check1,
+    Some(qt1),
+    empty_pkg_query_types(),
+    diags1,
+    ledger1,
+  )
+  assert_true(diags1.length() == 0, "same-line a.sort(); b.sort() must lower with 0 errors")
+  assert_true(
+    str_has(out1[0].content, "mbt_compat::arr_sort_float(a)") &&
+    str_has(out1[0].content, "mbt_compat::arr_sort_double(b)"),
+    "a.sort() must lower to arr_sort_float and b.sort() to arr_sort_double",
+  )
+
+  // Case 2: `a.sort(); self.very_long_receiver_name.sort()` where `d.col` points to `self`
+  // (`self` is closer to `a.sort()`'s `.sort` than to `self.very_long_receiver_name.sort()`'s `.sort`!)
+  let src2 = "fn second_only(a : Array[Int], self : Holder) -> Unit {\n  a.sort(); self.very_long_receiver_name.sort()\n}\n"
+  let check2 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let line2 = cur.split("\n")[1]
+    let self_pos = line2.index_of("self.very_long_receiver_name.sort()")
+    if self_pos >= 0 {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (self_pos + 1).to_string() + ",\"found\":\"Array[Double]\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let files2 = [GeneratedFile::{ rel_path: rel, content: src2, source_file: "main.mbt", anchors: [] }]
+  let diags2 : Array[Diag] = []
+  let ledger2 : Array[DriftEntry] = []
+  let (out2, _it2, _h2, _q2) = run_stage_b_with_ops_deps_and_qt(
+    files2,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check2,
+    None,
+    empty_pkg_query_types(),
+    diags2,
+    ledger2,
+  )
+  assert_true(diags2.length() == 0, "second_only must lower with 0 errors")
+  assert_true(
+    str_has(out2[0].content, "a.sort(); mbt_compat::arr_sort_double(self.very_long_receiver_name)"),
+    "must rewrite only self.very_long_receiver_name.sort() and leave a.sort() untouched",
+  )
+}
