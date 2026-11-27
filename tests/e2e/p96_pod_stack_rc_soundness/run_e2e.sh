@@ -555,7 +555,7 @@ P5
 for ORD in 1 2; do
   CAS_C5="$TMP_DIR/cas_c5_${ORD}"
   mkdir -p "$CAS_C5"
-  PION_CACHE_DIR="$CAS_C5" "$PIONC" build --release -o "$TMP_DIR/c5_${ORD}_rel" "$TMP_DIR/c5/app${ORD}"
+  PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_C5" "$PIONC" build --release -o "$TMP_DIR/c5_${ORD}_rel" "$TMP_DIR/c5/app${ORD}"
   OUT_C5=$("$TMP_DIR/c5_${ORD}_rel")
   echo "p96 Case 5 order ${ORD} native rel -> $OUT_C5"
   test "$OUT_C5" = "c5_${ORD}=hello-keeper-123"
@@ -742,7 +742,7 @@ PY6
 CAS_C6="$TMP_DIR/cas_c6"
 mkdir -p "$CAS_C6"
 # Cold CAS build (all deps parsed from real source -> recursive alias resolution in `bridge::forward`)
-PION_CACHE_DIR="$CAS_C6" "$PIONC" build --release -o "$TMP_DIR/c6_cold" "$TMP_DIR/c6/app"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_C6" "$PIONC" build --release -o "$TMP_DIR/c6_cold" "$TMP_DIR/c6/app"
 OUT_C6_COLD=$("$TMP_DIR/c6_cold")
 echo "p96 Case 6 cold CAS -> $OUT_C6_COLD"
 test "$OUT_C6_COLD" = "c6=alias-bridge-999"
@@ -757,7 +757,7 @@ test -n "$SAFE_STUB"
 grep -q "panic()" "$SAFE_STUB"
 # Hot CAS rebuild (app re-emits against cached `.pionstub`s: both `bridge::forward` & stubbed `safe_helper::inspect` must be heap)
 printf '// hot rebuild\n' >> "$TMP_DIR/c6/app/src/main.pion"
-PION_CACHE_DIR="$CAS_C6" "$PIONC" build --release -o "$TMP_DIR/c6_hot" "$TMP_DIR/c6/app"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_C6" "$PIONC" build --release -o "$TMP_DIR/c6_hot" "$TMP_DIR/c6/app"
 OUT_C6_HOT=$("$TMP_DIR/c6_hot")
 echo "p96 Case 6 hot CAS -> $OUT_C6_HOT"
 test "$OUT_C6_HOT" = "c6=alias-bridge-999"
@@ -1040,7 +1040,7 @@ pub fn main(w : World) -> Int {
 P7
 CAS_C7="$TMP_DIR/cas_c7"
 mkdir -p "$CAS_C7"
-PION_CACHE_DIR="$CAS_C7" "$PIONC" build --release -o "$TMP_DIR/c7_rel" "$TMP_DIR/c7/app"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_C7" "$PIONC" build --release -o "$TMP_DIR/c7_rel" "$TMP_DIR/c7/app"
 OUT_C7=$("$TMP_DIR/c7_rel")
 echo "p96 Case 7 native rel -> $OUT_C7"
 test "$OUT_C7" = "c7=enum-var-ok:330:enum-var-ok:440:enum-var-ok:550:enum-var-ok:660:770:23"

@@ -6718,20 +6718,40 @@ fn drv_c_source_section_flags(
 }
 
 ///|
-/// Compiles a package's active `c_sources` (`[link]` + platform section) into
-/// `$PION_CACHE_DIR/obj/cstub_<key>.o` (ccache Direct Mode with real compiler
-/// header dependencies + compiler version fingerprint, atomic temp + rename,
-/// LRU-tracked).
-/// Returns `Ok((any_cxx, any_kept_local))`.
-fn drv_compile_pkg_c_sources(
+struct DrvWsCstubMiss {
+  slot_idx : Int
+  is_cxx : Bool
+  src_size : Int64
+  compiler : String
+  src_path : String
+  compile_norm_src : String
+  compile_src_hash : String
+  compile_base_key : String
+  is_cl_exe : Bool
+  obj_tmp : String
+  dep_tmp : String
+  pre_hash_ms : Int64
+  pre_snap : Map[String, String]
+  search_dirs : Array[String]
+  argv : Array[String]
+}
+
+///|
+/// Compiles all workspace packages' `c_sources` with shared CAS lookup and
+/// dynamic work-stealing parallelism across up to `jobs` OS threads (C++ and
+/// largest files scheduled first), publishing outputs in deterministic
+/// topological order.
+fn drv_compile_ws_c_sources(
   world : World,
-  node : PkgNodeInput,
+  nodes : Array[PkgNodeInput],
+  topo_order : Array[Int],
   qbe_target : String,
   sysroot : String,
   need_pic : Bool,
   release : Bool,
   rt_lib : String,
   cache_dir : String,
+  jobs : Int,
   trace_cas : Bool,
   ver_cache : Map[String, String],
   file_hash_memo : Map[String, String],
@@ -6743,242 +6763,417 @@ fn drv_compile_pkg_c_sources(
   pin : DrvCasPinSession,
 ) -> Result[(Bool, Bool), String] {
   let os = drv_target_os(qbe_target)
-  let plat = if os == "macos" {
-    node.link_macos
-  } else if os == "ios" {
-    node.link_ios
-  } else if os == "android" {
-    node.link_android
-  } else if os == "windows" {
-    node.link_windows
-  } else if os == "wasm" {
-    node.link_wasm
-  } else {
-    node.link_linux
-  }
-  let c_sources : Array[String] = []
-  let mut i = 0
-  while i < node.link_common.c_sources.length() {
-    push_unique_lib(
-      c_sources,
-      drv_resolve_pkg_path(node.dir, node.link_common.c_sources[i]),
-    )
-    i = i + 1
-  }
-  i = 0
-  while i < plat.c_sources.length() {
-    push_unique_lib(c_sources, drv_resolve_pkg_path(node.dir, plat.c_sources[i]))
-    i = i + 1
-  }
-  if c_sources.length() == 0 {
-    return Ok((false, false))
-  }
-  let user_cc_flags : Array[String] = []
-  let mut user_has_opt = false
-  i = 0
-  while i < node.link_common.cc_flags.length() {
-    let fl = drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i])
-    if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
-      user_has_opt = true
-    }
-    user_cc_flags.push(fl)
-    i = i + 1
-  }
-  i = 0
-  while i < plat.cc_flags.length() {
-    let fl = drv_resolve_cc_flag(node.dir, plat.cc_flags[i])
-    if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
-      user_has_opt = true
-    }
-    user_cc_flags.push(fl)
-    i = i + 1
-  }
-  let cc_flags : Array[String] = drv_target_cc_flags(world, qbe_target, sysroot)
-  if need_pic && !drv_target_is_windows(qbe_target) {
-    cc_flags.push("-fPIC")
-  }
-  if release && !user_has_opt {
-    cc_flags.push("-O3")
-  }
-  i = 0
-  while i < user_cc_flags.length() {
-    cc_flags.push(user_cc_flags[i])
-    i = i + 1
-  }
   let rt_inc_dirs = drv_cstub_rt_inc_dirs(world, rt_lib, cache_dir)
   let rt_inc_dirs_joined = drv_join_char(rt_inc_dirs, "\n")
   let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
   let cxx_bin = drv_resolve_cc_driver(world, qbe_target, true)
+  let base_target_flags = drv_target_cc_flags(world, qbe_target, sysroot)
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
+
+  let slot_objs : Array[String] = []
+  let slot_keys : Array[String] = []
+  let misses : Array[DrvWsCstubMiss] = []
   let mut stage_dir = ""
   let mut keep_stage = false
   let mut any_cxx = false
-  let mut si = 0
-  while si < c_sources.length() {
-    let src_path = c_sources[si]
-    if !fs_exists(world, src_path) {
-      if stage_dir.length() > 0 && !keep_stage {
-        let _ = drv_clean_cstub_stage_dir(world, stage_dir)
+
+  let n = topo_order.length()
+  let mut k = 0
+  while k < n {
+    let node = nodes[topo_order[k]]
+    let plat = if os == "macos" {
+      node.link_macos
+    } else if os == "ios" {
+      node.link_ios
+    } else if os == "android" {
+      node.link_android
+    } else if os == "windows" {
+      node.link_windows
+    } else if os == "wasm" {
+      node.link_wasm
+    } else {
+      node.link_linux
+    }
+    let c_sources : Array[String] = []
+    let mut i = 0
+    while i < node.link_common.c_sources.length() {
+      push_unique_lib(
+        c_sources,
+        drv_resolve_pkg_path(node.dir, node.link_common.c_sources[i]),
+      )
+      i = i + 1
+    }
+    i = 0
+    while i < plat.c_sources.length() {
+      push_unique_lib(c_sources, drv_resolve_pkg_path(node.dir, plat.c_sources[i]))
+      i = i + 1
+    }
+    if c_sources.length() == 0 {
+      k = k + 1
+      continue
+    }
+    let user_cc_flags : Array[String] = []
+    let mut user_has_opt = false
+    i = 0
+    while i < node.link_common.cc_flags.length() {
+      let fl = drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i])
+      if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
+        user_has_opt = true
       }
-      return Err("c_source does not exist: " + src_path)
+      user_cc_flags.push(fl)
+      i = i + 1
     }
-    let is_cxx = drv_is_cxx_source(src_path)
-    if is_cxx {
-      any_cxx = true
+    i = 0
+    while i < plat.cc_flags.length() {
+      let fl = drv_resolve_cc_flag(node.dir, plat.cc_flags[i])
+      if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
+        user_has_opt = true
+      }
+      user_cc_flags.push(fl)
+      i = i + 1
     }
-    let compiler = if is_cxx { cxx_bin } else { cc_bin }
-    let cc_ver_fp = drv_cstub_cc_version_fp(world, cache_dir, compiler, ver_cache)
-    let eff_cc_flags : Array[String] = []
-    let mut efi = 0
-    while efi < cc_flags.length() {
-      eff_cc_flags.push(cc_flags[efi])
-      efi = efi + 1
+    let cc_flags : Array[String] = []
+    i = 0
+    while i < base_target_flags.length() {
+      cc_flags.push(base_target_flags[i])
+      i = i + 1
     }
-    let sec_flags = drv_c_source_section_flags(compiler, qbe_target, user_cc_flags)
-    efi = 0
-    while efi < sec_flags.length() {
-      eff_cc_flags.push(sec_flags[efi])
-      efi = efi + 1
+    if need_pic && !drv_target_is_windows(qbe_target) {
+      cc_flags.push("-fPIC")
     }
-    let eff_cc_flags_joined = drv_join_char(eff_cc_flags, "\n")
-    let src_hash = match drv_sha256_file(src_path, file_hash_memo) {
-      Some(h) => h
-      None => {
+    if release && !user_has_opt {
+      cc_flags.push("-O3")
+    }
+    i = 0
+    while i < user_cc_flags.length() {
+      cc_flags.push(user_cc_flags[i])
+      i = i + 1
+    }
+    let mut si = 0
+    while si < c_sources.length() {
+      let src_path = c_sources[si]
+      if !fs_exists(world, src_path) {
         if stage_dir.length() > 0 && !keep_stage {
           let _ = drv_clean_cstub_stage_dir(world, stage_dir)
         }
-        return Err("failed to read c_source " + src_path)
+        return Err("c_source does not exist: " + src_path)
       }
-    }
-    let norm_src = drv_cstub_canon_path(world, src_path)
-    let search_dirs = drv_cstub_collect_search_dirs(
-      world,
-      src_path,
-      eff_cc_flags,
-      rt_inc_dirs,
-    )
-    let base_key = drv_cstub_base_key(
-      qbe_target,
-      node.name,
-      compiler,
-      cc_ver_fp,
-      eff_cc_flags_joined,
-      rt_inc_dirs_joined,
-      norm_src,
-      src_hash,
-    )
-    let mut hit_final_key = ""
-    match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo, absent_memo) {
-      Some(fk) => {
-        let obj_path = cache_dir + "/obj/cstub_" + fk + ".o"
-        if drv_cas_pin_and_verify(
-          world,
-          cache_dir,
-          pin,
-          ["cstub_" + fk, "cstub_dep_" + base_key],
-          [obj_path],
-        ) {
-          hit_final_key = fk
-        }
+      let is_cxx = drv_is_cxx_source(src_path)
+      if is_cxx {
+        any_cxx = true
       }
-      None => ()
-    }
-    if hit_final_key.length() > 0 {
-      let obj_path = cache_dir + "/obj/cstub_" + hit_final_key + ".o"
-      if trace_cas {
-        io_eprintln(
-          world,
-          "[cas] cstub=" + src_path + " HIT key=" + drv_prefix16(hit_final_key),
-        )
+      let compiler = if is_cxx { cxx_bin } else { cc_bin }
+      let cc_ver_fp = drv_cstub_cc_version_fp(world, cache_dir, compiler, ver_cache)
+      let eff_cc_flags : Array[String] = []
+      let mut efi = 0
+      while efi < cc_flags.length() {
+        eff_cc_flags.push(cc_flags[efi])
+        efi = efi + 1
       }
-      out_objs.push(obj_path)
-      out_keys.push(hit_final_key)
-    } else {
-      if stage_dir.length() == 0 {
-        stage_dir = match
-          drv_mktemp_dir_near(world, cache_dir + "/obj/cstub_stage")
-        {
-          Ok(d) => d
-          Err(e) => return Err(e)
-        }
+      let sec_flags = drv_c_source_section_flags(compiler, qbe_target, user_cc_flags)
+      efi = 0
+      while efi < sec_flags.length() {
+        eff_cc_flags.push(sec_flags[efi])
+        efi = efi + 1
       }
-      let obj_tmp = stage_dir + "/obj_" + si.to_string() + ".o"
-      let dep_tmp = stage_dir + "/dep_" + si.to_string() + ".d"
-      let argv : Array[String] = [compiler]
-      let mut fi = 0
-      while fi < eff_cc_flags.length() {
-        argv.push(eff_cc_flags[fi])
-        fi = fi + 1
-      }
-      let mut ri = 0
-      while ri < rt_inc_dirs.length() {
-        argv.push("-I" + rt_inc_dirs[ri])
-        ri = ri + 1
-      }
-      argv.push("-c")
-      argv.push(src_path)
-      drv_cstub_append_dep_args(argv, compiler, dep_tmp, obj_tmp)
-      let is_cl_exe = drv_is_cl_exe_driver(compiler)
-      // Snapshot ancestor identities strictly BEFORE pre_hash_ms and uncached
-      // src_hash so a directory swap between hashing and compiling cannot pair
-      // a newly compiled .o with an earlier src_hash.
-      let pre_snap = drv_cstub_snapshot_pre(world, src_path, search_dirs)
-      let pre_hash_ms = clock_now_ms(world)
-      let compile_src_hash = match drv_cas_sha256_file_uncached(src_path) {
+      let eff_cc_flags_joined = drv_join_char(eff_cc_flags, "\n")
+      let src_hash = match drv_sha256_file(src_path, file_hash_memo) {
         Some(h) => h
         None => {
-          if !keep_stage {
+          if stage_dir.length() > 0 && !keep_stage {
             let _ = drv_clean_cstub_stage_dir(world, stage_dir)
           }
           return Err("failed to read c_source " + src_path)
         }
       }
-      let compile_norm_src = drv_cstub_canon_path(world, src_path)
-      let compile_base_key = drv_cstub_base_key(
+      let norm_src = drv_cstub_canon_path(world, src_path)
+      let search_dirs = drv_cstub_collect_search_dirs(
+        world,
+        src_path,
+        eff_cc_flags,
+        rt_inc_dirs,
+      )
+      let base_key = drv_cstub_base_key(
         qbe_target,
         node.name,
         compiler,
         cc_ver_fp,
         eff_cc_flags_joined,
         rt_inc_dirs_joined,
-        compile_norm_src,
-        compile_src_hash,
+        norm_src,
+        src_hash,
       )
-      let rc = proc_exec(world, argv)
-      if rc != 0 {
-        if !keep_stage {
-          let _ = drv_clean_cstub_stage_dir(world, stage_dir)
+      let mut hit_final_key = ""
+      match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo, absent_memo) {
+        Some(fk) => {
+          let obj_path = cache_dir + "/obj/cstub_" + fk + ".o"
+          if drv_cas_pin_and_verify(
+            world,
+            cache_dir,
+            pin,
+            ["cstub_" + fk, "cstub_dep_" + base_key],
+            [obj_path],
+          ) {
+            hit_final_key = fk
+          }
         }
-        return Err(
-          "failed to compile c_source " +
-          src_path +
-          " with " +
-          compiler +
-          " (exit code " +
-          rc.to_string() +
-          ")",
-        )
+        None => ()
       }
-      match
-        drv_cstub_publish_one(
-          world,
-          cache_dir,
-          stage_dir,
-          src_path,
+      if hit_final_key.length() > 0 {
+        let obj_path = cache_dir + "/obj/cstub_" + hit_final_key + ".o"
+        if trace_cas {
+          io_eprintln(
+            world,
+            "[cas] cstub=" + src_path + " HIT key=" + drv_prefix16(hit_final_key),
+          )
+        }
+        slot_objs.push(obj_path)
+        slot_keys.push(hit_final_key)
+      } else {
+        if stage_dir.length() == 0 {
+          stage_dir = match
+          drv_mktemp_dir_near(world, cache_dir + "/obj/cstub_stage")
+          {
+            Ok(d) => d
+            Err(e) => return Err(e)
+          }
+        }
+        let miss_idx = misses.length()
+        let obj_tmp = stage_dir + "/obj_" + miss_idx.to_string() + ".o"
+        let dep_tmp = stage_dir + "/dep_" + miss_idx.to_string() + ".d"
+        let argv : Array[String] = [compiler]
+        let mut fi = 0
+        while fi < eff_cc_flags.length() {
+          argv.push(eff_cc_flags[fi])
+          fi = fi + 1
+        }
+        let mut ri = 0
+        while ri < rt_inc_dirs.length() {
+          argv.push("-I" + rt_inc_dirs[ri])
+          ri = ri + 1
+        }
+        argv.push("-c")
+        argv.push(src_path)
+        drv_cstub_append_dep_args(argv, compiler, dep_tmp, obj_tmp)
+        let is_cl_exe = drv_is_cl_exe_driver(compiler)
+        let pre_snap = drv_cstub_snapshot_pre(world, src_path, search_dirs)
+        let pre_hash_ms = clock_now_ms(world)
+        let compile_src_hash = match drv_cas_sha256_file_uncached(src_path) {
+          Some(h) => h
+          None => {
+            if !keep_stage {
+              let _ = drv_clean_cstub_stage_dir(world, stage_dir)
+            }
+            return Err("failed to read c_source " + src_path)
+          }
+        }
+        let compile_norm_src = drv_cstub_canon_path(world, src_path)
+        let compile_base_key = drv_cstub_base_key(
+          qbe_target,
+          node.name,
+          compiler,
+          cc_ver_fp,
+          eff_cc_flags_joined,
+          rt_inc_dirs_joined,
           compile_norm_src,
           compile_src_hash,
-          compile_base_key,
-          is_cl_exe,
-          obj_tmp,
-          dep_tmp,
-          pre_hash_ms,
-          pre_snap,
-          search_dirs,
-          trace_cas,
-          out_new_keys,
-          out_new_sizes,
-          pin,
         )
+        let sz = fs_size(world, src_path)
+        let slot_idx = slot_objs.length()
+        slot_objs.push("")
+        slot_keys.push("")
+        misses.push(DrvWsCstubMiss::{
+          slot_idx: slot_idx,
+          is_cxx: is_cxx,
+          src_size: if sz > 0L { sz } else { 1L },
+          compiler: compiler,
+          src_path: src_path,
+          compile_norm_src: compile_norm_src,
+          compile_src_hash: compile_src_hash,
+          compile_base_key: compile_base_key,
+          is_cl_exe: is_cl_exe,
+          obj_tmp: obj_tmp,
+          dep_tmp: dep_tmp,
+          pre_hash_ms: pre_hash_ms,
+          pre_snap: pre_snap,
+          search_dirs: search_dirs,
+          argv: argv,
+        })
+      }
+      si = si + 1
+    }
+    k = k + 1
+  }
+
+  let n_miss = misses.length()
+  if n_miss > 0 {
+    let eff_jobs = if jobs > 0 { jobs } else { drv_default_jobs(world) }
+    if eff_jobs <= 1 || n_miss == 1 {
+      let mut mi = 0
+      while mi < n_miss {
+        let m = misses[mi]
+        let rc = proc_exec(world, m.argv)
+        if rc != 0 {
+          if !keep_stage {
+            let _ = drv_clean_cstub_stage_dir(world, stage_dir)
+          }
+          return Err(
+            "failed to compile c_source " +
+            m.src_path +
+            " with " +
+            m.compiler +
+            " (exit code " +
+            rc.to_string() +
+            ")",
+          )
+        }
+        mi = mi + 1
+      }
+    } else {
+      let order : Array[Int] = []
+      let mut mi = 0
+      while mi < n_miss {
+        order.push(mi)
+        mi = mi + 1
+      }
+      // Schedule C++ files first (heaviest), then largest source files first (LPT).
+      let mut oi = 1
+      while oi < n_miss {
+        let key_i = order[oi]
+        let key_cxx = misses[key_i].is_cxx
+        let key_sz = misses[key_i].src_size
+        let mut oj = oi - 1
+        while oj >= 0 {
+          let prev_i = order[oj]
+          let prev_cxx = misses[prev_i].is_cxx
+          let prev_sz = misses[prev_i].src_size
+          let prev_smaller = (!prev_cxx && key_cxx) ||
+          (prev_cxx == key_cxx &&
+            (prev_sz < key_sz || (prev_sz == key_sz && prev_i > key_i)))
+          if !prev_smaller {
+            break
+          }
+          order[oj + 1] = prev_i
+          oj = oj - 1
+        }
+        order[oj + 1] = key_i
+        oi = oi + 1
+      }
+      let nw = if n_miss < eff_jobs { n_miss } else { eff_jobs }
+      let work_ch : Channel[String] = Channel::new(n_miss)
+      let res_ch : Channel[String] = Channel::new(n_miss + 1)
+      oi = 0
+      while oi < n_miss {
+        let idx = order[oi]
+        let m = misses[idx]
+        let sb = StringBuilder()
+        sb.write_string(idx.to_string())
+        let mut ai = 0
+        while ai < m.argv.length() {
+          sb.write_char('\n')
+          sb.write_string(drv_ws_spec_escape(m.argv[ai]))
+          ai = ai + 1
+        }
+        let _ = work_ch.send(sb.to_string())
+        oi = oi + 1
+      }
+      work_ch.close()
+      scope(world, fn(s : Scope) -> Unit {
+        let mut wi = 0
+        while wi < nw {
+          spawn(s, fn() -> Unit {
+            while true {
+              match work_ch.recv() {
+                Some(payload) => {
+                  let lines = drv_split_lines(payload)
+                  if lines.length() >= 2 {
+                    let argv : Array[String] = []
+                    let mut li = 1
+                    while li < lines.length() {
+                      argv.push(drv_ws_spec_unescape(lines[li]))
+                      li = li + 1
+                    }
+                    let rc = proc_exec(world, argv)
+                    let _ = res_ch.send(lines[0] + ":" + rc.to_string())
+                  }
+                }
+                None => break
+              }
+            }
+          })
+          wi = wi + 1
+        }
+      })
+      res_ch.close()
+      let rcs : Array[Int] = []
+      mi = 0
+      while mi < n_miss {
+        rcs.push(-1)
+        mi = mi + 1
+      }
+      while true {
+        match res_ch.recv() {
+          Some(entry) => {
+            let colon = drv_find_substr(entry, ":", 0)
+            if colon > 0 {
+              let idx = drv_parse_nonneg_int64(slice_str(entry, 0, colon), -1L).to_int()
+              let rc_s = slice_str(entry, colon + 1, entry.length())
+              let rc_v = if drv_starts_with(rc_s, "-") {
+                0 - drv_parse_nonneg_int64(slice_str(rc_s, 1, rc_s.length()), 1L).to_int()
+              } else {
+                drv_parse_nonneg_int64(rc_s, 1L).to_int()
+              }
+              if idx >= 0 && idx < n_miss {
+                rcs[idx] = rc_v
+              }
+            }
+          }
+          None => break
+        }
+      }
+      mi = 0
+      while mi < n_miss {
+        if rcs[mi] != 0 {
+          if !keep_stage {
+            let _ = drv_clean_cstub_stage_dir(world, stage_dir)
+          }
+          let m = misses[mi]
+          return Err(
+            "failed to compile c_source " +
+            m.src_path +
+            " with " +
+            m.compiler +
+            " (exit code " +
+            rcs[mi].to_string() +
+            ")",
+          )
+        }
+        mi = mi + 1
+      }
+    }
+    let mut mi = 0
+    while mi < n_miss {
+      let m = misses[mi]
+      match
+      drv_cstub_publish_one(
+        world,
+        cache_dir,
+        stage_dir,
+        m.src_path,
+        m.compile_norm_src,
+        m.compile_src_hash,
+        m.compile_base_key,
+        m.is_cl_exe,
+        m.obj_tmp,
+        m.dep_tmp,
+        m.pre_hash_ms,
+        m.pre_snap,
+        m.search_dirs,
+        trace_cas,
+        out_new_keys,
+        out_new_sizes,
+        pin,
+      )
       {
         Err(e) => {
           if !keep_stage {
@@ -6991,11 +7186,18 @@ fn drv_compile_pkg_c_sources(
             keep_stage = true
             pin.temp_dirs.push(stage_dir)
           }
-          out_objs.push(obj_path)
-          out_keys.push(final_key)
+          slot_objs[m.slot_idx] = obj_path
+          slot_keys[m.slot_idx] = final_key
         }
       }
+      mi = mi + 1
     }
+  }
+
+  let mut si = 0
+  while si < slot_objs.length() {
+    out_objs.push(slot_objs[si])
+    out_keys.push(slot_keys[si])
     si = si + 1
   }
   if stage_dir.length() > 0 && !keep_stage {
@@ -9834,7 +10036,7 @@ fn drv_ws_should_fallback_parent(
     return miss_anc_bytes > cap
   }
   let self_bytes = drv_ws_pkg_source_bytes(nodes[topo_order[pkg_topo_idx]])
-  miss_anc_bytes > 65536L && miss_anc_bytes > self_bytes
+  miss_anc_bytes > 65536L && miss_anc_bytes > self_bytes * 2L
 }
 
 ///|
@@ -9862,6 +10064,75 @@ fn drv_ws_pkg_worth_worker(
 }
 
 ///|
+fn drv_keep_native_ssa(world : World) -> Bool {
+  drv_env_str(world, "PION_KEEP_NATIVE_SSA") == "1"
+}
+
+///|
+/// Opens a kernel-locked per-process staging directory under `<cache_dir>/ssa_tmp`
+/// (reusing the `.gc.lock` + `.lock` + `.reaping.*` protocol of `drv_make_ws_stage`)
+/// after sweeping any orphaned directories left by crashed/SIGKILL'd processes.
+/// Falls back to an empty `WsStageHandle` if locking fails, in which case callers
+/// place private `.ssa.tmp.<tag>` files in `<cache_dir>/ssa/`.
+fn drv_open_temp_ssa_stage(world : World, cache_dir : String) -> WsStageHandle {
+  let root = cache_dir + "/ssa_tmp"
+  drv_cleanup_stale_ws_stages(world, root)
+  match drv_make_ws_stage(world, root) {
+    Ok(sh) => sh
+    Err(_) => WsStageHandle::{ dir: "", lock_fd: -1L }
+  }
+}
+
+///|
+fn drv_close_temp_ssa_stage(
+  world : World,
+  cache_dir : String,
+  sh : WsStageHandle,
+) -> Unit {
+  if sh.dir.length() > 0 {
+    let root = cache_dir + "/ssa_tmp"
+    let gc_lk = c_fs_lock(drv_cpath(root + "/.gc.lock"))
+    if gc_lk < 0L {
+      if sh.lock_fd >= 0L {
+        c_fs_unlock(sh.lock_fd)
+      }
+      let _ = drv_remove_tree_nofollow(world, sh.dir)
+    } else {
+      if sh.lock_fd >= 0L {
+        c_fs_unlock(sh.lock_fd)
+      }
+      let reap_path = root +
+        "/.reaping." +
+        c_cli_getpid().to_string() +
+        "." +
+        c_cli_next_seq().to_string()
+      let moved = fs_rename(world, sh.dir, reap_path)
+      c_fs_unlock(gc_lk)
+      if moved {
+        let _ = drv_remove_tree_nofollow(world, reap_path)
+      }
+    }
+  } else if sh.lock_fd >= 0L {
+    c_fs_unlock(sh.lock_fd)
+  }
+}
+
+///|
+fn drv_temp_ssa_path(
+  cache_dir : String,
+  ssa_stage_dir : String,
+  key : String,
+  tag : String,
+  idx : Int,
+) -> String {
+  if ssa_stage_dir.length() > 0 {
+    ssa_stage_dir + "/" + key + "_" + idx.to_string() + ".ssa"
+  } else {
+    cache_dir + "/ssa/" + key + ".ssa.tmp." + tag + "_" + idx.to_string()
+  }
+}
+
+///|
 /// Authoritative parent-scheduled workspace DAG compiler (shared by Native and
 /// Wasm32). Dispatches worker processes only when >= 2 MISS packages are ready
 /// simultaneously and `eff_jobs > 1`, preserving P96 Case 6 parity, exact
@@ -9882,6 +10153,7 @@ fn drv_ws_run_dag(
   jobs : Int,
   trace_cas : Bool,
   pin : DrvCasPinSession,
+  ssa_stage_dir : String,
 ) -> Result[DrvWsDagOut, String] {
   let stage_root = cache_dir + "/ws_stage"
   drv_cleanup_stale_ws_stages(world, stage_root)
@@ -9891,6 +10163,12 @@ fn drv_ws_run_dag(
   let trans_dep_names = trans.names
   let pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
   let j2_mask = drv_j2_disable_mask(world)
+  let keep_native_ssa = drv_keep_native_ssa(world)
+  let ssa_tmp_tag = if !is_wasm && !keep_native_ssa {
+    drv_tmp_tag(world, "nat_ssa")
+  } else {
+    ""
+  }
 
   // Build direct dependency adjacency and in-degrees in topo index space.
   let name_to_topo : Map[String, Int] = Map([])
@@ -9944,6 +10222,7 @@ fn drv_ws_run_dag(
   let pkg_entry_sizes : Array[Int64] = []
   let fail_diag : Array[String] = []
   let pkg_done : Array[Bool] = []
+  let pkg_src_bytes : Array[Int64] = []
   let ready_queue : Array[Int] = []
   k = 0
   while k < n {
@@ -9959,6 +10238,7 @@ fn drv_ws_run_dag(
     pkg_entry_sizes.push(0L)
     fail_diag.push("")
     pkg_done.push(false)
+    pkg_src_bytes.push(drv_ws_pkg_source_bytes(nodes[topo_order[k]]))
     if in_deg[k] == 0 {
       drv_ws_insert_sorted(ready_queue, k)
     }
@@ -10105,7 +10385,11 @@ fn drv_ws_run_dag(
       let key = compute_pkg_key(idx)
       pkg_keys[idx] = key
       let obj_path = cache_dir + "/obj/" + key + ".o"
-      let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+      let ssa_path = if is_wasm || keep_native_ssa {
+        cache_dir + "/ssa/" + key + ".ssa"
+      } else {
+        drv_temp_ssa_path(cache_dir, ssa_stage_dir, key, ssa_tmp_tag, idx)
+      }
       let sig_path = cache_dir + "/sig/" + key + ".pionsig"
       let stub_path = cache_dir + "/sig/" + key + ".pionstub"
       pkg_obj_paths[idx] = obj_path
@@ -10347,6 +10631,7 @@ fn drv_ws_run_dag(
         }
         while can_spawn && in_flight < nw && ready_miss.length() > 0 {
           let mut pick_pos = -1
+          let mut pick_bytes : Int64 = -1L
           let mut ri = 0
           while ri < ready_miss.length() {
             let cand = ready_miss[ri]
@@ -10360,8 +10645,11 @@ fn drv_ws_run_dag(
                 min_pkg_bytes,
                 cand,
               ) {
+              let sz = pkg_src_bytes[cand]
+              if sz > pick_bytes {
+                pick_bytes = sz
               pick_pos = ri
-              break
+              }
             }
             ri = ri + 1
           }
@@ -10428,11 +10716,16 @@ fn drv_ws_run_dag(
         if in_flight == 0 {
           continue
         }
-        // If only small/fallback packages remain in ready_miss while workers are busy,
-        // compile one in-process on the main thread (staying in ST biased-RC mode).
-        if ready_miss.length() > 0 && ready_miss[0] < min_fail_idx {
-          let cand = ready_miss[0]
-          if !drv_ws_pkg_worth_worker(
+        // If any small/fallback package is ready while workers are busy, compile
+        // the largest one in-process on the main thread (staying in ST biased-RC mode).
+        if ready_miss.length() > 0 {
+          let mut fb_pos = -1
+          let mut fb_bytes : Int64 = -1L
+          let mut fi = 0
+          while fi < ready_miss.length() {
+            let cand = ready_miss[fi]
+            if cand < min_fail_idx &&
+            !drv_ws_pkg_worth_worker(
             world,
             nodes,
             topo_order,
@@ -10441,7 +10734,16 @@ fn drv_ws_run_dag(
             min_pkg_bytes,
             cand,
           ) {
-            let idx = drv_ws_pop_front(ready_miss)
+              let sz = pkg_src_bytes[cand]
+              if sz > fb_bytes {
+                fb_bytes = sz
+                fb_pos = fi
+              }
+            }
+            fi = fi + 1
+          }
+          if fb_pos >= 0 {
+            let idx = drv_ws_remove_at(ready_miss, fb_pos)
             compile_in_proc(idx)
             continue
           }
@@ -10632,12 +10934,25 @@ fn drv_ws_run_dag(
   } else if stage_lock_fd >= 0L {
     c_fs_unlock(stage_lock_fd)
   }
+  let cleanup_temp_ssas = fn() -> Unit {
+    if !is_wasm && !keep_native_ssa {
+      let mut ci = 0
+      while ci < n {
+        if pkg_ssa_paths[ci].length() > 0 {
+          let _ = fs_remove(world, pkg_ssa_paths[ci])
+        }
+        ci = ci + 1
+      }
+    }
+  }
   if min_fail_idx < n {
+    cleanup_temp_ssas()
     return Err(fail_diag[min_fail_idx])
   }
   let mut chk = 0
   while chk < n {
     if !pkg_done[chk] {
+      cleanup_temp_ssas()
       return Err(
         "internal error: workspace DAG did not complete package " +
         nodes[topo_order[chk]].declared_name,
@@ -10849,33 +11164,75 @@ fn drv_compile_missed(
         return Err(pub_err)
       }
     } else {
+      // LPT bin-packing by `.ssa` byte size so large packages near the end of
+      // topological order are spread evenly across QBE workers instead of piling
+      // onto the last bucket.
+      let ssa_sizes : Array[Int64] = []
+      let lpt_order : Array[Int] = []
+      let mut mi = 0
+      while mi < n_miss {
+        let sz = fs_size(world, miss_ssa_paths[mi])
+        ssa_sizes.push(if sz > 0L { sz } else { 1L })
+        lpt_order.push(mi)
+        mi = mi + 1
+      }
+      let mut si = 1
+      while si < n_miss {
+        let key_idx = lpt_order[si]
+        let key_sz = ssa_sizes[key_idx]
+        let mut sj = si - 1
+        while sj >= 0 &&
+        (ssa_sizes[lpt_order[sj]] < key_sz ||
+          (ssa_sizes[lpt_order[sj]] == key_sz && lpt_order[sj] > key_idx)) {
+          lpt_order[sj + 1] = lpt_order[sj]
+          sj = sj - 1
+        }
+        lpt_order[sj + 1] = key_idx
+        si = si + 1
+      }
+      let bucket_sbs : Array[StringBuilder] = []
+      let bucket_loads : Array[Int64] = []
+      let mut bi = 0
+      while bi < nw {
+        bucket_sbs.push(StringBuilder())
+        bucket_loads.push(0L)
+        bi = bi + 1
+      }
       let err_ch : Channel[String] = Channel::new(nw + 1)
       // Every batch's temporaries; the main thread publishes them below.
       let all_tmps : Array[String] = []
       let all_objs : Array[String] = []
+      mi = 0
+      while mi < n_miss {
+        let idx = lpt_order[mi]
+        let mut best = 0
+        let mut b = 1
+        while b < nw {
+          if bucket_loads[b] < bucket_loads[best] {
+            best = b
+          }
+          b = b + 1
+        }
+        let u_ssa = miss_ssa_paths[idx]
+        let u_obj = miss_obj_paths[idx]
+        let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+        bucket_sbs[best].write_string(u_ssa)
+        bucket_sbs[best].write_char('\n')
+        bucket_sbs[best].write_string(u_tmp)
+        bucket_sbs[best].write_char('\n')
+        bucket_loads[best] = bucket_loads[best] + ssa_sizes[idx]
+        all_tmps.push(u_tmp)
+        all_objs.push(u_obj)
+        mi = mi + 1
+      }
       let qmv = qbe_macos_ver
       let qb = qbe_bin
       let qt = qbe_target
       scope(world, fn(s : Scope) -> Unit {
         let mut wi = 0
         while wi < nw {
-          let start = drv_batch_start(wi, n_miss, nw)
-          let end = drv_batch_start(wi + 1, n_miss, nw)
-          let spec_sb = StringBuilder()
-          let mut mi = start
-          while mi < end {
-            let u_ssa = miss_ssa_paths[mi]
-            let u_obj = miss_obj_paths[mi]
-            let u_tmp = u_obj + ".tmp." + stamp_base + "_" + mi.to_string()
-            spec_sb.write_string(u_ssa)
-            spec_sb.write_char('\n')
-            spec_sb.write_string(u_tmp)
-            spec_sb.write_char('\n')
-            all_tmps.push(u_tmp)
-            all_objs.push(u_obj)
-            mi = mi + 1
-          }
-          let spec = spec_sb.to_string()
+          let spec = bucket_sbs[wi].to_string()
+          if spec.length() > 0 {
           spawn(s, fn() -> Unit {
             let lines = drv_split_lines(spec)
             let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
@@ -10892,6 +11249,7 @@ fn drv_compile_missed(
               )
             }
           })
+          }
           wi = wi + 1
         }
       })
@@ -10910,6 +11268,29 @@ fn drv_compile_missed(
       }
     }
   } else if n_miss > 1 {
+    let ssa_sizes : Array[Int64] = []
+    let lpt_order : Array[Int] = []
+    let mut smi = 0
+    while smi < n_miss {
+      let sz = fs_size(world, miss_ssa_paths[smi])
+      ssa_sizes.push(if sz > 0L { sz } else { 1L })
+      lpt_order.push(smi)
+      smi = smi + 1
+    }
+    let mut ssi = 1
+    while ssi < n_miss {
+      let key_idx = lpt_order[ssi]
+      let key_sz = ssa_sizes[key_idx]
+      let mut ssj = ssi - 1
+      while ssj >= 0 &&
+      (ssa_sizes[lpt_order[ssj]] < key_sz ||
+        (ssa_sizes[lpt_order[ssj]] == key_sz && lpt_order[ssj] > key_idx)) {
+        lpt_order[ssj + 1] = lpt_order[ssj]
+        ssj = ssj - 1
+      }
+      lpt_order[ssj + 1] = key_idx
+      ssi = ssi + 1
+    }
     let qbe_arch = drv_target_qbe_arch(qbe_target)
     let qbe_seh = drv_win_seh(world, qbe_target)
     let use_cc1as = apple_tools.ok && qbe_target == "arm64_apple" && sysroot.length() == 0
@@ -10930,7 +11311,7 @@ fn drv_compile_missed(
       scope(world, fn(s : Scope) -> Unit {
         let mut off = 0
         while off < batch {
-          let mi = base + off
+          let mi = lpt_order[base + off]
           let u_ssa = miss_ssa_paths[mi]
           let u_obj = miss_obj_paths[mi]
           let u_asm = u_obj + ".s." + stamp_base + "_" + mi.to_string()
@@ -11099,6 +11480,12 @@ fn drv_build_nodes_objects_entry(
 
   let n = topo.order.length()
   let trans = drv_trans_deps(nodes, topo.order)
+  let keep_native_ssa = drv_keep_native_ssa(world)
+  let ssa_stage = if keep_native_ssa {
+    WsStageHandle::{ dir: "", lock_fd: -1L }
+  } else {
+    drv_open_temp_ssa_stage(world, cache_dir)
+  }
   let dag = match drv_ws_run_dag(
     world,
     nodes,
@@ -11115,8 +11502,12 @@ fn drv_build_nodes_objects_entry(
     jobs,
     trace_cas,
     pin,
+    ssa_stage.dir,
   ) {
-    Err(e) => return Err(e)
+    Err(e) => {
+      drv_close_temp_ssa_stage(world, cache_dir, ssa_stage)
+      return Err(e)
+    }
     Ok(v) => v
   }
 
@@ -11155,7 +11546,7 @@ fn drv_build_nodes_objects_entry(
 
   // Compile all CAS-missed packages (parallel --obj-batch on direct_obj, parallel qbe+as otherwise)
   let n_miss = miss_keys.length()
-  match drv_compile_missed(
+  let compile_miss_res = drv_compile_missed(
     world,
     qbe_bin,
     qbe_target,
@@ -11168,7 +11559,12 @@ fn drv_build_nodes_objects_entry(
     miss_obj_paths,
     jobs,
     false,
-  ) {
+  )
+  if !keep_native_ssa && miss_ssa_paths.length() > 0 {
+    drv_remove_files(world, miss_ssa_paths, 0)
+  }
+  drv_close_temp_ssa_stage(world, cache_dir, ssa_stage)
+  match compile_miss_res {
     Err(e) => return Err(e)
     Ok(_) => ()
   }
@@ -11199,21 +11595,19 @@ fn drv_build_nodes_objects_entry(
   let file_hash_memo : Map[String, String] = Map([])
   let absent_memo : Map[String, Bool] = Map([])
   let mut has_local_cstub = false
-  k = 0
-  while k < n {
-    let node = nodes[topo.order[k]]
-    drv_collect_node_link_opts(node, qbe_target, ws_link_opts)
     let cstub_objs : Array[String] = []
     let cstub_keys : Array[String] = []
-    match drv_compile_pkg_c_sources(
+  match drv_compile_ws_c_sources(
       world,
-      node,
+    nodes,
+    topo.order,
       qbe_target,
       sysroot,
       need_pic,
       release,
       rt_lib,
       cache_dir,
+    jobs,
       trace_cas,
       cc_ver_cache,
       file_hash_memo,
@@ -11241,6 +11635,10 @@ fn drv_build_nodes_objects_entry(
       link_key_sb.write_string(cstub_keys[ci])
       ci = ci + 1
     }
+  k = 0
+  while k < n {
+    let node = nodes[topo.order[k]]
+    drv_collect_node_link_opts(node, qbe_target, ws_link_opts)
     let rc_objs : Array[String] = []
     let rc_keys : Array[String] = []
     match drv_compile_pkg_rc_sources(
@@ -11543,6 +11941,7 @@ fn drv_build_wasm_targets(
           jobs,
           trace_cas,
           pin,
+          "",
         ) {
           Err(e) => {
             drv_cas_pin_close(world, pin)
@@ -12288,6 +12687,39 @@ fn drv_build_targets(
       ui = ui + 1
     }
     let pkg_key = sha256_hex(pkg_key_sb.to_string())
+    let keep_unit_ssa = drv_keep_native_ssa(world)
+    let unit_ssa_stage = if keep_unit_ssa || miss_indices.length() == 0 {
+      WsStageHandle::{ dir: "", lock_fd: -1L }
+    } else {
+      drv_open_temp_ssa_stage(world, cache_dir)
+    }
+    let unit_ssa_tag = if keep_unit_ssa || miss_indices.length() == 0 {
+      ""
+    } else {
+      drv_tmp_tag(world, "unit_ssa")
+    }
+    let unit_ssa_paths : Array[String] = []
+    ui = 0
+    while ui < n_units {
+      if keep_unit_ssa {
+        unit_ssa_paths.push(cache_dir + "/ssa/" + unit_keys[ui] + ".ssa")
+      } else {
+        unit_ssa_paths.push(
+          drv_temp_ssa_path(cache_dir, unit_ssa_stage.dir, unit_keys[ui], unit_ssa_tag, ui),
+        )
+      }
+      ui = ui + 1
+    }
+    let cleanup_unit_ssas = fn() -> Unit {
+      if !keep_unit_ssa {
+        let mut ci = 0
+        while ci < miss_indices.length() {
+          let _ = fs_remove(world, unit_ssa_paths[miss_indices[ci]])
+          ci = ci + 1
+        }
+        drv_close_temp_ssa_stage(world, cache_dir, unit_ssa_stage)
+      }
+    }
     if miss_indices.length() == 0 {
       match
         drv_try_hit_native_bin(
@@ -12408,8 +12840,9 @@ fn drv_build_targets(
         let mut mi = 0
         while mi < miss_indices.length() {
           let idx = miss_indices[mi]
-          let path = cache_dir + "/ssa/" + unit_keys[idx] + ".ssa"
+          let path = unit_ssa_paths[idx]
           if !drv_emit_unit_file(world, prep, idx, path, release, qbe_target, entry_symbol, no_main) {
+            cleanup_unit_ssas()
             return Err("failed to write CAS unit ssa: " + path)
           }
           mi = mi + 1
@@ -12425,7 +12858,7 @@ fn drv_build_targets(
       while mi < n_miss {
         let idx = miss_indices[mi]
         let ukey = unit_keys[idx]
-        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+        let u_ssa = unit_ssa_paths[idx]
         let u_obj = obj_paths[idx]
         let u_tmp = u_obj + ".tmp." + stamp + "_" + idx.to_string()
         if direct_obj {
@@ -12436,9 +12869,11 @@ fn drv_build_targets(
           let rc_qbe = proc_exec(world, argv)
           if rc_qbe != 0 {
             let _ = fs_remove(world, u_tmp)
+            cleanup_unit_ssas()
             return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
           }
           if !drv_publish_tmp(world, u_tmp, u_obj, true) {
+            cleanup_unit_ssas()
             return Err("failed to publish CAS object: " + u_obj)
           }
         } else {
@@ -12446,6 +12881,7 @@ fn drv_build_targets(
           let rc_qbe = proc_exec(world, drv_qbe_text_argv(qbe_bin, qbe_arch, qbe_seh, u_asm, u_ssa))
           if rc_qbe != 0 {
             let _ = fs_remove(world, u_asm)
+            cleanup_unit_ssas()
             return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
           }
           let rc_as = drv_assemble_file(
@@ -12461,9 +12897,11 @@ fn drv_build_targets(
           let _ = fs_remove(world, u_asm)
           if rc_as != 0 {
             let _ = fs_remove(world, u_tmp)
+            cleanup_unit_ssas()
             return Err("as failed with exit code " + rc_as.to_string())
           }
           if !drv_publish_tmp(world, u_tmp, u_obj, true) {
+            cleanup_unit_ssas()
             return Err("failed to publish CAS object: " + u_obj)
           }
         }
@@ -12485,8 +12923,7 @@ fn drv_build_targets(
         let mut mi = 0
         while mi < n_miss {
           let idx = miss_indices[mi]
-          let ukey = unit_keys[idx]
-          let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+          let u_ssa = unit_ssa_paths[idx]
           let u_obj = obj_paths[idx]
           let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
           argv.push(u_ssa)
@@ -12498,10 +12935,12 @@ fn drv_build_targets(
         let rc_qbe = proc_exec(world, argv)
         if rc_qbe != 0 {
           drv_remove_files(world, tmps, 0)
+          cleanup_unit_ssas()
           return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
         }
         let pub_err = drv_publish_unit_objs(world, tmps, objs)
         if pub_err != "" {
+          cleanup_unit_ssas()
           return Err(pub_err)
         }
       } else {
@@ -12546,7 +12985,7 @@ fn drv_build_targets(
               let idx = miss_indices[k]
               let obj = obj_paths[idx]
               let tmp = obj + ".tmp." + stamp_base + "_" + idx.to_string()
-              paths.push(cache_dir + "/ssa/" + unit_keys[idx] + ".ssa")
+              paths.push(unit_ssa_paths[idx])
               tmps.push(tmp)
               all_tmps.push(tmp)
               all_objs.push(obj)
@@ -12623,6 +13062,7 @@ fn drv_build_targets(
         match emit_errors.recv() {
           Some(msg) => {
             drv_remove_files(world, all_tmps, 0)
+            cleanup_unit_ssas()
             return Err(msg)
           }
           None => ()
@@ -12631,12 +13071,14 @@ fn drv_build_targets(
         match err_ch.recv() {
           Some(err_msg) => {
             drv_remove_files(world, all_tmps, 0)
+            cleanup_unit_ssas()
             return Err(err_msg)
           }
           None => ()
         }
         let pub_err = drv_publish_unit_objs(world, all_tmps, all_objs)
         if pub_err != "" {
+          cleanup_unit_ssas()
           return Err(pub_err)
         }
       }
@@ -12663,7 +13105,7 @@ fn drv_build_targets(
           while off < batch {
             let idx = miss_indices[base + off]
             let ukey = unit_keys[idx]
-            let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+            let u_ssa = unit_ssa_paths[idx]
             let u_obj = obj_paths[idx]
             let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp_base + "_" + idx.to_string()
             let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
@@ -12725,17 +13167,20 @@ fn drv_build_targets(
         match err_ch.recv() {
           Some(err_msg) => {
             drv_remove_files(world, batch_tmps, 0)
+            cleanup_unit_ssas()
             return Err(err_msg)
           }
           None => ()
         }
         let pub_err = drv_publish_unit_objs(world, batch_tmps, batch_objs)
         if pub_err != "" {
+          cleanup_unit_ssas()
           return Err(pub_err)
         }
         base = base + batch
       }
     }
+    cleanup_unit_ssas()
 
     if !has_main && out_bin_arg == "" {
       drv_cas_pin_close(world, pin)
@@ -12787,6 +13232,7 @@ fn drv_build_targets(
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
   let obj_path = cache_dir + "/obj/" + key + ".o"
 
+  let keep_single_ssa = drv_keep_native_ssa(world) || emit_ssa_path != "" || emit_asm_path != ""
   let asm_only = emit_asm_path != "" &&
     out_bin_arg == "" &&
     emit_obj_path == "" &&
@@ -12796,9 +13242,13 @@ fn drv_build_targets(
   let mut has_main = true
   let mut active_obj_path = obj_path
   let cache_hit = drv_is_nonempty_regular_file(world, obj_path) &&
-    drv_is_nonempty_regular_file(world, ssa_path) &&
+  (!keep_single_ssa || drv_is_nonempty_regular_file(world, ssa_path)) &&
     drv_is_regular_file(sig_path) &&
+  (if keep_single_ssa {
     drv_cas_pin_and_verify(world, cache_dir, pin, [key], [obj_path, ssa_path])
+  } else {
+    drv_cas_pin_and_verify(world, cache_dir, pin, [key], [obj_path])
+  })
 
   if ssa_only && drv_is_nonempty_regular_file(world, ssa_path) {
     drv_ensure_parent_dir(world, emit_ssa_path)
@@ -12860,7 +13310,7 @@ fn drv_build_targets(
       }
     }
     let sz_sig = fs_size(world, sig_path)
-    let sz_ssa = fs_size(world, ssa_path)
+    let sz_ssa = if keep_single_ssa { fs_size(world, ssa_path) } else { 0L }
     let sz_obj = fs_size(world, obj_path)
     let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
       (if sz_ssa > 0L { sz_ssa } else { 0L }) +
@@ -12922,8 +13372,18 @@ fn drv_build_targets(
       return Err("failed to write CAS sig: " + sig_path)
     }
     let stamp = drv_tmp_tag(world, obj_path)
-    let ssa_tmp = ssa_path + ".tmp." + stamp
+    let single_ssa_stage = if keep_single_ssa {
+      WsStageHandle::{ dir: "", lock_fd: -1L }
+    } else {
+      drv_open_temp_ssa_stage(world, cache_dir)
+    }
+    let ssa_tmp = if keep_single_ssa || single_ssa_stage.dir.length() == 0 {
+      ssa_path + ".tmp." + stamp
+    } else {
+      single_ssa_stage.dir + "/" + key + ".ssa"
+    }
     if !drv_write_text_atomic(world, ssa_tmp, final_ssa) {
+      drv_close_temp_ssa_stage(world, cache_dir, single_ssa_stage)
       return Err("failed to write private ssa: " + ssa_tmp)
     }
     pin.temp_files.push(ssa_tmp)
@@ -13033,11 +13493,16 @@ fn drv_build_targets(
         obj_path,
       )
     }
-    let _ = drv_cas_publish_file_pinned(world, cache_dir, pin, [key], ssa_tmp, ssa_path)
+    if keep_single_ssa {
+      let _ = drv_cas_publish_file_pinned(world, cache_dir, pin, [key], ssa_tmp, ssa_path)
+    } else {
+      let _ = fs_remove(world, ssa_tmp)
+      drv_close_temp_ssa_stage(world, cache_dir, single_ssa_stage)
+    }
 
     if published_obj {
       let sz_sig = fs_size(world, sig_path)
-      let sz_ssa = fs_size(world, ssa_path)
+      let sz_ssa = if keep_single_ssa { fs_size(world, ssa_path) } else { 0L }
       let sz_obj = fs_size(world, obj_path)
       let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
         (if sz_ssa > 0L { sz_ssa } else { 0L }) +
@@ -14583,6 +15048,13 @@ fn drv_build_needed_objects(
   }
   let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
   let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1"
+  let keep_native_ssa = drv_keep_native_ssa(world)
+  let needed_ssa_stage = if keep_native_ssa {
+    WsStageHandle::{ dir: "", lock_fd: -1L }
+  } else {
+    drv_open_temp_ssa_stage(world, cache_dir)
+  }
+  let ssa_tmp_tag = if keep_native_ssa { "" } else { drv_tmp_tag(world, "test_ssa") }
   let sig_hashes : Map[String, String] = Map([])
   let stub_hashes : Map[String, String] = Map([])
   let miss_ssa_paths : Array[String] = []
@@ -14622,7 +15094,11 @@ fn drv_build_needed_objects(
       compiler_fp,
     )
     let obj_path = cache_dir + "/obj/" + key + ".o"
-    let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+    let ssa_path = if keep_native_ssa {
+      cache_dir + "/ssa/" + key + ".ssa"
+    } else {
+      drv_temp_ssa_path(cache_dir, needed_ssa_stage.dir, key, ssa_tmp_tag, k)
+    }
     let sig_path = cache_dir + "/sig/" + key + ".pionsig"
     let stub_path = cache_dir + "/sig/" + key + ".pionstub"
     drv_cas_pin_add(pin, key)
@@ -14669,6 +15145,10 @@ fn drv_build_needed_objects(
         false,
       )
       if cr.diagnostics.length() > 0 {
+        if !keep_native_ssa && miss_ssa_paths.length() > 0 {
+          drv_remove_files(world, miss_ssa_paths, 0)
+        }
+        drv_close_temp_ssa_stage(world, cache_dir, needed_ssa_stage)
         return Err(check_result_to_json(cr.diagnostics))
       }
       cr.tc.pkg_root = drv_normalize_path(drv_abs_path(world, node.dir))
@@ -14693,6 +15173,10 @@ fn drv_build_needed_objects(
       let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
       stub_paths[k] = stub_path
       if !drv_write_cas_text_atomic(world, ssa_path, res.ssa) {
+        if !keep_native_ssa && miss_ssa_paths.length() > 0 {
+          drv_remove_files(world, miss_ssa_paths, 0)
+        }
+        drv_close_temp_ssa_stage(world, cache_dir, needed_ssa_stage)
         return Err("failed to write CAS ssa: " + ssa_path)
       }
       miss_ssa_paths.push(ssa_path)
@@ -14702,7 +15186,7 @@ fn drv_build_needed_objects(
     obj_paths[k] = obj_path
     k = k + 1
   }
-  match drv_compile_missed(
+  let compile_needed_res = drv_compile_missed(
     world,
     qbe_bin,
     qbe_target,
@@ -14715,7 +15199,12 @@ fn drv_build_needed_objects(
     miss_obj_paths,
     jobs,
     quiet,
-  ) {
+  )
+  if !keep_native_ssa && miss_ssa_paths.length() > 0 {
+    drv_remove_files(world, miss_ssa_paths, 0)
+  }
+  drv_close_temp_ssa_stage(world, cache_dir, needed_ssa_stage)
+  match compile_needed_res {
     Err(e) => return Err(e)
     Ok(_) => ()
   }

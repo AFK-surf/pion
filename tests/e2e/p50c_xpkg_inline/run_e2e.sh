@@ -125,7 +125,7 @@ write_geom 0 1
 write_app "v1"
 BIN="$TMP_DIR/app_bin"
 TRACE1="$TMP_DIR/trace1.log"
-"$PIONC" build --release -o "$BIN" "$WS/app" 2>"$TRACE1"
+PION_KEEP_NATIVE_SSA=1 "$PIONC" build --release -o "$BIN" "$WS/app" 2>"$TRACE1"
 OUT1="$("$BIN")"
 # hot_path(4,5): dot = 4*5 + 5*4 = 40; add_scaled(40, 4, 3) = 52; acc_add(52, 5) = 57
 # cold_path(6): uses_priv(6) = (6*3+1)+1 = 20; big_fn(6) = 0+1+2+3+4+5 = 15; total = 35

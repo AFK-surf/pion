@@ -880,4 +880,264 @@ test "$STUB_COLD_OUT" = "$(printf 'field=6 nl=10,esc=27,sq=39,bs=92,ds=27,ss=27,
 test "$STUB_COLD_OUT" = "$STUB_HOT_OUT"
 echo "Contract A.13 (cold vs hot .pionstub fidelity: ECall(EField), escapes, SForIn, SLetTuple, generic method & impl): OK"
 
-echo "PASS: ws_parallel_build (Contract A & Contract B)"
+# --- Contract C: Native CAS zero-byte ssa/ cleanup, Wasm32 ssa/ retention, concurrent temp-SSA safety & parallel c_sources ---
+assert_ssa_empty() {
+  _label="$1"
+  _cdir="$2"
+  if [ -d "$_cdir/ssa" ]; then
+    _cnt=$(ls -A "$_cdir/ssa" | wc -l | tr -d ' ')
+    if [ "$_cnt" != "0" ]; then
+      echo "FAIL [$_label]: expected 0 files in $_cdir/ssa, found $_cnt:" >&2
+      ls -la "$_cdir/ssa" >&2
+      exit 1
+    fi
+  fi
+}
+
+# C.1: Native workspace cold build leaves 0 bytes in cas/ssa/ and hot rebuild hits 100% obj/
+CAS_C1="$TMP_DIR/cas_c1_nat"
+mkdir -p "$CAS_C1"
+PION_CACHE_DIR="$CAS_C1" "$PIONC" build --jobs 4 -o "$TMP_DIR/c1_cold" "$WS_D/app"
+assert_ssa_empty "C.1-native-ws-cold" "$CAS_C1"
+test "$(ls -1 "$CAS_C1/obj/"*.o | wc -l | tr -d ' ')" -ge 4
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_C1" "$PIONC" build --jobs 4 -o "$TMP_DIR/c1_hot" "$WS_D/app" 2>"$TMP_DIR/c1_hot.trace"
+assert_ssa_empty "C.1-native-ws-hot" "$CAS_C1"
+if grep -q '\[cas\] pkg=.* MISS ' "$TMP_DIR/c1_hot.trace"; then
+  echo "FAIL [C.1]: expected 100% CAS HIT on hot Native rebuild, got MISS:" >&2
+  cat "$TMP_DIR/c1_hot.trace" >&2
+  exit 1
+fi
+grep -q '\[cas\] pkg=app HIT ' "$TMP_DIR/c1_hot.trace"
+test "$("$TMP_DIR/c1_cold")" = "$("$TMP_DIR/c1_hot")"
+
+# C.2: Single-package single-file & multi-file Native builds leave 0 bytes in cas/ssa/
+CAS_C2S="$TMP_DIR/cas_c2_single"
+mkdir -p "$CAS_C2S"
+cat <<'EOF' > "$TMP_DIR/c2_single.pion"
+pub fn main(w : World) -> Int {
+  io_println(w, "c2_single_ok")
+  0
+}
+EOF
+PION_CACHE_DIR="$CAS_C2S" "$PIONC" build -o "$TMP_DIR/c2_single_bin" "$TMP_DIR/c2_single.pion"
+assert_ssa_empty "C.2-single-cold" "$CAS_C2S"
+PION_CACHE_DIR="$CAS_C2S" "$PIONC" build -o "$TMP_DIR/c2_single_bin2" "$TMP_DIR/c2_single.pion"
+assert_ssa_empty "C.2-single-hot" "$CAS_C2S"
+test "$("$TMP_DIR/c2_single_bin2")" = "c2_single_ok"
+
+CAS_C2M="$TMP_DIR/cas_c2_multi"
+mkdir -p "$CAS_C2M" "$TMP_DIR/c2_multi"
+cat <<'EOF' > "$TMP_DIR/c2_multi/a.pion"
+pub fn helper_a(x : Int) -> Int { x + 40 }
+EOF
+cat <<'EOF' > "$TMP_DIR/c2_multi/b.pion"
+pub fn main(w : World) -> Int {
+  io_println(w, "c2_multi=" + helper_a(2).to_string())
+  0
+}
+EOF
+PION_CACHE_DIR="$CAS_C2M" "$PIONC" build --jobs 2 -o "$TMP_DIR/c2_multi_bin" "$TMP_DIR/c2_multi/a.pion" "$TMP_DIR/c2_multi/b.pion"
+assert_ssa_empty "C.2-multi-cold" "$CAS_C2M"
+PION_CACHE_DIR="$CAS_C2M" "$PIONC" build --jobs 2 -o "$TMP_DIR/c2_multi_bin2" "$TMP_DIR/c2_multi/a.pion" "$TMP_DIR/c2_multi/b.pion"
+assert_ssa_empty "C.2-multi-hot" "$CAS_C2M"
+test "$("$TMP_DIR/c2_multi_bin2")" = "c2_multi=42"
+
+# C.3: PION_KEEP_NATIVE_SSA=1 retains .ssa in cas/ssa/
+CAS_C3="$TMP_DIR/cas_c3_keep"
+mkdir -p "$CAS_C3"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_C3" "$PIONC" build --jobs 4 -o "$TMP_DIR/c3_bin" "$WS_D/app"
+test "$(ls -1 "$CAS_C3/ssa/"*.ssa | wc -l | tr -d ' ')" -ge 4
+
+# C.4: Wasm32 still writes and hits cas/ssa/
+if command -v node >/dev/null 2>&1; then
+  CAS_C4="$TMP_DIR/cas_c4_wasm"
+  mkdir -p "$CAS_C4"
+  PION_CACHE_DIR="$CAS_C4" "$PIONC" build --jobs 4 --target wasm32 -o "$TMP_DIR/c4_cold.wasm" "$WS_D/app"
+  test "$(ls -1 "$CAS_C4/ssa/"*.ssa | wc -l | tr -d ' ')" -ge 4
+  PION_TRACE_CAS=1 PION_CACHE_DIR="$CAS_C4" "$PIONC" build --jobs 4 --target wasm32 -o "$TMP_DIR/c4_hot.wasm" "$WS_D/app" 2>"$TMP_DIR/c4_hot.trace"
+  grep -q '\[cas-wasm\] pkg=app HIT ' "$TMP_DIR/c4_hot.trace"
+  test "$(node "$WASM_RT" "$TMP_DIR/c4_hot.wasm")" = "$("$TMP_DIR/c1_cold")"
+fi
+
+# C.5: Two concurrent cold Native builds on the same shared CAS never delete each other's temp .ssa
+CAS_C5="$TMP_DIR/cas_c5_race"
+mkdir -p "$CAS_C5"
+PION_CACHE_DIR="$CAS_C5" "$PIONC" build --jobs 4 -o "$TMP_DIR/c5_p1" "$WS_D/app" &
+PID_C5_1=$!
+PION_CACHE_DIR="$CAS_C5" "$PIONC" build --jobs 4 -o "$TMP_DIR/c5_p2" "$WS_D/app" &
+PID_C5_2=$!
+wait "$PID_C5_1"
+wait "$PID_C5_2"
+assert_ssa_empty "C.5-concurrent-race" "$CAS_C5"
+test "$("$TMP_DIR/c5_p1")" = "$("$TMP_DIR/c5_p2")"
+
+# C.6: Parallel workspace c_sources compilation (--jobs 1 vs --jobs 4 across 3 packages)
+WS_CS="$TMP_DIR/ws_cstub_par"
+mkdir -p "$WS_CS/c1/src" "$WS_CS/c2/src" "$WS_CS/app/src"
+cat <<'EOF' > "$WS_CS/c1/pion.toml"
+[package]
+name = "c1"
+version = "0.1.0"
+[link]
+c_sources = ["c1.c"]
+EOF
+cat <<'EOF' > "$WS_CS/c1/c1.c"
+#include <stdint.h>
+int64_t c1_val(int64_t x) { return x * 3 + 1; }
+EOF
+cat <<'EOF' > "$WS_CS/c1/src/lib.pion"
+extern "C" fn c1_val(x : Int) -> Int
+pub fn get1(x : Int) -> Int { c1_val(x) }
+EOF
+cat <<'EOF' > "$WS_CS/c2/pion.toml"
+[package]
+name = "c2"
+version = "0.1.0"
+[link]
+c_sources = ["c2.c"]
+EOF
+cat <<'EOF' > "$WS_CS/c2/c2.c"
+#include <stdint.h>
+int64_t c2_val(int64_t x) { return x * 5 + 2; }
+EOF
+cat <<'EOF' > "$WS_CS/c2/src/lib.pion"
+extern "C" fn c2_val(x : Int) -> Int
+pub fn get2(x : Int) -> Int { c2_val(x) }
+EOF
+cat <<'EOF' > "$WS_CS/app/pion.toml"
+[package]
+name = "app_cs"
+version = "0.1.0"
+[dependencies]
+c1 = { path = "../c1" }
+c2 = { path = "../c2" }
+EOF
+cat <<'EOF' > "$WS_CS/app/src/main.pion"
+import "c1"
+import "c2"
+pub fn main(w : World) -> Int {
+  io_println(w, "cs=" + (c1::get1(4) + c2::get2(6)).to_string())
+  0
+}
+EOF
+CAS_C6_1="$TMP_DIR/cas_c6_j1"
+CAS_C6_4="$TMP_DIR/cas_c6_j4"
+mkdir -p "$CAS_C6_1" "$CAS_C6_4"
+PION_CACHE_DIR="$CAS_C6_1" "$PIONC" build --jobs 1 -o "$TMP_DIR/c6_j1" "$WS_CS/app"
+PION_CACHE_DIR="$CAS_C6_4" "$PIONC" build --jobs 4 -o "$TMP_DIR/c6_j4" "$WS_CS/app"
+assert_ssa_empty "C.6-cstub-j1" "$CAS_C6_1"
+assert_ssa_empty "C.6-cstub-j4" "$CAS_C6_4"
+test "$("$TMP_DIR/c6_j1")" = "cs=45"
+test "$("$TMP_DIR/c6_j4")" = "cs=45"
+
+# C.7: Downstream package type error leaves cas/ssa/ empty (and no leaked temp SSA)
+WS_ERR="$TMP_DIR/ws_err_ssa"
+mkdir -p "$WS_ERR/ok_dep/src" "$WS_ERR/bad_app/src"
+cat <<'EOF' > "$WS_ERR/ok_dep/pion.toml"
+[package]
+name = "ok_dep"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$WS_ERR/ok_dep/src/lib.pion"
+pub fn ok_val(x : Int) -> Int { x + 1 }
+EOF
+cat <<'EOF' > "$WS_ERR/bad_app/pion.toml"
+[package]
+name = "bad_app"
+version = "0.1.0"
+[dependencies]
+ok_dep = { path = "../ok_dep" }
+EOF
+cat <<'EOF' > "$WS_ERR/bad_app/src/main.pion"
+import "ok_dep"
+pub fn main(w : World) -> Int {
+  let _ : String = ok_dep::ok_val(1)
+  0
+}
+EOF
+CAS_C7="$TMP_DIR/cas_c7_err"
+mkdir -p "$CAS_C7"
+if PION_CACHE_DIR="$CAS_C7" "$PIONC" build --jobs 4 -o "$TMP_DIR/c7_bad" "$WS_ERR/bad_app" >/dev/null 2>&1; then
+  echo "FAIL [C.7]: expected downstream type error to fail build" >&2
+  exit 1
+fi
+assert_ssa_empty "C.7-type-err" "$CAS_C7"
+
+# C.8: `pionc test` leaves cas/ssa/ empty
+WS_T="$TMP_DIR/ws_test_ssa"
+mkdir -p "$WS_T/tdep/src" "$WS_T/tapp/src"
+cat <<'EOF' > "$WS_T/tdep/pion.toml"
+[package]
+name = "tdep"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$WS_T/tdep/src/lib.pion"
+pub fn dbl(x : Int) -> Int { x * 2 }
+EOF
+cat <<'EOF' > "$WS_T/tapp/pion.toml"
+[package]
+name = "tapp"
+version = "0.1.0"
+[dependencies]
+tdep = { path = "../tdep" }
+EOF
+cat <<'EOF' > "$WS_T/tapp/src/lib.pion"
+import "tdep"
+pub fn quad(x : Int) -> Int { tdep::dbl(tdep::dbl(x)) }
+test "quad_ok" {
+  if quad(3) != 12 {
+    panic()
+  }
+}
+EOF
+CAS_C8="$TMP_DIR/cas_c8_test"
+mkdir -p "$CAS_C8"
+T_JSON="$(PION_CACHE_DIR="$CAS_C8" "$PIONC" test --json --jobs 4 "$WS_T/tapp")"
+printf '%s' "$T_JSON" | grep -q '"ok":true'
+printf '%s' "$T_JSON" | grep -q '"failed":0'
+assert_ssa_empty "C.8-pionc-test" "$CAS_C8"
+
+# C.9: Large workspace (>64 KB ancestor + >64 KB siblings) --jobs 1 vs --jobs 4 byte-for-byte parity
+# plus orphan ssa_tmp/.pion_ws.* crash-reaping check
+WS_BIG="$TMP_DIR/ws_big_anc"
+mkdir -p "$WS_BIG/anc/src" "$WS_BIG/s1/src" "$WS_BIG/s2/src" "$WS_BIG/app/src"
+python3 - "$WS_BIG" <<'PYBIG'
+import os, sys
+root = sys.argv[1]
+open(os.path.join(root, "anc/pion.toml"), "w").write('[package]\nname = "anc"\nversion = "0.1.0"\n')
+with open(os.path.join(root, "anc/src/lib.pion"), "w") as f:
+    for i in range(1800):
+        f.write(f"pub fn anc_f{i}(x : Int) -> Int {{ x + {i} }}\n")
+    f.write("pub fn anc_sum(x : Int) -> Int { anc_f0(x) + anc_f1799(x) }\n")
+for sname, mult in [("s1", 3), ("s2", 5)]:
+    open(os.path.join(root, f"{sname}/pion.toml"), "w").write(
+        f'[package]\nname = "{sname}"\nversion = "0.1.0"\n[dependencies]\nanc = {{ path = "../anc" }}\n'
+    )
+    with open(os.path.join(root, f"{sname}/src/lib.pion"), "w") as f:
+        f.write('import "anc"\n')
+        for i in range(1200):
+            f.write(f"fn {sname}_p{i}(x : Int) -> Int {{ x + {i} }}\n")
+        f.write(f"pub fn {sname}_run(x : Int) -> Int {{ anc::anc_sum(x) * {mult} + {sname}_p1199(1) }}\n")
+open(os.path.join(root, "app/pion.toml"), "w").write(
+    '[package]\nname = "big_app"\nversion = "0.1.0"\n[dependencies]\ns1 = { path = "../s1" }\ns2 = { path = "../s2" }\n'
+)
+open(os.path.join(root, "app/src/main.pion"), "w").write(
+    'import "s1"\nimport "s2"\npub fn main(w : World) -> Int {\n  io_println(w, "big=" + (s1::s1_run(10) + s2::s2_run(10)).to_string())\n  0\n}\n'
+)
+PYBIG
+CAS_C9_1="$TMP_DIR/cas_c9_j1"
+CAS_C9_4="$TMP_DIR/cas_c9_j4"
+mkdir -p "$CAS_C9_1" "$CAS_C9_4/ssa_tmp/.pion_ws.999999.1"
+: > "$CAS_C9_4/ssa_tmp/.pion_ws.999999.1/.lock"
+printf 'stale orphan ssa\n' > "$CAS_C9_4/ssa_tmp/.pion_ws.999999.1/orphan.ssa"
+PION_CACHE_DIR="$CAS_C9_1" "$PIONC" build --jobs 1 -o "$TMP_DIR/c9_j1" "$WS_BIG/app"
+PION_CACHE_DIR="$CAS_C9_4" "$PIONC" build --jobs 4 -o "$TMP_DIR/c9_j4" "$WS_BIG/app"
+assert_ssa_empty "C.9-big-j1" "$CAS_C9_1"
+assert_ssa_empty "C.9-big-j4" "$CAS_C9_4"
+assert_cas_parity "C.9-big-anc-parity" "$CAS_C9_1" "$CAS_C9_4"
+test ! -d "$CAS_C9_4/ssa_tmp/.pion_ws.999999.1"
+test "$("$TMP_DIR/c9_j1")" = "$("$TMP_DIR/c9_j4")"
+
+echo "Contract C (Native zero-byte ssa/ cleanup, PION_KEEP_NATIVE_SSA=1, Wasm32 ssa/ retention, concurrent temp-SSA race, parallel c_sources, err/test/big-anc parity + orphan reap): OK"
+
+echo "PASS: ws_parallel_build (Contract A, Contract B & Contract C)"

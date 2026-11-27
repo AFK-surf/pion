@@ -180,7 +180,7 @@ CAS_DIR="$TMP_DIR/cas"
 mkdir -p "$CAS_DIR"
 
 # 1. Case 1: Native --release + SSA verification
-PION_CACHE_DIR="$CAS_DIR" "$PIONC" build --release -o "$TMP_DIR/xpkg_rel" "$TMP_DIR/ws/app_pkg"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$CAS_DIR" "$PIONC" build --release -o "$TMP_DIR/xpkg_rel" "$TMP_DIR/ws/app_pkg"
 XPKG_REL=$("$TMP_DIR/xpkg_rel")
 echo "p74f Case 1 native release -> $XPKG_REL"
 test -n "$XPKG_REL"
