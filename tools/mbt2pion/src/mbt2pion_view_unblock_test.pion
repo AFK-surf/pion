@@ -1,0 +1,105 @@
+///| Wave F6-4c-2: Precision & unblock tests (paired positive + negative adversaries).
+
+test "F6-4c-2: MbtJson::Object pure-map provenance positive & new_by negative" {
+  let pos_src = "struct Ev { out : Bool\n  msg : mbt_compat::MbtJson }\n\nfn id_of(m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson]) -> Option[Int] {\n  match m.get(\"id\") {\n    Some(mbt_compat::MbtJson::Number(d, _)) => Some(d.to_int())\n    _ => None\n  }\n}\n\nfn answers(evs : Array[Ev], id : Int) -> Bool {\n  evs.iter().any(fn(e) {\n    !e.out && e.msg is mbt_compat::MbtJson::Object(m) && (m.contains(\"ok\") || m.contains(\"error\")) && id_of(m) == Some(id)\n  })\n}\n"
+  let toks = lex_moonbit(pos_src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  match lookup_fn_mutation_summary(ms, "id_of") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "id_of on MbtJson::Object map must be pure when package never uses new_by")
+    None => assert_true(false, "expected id_of summary")
+  }
+  match lookup_fn_mutation_summary(ms, "answers") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "Replay::answers with is Object(m) + id_of(m) must be pure")
+    None => assert_true(false, "expected answers summary")
+  }
+  // Negative adversary: when the package uses `OrderedMap::new_by`, MbtJson::Object map param must fail-closed!
+  let neg_src = "fn make_bad() -> mbt_compat::OrderedMap[String, mbt_compat::MbtJson] {\n  OrderedMap::new_by(fn(k) { 0 }, fn(a, b) { a == b })\n}\n\nfn id_of(m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson]) -> Option[Int] {\n  match m.get(\"id\") {\n    Some(mbt_compat::MbtJson::Number(d, _)) => Some(d.to_int())\n    _ => None\n  }\n}\n"
+  let neg_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_src)])
+  match lookup_fn_mutation_summary(neg_ms, "id_of") {
+    Some(s) => assert_true(s.unknown, "id_of MUST fail-closed when package contains OrderedMap::new_by")
+    None => assert_true(false, "expected neg id_of summary")
+  }
+}
+
+test "F6-4c-2: Gate D2 read-only non-escaping slice call arg positive & negative" {
+  let pos_src = "fn scan_run(run : mbt_compat::ArrayView[Int]) -> Int {\n  let mut total = 0\n  for x in run {\n    total = total + x\n  }\n  total\n}\n\nfn caller(ops : Array[Int], i : Int, n : Int) -> Int {\n  scan_run(mbt_compat::__mbt_slice_borrow(ops, i, i + n))\n}\n"
+  let toks = lex_moonbit(pos_src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  let lines = pos_src.split("\n")
+  let mutated : Map[Int, Bool] = Map()
+  let dl : Array[DriftEntry] = []
+  let changed = stage_b_rewrite_borrowed_slice_ro_call_args(lines, toks, [toks], ms, "t.pion", pos_src, None, mutated, dl)
+  let joined = lines.join("\n")
+  assert_true(changed && str_has(joined, "mbt_compat::ArrayBuf::from_array(ops).exact_view(i, i + n)"), "Gate D2 rewrites pure private slice arg to ArrayBuf::from_array(..).exact_view(..)")
+  assert_true(dl.length() == 1 && dl[0].category == "mutation_summary_allow_d", "Gate D2 records mutation_summary_allow_d")
+
+  // Negative 1: callee mutates `run` (`run[0] = 1`) -> MUST NOT rewrite
+  let neg1 = "fn mut_run(run : mbt_compat::ArrayView[Int]) -> Unit {\n  run[0] = 1\n}\n\nfn caller(ops : Array[Int]) -> Unit {\n  mut_run(mbt_compat::__mbt_slice_borrow(ops, 0, 1))\n}\n"
+  let t1 = lex_moonbit(neg1)
+  let l1 = neg1.split("\n")
+  let c1 = stage_b_rewrite_borrowed_slice_ro_call_args(l1, t1, [t1], collect_pkg_mutation_summary_tokens([t1]), "n1.pion", neg1, None, Map(), [])
+  assert_true(!c1, "Gate D2 MUST reject mutating slice callee")
+
+  // Negative 2: `pub` callee -> MUST NOT rewrite
+  let neg2 = "pub fn pub_run(run : mbt_compat::ArrayView[Int]) -> Int {\n  run.length()\n}\n\nfn caller(ops : Array[Int]) -> Int {\n  pub_run(mbt_compat::__mbt_slice_borrow(ops, 0, 1))\n}\n"
+  let t2 = lex_moonbit(neg2)
+  let l2 = neg2.split("\n")
+  let c2 = stage_b_rewrite_borrowed_slice_ro_call_args(l2, t2, [t2], collect_pkg_mutation_summary_tokens([t2]), "n2.pion", neg2, None, Map(), [])
+  assert_true(!c2, "Gate D2 MUST reject pub callee")
+
+  // Negative 3: escaping slice (returned or passed to another function) -> MUST NOT rewrite
+  let neg3 = "fn esc_run(run : mbt_compat::ArrayView[Int]) -> mbt_compat::ArrayView[Int] {\n  run\n}\n\nfn caller(ops : Array[Int]) -> mbt_compat::ArrayView[Int] {\n  esc_run(mbt_compat::__mbt_slice_borrow(ops, 0, 1))\n}\n"
+  let t3 = lex_moonbit(neg3)
+  let l3 = neg3.split("\n")
+  let c3 = stage_b_rewrite_borrowed_slice_ro_call_args(l3, t3, [t3], collect_pkg_mutation_summary_tokens([t3]), "n3.pion", neg3, None, Map(), [])
+  assert_true(!c3, "Gate D2 MUST reject escaping slice callee")
+}
+
+test "F6-4c-2: multiline match arm if-guard never pollutes callables or outer_sh" {
+  let src = "fn check_guard(opt : Option[Int], xs : Array[Int]) -> Bool {\n  let m : mbt_compat::OrderedMap[Int, Int] = mbt_compat::ordered_map_new()\n  let ok = match opt {\n    Some(v)\n      if m.contains(v) && physical_equal(xs, xs) => true\n    _ => false\n  }\n  ok && xs.iter().any(fn(x) { m.contains(x) })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  match lookup_fn_mutation_summary(ms, "check_guard") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "multiline match if-guard must not mark m or physical_equal as shadowed/callable")
+    None => assert_true(false, "expected check_guard summary")
+  }
+}
+
+test "F6-4c-2: fresh non-escaping local to_array() allows filter_map while aliased fails closed" {
+  let pos_src = "fn run_fresh(m : mbt_compat::OrderedMap[Int, Int], f : (Int) -> Option[Int]) -> Array[Int] {\n  let ats = mbt_compat::ordered_map_keys_iter(m).to_array()\n  ats.filter_map(fn(at) { f(at) })\n}\n"
+  let toks = lex_moonbit(pos_src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  let mut fm_line = 0
+  let mut fm_col = 0
+  for tk in toks {
+    if tk.raw == "filter_map" { fm_line = tk.line; fm_col = tk.col }
+  }
+  let ok = stage_b_check_hof_ro_with_summary(toks, ms, "fm.pion", pos_src, None, "filter_map", "Int", fm_line, fm_col, true, [])
+  assert_true(ok, "fresh non-escaping local ats from ordered_map_keys_iter().to_array() allows filter_map")
+
+  // Negative: aliased parameter array with opaque callback -> MUST fail-closed
+  let neg_src = "fn run_param(ats : Array[Int], f : (Int) -> Option[Int]) -> Array[Int] {\n  ats.filter_map(fn(at) { f(at) })\n}\n"
+  let ntoks = lex_moonbit(neg_src)
+  let mut nline = 0
+  let mut ncol = 0
+  for tk in ntoks {
+    if tk.raw == "filter_map" { nline = tk.line; ncol = tk.col }
+  }
+  let bad_ok = stage_b_check_hof_ro_with_summary(ntoks, collect_pkg_mutation_summary_tokens([ntoks]), "fm_neg.pion", neg_src, None, "filter_map", "Int", nline, ncol, true, [])
+  assert_true(!bad_ok, "aliased param array with opaque callback MUST fail-closed in filter_map")
+}
+
+test "F6-4c-2: E_UNKNOWN_PACKAGE exits Stage B immediately on round 1" {
+  let src = "import missing_pkg\nfn f(xs : Array[Int]) -> Int {\n  xs.length()\n}\n"
+  let files : Array[GeneratedFile] = [
+    GeneratedFile::{ rel_path: "u.pion", content: src, source_file: "u.mbt", anchors: [] },
+  ]
+  let calls = [0]
+  let mock_check = fn(_batch : Array[(String, String)]) -> String {
+    calls[0] = calls[0] + 1
+    "{\"ok\":false,\"diagnostics\":[{\"code\":\"E_UNKNOWN_PACKAGE\",\"severity\":\"error\",\"file\":\"u.pion\",\"line\":1,\"col\":1,\"message\":\"unknown imported package `missing_pkg`\"}]}"
+  }
+  let (_, iters, _) = run_stage_b_with_ops_and_deps(files, ApiMap::{ symbols: [], pkg_aliases: Map() }, Map(), Map(), mock_check, [], [])
+  assert_eq(iters, 1)
+  assert_eq(calls[0], 1)
+}

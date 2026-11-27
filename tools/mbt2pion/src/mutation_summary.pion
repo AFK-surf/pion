@@ -544,8 +544,11 @@ fn ms_add_pat_idents(tokens : Array[Token], s : Int, e : Int, out : Map[String, 
   let mut k = s
   while k < e {
     if tokens[k].kind == TokenKind::Ident && !ms_is_pattern_kw(tokens[k].raw) {
-      // Skip struct field labels `field: pat` (the value pattern is scanned next)
-      if !(k + 1 < e && tokens[k + 1].kind == TokenKind::Colon) {
+      // Skip struct field labels `field: pat`, call targets `f(...)`, and member/qualified paths `.f` / `::f`.
+      let is_field_label = k + 1 < e && tokens[k + 1].kind == TokenKind::Colon
+      let is_call_target = k + 1 < e && tokens[k + 1].kind == TokenKind::LParen
+      let is_member_or_qual = k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)
+      if !is_field_label && !is_call_target && !is_member_or_qual {
         out[tokens[k].raw] = true
       }
     }
@@ -693,9 +696,25 @@ fn ms_collect_pattern_bound_idents_in_span_full(
         } else if d == 0 && (pk == TokenKind::Semi || pk == TokenKind::FatArrow) {
           break
         } else if d == 0 && tokens[ps].newline_before {
-          // Include `ps` itself as the start of this arm pattern line
-          ps = ps - 1
-          break
+          // Keep scanning backward across multiline `match` arm patterns and `if` guards
+          // (e.g. `Some(x) if cond1 &&\n  cond2 =>`), stopping only at a real arm boundary.
+          let continues_from_prev = ps > s && (
+            tokens[ps - 1].kind == TokenKind::AmpAmp ||
+            tokens[ps - 1].kind == TokenKind::PipePipe ||
+            tokens[ps - 1].kind == TokenKind::Pipe ||
+            tokens[ps - 1].kind == TokenKind::Comma ||
+            tokens[ps - 1].raw == "if" ||
+            tokens[ps].kind == TokenKind::AmpAmp ||
+            tokens[ps].kind == TokenKind::PipePipe ||
+            tokens[ps].kind == TokenKind::Pipe ||
+            tokens[ps].raw == "if" ||
+            ms_is_expr_continuation_tok(tokens[ps - 1], tokens[ps])
+          )
+          if !continues_from_prev {
+            // Include `ps` itself as the start of this arm pattern line
+            ps = ps - 1
+            break
+          }
         }
         ps = ps - 1
       }
@@ -733,10 +752,31 @@ fn ms_collect_closure_param_names(tokens : Array[Token], s : Int, e : Int, out :
       }
     } else if tokens[i].kind == TokenKind::FatArrow && i > s {
       if tokens[i - 1].kind == TokenKind::Ident && !ms_is_pattern_kw(tokens[i - 1].raw) {
-        out[tokens[i - 1].raw] = true
+        let prev_is_expr = i >= s + 2 && (
+          tokens[i - 2].kind == TokenKind::Dot ||
+          tokens[i - 2].kind == TokenKind::ColonColon ||
+          tokens[i - 2].kind == TokenKind::AmpAmp ||
+          tokens[i - 2].kind == TokenKind::PipePipe ||
+          tokens[i - 2].kind == TokenKind::EqEq ||
+          tokens[i - 2].kind == TokenKind::BangEq ||
+          tokens[i - 2].kind == TokenKind::Bang ||
+          tokens[i - 2].raw == "if" ||
+          tokens[i - 2].raw == "is" ||
+          tokens[i - 2].raw == "in" ||
+          tokens[i - 2].raw == "as"
+        )
+        if !prev_is_expr {
+          out[tokens[i - 1].raw] = true
+        }
       } else if tokens[i - 1].kind == TokenKind::RParen {
         let lp = find_open_before(tokens, i - 1, s)
-        if lp >= s {
+        let is_call_or_ctor = lp > s && (
+          tokens[lp - 1].kind == TokenKind::Ident ||
+          tokens[lp - 1].kind == TokenKind::UpperIdent ||
+          tokens[lp - 1].kind == TokenKind::Dot ||
+          tokens[lp - 1].kind == TokenKind::ColonColon
+        )
+        if lp >= s && !is_call_or_ctor {
           let pnames = collect_pion_fn_param_names(tokens, lp, i - 1)
           for pn in pnames {
             if pn.length() > 0 && pn != "_" {
@@ -1148,6 +1188,26 @@ fn ms_infer_expr_ty(
     None => ()
   }
   if is_ambig_local {
+    // Pattern-bound `MbtJson::Object(m)` / `MbtJson::Number(d, _)` payload types are fixed by `mbt_compat::MbtJson`.
+    if tk.kind == TokenKind::Ident && !pkg.declared_types.contains("MbtJson") && !pkg.enum_ctor_types.contains("Object") {
+      let mut scan = end_i - 1
+      let lo_scan = if end_i > 80 { end_i - 80 } else { 0 }
+      while scan > lo_scan + 1 {
+        if tokens[scan].kind == TokenKind::Ident && tokens[scan].raw == tk.raw {
+          if scan >= 2 && tokens[scan - 1].kind == TokenKind::LParen &&
+          tokens[scan - 2].kind == TokenKind::UpperIdent && tokens[scan - 2].raw == "Object" &&
+          scan + 1 < tokens.length() && tokens[scan + 1].kind == TokenKind::RParen {
+            return "mbt_compat::OrderedMap[String, mbt_compat::MbtJson]"
+          }
+          if scan >= 2 && tokens[scan - 1].kind == TokenKind::LParen &&
+          tokens[scan - 2].kind == TokenKind::UpperIdent && tokens[scan - 2].raw == "Number" &&
+          scan + 1 < tokens.length() && tokens[scan + 1].kind == TokenKind::Comma {
+            return "Double"
+          }
+        }
+        scan = scan - 1
+      }
+    }
     return ""
   }
   // Unshadowed top-level `let`/`const` binding with explicit type annotation
@@ -1342,6 +1402,17 @@ fn ms_infer_expr_ty(
             }
             return ""
           }
+          if m == "get" && is_arr_recv {
+            let elem = ms_extract_array_elem_ty(recv_ty)
+            return if elem.length() > 0 { "Option[" + elem + "]" } else { "" }
+          }
+          if (m == "unwrap" || m == "unwrap_or" || m == "or") && rh == "Option" {
+            let t_opt = ms_strip_pkg_prefix(recv_ty)
+            if t_opt.starts_with("Option[") && t_opt.ends_with("]") {
+              return t_opt.slice(7, t_opt.length() - 1).trim()
+            }
+            return ""
+          }
           if m == "is_some" || m == "is_none" {
             if rh == "Option" { return "Bool" }
             return ""
@@ -1533,6 +1604,16 @@ fn ms_is_pure_map_ctor_expr(
   let lp = find_open_before(tokens, expr_e - 1, expr_s)
   if lp <= expr_s {
     return false
+  }
+  // `mbt_compat::OrderedMap::(new|from_array|of|from_iter)(...)` / `mbt_compat::OrderedSet::...(...)`
+  if lp == expr_s + 5 && tokens[expr_s].raw == "mbt_compat" &&
+  tokens[expr_s + 1].kind == TokenKind::ColonColon &&
+  (tokens[expr_s + 2].raw == "OrderedMap" || tokens[expr_s + 2].raw == "OrderedSet") &&
+  tokens[expr_s + 3].kind == TokenKind::ColonColon && tokens[expr_s + 4].kind == TokenKind::Ident {
+    let nm = tokens[expr_s + 4].raw
+    if nm == "new" || nm == "from_array" || nm == "of" || nm == "from_iter" {
+      return true
+    }
   }
   // `mbt_compat::<ctor>(...)`
   if lp == expr_s + 3 && tokens[expr_s].raw == "mbt_compat" &&
@@ -1808,9 +1889,10 @@ fn ms_is_proven_pure_map_recv(
       if pure_map_vars.contains(tk.raw) {
         return true
       }
-      return pkg.pure_map_globals.contains(tk.raw) && !local_var_types.contains(tk.raw) && !forbidden_fns.contains(tk.raw)
-    }
-    if recv_end >= 2 && tokens[recv_end - 1].kind == TokenKind::Dot {
+      if pkg.pure_map_globals.contains(tk.raw) && !local_var_types.contains(tk.raw) && !forbidden_fns.contains(tk.raw) {
+        return true
+      }
+    } else if recv_end >= 2 && tokens[recv_end - 1].kind == TokenKind::Dot {
       let base_ty = ms_infer_expr_ty(pkg, tokens, recv_end - 2, content, qfi_opt, local_var_types)
       let bh = ms_type_head(base_ty)
       if bh.length() > 0 && !ms_is_qualified_external_ty(base_ty) &&
@@ -1818,12 +1900,21 @@ fn ms_is_proven_pure_map_recv(
         return true
       }
     }
-    return false
   }
   if tk.kind == TokenKind::RParen {
     let rs = receiver_path_start_token(tokens, recv_end)
-    if rs >= 0 && rs <= recv_end {
-      return ms_is_pure_map_ctor_expr(pkg, tokens, rs, recv_end + 1, local_var_types, forbidden_fns, active_generics)
+    if rs >= 0 && rs <= recv_end &&
+    ms_is_pure_map_ctor_expr(pkg, tokens, rs, recv_end + 1, local_var_types, forbidden_fns, active_generics) {
+      return true
+    }
+  }
+  // `MbtJson::Object(m)` maps (`OrderedMap[String, MbtJson]`) have built-in String keys and
+  // cannot carry a custom `new_by` comparator when the package never uses `new_by`.
+  if !pkg.custom_ops.contains("#uses_new_by") {
+    let rty = ms_strip_pkg_prefix(ms_infer_expr_ty(pkg, tokens, recv_end, content, qfi_opt, local_var_types)).replace(" ", "")
+    if rty == "OrderedMap[String,MbtJson]" || rty == "OrderedMap[String,mbt_compat::MbtJson]" ||
+    rty == "Map[String,MbtJson]" || rty == "Map[String,mbt_compat::MbtJson]" {
+      return true
     }
   }
   false
@@ -2452,7 +2543,9 @@ fn ms_scan_span(
         }
         let lhs_pure = ms_ty_is_pure_eq(eff_lhs, pkg.pure_eq_types, active_generics)
         let rhs_pure = ms_ty_is_pure_eq(eff_rhs, pkg.pure_eq_types, active_generics)
-        lhs_pure && rhs_pure
+        // `==`/`!=` is homogeneous `(T, T) -> Bool`: if either side is proven pure-Eq
+        // and the other side is merely uninferred (""), `==`/`!=` cannot dispatch to a custom Eq impl.
+        (lhs_pure && rhs_pure) || (lhs_pure && eff_rhs.length() == 0) || (rhs_pure && eff_lhs.length() == 0)
       } else {
         ms_is_builtin_scalar_ty(lhs_ty) && ms_is_builtin_scalar_ty(rhs_ty)
       }
@@ -2592,8 +2685,17 @@ fn ms_scan_span(
           if kk == TokenKind::Eq && ms_is_named_call_arg_eq(tokens, lhs_end, s) {
             ()
           } else {
-            // Variable reassignment `xs = ...`: fail-closed when LHS type is unknown
-            let vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+            // Variable reassignment `xs = ...`: fail-closed when both LHS and RHS types are unknown
+            let mut vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+            if vty.length() == 0 && i + 1 < e {
+              let rhs_end_a = ms_postfix_expr_end(tokens, i + 1, e)
+              if rhs_end_a >= i + 1 {
+                let rty_a = ms_infer_expr_ty(pkg, tokens, rhs_end_a, content, qfi_opt, local_var_types)
+                if ms_is_builtin_scalar_ty(rty_a) {
+                  vty = rty_a
+                }
+              }
+            }
             if vty.length() == 0 {
               sum.mutates_any_array = true
               sum.unknown = true
@@ -3314,6 +3416,17 @@ pub fn collect_pkg_mutation_summary(
   op_lookup : Map[String, String],
 ) -> PkgMutationSummary {
   let pkg = PkgMutationSummary::empty()
+  for ts_nb in all_tokens {
+    for tk_nb in ts_nb {
+      if tk_nb.raw == "new_by" {
+        pkg.custom_ops["#uses_new_by"] = true
+        break
+      }
+    }
+    if pkg.custom_ops.contains("#uses_new_by") {
+      break
+    }
+  }
   for k in dep_methods.keys() {
     pkg.dep_methods[k] = true
     if k == "eq" || k == "equal" || k == "op_equal" {
@@ -5014,23 +5127,26 @@ fn ms_apply_enclosing_closures(
   }
 }
 
-pub fn summarize_expr_span(
+pub struct MsFnEnv {
+  callables : Map[String, Bool]
+  vt : Map[String, String]
+  pmv : Map[String, Bool]
+  body_close : Int
+}
+
+pub fn ms_build_fn_env(
   pkg : PkgMutationSummary,
   tokens : Array[Token],
-  s : Int,
-  e : Int,
   fn_body_open : Int,
   content : String,
   qfi_opt : Option[QtFileIndex],
-  extra_var_types : Map[String, String],
   active_generics : Map[String, Bool],
-) -> FnMutationSummary {
-  let sum = FnMutationSummary::empty()
+) -> MsFnEnv {
   let callables = if fn_body_open >= 0 { callable_locals(tokens, fn_body_open) } else { Map() }
   if fn_body_open >= 0 { ms_collect_pattern_bound_idents(tokens, fn_body_open, callables) }
   let vt : Map[String, String] = Map()
   let pmv : Map[String, Bool] = Map()
-  // Seed with enclosing function's parameter types + locals
+  let mut body_close = -1
   if fn_body_open >= 0 {
     let fstart = fn_start_of(tokens, fn_body_open)
     if fstart >= 0 {
@@ -5043,7 +5159,7 @@ pub fn summarize_expr_span(
         }
       }
     }
-    let body_close = find_matching_delim(tokens, fn_body_open)
+    body_close = find_matching_delim(tokens, fn_body_open)
     ms_collect_local_var_types(pkg, tokens, fn_body_open + 1, body_close, content, qfi_opt, vt, pmv, callables, active_generics)
     let outer_sh : Map[String, Bool] = Map()
     ms_collect_pattern_bound_idents_in_span_ex(tokens, fn_body_open + 1, body_close, outer_sh, false)
@@ -5053,7 +5169,33 @@ pub fn summarize_expr_span(
     let outer_reass : Map[String, Bool] = Map()
     ms_collect_reassigned_idents(tokens, fn_body_open + 1, body_close, outer_reass)
     ms_prune_pure_map_vars(pmv, outer_reass)
-    ms_apply_enclosing_closures(pkg, tokens, fn_body_open, body_close, s, e, content, qfi_opt, vt, pmv, callables, active_generics)
+  }
+  MsFnEnv::{ callables, vt, pmv, body_close }
+}
+
+pub fn summarize_expr_span_with_env(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  fn_body_open : Int,
+  env : MsFnEnv,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  extra_var_types : Map[String, String],
+  active_generics : Map[String, Bool],
+) -> FnMutationSummary {
+  let sum = FnMutationSummary::empty()
+  let vt : Map[String, String] = Map()
+  for k in env.vt.keys() {
+    match env.vt.get(k) {
+      Some(v) => vt[k] = v
+      None => ()
+    }
+  }
+  let pmv = ms_clone_bool_map(env.pmv)
+  if fn_body_open >= 0 && env.body_close > fn_body_open {
+    ms_apply_enclosing_closures(pkg, tokens, fn_body_open, env.body_close, s, e, content, qfi_opt, vt, pmv, env.callables, active_generics)
   }
   for k in extra_var_types.keys() {
     match extra_var_types.get(k) {
@@ -5065,7 +5207,7 @@ pub fn summarize_expr_span(
     }
   }
   if fn_body_open < 0 {
-    ms_collect_local_var_types(pkg, tokens, s, e, content, qfi_opt, vt, pmv, callables, active_generics)
+    ms_collect_local_var_types(pkg, tokens, s, e, content, qfi_opt, vt, pmv, env.callables, active_generics)
   }
   if fn_body_open < 0 || extra_var_types.length() > 0 {
     let inner_sh : Map[String, Bool] = Map()
@@ -5078,8 +5220,23 @@ pub fn summarize_expr_span(
     ms_prune_pure_map_vars(pmv, inner_reass)
   }
   let dummy_edges : Array[String] = []
-  ms_scan_span(pkg, tokens, s, e, fn_body_open, content, qfi_opt, vt, pmv, callables, active_generics, sum, dummy_edges, false, 0)
+  ms_scan_span(pkg, tokens, s, e, fn_body_open, content, qfi_opt, vt, pmv, env.callables, active_generics, sum, dummy_edges, false, 0)
   sum
+}
+
+pub fn summarize_expr_span(
+  pkg : PkgMutationSummary,
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  fn_body_open : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  extra_var_types : Map[String, String],
+  active_generics : Map[String, Bool],
+) -> FnMutationSummary {
+  let env = ms_build_fn_env(pkg, tokens, fn_body_open, content, qfi_opt, active_generics)
+  summarize_expr_span_with_env(pkg, tokens, s, e, fn_body_open, env, content, qfi_opt, extra_var_types, active_generics)
 }
 
 ///| Summarize a callback argument `[arg_s, arg_e)` (inline closure, local closure, or top-level fn)

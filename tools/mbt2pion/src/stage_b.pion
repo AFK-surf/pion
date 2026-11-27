@@ -1884,7 +1884,6 @@ pub fn run_stage_b_with_ops_deps_and_qt(
   // never altering cross-file visible signatures or types; any future rewrite that changes
   // exported signatures/types must invalidate the whole package snapshot (`qt_snap_dirty = true`).
   let mut qt_snap_dirty = !qt_snap.ok
-  let mut has_unknown_pkg_diag = false
   let mut qt_used_prev_round = false
   let mut prev_round_changed_cap_file = false
 
@@ -1920,7 +1919,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     let should_top_qt = if iter == 0 {
       !qt_snap.ok && need_qt_for_capacity
     } else {
-      need_qt_for_capacity && qt_snap_dirty && !has_unknown_pkg_diag &&
+      need_qt_for_capacity && qt_snap_dirty &&
       (qt_used_prev_round || prev_round_changed_cap_file)
     }
     let raw_json = if should_top_qt {
@@ -1943,6 +1942,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       check_fn(batch)
     }
     let pdiags = parse_pionc_diagnostics(raw_json)
+    let mut has_unknown_pkg_diag = false
     for d in pdiags {
       if d.code == "E_UNKNOWN_PACKAGE" {
         has_unknown_pkg_diag = true
@@ -1969,7 +1969,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     final_hist = sort_histogram(hist_pairs)
     iter = iter + 1
 
-    if pdiags.length() == 0 {
+    if pdiags.length() == 0 || has_unknown_pkg_diag {
       break
     }
 
@@ -1986,9 +1986,6 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       qt_used_this_round = true
       if qt_snap.ok && !qt_snap_dirty {
         return qt_snap
-      }
-      if has_unknown_pkg_diag {
-        return empty_pkg_query_types()
       }
       match round_qt {
         Some(qt) => qt
@@ -2147,8 +2144,8 @@ pub fn run_stage_b_with_ops_deps_and_qt(
           None
         }
       }
-      // Gate D: Rewrite provably read-only `for x in arr[lo:hi]` borrowed-slice loops into
-      // MoonBit-exact clamped index `while` loops before Stage A.5 sees `__mbt_slice_borrow`.
+      // Gate D: Rewrite provably read-only `for x in arr[lo:hi]` borrowed-slice loops and
+      // read-only non-escaping `callee(..., arr[lo:hi], ...)` call arguments before Stage A.5 sees `__mbt_slice_borrow`.
       if str_has(f.content, "__mbt_slice_borrow") {
         let ftoks_d = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
         let file_qfi_d = get_file_qfi()
@@ -2160,6 +2157,19 @@ pub fn run_stage_b_with_ops_deps_and_qt(
           f.content,
           file_qfi_d,
           get_used_idents(),
+          mutated_lines,
+          drift_ledger,
+        ) {
+          file_changed = true
+        }
+        if stage_b_rewrite_borrowed_slice_ro_call_args(
+          lines,
+          ftoks_d,
+          get_all_round_tokens(),
+          get_mut_summary(),
+          f.rel_path,
+          f.content,
+          file_qfi_d,
           mutated_lines,
           drift_ledger,
         ) {
@@ -2247,7 +2257,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                       stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, probe_diags)
                       let ftoks_b = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
                       let elem_ty_b = ms_extract_array_elem_ty(rty)
-                      let ms_safe = stage_b_check_search_by_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), elem_ty_b, d.line, d.col, probe_diags.length() > 0, drift_ledger)
+                      let ms_safe = stage_b_check_hof_ro_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), mname, elem_ty_b, d.line, d.col, probe_diags.length() > 0, drift_ledger)
                       if !ms_safe {
                         if probe_diags.length() > 0 {
                           for pd in probe_diags {
@@ -2276,8 +2286,30 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                               f.rel_path,
                               d.line,
                               d.col,
-                              "callback in `Array::search_by(...)` may mutate receiver or aliased array (fail-closed by mutation_summary)",
+                              "callback in `Array::" + mname + "(...)` may mutate receiver or aliased array (fail-closed by mutation_summary)",
                             ))
+                          }
+                        }
+                      }
+                    } else if helper == "mbt_compat::arr_filter_map" {
+                      let probe_diags : Array[Diag] = []
+                      stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, probe_diags)
+                      if probe_diags.length() > 0 {
+                        let ftoks_b = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
+                        let elem_ty_b = ms_extract_array_elem_ty(rty)
+                        let ms_safe = stage_b_check_hof_ro_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), mname, elem_ty_b, d.line, d.col, true, drift_ledger)
+                        if !ms_safe {
+                          for pd in probe_diags {
+                            let mut dup = false
+                            for existing in diags {
+                              if existing.code == pd.code && existing.file == pd.file && existing.line == pd.line && existing.col == pd.col {
+                                dup = true
+                                break
+                              }
+                            }
+                            if !dup {
+                              diags.push(pd)
+                            }
                           }
                         }
                       }
@@ -2294,8 +2326,28 @@ pub fn run_stage_b_with_ops_deps_and_qt(
                   }
                   if helper == "mbt_compat::arr_sort_by_key" {
                     let ftoks = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
-                    if !stage_b_check_sort_key_closure_cached(ftoks, get_sort_key_env(), f.rel_path, d.line, d.col, diags) {
-                      skip_rewrite = true
+                    let probe_sort_diags : Array[Diag] = []
+                    let base_sort_ok = stage_b_check_sort_key_closure_cached(ftoks, get_sort_key_env(), f.rel_path, d.line, d.col, probe_sort_diags)
+                    if !base_sort_ok {
+                      let has_qfi_sk = match get_file_qfi() { Some(_) => true, None => false }
+                      let elem_ty_sk = ms_extract_array_elem_ty(rty)
+                      let ms_sort_ok = (dep_methods.length() == 0 || has_qfi_sk) &&
+                      stage_b_check_hof_ro_with_summary(ftoks, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), "sort_by_key", elem_ty_sk, d.line, d.col, true, drift_ledger)
+                      if !ms_sort_ok {
+                        for pd in probe_sort_diags {
+                          let mut dup = false
+                          for existing in diags {
+                            if existing.code == pd.code && existing.file == pd.file && existing.line == pd.line {
+                              dup = true
+                              break
+                            }
+                          }
+                          if !dup {
+                            diags.push(pd)
+                          }
+                        }
+                        skip_rewrite = true
+                      }
                     }
                   }
                   if helper == "mbt_compat::arr_iter" {
@@ -4015,8 +4067,72 @@ fn stage_b_check_shrink_snapshot_with_summary(
   false
 }
 
-///| Gate B: `Array::search_by(cb)` callback purity backed by `PkgMutationSummary` + allow ledger.
-fn stage_b_check_search_by_with_summary(
+///| True iff `recv_end` is a fresh non-escaping local array variable in `[body_open, body_close)`
+///| (allocated locally via `[]` / `Array::new` / `.to_array()` / `.copy()` / `mbt_compat::arr_*`,
+///| never handed out/aliased/captured before `op_tok`, and not directly mutated inside `[cb_s, cb_e)`).
+fn stage_b_is_fresh_non_escaping_local_recv(
+  tokens : Array[Token],
+  recv_end : Int,
+  op_tok : Int,
+  body_open : Int,
+  cb_s : Int,
+  cb_e : Int,
+) -> Bool {
+  if recv_end < 0 || body_open < 0 {
+    return false
+  }
+  if tokens[recv_end].kind != TokenKind::Ident {
+    return false
+  }
+  if recv_end > 0 && (tokens[recv_end - 1].kind == TokenKind::Dot || tokens[recv_end - 1].kind == TokenKind::ColonColon) {
+    return false
+  }
+  let rname = tokens[recv_end].raw
+  let body_close = find_matching_delim(tokens, body_open)
+  let is_fresh = fresh_local_binding(tokens, rname, body_open, op_tok, false) ||
+  ms_is_fresh_container_local(tokens, rname, body_open, op_tok)
+  if !is_fresh {
+    return false
+  }
+  // Never handed out, stored, returned, or captured by any other closure before the end of this call.
+  // Allow `rname` to appear inside `[cb_s, cb_e)` ONLY if it is never mutated there.
+  let mut k = body_open + 1
+  while k < op_tok {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Ident && tk.raw == rname &&
+    !(tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon) {
+      let nx = if k + 1 < body_close { tokens[k + 1].kind } else { TokenKind::RBrace }
+      let read_through = nx == TokenKind::Dot || nx == TokenKind::LBracket
+      let pk = tokens[k - 1]
+      let is_let_decl = pk.raw == "let" || (pk.raw == "mut" && k >= 2 && tokens[k - 2].raw == "let")
+      if !is_let_decl {
+        let o = enclosing_open(tokens, k, body_open, TokenKind::LParen)
+        let compat = o >= 3 && tokens[o - 2].kind == TokenKind::ColonColon && tokens[o - 3].raw == "mbt_compat"
+        let arg = !compat && (pk.kind == TokenKind::LParen || pk.kind == TokenKind::Comma) &&
+        (nx == TokenKind::RParen || nx == TokenKind::Comma)
+        let stored = !read_through && (pk.kind == TokenKind::Eq || pk.kind == TokenKind::LBracket ||
+          pk.kind == TokenKind::Colon || pk.kind == TokenKind::Comma || pk.raw == "return")
+        if arg || stored || enclosing_closure_open(tokens, k, body_open) >= 0 {
+          return false
+        }
+      }
+    }
+    k = k + 1
+  }
+  // Inside `[cb_s, cb_e)`, forbid any direct mention of `rname` (so callback cannot mutate or alias `rname`).
+  let mut j = cb_s
+  while j < cb_e {
+    if tokens[j].kind == TokenKind::Ident && tokens[j].raw == rname &&
+    !(j > 0 && (tokens[j - 1].kind == TokenKind::Dot || tokens[j - 1].kind == TokenKind::ColonColon)) {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| Backwards-compatible wrapper for `Array::search_by(cb)` Gate B check.
+pub fn stage_b_check_search_by_with_summary(
   tokens : Array[Token],
   mut_summary : PkgMutationSummary,
   f_rel : String,
@@ -4028,12 +4144,30 @@ fn stage_b_check_search_by_with_summary(
   record_allow : Bool,
   drift_ledger : Array[DriftEntry],
 ) -> Bool {
+  stage_b_check_hof_ro_with_summary(tokens, mut_summary, f_rel, content, qfi_opt, "search_by", elem_ty, line, col, record_allow, drift_ledger)
+}
+
+///| Gate B: `Array::search_by(cb)` / `Array::filter_map(cb)` / `Array::sort_by_key(cb)` callback purity
+///| backed by `PkgMutationSummary` + fresh non-escaping local independence + allow ledger.
+fn stage_b_check_hof_ro_with_summary(
+  tokens : Array[Token],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  mname : String,
+  elem_ty : String,
+  line : Int,
+  col : Int,
+  record_allow : Bool,
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
   let n = tokens.length() - 1
   let mut dot_i = -1
   let mut best_dist = 1000000
   let mut ti = 0
   while ti + 2 < n {
-    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == "search_by" &&
+    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == mname &&
     tokens[ti + 2].kind == TokenKind::LParen && tokens[ti + 1].line == line {
       let dist = if tokens[ti + 1].col >= col { tokens[ti + 1].col - col } else { col - tokens[ti + 1].col }
       if dist < best_dist {
@@ -4055,9 +4189,7 @@ fn stage_b_check_search_by_with_summary(
   if body_open < 0 {
     return false
   }
-  let active_gen = enclosing_fn_generic_params(tokens, body_open)
-  let sum = summarize_callback_arg(mut_summary, tokens, arg_s, arg_e, body_open, content, qfi_opt, elem_ty, active_gen)
-  if !summary_may_mutate_array(sum, elem_ty) {
+  if mname != "sort_by_key" && stage_b_is_fresh_non_escaping_local_recv(tokens, dot_i - 1, dot_i, body_open, arg_s, arg_e) {
     if record_allow {
       stage_b_record_mutation_allow(
         drift_ledger,
@@ -4065,9 +4197,31 @@ fn stage_b_check_search_by_with_summary(
         f_rel,
         line,
         col,
-        "search_by",
-        "mbt_compat::arr_search_by",
-        "mutation_summary proved search_by callback cannot mutate Array[" + elem_ty + "]",
+        mname,
+        "mbt_compat::arr_" + mname,
+        "fresh non-escaping local receiver cannot be aliased or mutated by " + mname + " callback",
+      )
+    }
+    return true
+  }
+  let active_gen = enclosing_fn_generic_params(tokens, body_open)
+  let sum = summarize_callback_arg(mut_summary, tokens, arg_s, arg_e, body_open, content, qfi_opt, elem_ty, active_gen)
+  let cb_ok = if mname == "sort_by_key" {
+    !sum.unknown && !sum.mutates_any_array && sum.mutated_elem_types.length() == 0
+  } else {
+    !summary_may_mutate_array(sum, elem_ty)
+  }
+  if cb_ok {
+    if record_allow {
+      stage_b_record_mutation_allow(
+        drift_ledger,
+        "mutation_summary_allow_b",
+        f_rel,
+        line,
+        col,
+        mname,
+        "mbt_compat::arr_" + mname,
+        "mutation_summary proved " + mname + " callback cannot mutate Array[" + elem_ty + "]",
       )
     }
     return true
@@ -4125,6 +4279,11 @@ fn stage_b_check_kept_iter_with_summary(
     (tokens[close_p + 2].raw == "any" || tokens[close_p + 2].raw == "all" || tokens[close_p + 2].raw == "find_first") &&
     tokens[close_p + 3].kind == TokenKind::LParen
     if is_imm_pred && !is_array_literal_end(tokens, dot_i - 1) {
+      let cb_close_p = find_matching_delim(tokens, close_p + 3)
+      let bo_c = outermost_body_open(tokens, dot_i)
+      if stage_b_is_fresh_non_escaping_local_recv(tokens, dot_i - 1, dot_i, bo_c, close_p + 4, cb_close_p) {
+        return true
+      }
       match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
         Some(_) => return true
         None => why = "callback in immediate `.iter()." + tokens[close_p + 2].raw + "(...)` may mutate the array (trait/operator/opaque/mutating call)"
@@ -4133,6 +4292,28 @@ fn stage_b_check_kept_iter_with_summary(
       return true
     }
   } else {
+    let close_p = find_matching_delim(tokens, dot_i + 2)
+    let is_imm_pred = close_p == dot_i + 3 && close_p + 3 < tokens.length() &&
+    tokens[close_p + 1].kind == TokenKind::Dot &&
+    (tokens[close_p + 2].raw == "any" || tokens[close_p + 2].raw == "all" || tokens[close_p + 2].raw == "find_first") &&
+    tokens[close_p + 3].kind == TokenKind::LParen
+    if is_imm_pred {
+      let cb_close_p = find_matching_delim(tokens, close_p + 3)
+      let bo_c = outermost_body_open(tokens, dot_i)
+      if stage_b_is_fresh_non_escaping_local_recv(tokens, dot_i - 1, dot_i, bo_c, close_p + 4, cb_close_p) {
+        stage_b_record_mutation_allow(
+          drift_ledger,
+          "mutation_summary_allow_c",
+          f_rel,
+          line,
+          col,
+          ".iter()",
+          "mbt_compat::arr_iter",
+          "fresh non-escaping local receiver cannot be aliased or mutated by immediate .iter()." + tokens[close_p + 2].raw + "(cb)",
+        )
+        return true
+      }
+    }
     match immediate_iter_consumer_allow_with_summary(tokens, dot_i, mut_summary, content, qfi_opt, elem_ty) {
       Some(detail) => {
         stage_b_record_mutation_allow(
@@ -4414,6 +4595,335 @@ fn stage_b_rewrite_borrowed_slice_for_loops(
                   )
                   i = rb + 1
                   continue
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  any_changed
+}
+
+///| Check whether parameter `param_name` at index `param_idx` of private package function `callee_name`
+///| (body `(bo, bc)`) is strictly read-only, non-escaping, and never read during/after an `Array[elem_ty]` mutation.
+fn stage_b_callee_slice_param_is_ro_safe(
+  tokens : Array[Token],
+  bo : Int,
+  bc : Int,
+  callee_name : String,
+  param_name : String,
+  param_idx : Int,
+  elem_ty : String,
+  mut_summary : PkgMutationSummary,
+  active_gen : Map[String, Bool],
+) -> Bool {
+  // 1. Scan all occurrences of `param_name` in `(bo, bc)` for read-only + non-escaping discipline.
+  let mut k = bo + 1
+  while k < bc {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Ident && tk.raw == param_name &&
+    !(k > bo && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) {
+      // Must not be inside a closure literal or loop body (except as the iterable of `for x in param_name { ... }`).
+      if enclosing_closure_open(tokens, k, bo) >= 0 {
+        return false
+      }
+      // Check if this occurrence is `for <var> in <param_name> { <body> }`.
+      if k >= bo + 2 && tokens[k - 1].raw == "in" && k + 1 < bc && tokens[k + 1].kind == TokenKind::LBrace {
+        let lb = k + 1
+        let rb = find_matching_delim(tokens, lb)
+        if rb <= lb || rb >= bc {
+          return false
+        }
+        // Loop body must not mutate `Array[elem_ty]` (or be unknown).
+        let bsum = summarize_expr_span(mut_summary, tokens, lb + 1, rb, bo, "", None, Map(), active_gen)
+        if summary_may_mutate_array(bsum, elem_ty) {
+          return false
+        }
+        k = k + 1
+        continue
+      }
+      // Check read-only methods: `param_name.length()` / `param_name.is_empty()` / `param_name.get(...)`
+      if k + 3 < bc && tokens[k + 1].kind == TokenKind::Dot && tokens[k + 3].kind == TokenKind::LParen {
+        let m = tokens[k + 2].raw
+        if m == "length" || m == "is_empty" || m == "get" {
+          k = k + 1
+          continue
+        }
+        return false
+      }
+      // Check read-only indexing `param_name[idx]` (not followed by `=` or `AssignOp`)
+      if k + 1 < bc && tokens[k + 1].kind == TokenKind::LBracket {
+        let rb = find_matching_delim(tokens, k + 1)
+        if rb > k + 1 && rb + 1 < bc && tokens[rb + 1].kind != TokenKind::Eq && tokens[rb + 1].kind != TokenKind::AssignOp {
+          k = k + 1
+          continue
+        }
+        return false
+      }
+      // Check direct recursive call `callee_name(..., param_name, ...)` at exact same `param_idx`.
+      let lp = enclosing_open(tokens, k, bo, TokenKind::LParen)
+      if lp > bo + 1 && tokens[lp - 1].kind == TokenKind::Ident && tokens[lp - 1].raw == callee_name &&
+      !(lp > bo + 2 && (tokens[lp - 2].kind == TokenKind::Dot || tokens[lp - 2].kind == TokenKind::ColonColon)) {
+        let rp = find_matching_delim(tokens, lp)
+        if rp > lp && rp < bc {
+          let cargs = ms_split_call_args(tokens, lp, rp)
+          if param_idx < cargs.length() && cargs[param_idx].0 == k && cargs[param_idx].1 == k + 1 {
+            // Ensure `param_name` is not used inside an enclosing `while`/`for` loop.
+            let mut enc = enclosing_open(tokens, lp, bo, TokenKind::LBrace)
+            while enc > bo {
+              let mut h = enc - 1
+              while h > bo && !tokens[h].newline_before {
+                if tokens[h].raw == "while" || tokens[h].raw == "for" {
+                  return false
+                }
+                h = h - 1
+              }
+              enc = enclosing_open(tokens, enc, bo, TokenKind::LBrace)
+            }
+            // Ensure no further use of `param_name` occurs in the same enclosing block after `rp`.
+            let blk_o = enclosing_open(tokens, lp, bo, TokenKind::LBrace)
+            let blk_c = if blk_o >= bo { find_matching_delim(tokens, blk_o) } else { bc }
+            let mut after_k = rp + 1
+            while after_k < blk_c {
+              if tokens[after_k].kind == TokenKind::Ident && tokens[after_k].raw == param_name &&
+              !(tokens[after_k - 1].kind == TokenKind::Dot || tokens[after_k - 1].kind == TokenKind::ColonColon) {
+                return false
+              }
+              after_k = after_k + 1
+            }
+            k = k + 1
+            continue
+          }
+        }
+      }
+      // Any other use (return, store, alias, non-recursive call arg, mutation) -> fail-closed!
+      return false
+    }
+    k = k + 1
+  }
+  // 2. Ensure no `Array[elem_ty]` mutation occurs in `(bo, k)` BEFORE any use of `param_name` in the same linear path:
+  //    Check the whole function summary first (fast path); if it mutates `Array[elem_ty]`, verify that
+  //    every use of `param_name` has zero `Array[elem_ty]` mutations between its enclosing block start and the use,
+  //    and zero `Array[elem_ty]` mutations at the top-level prefix before the first branch containing `param_name`.
+  match lookup_fn_mutation_summary(mut_summary, callee_name) {
+    Some(fsum) =>
+    if !summary_may_mutate_array(fsum, elem_ty) {
+      return true
+    }
+    None => ()
+  }
+  // Structural prefix check: for every use of `param_name` at `u`, walk enclosing blocks up to `bo`;
+  // in each block `[blk_o + 1, u)` (skipping earlier `if ... { ... return ... }` blocks), no `Array[elem_ty]` mutation may occur.
+  k = bo + 1
+  while k < bc {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Ident && tk.raw == param_name &&
+    !(k > bo && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) {
+      let mut cur_u = k
+      let mut blk_o = enclosing_open(tokens, cur_u, bo, TokenKind::LBrace)
+      while blk_o >= bo {
+        // Only check statements in this block prior to `cur_u` (stop at `=>` if inside a `match` arm!).
+        let mut seg_s = blk_o + 1
+        let mut scan = cur_u - 1
+        let mut sd = 0
+        while scan > blk_o {
+          let sk = tokens[scan].kind
+          if sk == TokenKind::RBrace || sk == TokenKind::RParen || sk == TokenKind::RBracket { sd = sd + 1 }
+          else if sk == TokenKind::LBrace || sk == TokenKind::LParen || sk == TokenKind::LBracket { if sd > 0 { sd = sd - 1 } }
+          else if sd == 0 && sk == TokenKind::FatArrow {
+            seg_s = scan + 1
+            break
+          }
+          scan = scan - 1
+        }
+        // Skip complete prior `if ... { ... return ... }` blocks at depth 0 inside `[seg_s, cur_u)`.
+        let mut p = seg_s
+        while p < cur_u {
+          if tokens[p].raw == "if" {
+            let mut lb = p + 1
+            while lb < cur_u && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+            if lb < cur_u {
+              let rb = find_matching_delim(tokens, lb)
+              if rb > lb && rb < cur_u && !(rb + 1 < cur_u && tokens[rb + 1].raw == "else") {
+                // Check if the `if` block unconditionally returns (ends with `return ...`)
+                let mut has_ret = false
+                let mut rk = lb + 1
+                while rk < rb {
+                  if tokens[rk].raw == "return" { has_ret = true; break }
+                  rk = rk + 1
+                }
+                if has_ret {
+                  // Only check the condition `[p + 1, lb)`!
+                  let csum = summarize_expr_span(mut_summary, tokens, p + 1, lb, bo, "", None, Map(), active_gen)
+                  if summary_may_mutate_array(csum, elem_ty) {
+                    return false
+                  }
+                  p = rb + 1
+                  continue
+                }
+              }
+            }
+          }
+          // Check up to the next statement or `cur_u`
+          let mut nxt = p + 1
+          let mut nd = 0
+          while nxt < cur_u {
+            let nk = tokens[nxt].kind
+            if nk == TokenKind::LBrace || nk == TokenKind::LParen || nk == TokenKind::LBracket { nd = nd + 1 }
+            else if nk == TokenKind::RBrace || nk == TokenKind::RParen || nk == TokenKind::RBracket { if nd > 0 { nd = nd - 1 } }
+            else if nd == 0 && tokens[nxt].raw == "if" { break }
+            nxt = nxt + 1
+          }
+          let ssum = summarize_expr_span(mut_summary, tokens, p, nxt, bo, "", None, Map(), active_gen)
+          if summary_may_mutate_array(ssum, elem_ty) {
+            return false
+          }
+          p = nxt
+        }
+        if blk_o == bo {
+          break
+        }
+        cur_u = blk_o
+        blk_o = enclosing_open(tokens, blk_o, bo, TokenKind::LBrace)
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Gate D2: Rewrite `callee(..., mbt_compat::__mbt_slice_borrow(recv, lo, hi), ...)` to
+///| `mbt_compat::array_slice_clamp(recv, lo, hi)` when `callee` is a unique package-private function
+///| whose target parameter is proven strictly read-only, non-escaping, and never read during/after
+///| any `Array[E]` mutation.
+fn stage_b_rewrite_borrowed_slice_ro_call_args(
+  lines : Array[String],
+  tokens : Array[Token],
+  all_tokens : Array[Array[Token]],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  mutated_lines : Map[Int, Bool],
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  let n = tokens.length() - 1
+  let mut any_changed = false
+  let mut i = 0
+  while i + 4 < n {
+    if tokens[i].raw == "mbt_compat" && tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].raw == "__mbt_slice_borrow" && tokens[i + 3].kind == TokenKind::LParen {
+      let sl_rp = find_matching_delim(tokens, i + 3)
+      let lidx = tokens[i].line - 1
+      if sl_rp > i + 3 && lidx >= 0 && lidx < lines.length() && tokens[sl_rp].line - 1 == lidx &&
+      !mutated_lines.contains(lidx) {
+        let sargs = ms_split_call_args(tokens, i + 3, sl_rp)
+        let call_lp = enclosing_open(tokens, i, 0, TokenKind::LParen)
+        if sargs.length() == 3 && call_lp > 0 && tokens[call_lp - 1].kind == TokenKind::Ident &&
+        !(call_lp >= 2 && (tokens[call_lp - 2].kind == TokenKind::Dot || tokens[call_lp - 2].kind == TokenKind::ColonColon)) {
+          let callee_name = tokens[call_lp - 1].raw
+          let call_rp = find_matching_delim(tokens, call_lp)
+          let cargs = if call_rp > call_lp { ms_split_call_args(tokens, call_lp, call_rp) } else { [] }
+          let mut arg_idx = -1
+          let mut ai = 0
+          while ai < cargs.length() {
+            if cargs[ai].0 == i && cargs[ai].1 == sl_rp + 1 {
+              arg_idx = ai
+              break
+            }
+            ai = ai + 1
+          }
+          if arg_idx >= 0 {
+            let recv_s = sargs[0].0
+            let recv_e = sargs[0].1
+            let mut recv_ty = match qfi_opt {
+              Some(qfi) =>
+              match qt_lookup_expr_span_ty(qfi, content, tokens[recv_s].start_byte, tokens[recv_e - 1].end_byte, true) {
+                Some(t) => t
+                None => ""
+              }
+              None => ""
+            }
+            if recv_ty.length() == 0 {
+              let fn_bo = outermost_body_open(tokens, i)
+              let env = ms_build_fn_env(mut_summary, tokens, fn_bo, content, qfi_opt, enclosing_fn_generic_params(tokens, fn_bo))
+              recv_ty = ms_infer_expr_ty(mut_summary, tokens, recv_e - 1, content, qfi_opt, env.vt)
+            }
+            let rt_clean = ms_strip_pkg_prefix(recv_ty)
+            if rt_clean.starts_with("Array[") && rt_clean.ends_with("]") {
+              let elem_ty = ms_extract_array_elem_ty(rt_clean)
+              // Locate unique private top-level `fn callee_name(...)` in `all_tokens`
+              let mut found_cnt = 0
+              let mut found_ts : Array[Token] = []
+              let mut found_bo = -1
+              let mut found_bc = -1
+              let mut found_param = ""
+              let mut found_is_pub = false
+              let mut found_is_gen = false
+              for ts in all_tokens {
+                let tn = ts.length() - 1
+                let mut ti = 0
+                while ti + 2 < tn {
+                  if ts[ti].raw == "fn" && ts[ti + 1].kind == TokenKind::Ident && ts[ti + 1].raw == callee_name &&
+                  outermost_body_open(ts, ti) < 0 {
+                    found_cnt = found_cnt + 1
+                    if ti > 0 && ts[ti - 1].raw == "pub" {
+                      found_is_pub = true
+                    }
+                    let mut p = ti + 2
+                    if p < tn && ts[p].kind == TokenKind::LBracket {
+                      found_is_gen = true
+                      p = find_matching_delim(ts, p) + 1
+                    }
+                    if p < tn && ts[p].kind == TokenKind::LParen {
+                      let rp = find_matching_delim(ts, p)
+                      let pnames = collect_pion_fn_param_names(ts, p, rp)
+                      if arg_idx < pnames.length() {
+                        found_param = pnames[arg_idx]
+                      }
+                      let mut bo = rp + 1
+                      while bo < tn && ts[bo].kind != TokenKind::LBrace { bo = bo + 1 }
+                      if bo < tn && ts[bo].kind == TokenKind::LBrace {
+                        found_ts = ts
+                        found_bo = bo
+                        found_bc = find_matching_delim(ts, bo)
+                      }
+                    }
+                  }
+                  ti = ti + 1
+                }
+              }
+              if found_cnt == 1 && !found_is_pub && !found_is_gen && found_bo >= 0 && found_bc > found_bo &&
+              found_param.length() > 0 && elem_ty.length() > 0 &&
+              stage_b_callee_slice_param_is_ro_safe(found_ts, found_bo, found_bc, callee_name, found_param, arg_idx, elem_ty, mut_summary, Map()) {
+                let cur_ln = lines[lidx]
+                let needle = "mbt_compat::__mbt_slice_borrow("
+                let start_c = if tokens[i].col > 0 { tokens[i].col - 1 } else { 0 }
+                let end_c = tokens[sl_rp].col
+                if start_c >= 0 && end_c > start_c && end_c <= cur_ln.length() &&
+                start_c + needle.length() <= end_c &&
+                cur_ln.slice(start_c, start_c + needle.length()) == needle &&
+                cur_ln.slice(end_c - 1, end_c) == ")" {
+                  let recv_txt = content.slice(tokens[recv_s].start_byte, tokens[recv_e - 1].end_byte)
+                  let lo_txt = content.slice(tokens[sargs[1].0].start_byte, tokens[sargs[1].1 - 1].end_byte)
+                  let hi_txt = content.slice(tokens[sargs[2].0].start_byte, tokens[sargs[2].1 - 1].end_byte)
+                  let repl = "mbt_compat::ArrayBuf::from_array(" + recv_txt + ").exact_view(" + lo_txt + ", " + hi_txt + ")"
+                  lines[lidx] = cur_ln.slice(0, start_c) + repl + cur_ln.slice(end_c, cur_ln.length())
+                  mutated_lines[lidx] = true
+                  any_changed = true
+                  stage_b_record_mutation_allow(
+                    drift_ledger,
+                    "mutation_summary_allow_d",
+                    f_rel,
+                    tokens[i].line,
+                    tokens[i].col,
+                    callee_name + "(..., slice, ...)",
+                    "mbt_compat::ArrayBuf::from_array(..).exact_view(..)",
+                    "proven read-only non-escaping slice arg to private `" + callee_name + "`",
+                  )
                 }
               }
             }
