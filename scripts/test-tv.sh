@@ -49,9 +49,11 @@ for spec in "opt_suite:tests/tv/opt_suite.pion:strict" "codec:tests/lean/codec:"
   mode=${rest#*:}
   cas="$WORK/cas_$name"
   mkdir -p "$cas"
-  PION_CACHE_DIR="$cas" "$PIONC" build --emit-staticlib "$WORK/$name.a" "$ROOT_DIR/$path" >/dev/null
-  V=0; S=0; R=0
+  PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$cas" "$PIONC" build --emit-staticlib "$WORK/$name.a" "$ROOT_DIR/$path" >/dev/null
+  V=0; S=0; R=0; SSA_COUNT=0
   for ssa in "$cas"/ssa/*.ssa; do
+    [ -f "$ssa" ] || continue
+    SSA_COUNT=$((SSA_COUNT + 1))
     dump="$WORK/$name.$(basename "$ssa" .ssa).mg"
     "$QBE" -d MG -o /dev/null "$ssa" 2> "$dump"
     set +e
@@ -71,7 +73,11 @@ for spec in "opt_suite:tests/tv/opt_suite.pion:strict" "codec:tests/lean/codec:"
       FAIL=1
     fi
   done
-  echo "$name: validated=$V skipped=$S rejected=$R"
+  if [ "$SSA_COUNT" -eq 0 ]; then
+    echo "FAIL: $name produced 0 CAS .ssa files in $cas/ssa" >&2
+    exit 1
+  fi
+  echo "$name: ssa_files=$SSA_COUNT validated=$V skipped=$S rejected=$R"
 done
 if [ "$FAIL" -ne 0 ]; then
   echo "FAIL: real QBE optimisations were not all validated" >&2

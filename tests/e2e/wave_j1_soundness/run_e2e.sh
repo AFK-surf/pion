@@ -6962,7 +6962,7 @@ EOF
 
 PION_CACHE_DIR="$TMP_DIR/cas_r45" "$PIONC" build -o "$TMP_DIR/r45_b" "$TMP_DIR/r45/app"
 test "$("$TMP_DIR/r45_b")" = "7"
-PION_CACHE_DIR="$TMP_DIR/cas_r45_rel" "$PIONC" build --release -o "$TMP_DIR/r45_rel_b" "$TMP_DIR/r45/app"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$TMP_DIR/cas_r45_rel" "$PIONC" build --release -o "$TMP_DIR/r45_rel_b" "$TMP_DIR/r45/app"
 test "$("$TMP_DIR/r45_rel_b")" = "7"
 grep -E 'data \$pion_vtable_.*dep.*Hidden.*\$pion_dyn_wrap_.*(_M3_tag|__tag)' "$TMP_DIR/cas_r45_rel"/ssa/*.ssa > /dev/null
 if grep -E 'data \$pion_vtable_.*dep.*Hidden' "$TMP_DIR/cas_r45_rel"/ssa/*.ssa | grep -qvE '\$pion_dyn_wrap_.*(_M3_tag|__tag)'; then
@@ -8604,7 +8604,7 @@ pub fn main(world : World) -> Unit {
 EOF
 PION_CACHE_DIR="$TMP_DIR/cas_p2_r5_dev" "$PIONC" build -o "$TMP_DIR/p2_r5_dev" "$TMP_DIR/p2_r5_alias/app"
 test "$("$TMP_DIR/p2_r5_dev")" = "1214:44"
-PION_CACHE_DIR="$TMP_DIR/cas_p2_r5_rel" "$PIONC" build --release -o "$TMP_DIR/p2_r5_rel" "$TMP_DIR/p2_r5_alias/app"
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$TMP_DIR/cas_p2_r5_rel" "$PIONC" build --release -o "$TMP_DIR/p2_r5_rel" "$TMP_DIR/p2_r5_alias/app"
 test "$("$TMP_DIR/p2_r5_rel")" = "1214:44"
 # SSA assertion: monomorphized lg::run_hit MUST reload arr data ptr (+ 24) inside the loop body, never hoisted to preheader
 P2_R5_SSA=$(find "$TMP_DIR/cas_p2_r5_rel" -name '*.ssa' -exec grep -l 'run_hit' {} + | head -n 1)

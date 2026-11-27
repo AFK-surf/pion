@@ -67,7 +67,7 @@ for MODE in dev release; do
   export PION_CACHE_DIR="$TMP_DIR/cas_$MODE"
   mkdir -p "$PION_CACHE_DIR"
   for APP in app thin; do
-    "$PIONC" build $FLAG -o "$TMP_DIR/${APP}_$MODE" "$PKGS/$APP"
+    PION_KEEP_NATIVE_SSA=1 "$PIONC" build $FLAG -o "$TMP_DIR/${APP}_$MODE" "$PKGS/$APP"
   done
   scan "$PION_CACHE_DIR" "ssa $MODE"
   "$TMP_DIR/app_$MODE" > "$TMP_DIR/native.$MODE.txt"

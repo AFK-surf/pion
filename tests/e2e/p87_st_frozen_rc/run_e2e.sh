@@ -550,7 +550,7 @@ EOF
 
 REENT_CAS="$CAS_DIR/reent_units"
 rm -rf "$REENT_CAS"
-PION_CACHE_DIR="$REENT_CAS" "$PIONC" build --release --no-main "$REENT_DIR/a.pion" "$REENT_DIR/b.pion" >/dev/null
+PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$REENT_CAS" "$PIONC" build --release --no-main "$REENT_DIR/a.pion" "$REENT_DIR/b.pion" >/dev/null
 
 UNIT_SSA_COUNT=$(ls -1 "$REENT_CAS/ssa/"*.ssa | wc -l | tr -d ' ')
 UNIT_OBJ_COUNT=$(ls -1 "$REENT_CAS/obj/"*.o | wc -l | tr -d ' ')

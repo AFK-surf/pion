@@ -187,7 +187,7 @@ for MODE in dev release; do
   for J in 1 2 4 8; do
     rm -rf "$TMP_DIR/cas_j"
     mkdir -p "$TMP_DIR/cas_j"
-    PION_CACHE_DIR="$TMP_DIR/cas_j" "$PIONC" build $FLAG --jobs "$J" -o "$TMP_DIR/prog_${MODE}_$J" "$PROG"
+    PION_KEEP_NATIVE_SSA=1 PION_CACHE_DIR="$TMP_DIR/cas_j" "$PIONC" build $FLAG --jobs "$J" -o "$TMP_DIR/prog_${MODE}_$J" "$PROG"
     N=$(find "$TMP_DIR/cas_j/ssa" -name '*.ssa' -type f | wc -l | tr -d ' ')
     [ "$N" -eq 4 ] || fail "prog $MODE --jobs $J: $N CAS SSA units, want 4"
     "$TMP_DIR/prog_${MODE}_$J" > "$TMP_DIR/prog_${MODE}_$J.out"
