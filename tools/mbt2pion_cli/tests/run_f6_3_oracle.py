@@ -551,8 +551,29 @@ fn pos_precision_and_compat() -> String {
     split_paren + "|" + split_idx + "|" + split_any.to_string() + "|" + j_str + "|" + wide_repr + "|" + deep_repr
 }
 
+// Positive case: multiline match arm if-guard must not pollute callables or outer_sh.
+fn pos_multiline_match_guard() -> String {
+  let nums : Array[Int] = [10, 20, 30, 40]
+  let km : Map[Int, Int] = Map::new()
+  km[2] = 20
+  km[4] = 40
+  let guard_ok = match Some(2) {
+    Some(v) if km.contains(v) &&
+      physical_equal(nums, nums) => true
+    _ => false
+  }
+  let guard_any = [1, 2, 3].iter().any(fn(x) { km.contains(x) })
+  let fxs = [3, 4]
+  let fseen : Array[Int] = []
+  let fout = fxs.filter_map(fn(x) {
+    fseen.push(x)
+    Some(x)
+  })
+  guard_ok.to_string() + "|" + guard_any.to_string() + "|" + (fout.length() + fseen.length()).to_string()
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat() + " :: " + pos_multiline_match_guard()
 }
 '''
 
@@ -1353,6 +1374,151 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
   let b = InterpForShadowBox::{ m: Map::new() }
   taint_for_shadow(b, ext)
   xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_generic_param_alias_search_by",
+        r'''
+fn[T] walk(xs : Array[T], ys : Array[Int]) -> Int? {
+  xs.search_by(fn(_x) {
+    if ys.length() == 2 { ys.push(9) }
+    false
+  })
+}
+pub fn probe() -> Int? {
+  let a : Array[Int] = [3, 4]
+  walk(a, a)
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_shadowed_some_custom_eq_search_by",
+        r'''
+enum Flag {
+  Some(Int)
+}
+struct EvilBox {
+  xs : Array[Int]
+}
+impl Eq for EvilBox with equal(self, _other) {
+  self.xs.push(9)
+  true
+}
+pub fn run(xs : Array[Int]) -> Int? {
+  let b = EvilBox::{ xs }
+  let f = Flag::Some(1)
+  xs.search_by(fn(_x) {
+    let _ = b == b
+    let _ = match f { Flag::Some(n) => n }
+    false
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_param_json_map_contains",
+        r'''
+pub fn choose(xs : Array[Int], m : Map[String, Json], log : Array[String]) -> Bool {
+  let _ = log
+  xs.iter().any(fn(_x) { m.contains("k") })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_json_object_guard_rebind_array_search_by",
+        r'''
+pub fn run(xs : Array[Json], k : Json) -> Int? {
+  xs.search_by(fn(j) {
+    match j {
+      Object(m) if k is Array(m) => {
+        m.clear()
+        true
+      }
+      _ => false
+    }
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_json_object_guard_rebind_array_idx_search_by",
+        r'''
+pub fn run(xs : Array[Json], k : Json) -> Int? {
+  xs.search_by(fn(j) {
+    match j {
+      Object(m) if k is Array(m) => {
+        m[0] = j
+        true
+      }
+      _ => false
+    }
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_impl_generic_shadow_struct_t_search_by",
+        r'''
+struct T {
+  n : Int
+}
+struct Bucket[T] {
+  xs : Array[T]
+  ys : Array[Int]
+}
+impl[T] Eq for Bucket[T] with equal(a, _b) {
+  let xs : Array[T] = a.xs
+  let ys : Array[Int] = a.ys
+  match xs.search_by(fn(_x) {
+    if ys.length() == 2 { ys.push(9) }
+    false
+  }) {
+    Some(_) => true
+    None => false
+  }
+}
+pub fn probe() -> Bool {
+  let a : Array[Int] = [3, 4]
+  let b = Bucket::{ xs: a, ys: a }
+  let _ = T::{ n: 0 }
+  b == b
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_impl_generic_shadow_struct_t_iter_any",
+        r'''
+struct T {
+  n : Int
+}
+struct Bucket[T] {
+  xs : Array[T]
+  ys : Array[Int]
+}
+impl[T] Eq for Bucket[T] with equal(a, _b) {
+  let xs : Array[T] = a.xs
+  let ys : Array[Int] = a.ys
+  let mut count = 0
+  let _ = xs.iter().any(fn(_) {
+    count = count + 1
+    ys.clear()
+    false
+  })
+  count == 2
+}
+pub fn probe() -> Bool {
+  let a : Array[Int] = [3, 4]
+  let b = Bucket::{ xs: a, ys: a }
+  let _ = T::{ n: 0 }
+  b == b
 }
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",

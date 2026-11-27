@@ -96,6 +96,25 @@ pub fn summary_may_mutate_array(sum : FnMutationSummary, target_elem_ty : String
   sum.mutated_elem_types.contains(t)
 }
 
+///| Context-aware `summary_may_mutate_array`: fails closed when `target_elem_ty` is empty,
+///| contains an active generic type parameter (e.g. `Array[T]` aliasing `Array[Int]`),
+///| or is not a ground canonical type in `pkg`.
+pub fn summary_may_mutate_array_in_ctx(
+  pkg : PkgMutationSummary,
+  sum : FnMutationSummary,
+  target_elem_ty : String,
+  active_generics : Map[String, Bool],
+) -> Bool {
+  let t = target_elem_ty.trim()
+  let elem_check = if t.length() == 0 || ms_ty_contains_generic(t, active_generics) ||
+  !qt_is_ground_canon_type(t, pkg.declared_types, active_generics) {
+    ""
+  } else {
+    t
+  }
+  summary_may_mutate_array(sum, elem_check)
+}
+
 pub struct PkgMutationSummary {
   summaries : Map[String, FnMutationSummary]
   declared_types : Map[String, Bool]
@@ -544,8 +563,11 @@ fn ms_add_pat_idents(tokens : Array[Token], s : Int, e : Int, out : Map[String, 
   let mut k = s
   while k < e {
     if tokens[k].kind == TokenKind::Ident && !ms_is_pattern_kw(tokens[k].raw) {
-      // Skip struct field labels `field: pat` (the value pattern is scanned next)
-      if !(k + 1 < e && tokens[k + 1].kind == TokenKind::Colon) {
+      // Skip struct field labels `field: pat`, call targets `f(...)`, and member/qualified paths `.f` / `::f`.
+      let is_field_label = k + 1 < e && tokens[k + 1].kind == TokenKind::Colon
+      let is_call_target = k + 1 < e && tokens[k + 1].kind == TokenKind::LParen
+      let is_member_or_qual = k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)
+      if !is_field_label && !is_call_target && !is_member_or_qual {
         out[tokens[k].raw] = true
       }
     }
@@ -693,9 +715,25 @@ fn ms_collect_pattern_bound_idents_in_span_full(
         } else if d == 0 && (pk == TokenKind::Semi || pk == TokenKind::FatArrow) {
           break
         } else if d == 0 && tokens[ps].newline_before {
-          // Include `ps` itself as the start of this arm pattern line
-          ps = ps - 1
-          break
+          // Keep scanning backward across multiline `match` arm patterns and `if` guards
+          // (e.g. `Some(x) if cond1 &&\n  cond2 =>`), stopping only at a real arm boundary.
+          let continues_from_prev = ps > s && (
+            tokens[ps - 1].kind == TokenKind::AmpAmp ||
+            tokens[ps - 1].kind == TokenKind::PipePipe ||
+            tokens[ps - 1].kind == TokenKind::Pipe ||
+            tokens[ps - 1].kind == TokenKind::Comma ||
+            tokens[ps - 1].raw == "if" ||
+            tokens[ps].kind == TokenKind::AmpAmp ||
+            tokens[ps].kind == TokenKind::PipePipe ||
+            tokens[ps].kind == TokenKind::Pipe ||
+            tokens[ps].raw == "if" ||
+            ms_is_expr_continuation_tok(tokens[ps - 1], tokens[ps])
+          )
+          if !continues_from_prev {
+            // Include `ps` itself as the start of this arm pattern line
+            ps = ps - 1
+            break
+          }
         }
         ps = ps - 1
       }
@@ -733,10 +771,31 @@ fn ms_collect_closure_param_names(tokens : Array[Token], s : Int, e : Int, out :
       }
     } else if tokens[i].kind == TokenKind::FatArrow && i > s {
       if tokens[i - 1].kind == TokenKind::Ident && !ms_is_pattern_kw(tokens[i - 1].raw) {
-        out[tokens[i - 1].raw] = true
+        let prev_is_expr = i >= s + 2 && (
+          tokens[i - 2].kind == TokenKind::Dot ||
+          tokens[i - 2].kind == TokenKind::ColonColon ||
+          tokens[i - 2].kind == TokenKind::AmpAmp ||
+          tokens[i - 2].kind == TokenKind::PipePipe ||
+          tokens[i - 2].kind == TokenKind::EqEq ||
+          tokens[i - 2].kind == TokenKind::BangEq ||
+          tokens[i - 2].kind == TokenKind::Bang ||
+          tokens[i - 2].raw == "if" ||
+          tokens[i - 2].raw == "is" ||
+          tokens[i - 2].raw == "in" ||
+          tokens[i - 2].raw == "as"
+        )
+        if !prev_is_expr {
+          out[tokens[i - 1].raw] = true
+        }
       } else if tokens[i - 1].kind == TokenKind::RParen {
         let lp = find_open_before(tokens, i - 1, s)
-        if lp >= s {
+        let is_call_or_ctor = lp > s && (
+          tokens[lp - 1].kind == TokenKind::Ident ||
+          tokens[lp - 1].kind == TokenKind::UpperIdent ||
+          tokens[lp - 1].kind == TokenKind::Dot ||
+          tokens[lp - 1].kind == TokenKind::ColonColon
+        )
+        if lp >= s && !is_call_or_ctor {
           let pnames = collect_pion_fn_param_names(tokens, lp, i - 1)
           for pn in pnames {
             if pn.length() > 0 && pn != "_" {
@@ -1248,6 +1307,8 @@ fn ms_infer_expr_ty(
       if callee.kind == TokenKind::UpperIdent {
         let is_opt_some = callee.raw == "Some" &&
         !pkg.declared_types.contains("Option") && !pkg.using_types.contains("Option") &&
+        !pkg.declared_types.contains("Some") && !pkg.using_types.contains("Some") &&
+        !local_var_types.contains("Some") &&
         (
           (lp >= 3 && tokens[lp - 2].kind == TokenKind::ColonColon && tokens[lp - 3].raw == "Option" &&
             !(lp >= 4 && (tokens[lp - 4].kind == TokenKind::ColonColon || tokens[lp - 4].kind == TokenKind::Dot))) ||
@@ -1257,7 +1318,8 @@ fn ms_infer_expr_ty(
         )
         if is_opt_some {
           let cargs = ms_split_call_args(tokens, lp, end_i)
-          if cargs.length() == 1 && cargs[0].0 < cargs[0].1 {
+          if cargs.length() == 1 && cargs[0].0 < cargs[0].1 &&
+          ms_postfix_expr_end(tokens, cargs[0].0, cargs[0].1) == cargs[0].1 - 1 {
             let arg_ty = ms_infer_expr_ty(pkg, tokens, cargs[0].1 - 1, content, qfi_opt, local_var_types)
             if arg_ty.length() > 0 {
               return "Option[" + arg_ty + "]"
@@ -1339,6 +1401,17 @@ fn ms_infer_expr_ty(
                   return "Option[" + parts_get[1].trim() + "]"
                 }
               }
+            }
+            return ""
+          }
+          if m == "get" && is_arr_recv {
+            let elem = ms_extract_array_elem_ty(recv_ty)
+            return if elem.length() > 0 { "Option[" + elem + "]" } else { "" }
+          }
+          if (m == "unwrap" || m == "unwrap_or" || m == "or") && rh == "Option" {
+            let t_opt = ms_strip_pkg_prefix(recv_ty)
+            if t_opt.starts_with("Option[") && t_opt.ends_with("]") {
+              return t_opt.slice(7, t_opt.length() - 1).trim()
             }
             return ""
           }
@@ -1533,6 +1606,16 @@ fn ms_is_pure_map_ctor_expr(
   let lp = find_open_before(tokens, expr_e - 1, expr_s)
   if lp <= expr_s {
     return false
+  }
+  // `mbt_compat::OrderedMap::(new|from_array|of|from_iter)(...)` / `mbt_compat::OrderedSet::...(...)`
+  if lp == expr_s + 5 && tokens[expr_s].raw == "mbt_compat" &&
+  tokens[expr_s + 1].kind == TokenKind::ColonColon &&
+  (tokens[expr_s + 2].raw == "OrderedMap" || tokens[expr_s + 2].raw == "OrderedSet") &&
+  tokens[expr_s + 3].kind == TokenKind::ColonColon && tokens[expr_s + 4].kind == TokenKind::Ident {
+    let nm = tokens[expr_s + 4].raw
+    if nm == "new" || nm == "from_array" || nm == "of" || nm == "from_iter" {
+      return true
+    }
   }
   // `mbt_compat::<ctor>(...)`
   if lp == expr_s + 3 && tokens[expr_s].raw == "mbt_compat" &&
@@ -1808,9 +1891,10 @@ fn ms_is_proven_pure_map_recv(
       if pure_map_vars.contains(tk.raw) {
         return true
       }
-      return pkg.pure_map_globals.contains(tk.raw) && !local_var_types.contains(tk.raw) && !forbidden_fns.contains(tk.raw)
-    }
-    if recv_end >= 2 && tokens[recv_end - 1].kind == TokenKind::Dot {
+      if pkg.pure_map_globals.contains(tk.raw) && !local_var_types.contains(tk.raw) && !forbidden_fns.contains(tk.raw) {
+        return true
+      }
+    } else if recv_end >= 2 && tokens[recv_end - 1].kind == TokenKind::Dot {
       let base_ty = ms_infer_expr_ty(pkg, tokens, recv_end - 2, content, qfi_opt, local_var_types)
       let bh = ms_type_head(base_ty)
       if bh.length() > 0 && !ms_is_qualified_external_ty(base_ty) &&
@@ -1818,12 +1902,12 @@ fn ms_is_proven_pure_map_recv(
         return true
       }
     }
-    return false
   }
   if tk.kind == TokenKind::RParen {
     let rs = receiver_path_start_token(tokens, recv_end)
-    if rs >= 0 && rs <= recv_end {
-      return ms_is_pure_map_ctor_expr(pkg, tokens, rs, recv_end + 1, local_var_types, forbidden_fns, active_generics)
+    if rs >= 0 && rs <= recv_end &&
+    ms_is_pure_map_ctor_expr(pkg, tokens, rs, recv_end + 1, local_var_types, forbidden_fns, active_generics) {
+      return true
     }
   }
   false
@@ -2592,8 +2676,21 @@ fn ms_scan_span(
           if kk == TokenKind::Eq && ms_is_named_call_arg_eq(tokens, lhs_end, s) {
             ()
           } else {
-            // Variable reassignment `xs = ...`: fail-closed when LHS type is unknown
-            let vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+            // Variable reassignment `xs = ...`: fail-closed when both LHS and RHS types are unknown
+            let mut vty = ms_infer_expr_ty(pkg, tokens, lhs_end, content, qfi_opt, local_var_types)
+            if vty.length() == 0 && i + 1 < e {
+              let rhs_end_a = ms_postfix_expr_end(tokens, i + 1, e)
+              let at_stmt_end = rhs_end_a + 1 >= e ||
+              tokens[rhs_end_a + 1].newline_before ||
+              tokens[rhs_end_a + 1].kind == TokenKind::Semi ||
+              tokens[rhs_end_a + 1].kind == TokenKind::RBrace
+              if rhs_end_a >= i + 1 && at_stmt_end {
+                let rty_a = ms_infer_expr_ty(pkg, tokens, rhs_end_a, content, qfi_opt, local_var_types)
+                if ms_is_builtin_scalar_ty(rty_a) {
+                  vty = rty_a
+                }
+              }
+            }
             if vty.length() == 0 {
               sum.mutates_any_array = true
               sum.unknown = true
