@@ -1,0 +1,631 @@
+///| Unit tests for Stage A & lower_error gap fixes:
+///| 1. Struct update `{ ..base, ... }` static constructor & `Array::remove` type propagation (fail-closed)
+///| 2. Array rest pattern `[step, .. rest] if guard => ...` (2-token rest binding without `as`)
+///| 3. Top-level `let` non-raising closure containing `try`/`catch` & stdlib raising calls with known `--dep` args
+
+///|
+test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::remove" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "optpkg",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  // 1. Cross-package verified `--dep` ABI v2 struct + `pionc doc --json` fn signature for `@optpkg.Options::default()`
+  let dep_src = SourceFile::{
+    rel_path: "opts.mbt",
+    content: "pub(all) struct Options {\n  fonts : Int\n  font_family : String\n}\npub fn Options::default() -> Options {\n  { fonts: 0, font_family: \"\" }\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep optpkg transpiles cleanly")
+  let optpkg_doc = "{\"packages\":[{\"name\":\"optpkg\",\"items\":[{\"kind\":\"fn\",\"name\":\"Options::default\",\"sig\":\"pub fn Options::default() -> Options\"}]}]}"
+
+  let user_src = SourceFile::{
+    rel_path: "use_opts.mbt",
+    content: "pub fn make_opts(fonts : Int, own : String) -> @optpkg.Options {\n  { ..@optpkg.Options::default(), fonts, font_family: own }\n}\n",
+    is_test: false,
+  }
+  let user_res = transpile_package_with_abis([user_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  assert_true(user_res.blockers == 0, "cross-pkg static ctor struct update has 0 blockers")
+  let mut user_out = ""
+  for f in user_res.files {
+    if f.rel_path == "use_opts.pion" {
+      user_out = f.content
+    }
+  }
+  assert_true(str_has(user_out, "optpkg::Options::{"), "cross-pkg static ctor resolves to optpkg::Options::")
+
+  // 1b. Fail-closed: cross-pkg unknown static method `@optpkg.Options::nonexistent()` MUST fail closed
+  let bad_method_src = SourceFile::{
+    rel_path: "bad_method.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@optpkg.Options::nonexistent(), fonts: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_method_res = transpile_package_with_abis([bad_method_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_method = false
+  for d in bad_method_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_method = true
+    }
+  }
+  assert_true(saw_ambig_method, "cross-pkg unknown static method must fail closed")
+
+  // 1c. Local static method returning a DIFFERENT struct (`A::make_b() -> B`) MUST resolve to `B::` (never `A::`)
+  let diff_ret_src = SourceFile::{
+    rel_path: "diff_ret.mbt",
+    content: "pub struct A {\n  x : Int\n  a : Int\n}\n" +
+    "pub struct B {\n  x : Int\n  b : Int\n}\n" +
+    "pub fn A::make_b() -> B {\n  { x: 1, b: 9 }\n}\n" +
+    "pub fn run() -> Int {\n  let v = { ..A::make_b(), x: 2 }\n  v.x + v.b\n}\n",
+    is_test: false,
+  }
+  let diff_ret_res = transpile_package([diff_ret_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(diff_ret_res.blockers == 0, "A::make_b() -> B struct update has 0 blockers")
+  let mut diff_ret_out = ""
+  for f in diff_ret_res.files {
+    if f.rel_path == "diff_ret.pion" {
+      diff_ret_out = f.content
+    }
+  }
+  assert_true(str_has(diff_ret_out, "B::{ ..A::make_b(), x: 2 }"), "A::make_b() -> B resolves to B::, never A::")
+
+  // 2. Fail-closed: unknown package static ctor without `--dep` ABI MUST emit MBT2PION_AMBIGUOUS_STRUCT_UPDATE
+  let bad_unk_src = SourceFile::{
+    rel_path: "bad_unk.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@missing.Options::default(), fonts: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_unk_res = transpile_package([bad_unk_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_unk = false
+  for d in bad_unk_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_unk = true
+    }
+  }
+  assert_true(saw_ambig_unk, "unknown pkg static ctor without --dep ABI must fail closed")
+
+  // 3. Fail-closed: cross-pkg static ctor with nonexistent overridden field MUST fail closed
+  let bad_fld_src = SourceFile::{
+    rel_path: "bad_fld.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@optpkg.Options::default(), nonexistent: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_fld_res = transpile_package_with_abis([bad_fld_src], empty_api_map(), default_recipes(), [], [], [optpkg_doc], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_fld = false
+  for d in bad_fld_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_fld = true
+    }
+  }
+  assert_true(saw_ambig_fld, "cross-pkg static ctor with unknown field must fail closed")
+
+  // 4. Local static ctor + `Array::remove` element type propagation (`let k = items.remove(at); { ..k, ... }`)
+  let local_src = SourceFile::{
+    rel_path: "local_upd.mbt",
+    content: "pub struct Item {\n  id : Int\n  state : String\n  wanted : Bool\n}\n" +
+    "pub fn Item::default() -> Item {\n  { id: 0, state: \"idle\", wanted: false }\n}\n" +
+    "pub fn promote(items : Array[Item], at : Int) -> Item {\n" +
+    "  let k = items.remove(at)\n" +
+    "  items.insert(0, { ..k, state: \"going\", wanted: true })\n" +
+    "  { ..Item::default(), id: 42 }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let local_res = transpile_package([local_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(local_res.blockers == 0, "local static ctor and Array::remove struct update have 0 blockers")
+  let mut local_out = ""
+  for f in local_res.files {
+    if f.rel_path == "local_upd.pion" {
+      local_out = f.content
+    }
+  }
+  assert_true(str_has(local_out, "Item::{ ..k, state: \"going\", wanted: true }"), "Array::remove propagates element struct type Item")
+  assert_true(str_has(local_out, "Item::{ ..Item::default(), id: 42 }"), "local static ctor resolves to Item::")
+}
+
+///|
+test "stage_a_gaps: array rest pattern [step, .. rest] with if guard and nested ctor" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  let src = SourceFile::{
+    rel_path: "rest_pat.mbt",
+    content: "pub enum Wrap {\n  List(ArrayView[Int])\n}\n" +
+    "pub fn walk(path : ArrayView[String]) -> Int {\n" +
+    "  match path {\n" +
+    "    [step, .. rest] if step.length() > 0 => rest.length()\n" +
+    "    [\"*\", .. rest] => rest.length() + 1\n" +
+    "    [] => 0\n" +
+    "    _ => -1\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn head_tail(w : Wrap) -> Int {\n" +
+    "  match w {\n" +
+    "    List([h, .. tail]) if h > 0 => h + tail.length()\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut has_stage_a_err = false
+  for d in res.diagnostics {
+    if d.code != "MBT2PION_PROBE_RESIDUAL" {
+      has_stage_a_err = true
+    }
+  }
+  assert_true(!has_stage_a_err, "[step, .. rest] with guard and nested ctor have 0 Stage A errors")
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "rest_pat.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "mbt_compat::__mbt_slice_borrow("), "2-token .. rest binds tail slice via __mbt_slice_borrow")
+
+  // Fail-closed: multiple `..` rest patterns in one array pattern
+  let bad_src = SourceFile::{
+    rel_path: "bad_rest.mbt",
+    content: "pub fn bad(xs : Array[Int]) -> Int {\n  match xs {\n    [a, .. r1, .. r2] => a + r1.length() + r2.length()\n    _ => 0\n  }\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(bad_res.blockers >= 1, "multiple .. rest patterns must fail closed")
+}
+
+///|
+test "stage_a_gaps: top-level let closure try/catch and stdlib raising call with dep arg" {
+  let cfg = default_error_lower_config()
+  let dep_abi = PackageAbi::{
+    package_name: "host",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    raising_fns: [],
+    ffi_shim_prefix: "",
+    publishable: true,
+    empty_target_pkg: false,
+    empty_target: "",
+  }
+  let st = empty_symbol_table()
+  symtab_load_dep_abi(st, "host", dep_abi)
+  let env = build_external_error_env(st, [("host", dep_abi)], Map())
+
+  // 1. Top-level `let` containing non-raising closure `fn(_) { try Some(@json.parse(@host.state())) catch { _ => None } }`
+  let src_ok = "let computed_val : Int = make_computed(fn(_) {\n" +
+  "  let v = try Some(@json.parse(@host.state())) catch { _ => None }\n" +
+  "  match v { Some(_) => 1; None => 0 }\n" +
+  "})\n" +
+  "pub fn read_limit() -> Int {\n" +
+  "  @string.parse_int(@host.env(\"LIMIT\")[:]) catch { _ => 16384 }\n" +
+  "}\n"
+  let d_ok : Array[Diag] = []
+  let out_ok = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "ok.mbt", content: src_ok, is_test: false }],
+    cfg,
+    env,
+    d_ok,
+  )
+  assert_true(d_ok.length() == 0, "top-level let closure try/catch and known-dep arg parse_int have 0 diags")
+  assert_true(str_has(out_ok[0].content, "mbt_compat::mbt_json_parse(@host.state())"), "top-level let closure json.parse lowered")
+  assert_true(str_has(out_ok[0].content, "mbt_compat::str_try_parse_int(@host.env(\"LIMIT\")[:])"), "parse_int with known-dep slice arg lowered")
+
+  // 2. Fail-closed: unknown external pkg inside `parse_int(...) catch` without `--dep`
+  let src_unk = "pub fn bad_limit() -> Int {\n  @string.parse_int(@unknown.env(\"LIMIT\")[:]) catch { _ => 16384 }\n}\n"
+  let d_unk : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "unk.mbt", content: src_unk, is_test: false }],
+    cfg,
+    env,
+    d_unk,
+  )
+  assert_true(d_unk.length() >= 1, "unknown external arg inside catch must fail closed")
+
+  // 3. Fail-closed: `const` initializer with closure containing `try`/`catch`
+  let src_const = "const BAD_C : Int = make_computed(fn(_) { @json.parse(\"1\") catch { _ => 0 } })\n"
+  let d_const : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_c.mbt", content: src_const, is_test: false }],
+    cfg,
+    env,
+    d_const,
+  )
+  assert_true(d_const.length() >= 1, "top-level const with closure try/catch must fail closed")
+
+  // 4. Fail-closed: top-level `let` closure with uncaught `raise`
+  let src_raise = "priv suberror E String\nlet bad_r : Int = make_computed(fn(_) { raise E(\"boom\") })\n"
+  let d_raise : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_r.mbt", content: src_raise, is_test: false }],
+    cfg,
+    env,
+    d_raise,
+  )
+  assert_true(d_raise.length() >= 1, "top-level let closure with uncaught raise must fail closed")
+
+  // 5. Fail-closed: top-level `let` closure whose default parameter contains `try`/`catch`
+  let src_def_param = "let bad_def = fn(x? : Int = try @json.parse(\"1\") catch { _ => 0 }) { x }\n"
+  let d_def_param : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_def.mbt", content: src_def_param, is_test: false }],
+    cfg,
+    env,
+    d_def_param,
+  )
+  assert_true(d_def_param.length() >= 1, "top-level let closure default param with try/catch must fail closed")
+
+  // 6. Fail-closed: nested inline `fn` closure inside a function whose default param contains `try`/`catch`
+  let src_nested_def = "pub fn outer() -> Int {\n" +
+  "  let g = fn(x? : Int = try @json.parse(\"1\") catch { _ => 0 }) { x }\n" +
+  "  g()\n" +
+  "}\n"
+  let d_nested_def : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "nested_def.mbt", content: src_nested_def, is_test: false }],
+    cfg,
+    env,
+    d_nested_def,
+  )
+  assert_true(d_nested_def.length() >= 1, "nested inline closure default param with try/catch must fail closed")
+}
+
+///|
+test "stage_a_gaps: generic static method type-param T colliding with struct T fails closed; blackbox & dep alias resolve" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: true,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  // 1. Local generic static method `pub fn[T] Factory::keep(value : T) -> T` colliding with `struct T`
+  let local_gen_src = SourceFile::{
+    rel_path: "local_gen.mbt",
+    content: "pub struct B {\n  x : Int\n  y : Int\n}\n" +
+    "pub struct T {\n  x : Int\n  y : Int\n}\n" +
+    "pub struct Factory {\n  id : Int\n}\n" +
+    "pub fn[T] Factory::keep(value : T) -> T {\n  value\n}\n" +
+    "pub fn run(b : B) -> Int {\n  let u = { ..Factory::keep(b), x: 1 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let local_gen_res = transpile_package([local_gen_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut local_gen_ambig = false
+  for d in local_gen_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      local_gen_ambig = true
+    }
+  }
+  assert_true(local_gen_ambig, "local generic Factory::keep(b) -> T colliding with struct T must fail closed")
+  for f in local_gen_res.files {
+    assert_true(!str_has(f.content, "T::{"), "local generic Factory::keep must never fabricate T::{")
+  }
+
+  // 2. Cross-package generic `@dep.Factory::keep(b)` colliding with `dep::T`, plus `@d` alias -> canon `dep` non-generic `@d.Factory::make()`
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "dep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let dep_src = SourceFile::{
+    rel_path: "dep.mbt",
+    content: "pub(all) struct B {\n  x : Int\n  y : Int\n}\n" +
+    "pub(all) struct T {\n  x : Int\n  y : Int\n}\n" +
+    "pub(all) struct Factory {\n  id : Int\n}\n" +
+    "pub fn Factory::make() -> B {\n  { x: 1, y: 2 }\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep package transpiles cleanly")
+  let dep_doc = "{\"packages\":[{\"name\":\"dep\",\"items\":[" +
+  "{\"kind\":\"fn\",\"name\":\"Factory::keep\",\"sig\":\"pub fn[T] Factory::keep(value : T) -> T\"}," +
+  "{\"kind\":\"fn\",\"name\":\"Factory::make\",\"sig\":\"pub fn Factory::make() -> B\"}" +
+  "]}]}"
+
+  let xpkg_gen_src = SourceFile::{
+    rel_path: "xpkg_gen.mbt",
+    content: "pub fn run(b : @dep.B) -> Int {\n  let u = { ..@dep.Factory::keep(b), x: 1 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let xpkg_gen_res = transpile_package_with_abis([xpkg_gen_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("dep", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut xpkg_gen_ambig = false
+  for d in xpkg_gen_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      xpkg_gen_ambig = true
+    }
+  }
+  assert_true(xpkg_gen_ambig, "cross-pkg generic @dep.Factory::keep(b) -> T colliding with dep::T must fail closed")
+  for f in xpkg_gen_res.files {
+    assert_true(!str_has(f.content, "dep::T::{"), "cross-pkg generic Factory::keep must never fabricate dep::T::{")
+  }
+
+  // 3. Cross-package `--dep d=<dir>` alias (`d` != canonical pkg `dep`) non-generic `@d.Factory::make()` resolves cleanly
+  let xpkg_alias_src = SourceFile::{
+    rel_path: "xpkg_alias.mbt",
+    content: "pub fn run() -> Int {\n  let u = { ..@d.Factory::make(), x: 9 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let xpkg_alias_res = transpile_package_with_abis([xpkg_alias_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("d", dep_res.abi)], [], app_opts, [], false, noop_check)
+  assert_true(xpkg_alias_res.blockers == 0, "cross-pkg alias @d.Factory::make() struct update has 0 blockers")
+  let mut xpkg_alias_out = ""
+  for f in xpkg_alias_res.files {
+    if f.rel_path == "xpkg_alias.pion" {
+      xpkg_alias_out = f.content
+    }
+  }
+  assert_true(str_has(xpkg_alias_out, "d::B::{"), "cross-pkg alias @d.Factory::make() resolves to d::B::")
+
+  // 4. Blackbox test private static method `Only::make() -> C` resolves to `C::`
+  let bb_prod_src = SourceFile::{
+    rel_path: "prod.mbt",
+    content: "pub fn dummy() -> Int { 0 }\n",
+    is_test: false,
+  }
+  let bb_test_src = SourceFile::{
+    rel_path: "bb_test.mbt",
+    content: "struct C {\n  a : Int\n  b : Int\n}\n" +
+    "struct Only {\n  k : Int\n}\n" +
+    "fn Only::make() -> C {\n  { a: 1, b: 2 }\n}\n" +
+    "test \"bb static ctor\" {\n  let v = { ..Only::make(), a: 10 }\n  assert_eq(v.a + v.b, 12)\n}\n",
+    is_test: true,
+  }
+  let bb_res = transpile_package([bb_prod_src, bb_test_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(bb_res.blockers == 0, "blackbox private Only::make() -> C struct update has 0 blockers")
+  let mut bb_out = ""
+  for f in bb_res.files {
+    if f.rel_path == "bb_test.pion" {
+      bb_out = f.content
+    }
+  }
+  assert_true(str_has(bb_out, "C::{ ..Only::make(), a: 10 }"), "blackbox Only::make() resolves to C::")
+}
+
+///|
+test "stage_a_gaps: postfix receiver struct update must not inherit outer expected return type" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let preamble = "pub struct B {\n  x : Int\n  y : Int\n}\n" +
+  "pub struct Out {\n  x : Int\n  y : Int\n}\n" +
+  "pub struct Factory {\n  id : Int\n}\n" +
+  "pub fn[A] Factory::keep(v : A) -> A {\n  v\n}\n" +
+  "pub fn B::pick(self : B) -> Out {\n  { x: 42, y: self.y }\n}\n" +
+  "pub fn Out::pick(self : Out) -> Out {\n  { x: 7, y: self.y }\n}\n" +
+  "pub fn bump(n : Int) -> Int {\n  n + 1\n}\n"
+
+  // 1. Direct postfix `.pick()` -> must fail closed, NEVER fabricate `Out::{`
+  let direct_src = SourceFile::{
+    rel_path: "direct.mbt",
+    content: preamble + "pub fn make(b : B) -> Out {\n  { ..Factory::keep(b), x: bump(1) }.pick()\n}\n",
+    is_test: false,
+  }
+  let direct_res = transpile_package([direct_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut direct_ambig = false
+  for d in direct_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      direct_ambig = true
+    }
+  }
+  assert_true(direct_ambig, "postfix { ..Factory::keep(b), ... }.pick() must fail closed")
+  for f in direct_res.files {
+    assert_true(!str_has(f.content, "Out::{ ..Factory::keep"), "postfix receiver must never inherit Out::{")
+  }
+
+  // 2. Parenthesized postfix `({ ..Factory::keep(b), ... }).pick()` -> must fail closed
+  let paren_src = SourceFile::{
+    rel_path: "paren.mbt",
+    content: preamble + "pub fn make(b : B) -> Out {\n  ({ ..Factory::keep(b), x: bump(1) }).pick()\n}\n",
+    is_test: false,
+  }
+  let paren_res = transpile_package([paren_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut paren_ambig = false
+  for d in paren_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      paren_ambig = true
+    }
+  }
+  assert_true(paren_ambig, "parenthesized postfix ({ ..Factory::keep(b), ... }).pick() must fail closed")
+  for f in paren_res.files {
+    assert_true(!str_has(f.content, "Out::{ ..Factory::keep"), "parenthesized postfix receiver must never inherit Out::{")
+  }
+
+  // 3. Multiline chained `.pick()` -> must fail closed
+  let multi_src = SourceFile::{
+    rel_path: "multi.mbt",
+    content: preamble + "pub fn make(b : B) -> Out {\n  { ..Factory::keep(b), x: bump(1) }\n  .pick()\n}\n",
+    is_test: false,
+  }
+  let multi_res = transpile_package([multi_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut multi_ambig = false
+  for d in multi_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      multi_ambig = true
+    }
+  }
+  assert_true(multi_ambig, "multiline postfix { ..Factory::keep(b), ... }\\n.pick() must fail closed")
+  for f in multi_res.files {
+    assert_true(!str_has(f.content, "Out::{ ..Factory::keep"), "multiline postfix receiver must never inherit Out::{")
+  }
+
+  // 4. Block-wrapped postfix `{ { ..Factory::keep(b), x: bump(1) } }.pick()` and
+  //    `{ let _ = 0; { ..Factory::keep(b), x: bump(1) } }.pick()` -> must fail closed
+  let blk_wrap_src = SourceFile::{
+    rel_path: "blk_wrap.mbt",
+    content: preamble + "pub fn make(b : B) -> Out {\n  { { ..Factory::keep(b), x: bump(1) } }.pick()\n}\n",
+    is_test: false,
+  }
+  let blk_wrap_res = transpile_package([blk_wrap_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut blk_wrap_ambig = false
+  for d in blk_wrap_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      blk_wrap_ambig = true
+    }
+  }
+  assert_true(blk_wrap_ambig, "block-wrapped postfix { { ..Factory::keep(b), ... } }.pick() must fail closed")
+  for f in blk_wrap_res.files {
+    assert_true(!str_has(f.content, "Out::{ x: bump"), "block-wrapped postfix receiver must never inherit Out::{")
+  }
+
+  let stmt_wrap_src = SourceFile::{
+    rel_path: "stmt_wrap.mbt",
+    content: preamble + "pub fn make(b : B) -> Out {\n  { let _ = 0; { ..Factory::keep(b), x: bump(1) } }.pick()\n}\n",
+    is_test: false,
+  }
+  let stmt_wrap_res = transpile_package([stmt_wrap_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut stmt_wrap_ambig = false
+  for d in stmt_wrap_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      stmt_wrap_ambig = true
+    }
+  }
+  assert_true(stmt_wrap_ambig, "stmt-block-wrapped postfix { let _ = 0; { ..Factory::keep(b), ... } }.pick() must fail closed")
+  for f in stmt_wrap_res.files {
+    assert_true(!str_has(f.content, "Out::{ x: bump"), "stmt-block-wrapped postfix receiver must never inherit Out::{")
+  }
+
+  // 5. Positive: direct typed binding `let v : B = { ..Factory::keep(b), x: bump(1) }; v.pick()` resolves to `B::{`
+  //    AND emits compiler-enforced `let su_b_... : B = Factory::keep(b);`
+  let ok_src = SourceFile::{
+    rel_path: "ok.mbt",
+    content: preamble + "pub fn make_ok(b : B) -> Out {\n  let v : B = { ..Factory::keep(b), x: bump(1) }\n  v.pick()\n}\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package([ok_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(ok_res.blockers == 0, "typed binding let v : B = { ..Factory::keep(b), ... } has 0 blockers")
+  let mut ok_out = ""
+  for f in ok_res.files {
+    if f.rel_path == "ok.pion" {
+      ok_out = f.content
+    }
+  }
+  assert_true(str_has(ok_out, "B::{") && !str_has(ok_out, "Out::{ x: bump"), "typed binding resolves to B::{")
+  assert_true(str_has(ok_out, " : B = Factory::keep(b);"), "non-generic struct update emits compiler-enforced `: B` type annotation on base temp")
+}
+
+///|
+test "stage_a_gaps: generic struct update preserves declaration eval order with if-false type unifier" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  // 1. Local generic struct `Box[T]` with unannotated `same(s)` base & effectful `b` field
+  let local_src = SourceFile::{
+    rel_path: "gen_order.mbt",
+    content: "pub struct Box[T] {\n  mut a : Int\n  b : T\n}\n" +
+    "pub fn[A] same(v : A) -> A {\n  v\n}\n" +
+    "pub fn probe() -> Int {\n" +
+    "  let s : Box[Int] = Box::{ a: 1, b: 0 }\n" +
+    "  let result = Box::{ ..same(s), b: { s.a = 9; 7 } }\n" +
+    "  result.a * 100 + s.a * 10 + result.b\n" +
+    "}\n",
+    is_test: false,
+  }
+  let local_res = transpile_package([local_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(local_res.blockers == 0, "local generic Box struct update has 0 blockers")
+  let mut local_out = ""
+  for f in local_res.files {
+    if f.rel_path == "gen_order.pion" {
+      local_out = f.content
+    }
+  }
+  assert_true(str_has(local_out, "Box::{ a: __mbt_su_b_"), "local generic Box stays on declaration-order expansion")
+  assert_true(str_has(local_out, "if false { __mbt_su_b_"), "local generic Box emits if-false compile-time type unifier")
+
+  // 2. Cross-package generic `Box[T]` via static method `Box::same(s)`
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "gbox",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let dep_src = SourceFile::{
+    rel_path: "gbox.mbt",
+    content: "pub(all) struct Box[T] {\n  mut a : Int\n  b : T\n}\n" +
+    "pub fn[A] Box::same(v : A) -> A {\n  v\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep gbox transpiles cleanly")
+  let dep_doc = "{\"packages\":[{\"name\":\"gbox\",\"items\":[{\"kind\":\"fn\",\"name\":\"Box::same\",\"sig\":\"pub fn[A] Box::same(v : A) -> A\"}]}]}"
+
+  let xpkg_src = SourceFile::{
+    rel_path: "xpkg_order.mbt",
+    content: "pub fn probe() -> Int {\n" +
+    "  let s : @gbox.Box[Int] = @gbox.Box::{ a: 1, b: 0 }\n" +
+    "  let result = @gbox.Box::{ ..@gbox.Box::same(s), b: { s.a = 9; 7 } }\n" +
+    "  result.a * 100 + s.a * 10 + result.b\n" +
+    "}\n",
+    is_test: false,
+  }
+  let xpkg_res = transpile_package_with_abis([xpkg_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("gbox", dep_res.abi)], [], app_opts, [], false, noop_check)
+  assert_true(xpkg_res.blockers == 0, "cross-pkg generic Box struct update has 0 blockers")
+  let mut xpkg_out = ""
+  for f in xpkg_res.files {
+    if f.rel_path == "xpkg_order.pion" {
+      xpkg_out = f.content
+    }
+  }
+  assert_true(str_has(xpkg_out, "gbox::Box::{ a: __mbt_su_b_"), "cross-pkg generic Box stays on declaration-order expansion")
+  assert_true(str_has(xpkg_out, "if false { __mbt_su_b_"), "cross-pkg generic Box emits if-false compile-time type unifier")
+}

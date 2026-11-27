@@ -75,27 +75,60 @@ fn fmt_write_indent(sb : StringBuilder, level : Int) -> Unit {
 }
 
 ///|
-/// Normalize intra-line horizontal whitespace outside string/char/byte literals
-/// and line comments (`//`), collapsing runs of spaces/tabs to a single space
-/// while preserving comments and literals verbatim.
-fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
+/// Normalize intra-line horizontal whitespace outside lexer-identified literal/interpolation
+/// spans and line comments (`//`), collapsing runs of spaces/tabs to a single space while
+/// preserving comments, literals (`StringLit`, `InterpStart`/`Mid`/`End`, `CharLit`, `ByteLit`),
+/// and `#|` raw multiline spans verbatim.
+/// Populates `body_lit_starts`/`body_lit_ends` with the literal spans mapped into the returned
+/// body string, and returns `(normalized_body, body_raw_pos)`.
+fn fmt_normalize_line_body(
+  line : String,
+  start : Int,
+  end : Int,
+  raw_ml_pos : Int,
+  lit_starts : Array[Int],
+  lit_ends : Array[Int],
+  lit_lo : Int,
+  lit_hi : Int,
+  body_lit_starts : Array[Int],
+  body_lit_ends : Array[Int],
+) -> (String, Int) {
   let sb = StringBuilder()
   let utf8 = host_str_is_utf8()
+  let has_raw = raw_ml_pos >= start && raw_ml_pos < end
+  let norm_end = if has_raw { raw_ml_pos } else { end }
   let mut i = start
+  let mut lk = lit_lo
   let mut in_space = false
-  while i < end {
-    let c = str_code_at(line, i)
-    // Line comment: copy rest of trimmed line verbatim
-    if c == 47 && i + 1 < end && str_code_at(line, i + 1) == 47 {
+  while i < norm_end {
+    while lk < lit_hi && lit_ends[lk] <= i {
+      lk = lk + 1
+    }
+    if lk < lit_hi && lit_starts[lk] <= i && i < lit_ends[lk] {
       if in_space {
         sb.write_char(' ')
         in_space = false
       }
-      sb_write_range(sb, line, i, end)
+      let seg_end = if lit_ends[lk] < norm_end { lit_ends[lk] } else { norm_end }
+      let bs = sb.length()
+      sb_write_range(sb, line, i, seg_end)
+      let be = sb.length()
+      body_lit_starts.push(bs)
+      body_lit_ends.push(be)
+      i = seg_end
+      continue
+    }
+    let c = str_code_at(line, i)
+    // Line comment: copy rest of trimmed line verbatim
+    if c == 47 && i + 1 < norm_end && str_code_at(line, i + 1) == 47 {
+      if in_space {
+        sb.write_char(' ')
+        in_space = false
+      }
+      sb_write_range(sb, line, i, norm_end)
       break
     }
-    // String literal "..." or char / byte literal '...' (also covers the
-    // '...' part of b'...'): copied verbatim up to the matching quote.
+    // Fallback for malformed/unterminated quote literals outside lexed spans
     if c == 34 || c == 39 {
       if in_space {
         sb.write_char(' ')
@@ -103,10 +136,10 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
       }
       let lit_start = i
       i = i + 1
-      while i < end {
+      while i < norm_end {
         let sc = str_code_at(line, i)
         i = i + 1
-        if sc == 92 && i < end {
+        if sc == 92 && i < norm_end {
           i = i + 1
         } else if sc == c {
           break
@@ -132,7 +165,16 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
       i = i + str_scalar_len(line, i, utf8)
     }
   }
-  sb.to_string()
+  if has_raw {
+    if in_space {
+      sb.write_char(' ')
+    }
+    let body_raw_pos = sb.length()
+    sb_write_range(sb, line, raw_ml_pos, end)
+    (sb.to_string(), body_raw_pos)
+  } else {
+    (sb.to_string(), -1)
+  }
 }
 
 ///|
@@ -145,6 +187,65 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
 /// - strictly idempotent: `format_source(format_source(s)) == format_source(s)`
 pub fn format_source(source : String) -> String {
   let len = source.length()
+  // Single source of truth for ALL literal, interpolation, and `#|` raw multiline spans:
+  // reuse lexer.pion directly so `StringLit`, `InterpStart`/`Mid`/`End`, `CharLit`, `ByteLit`,
+  // inline `#|`, and multi-line interpolated strings match lexer semantics 100%.
+  let ls = lex_with_spans("<fmt>", source)
+  let raw_starts : Array[Int] = []
+  let raw_ends : Array[Int] = []
+  let lit_starts : Array[Int] = []
+  let lit_ends : Array[Int] = []
+  let lit_is_interp_cont : Array[Bool] = []
+  let mut ti = 0
+  let tlen = ls.tokens.length()
+  while ti < tlen {
+    let tok = ls.tokens[ti]
+    match tok.kind {
+      StringLit(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(false)
+        if tok.raw.length() >= 2 &&
+          str_code_at(tok.raw, 0) == 35 &&
+          str_code_at(tok.raw, 1) == 124 {
+          raw_starts.push(ls.starts[ti])
+          raw_ends.push(ls.ends[ti])
+        }
+      }
+      InterpStart(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(false)
+      }
+      InterpMid(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(true)
+      }
+      InterpEnd(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(true)
+      }
+      CharLit(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(false)
+      }
+      ByteLit(_) => {
+        lit_starts.push(ls.starts[ti])
+        lit_ends.push(ls.ends[ti])
+        lit_is_interp_cont.push(false)
+      }
+      _ => ()
+    }
+    ti = ti + 1
+  }
+  let mut raw_idx = 0
+  let raw_count = raw_starts.length()
+  let mut lit_idx = 0
+  let lit_count = lit_starts.length()
+
   let out = StringBuilder()
   let opener_indents : Array[Int] = []
   // 0 = delimiter `{`/`(`/`[`, 1 = JSX opening tag header `<Tag`, 2 = JSX element body `>...</Tag>`
@@ -163,19 +264,44 @@ pub fn format_source(source : String) -> String {
     if pos < len && str_code_at(source, pos) == 10 {
       pos = pos + 1
     }
-    // Strip trailing CR / spaces / tabs
-    while line_end > line_start {
-      let tc = str_code_at(source, line_end - 1)
-      if tc == 13 || fmt_is_hspace(tc) {
-        line_end = line_end - 1
-      } else {
-        break
-      }
-    }
     // Strip leading spaces / tabs
     let mut trim_start = line_start
     while trim_start < line_end && fmt_is_hspace(str_code_at(source, trim_start)) {
       trim_start = trim_start + 1
+    }
+    while raw_idx < raw_count && raw_ends[raw_idx] < line_start {
+      raw_idx = raw_idx + 1
+    }
+    let raw_ml_pos = if raw_idx < raw_count {
+      let ts = raw_starts[raw_idx]
+      let te = raw_ends[raw_idx]
+      if ts >= line_start && ts < line_end {
+        ts
+      } else if ts < line_start && te >= line_start {
+        trim_start
+      } else {
+        -1
+      }
+    } else {
+      -1
+    }
+    if raw_ml_pos < 0 {
+      // Strip trailing CR / spaces / tabs on non-`#|` lines
+      while line_end > trim_start {
+        let tc = str_code_at(source, line_end - 1)
+        if tc == 13 || fmt_is_hspace(tc) {
+          line_end = line_end - 1
+        } else {
+          break
+        }
+      }
+    } else if line_end > raw_ml_pos + 2 && str_code_at(source, line_end - 1) == 13 {
+      // Match lexer.pion: strip a single CRLF `\r`, unless the raw string payload itself
+      // ends with `\r` (e.g. `#|a\r\r\n`), in which case keeping the CRLF preserves both
+      // the lexer's decoded value and formatter idempotency.
+      if !(line_end > raw_ml_pos + 3 && str_code_at(source, line_end - 2) == 13) {
+        line_end = line_end - 1
+      }
     }
     if trim_start >= line_end {
       if wrote_any {
@@ -189,53 +315,79 @@ pub fn format_source(source : String) -> String {
       pending_blank = false
     }
 
-    let body = fmt_normalize_line_body(source, trim_start, line_end)
+    while lit_idx < lit_count && lit_ends[lit_idx] <= line_start {
+      lit_idx = lit_idx + 1
+    }
+    let mut lit_hi = lit_idx
+    while lit_hi < lit_count && lit_starts[lit_hi] < line_end {
+      lit_hi = lit_hi + 1
+    }
+    let is_interp_cont = lit_idx < lit_hi &&
+      lit_is_interp_cont[lit_idx] &&
+      lit_starts[lit_idx] == trim_start
+    let body_lit_starts : Array[Int] = []
+    let body_lit_ends : Array[Int] = []
+    let (body, body_raw_pos) = fmt_normalize_line_body(
+      source,
+      trim_start,
+      line_end,
+      raw_ml_pos,
+      lit_starts,
+      lit_ends,
+      lit_idx,
+      lit_hi,
+      body_lit_starts,
+      body_lit_ends,
+    )
     let blen = body.length()
+    let scan_end = if body_raw_pos >= 0 { body_raw_pos } else { blen }
 
     // Consume leading closing delimiters (`}`, `)`, `]`, `</...>`, or multi-line JSX `>` / `/>`)
     let mut line_indent = cur_indent
     let mut i = 0
     let mut opened_unclosed = 0
-    if opener_kinds.length() > 0 && opener_kinds[opener_kinds.length() - 1] == 1 {
-      if i + 1 < blen && str_code_at(body, i) == 47 && str_code_at(body, i + 1) == 62 {
+    if !is_interp_cont {
+      if opener_kinds.length() > 0 && opener_kinds[opener_kinds.length() - 1] == 1 {
+        if i + 1 < blen && str_code_at(body, i) == 47 && str_code_at(body, i + 1) == 62 {
+          match opener_indents.pop() {
+            Some(prev_indent) => line_indent = prev_indent
+            None => line_indent = 0
+          }
+          let _ = opener_kinds.pop()
+          i = i + 2
+        } else if i < blen && str_code_at(body, i) == 62 {
+          match opener_indents.pop() {
+            Some(prev_indent) => line_indent = prev_indent
+            None => line_indent = 0
+          }
+          let _ = opener_kinds.pop()
+          opener_indents.push(line_indent)
+          opener_kinds.push(2)
+          opened_unclosed = opened_unclosed + 1
+          i = i + 1
+        }
+      }
+      while i < blen && fmt_is_closer(str_code_at(body, i)) {
         match opener_indents.pop() {
           Some(prev_indent) => line_indent = prev_indent
           None => line_indent = 0
         }
         let _ = opener_kinds.pop()
-        i = i + 2
-      } else if i < blen && str_code_at(body, i) == 62 {
-        match opener_indents.pop() {
-          Some(prev_indent) => line_indent = prev_indent
-          None => line_indent = 0
-        }
-        let _ = opener_kinds.pop()
-        opener_indents.push(line_indent)
-        opener_kinds.push(2)
-        opened_unclosed = opened_unclosed + 1
         i = i + 1
       }
-    }
-    while i < blen && fmt_is_closer(str_code_at(body, i)) {
-      match opener_indents.pop() {
-        Some(prev_indent) => line_indent = prev_indent
-        None => line_indent = 0
+      let in_hdr_after_closers = opener_kinds.length() > 0 &&
+        opener_kinds[opener_kinds.length() - 1] == 1
+      if !in_hdr_after_closers &&
+        i + 1 < blen &&
+        str_code_at(body, i) == 60 &&
+        str_code_at(body, i + 1) == 47 {
+        match opener_indents.pop() {
+          Some(prev_indent) => line_indent = prev_indent
+          None => line_indent = 0
+        }
+        let _ = opener_kinds.pop()
+        i = fmt_skip_jsx_close_tag(body, blen, i)
       }
-      let _ = opener_kinds.pop()
-      i = i + 1
-    }
-    let in_hdr_after_closers = opener_kinds.length() > 0 &&
-      opener_kinds[opener_kinds.length() - 1] == 1
-    if !in_hdr_after_closers &&
-      i + 1 < blen &&
-      str_code_at(body, i) == 60 &&
-      str_code_at(body, i + 1) == 47 {
-      match opener_indents.pop() {
-        Some(prev_indent) => line_indent = prev_indent
-        None => line_indent = 0
-      }
-      let _ = opener_kinds.pop()
-      i = fmt_skip_jsx_close_tag(body, blen, i)
     }
 
     fmt_write_indent(out, line_indent)
@@ -247,20 +399,32 @@ pub fn format_source(source : String) -> String {
     let mut cur_base = line_indent
     let mut last_sig_char = if i > 0 { str_code_at(body, i - 1) } else { 0 }
     let mut last_sig_pos = if i > 0 { i - 1 } else { -1 }
-    while i < blen {
+    let mut blk = 0
+    let bl_cnt = body_lit_starts.length()
+    while i < scan_end {
+      while blk < bl_cnt && body_lit_ends[blk] <= i {
+        blk = blk + 1
+      }
+      if blk < bl_cnt && body_lit_starts[blk] <= i && i < body_lit_ends[blk] {
+        let seg_end = if body_lit_ends[blk] < scan_end { body_lit_ends[blk] } else { scan_end }
+        last_sig_char = 34
+        last_sig_pos = if seg_end > i { seg_end - 1 } else { i }
+        i = seg_end
+        continue
+      }
       let c = str_code_at(body, i)
       // Line comment: ignore rest of line for delimiter tracking
-      if c == 47 && i + 1 < blen && str_code_at(body, i + 1) == 47 {
+      if c == 47 && i + 1 < scan_end && str_code_at(body, i + 1) == 47 {
         break
       }
       // String literal
       if c == 34 {
         let start_q = i
         i = i + 1
-        while i < blen {
+        while i < scan_end {
           let sc = str_code_at(body, i)
           i = i + 1
-          if sc == 92 && i < blen {
+          if sc == 92 && i < scan_end {
             i = i + 1
           } else if sc == 34 {
             break
@@ -274,10 +438,10 @@ pub fn format_source(source : String) -> String {
       if c == 39 {
         let start_q = i
         i = i + 1
-        while i < blen {
+        while i < scan_end {
           let cc = str_code_at(body, i)
           i = i + 1
-          if cc == 92 && i < blen {
+          if cc == 92 && i < scan_end {
             i = i + 1
           } else if cc == 39 {
             break
