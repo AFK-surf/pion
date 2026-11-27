@@ -1622,6 +1622,83 @@ fn lower_anon_shorthand_struct_lit(
 
 ///| Resolve an anonymous `{ ... }` struct literal to its concrete local struct name `S`
 ///| (using expected type first, then unique field-set match across `ctx.struct_field_renames`)
+///| Return true if type string `ty` mentions any uninstantiated formal type parameter from `gparams`.
+fn static_ret_mentions_generic(ty : String, gparams : Array[String]) -> Bool {
+  if ty.length() == 0 || gparams.length() == 0 {
+    return false
+  }
+  let gset : Map[String, Bool] = Map()
+  for gp in gparams {
+    gset[gp] = true
+  }
+  type_mentions_any_generic(ty, gset)
+}
+
+///| Look up the concrete (non-generic-param-leaking) return type of a static method `Type::method`
+///| or cross-package `pkg::Type::method`, honoring blackbox shadowing and `--dep` alias -> canon pkg mapping.
+///| Returns `""` (fail-closed) when unknown or when the declared return type mentions a formal type parameter.
+fn lookup_static_method_concrete_ret_type(
+  ctx : StageAContext,
+  pkg_candidates : Array[String],
+  tname : String,
+  mname : String,
+) -> String {
+  if pkg_candidates.length() == 0 {
+    let key = tname + "::" + mname
+    if ctx.cur_is_blackbox {
+      let bb_shadowed = ctx.symtab.blackbox_fn_ret_types.contains(key) ||
+      ctx.symtab.blackbox_fn_param_types.contains(key) ||
+      ctx.symtab.blackbox_fn_type_params.contains(key)
+      if bb_shadowed {
+        let rty = match ctx.symtab.blackbox_fn_ret_types.get(key) {
+          Some(r) => r
+          None => ""
+        }
+        if rty.length() == 0 {
+          return ""
+        }
+        match ctx.symtab.blackbox_fn_type_params.get(key) {
+          Some(tps) => if static_ret_mentions_generic(rty, tps) { return "" }
+          None => ()
+        }
+        return rty
+      }
+    }
+    let rty = match ctx.symtab.fn_ret_types.get(key) {
+      Some(r) => r
+      None => ""
+    }
+    if rty.length() == 0 {
+      return ""
+    }
+    match ctx.symtab.fn_type_params.get(key) {
+      Some(tps) => if static_ret_mentions_generic(rty, tps) { return "" }
+      None => ()
+    }
+    return rty
+  }
+  // Cross-package lookup: check alias, raw pkg, and canonical package name
+  let mut rty = ""
+  for p in pkg_candidates {
+    let k = p + "::" + tname + "::" + mname
+    match ctx.symtab.fn_ret_types.get(k) {
+      Some(r) => if r.length() > 0 { rty = r; break }
+      None => ()
+    }
+  }
+  if rty.length() == 0 {
+    return ""
+  }
+  for p in pkg_candidates {
+    let k = p + "::" + tname + "::" + mname
+    match ctx.symtab.fn_type_params.get(k) {
+      Some(tps) => if static_ret_mentions_generic(rty, tps) { return "" }
+      None => ()
+    }
+  }
+  rty
+}
+
 ///| so we emit explicit `S::{ ... }` instead of anonymous `{ ... }` (which avoids Pion native SIGSEGV!).
 fn resolve_anon_struct_literal_name(
   ctx : StageAContext,
@@ -1695,21 +1772,27 @@ fn resolve_anon_struct_literal_name(
       ""
     }
     // Static method call base: `@pkg.Type::ctor(...)`, `pkg::Type::ctor(...)`, or `Type::ctor(...)`
-    // MUST look up the actual declared return type in `fn_ret_types` / `blackbox_fn_ret_types`
-    // (never blindly assume `Type::ctor(...)` returns `Type` — fail closed when unknown!).
+    // MUST look up the actual concrete declared return type (never blindly assume `Type::ctor(...)`
+    // returns `Type` and never treat an uninstantiated generic type param `T` as a struct `T`).
     let mut base_from_static_ctor = false
     if raw_base.length() == 0 && base_s > 0 && base_e > base_s {
       let bt0 = tokens[base_s]
-      let lookup_ret = fn(key : String) -> String {
-        match ctx.symtab.fn_ret_types.get(key) {
-          Some(rt) => if rt.length() > 0 { return rt }
+      let build_pkg_cands = fn(raw_pkg : String, mapped_pkg : String) -> Array[String] {
+        let cands : Array[String] = [mapped_pkg]
+        if raw_pkg != mapped_pkg {
+          cands.push(raw_pkg)
+        }
+        match ctx.symtab.dep_alias_to_canon_pkg.get(mapped_pkg) {
+          Some(cp) => if cp.length() > 0 && cp != mapped_pkg && cp != raw_pkg { cands.push(cp) }
           None => ()
         }
-        match ctx.symtab.blackbox_fn_ret_types.get(key) {
-          Some(rt) => if rt.length() > 0 { return rt }
-          None => ()
+        if raw_pkg != mapped_pkg {
+          match ctx.symtab.dep_alias_to_canon_pkg.get(raw_pkg) {
+            Some(cp) => if cp.length() > 0 && cp != mapped_pkg && cp != raw_pkg { cands.push(cp) }
+            None => ()
+          }
         }
-        ""
+        cands
       }
       if bt0.kind == TokenKind::PkgRef && base_s + 5 < base_e &&
       tokens[base_s + 1].kind == TokenKind::Dot &&
@@ -1722,10 +1805,7 @@ fn resolve_anon_struct_literal_name(
         let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
         let tname = tokens[base_s + 2].raw
         let mname = tokens[base_s + 4].raw
-        let mut rty = lookup_ret(mapped_pkg + "::" + tname + "::" + mname)
-        if rty.length() == 0 && raw_pkg != mapped_pkg {
-          rty = lookup_ret(raw_pkg + "::" + tname + "::" + mname)
-        }
+        let rty = lookup_static_method_concrete_ret_type(ctx, build_pkg_cands(raw_pkg, mapped_pkg), tname, mname)
         if rty.length() > 0 {
           let rclean = strip_type_args_sym(rty)
           if !str_has(rclean, "::") {
@@ -1753,10 +1833,7 @@ fn resolve_anon_struct_literal_name(
         let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
         let tname = tokens[base_s + 2].raw
         let mname = tokens[base_s + 4].raw
-        let mut rty = lookup_ret(mapped_pkg + "::" + tname + "::" + mname)
-        if rty.length() == 0 && raw_pkg != mapped_pkg {
-          rty = lookup_ret(raw_pkg + "::" + tname + "::" + mname)
-        }
+        let rty = lookup_static_method_concrete_ret_type(ctx, build_pkg_cands(raw_pkg, mapped_pkg), tname, mname)
         if rty.length() > 0 {
           let rclean = strip_type_args_sym(rty)
           if !str_has(rclean, "::") {
@@ -1778,7 +1855,7 @@ fn resolve_anon_struct_literal_name(
       tokens[base_s + 2].kind == TokenKind::Ident &&
       tokens[base_s + 3].kind == TokenKind::LParen &&
       find_matching_delim(tokens, base_s + 3) == base_e - 1 {
-        let rty = lookup_ret(bt0.raw + "::" + tokens[base_s + 2].raw)
+        let rty = lookup_static_method_concrete_ret_type(ctx, [], bt0.raw, tokens[base_s + 2].raw)
         if rty.length() > 0 {
           raw_base = rty
           base_from_static_ctor = true
@@ -4427,13 +4504,13 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       None => ()
     }
   }
-  // Local static method call `Type::method(...)` -> look up `symtab.fn_ret_types`
+  // Local static method call `Type::method(...)` -> concrete return type (honoring blackbox & generics)
   if t.kind == TokenKind::UpperIdent && start + 3 < end &&
   tokens[start + 1].kind == TokenKind::ColonColon && tokens[start + 2].kind == TokenKind::Ident &&
   tokens[start + 3].kind == TokenKind::LParen && find_matching_delim(tokens, start + 3) == end - 1 {
-    match ctx.symtab.fn_ret_types.get(t.raw + "::" + tokens[start + 2].raw) {
-      Some(rty) => if rty.length() > 0 { return rty }
-      None => ()
+    let rty = lookup_static_method_concrete_ret_type(ctx, [], t.raw, tokens[start + 2].raw)
+    if rty.length() > 0 {
+      return rty
     }
   }
   // Local method call `recv.method(...)` -> look up `Type::method` in `symtab.fn_ret_types`,
@@ -16363,9 +16440,15 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
             }
             if is_blackbox {
               ctx.symtab.blackbox_fn_param_types[qual_fn] = pts
+              if fn_added_g.length() > 0 {
+                ctx.symtab.blackbox_fn_type_params[qual_fn] = fn_added_g
+              }
             } else {
               ctx.symtab.local_fn_names[qual_fn] = true
               ctx.symtab.fn_param_types[qual_fn] = pts
+              if fn_added_g.length() > 0 {
+                ctx.symtab.fn_type_params[qual_fn] = fn_added_g
+              }
               register_local_fn_meta_f3d2(ctx, qual_fn, tokens, name_i + 3, cp, pnames, ptys)
               let p_renames = compute_param_renames(extract_raw_param_names(tokens, name_i + 3, cp))
               if p_renames.length() > 0 {
@@ -16396,18 +16479,22 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
                 ctx.symtab.method_unique_param_types.remove(mname)
                 ctx.symtab.method_unique_param_renames.remove(mname)
               }
-              if cp + 1 < n && tokens[cp + 1].kind == TokenKind::Arrow {
-                let mut re = cp + 2
-                let mut rd = 0
-                while re < n {
-                  let rk = tokens[re].kind
-                  if rd == 0 && (rk == TokenKind::LBrace || rk == TokenKind::Eq) { break }
-                  if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
-                  else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
-                  re = re + 1
-                }
-                let rty = lower_type_tokens(tokens, cp + 2, re, ctx.symtab, ctx.recipes).trim()
-                if rty.length() > 0 {
+            }
+            if cp + 1 < n && tokens[cp + 1].kind == TokenKind::Arrow {
+              let mut re = cp + 2
+              let mut rd = 0
+              while re < n {
+                let rk = tokens[re].kind
+                if rd == 0 && (rk == TokenKind::LBrace || rk == TokenKind::Eq) { break }
+                if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+                else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+                re = re + 1
+              }
+              let rty = lower_type_tokens(tokens, cp + 2, re, ctx.symtab, ctx.recipes).trim()
+              if rty.length() > 0 {
+                if is_blackbox {
+                  ctx.symtab.blackbox_fn_ret_types[qual_fn] = rty
+                } else {
                   ctx.symtab.fn_ret_types[qual_fn] = rty
                 }
               }
@@ -16459,8 +16546,14 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
               let p_renames = compute_param_renames(extract_raw_param_names(tokens, name_i + 1, cp))
               if is_blackbox {
                 ctx.symtab.blackbox_fn_param_types[fn_tok.raw] = pts
+                if fn_added_g.length() > 0 {
+                  ctx.symtab.blackbox_fn_type_params[fn_tok.raw] = fn_added_g
+                }
               } else {
                 ctx.symtab.fn_param_types[fn_tok.raw] = pts
+                if fn_added_g.length() > 0 {
+                  ctx.symtab.fn_type_params[fn_tok.raw] = fn_added_g
+                }
                 register_local_fn_meta_f3d2(ctx, fn_tok.raw, tokens, name_i + 1, cp, pnames, ptys)
               }
               if p_renames.length() > 0 {

@@ -284,4 +284,138 @@ test "stage_a_gaps: top-level let closure try/catch and stdlib raising call with
     d_def_param,
   )
   assert_true(d_def_param.length() >= 1, "top-level let closure default param with try/catch must fail closed")
+
+  // 6. Fail-closed: nested inline `fn` closure inside a function whose default param contains `try`/`catch`
+  let src_nested_def = "pub fn outer() -> Int {\n" +
+  "  let g = fn(x? : Int = try @json.parse(\"1\") catch { _ => 0 }) { x }\n" +
+  "  g()\n" +
+  "}\n"
+  let d_nested_def : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "nested_def.mbt", content: src_nested_def, is_test: false }],
+    cfg,
+    env,
+    d_nested_def,
+  )
+  assert_true(d_nested_def.length() >= 1, "nested inline closure default param with try/catch must fail closed")
+}
+
+///|
+test "stage_a_gaps: generic static method type-param T colliding with struct T fails closed; blackbox & dep alias resolve" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: true,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  // 1. Local generic static method `pub fn[T] Factory::keep(value : T) -> T` colliding with `struct T`
+  let local_gen_src = SourceFile::{
+    rel_path: "local_gen.mbt",
+    content: "pub struct B {\n  x : Int\n  y : Int\n}\n" +
+    "pub struct T {\n  x : Int\n  y : Int\n}\n" +
+    "pub struct Factory {\n  id : Int\n}\n" +
+    "pub fn[T] Factory::keep(value : T) -> T {\n  value\n}\n" +
+    "pub fn run(b : B) -> Int {\n  let u = { ..Factory::keep(b), x: 1 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let local_gen_res = transpile_package([local_gen_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut local_gen_ambig = false
+  for d in local_gen_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      local_gen_ambig = true
+    }
+  }
+  assert_true(local_gen_ambig, "local generic Factory::keep(b) -> T colliding with struct T must fail closed")
+  for f in local_gen_res.files {
+    assert_true(!str_has(f.content, "T::{"), "local generic Factory::keep must never fabricate T::{")
+  }
+
+  // 2. Cross-package generic `@dep.Factory::keep(b)` colliding with `dep::T`, plus `@d` alias -> canon `dep` non-generic `@d.Factory::make()`
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "dep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let dep_src = SourceFile::{
+    rel_path: "dep.mbt",
+    content: "pub(all) struct B {\n  x : Int\n  y : Int\n}\n" +
+    "pub(all) struct T {\n  x : Int\n  y : Int\n}\n" +
+    "pub(all) struct Factory {\n  id : Int\n}\n" +
+    "pub fn Factory::make() -> B {\n  { x: 1, y: 2 }\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep package transpiles cleanly")
+  let dep_doc = "{\"packages\":[{\"name\":\"dep\",\"items\":[" +
+  "{\"kind\":\"fn\",\"name\":\"Factory::keep\",\"sig\":\"pub fn[T] Factory::keep(value : T) -> T\"}," +
+  "{\"kind\":\"fn\",\"name\":\"Factory::make\",\"sig\":\"pub fn Factory::make() -> B\"}" +
+  "]}]}"
+
+  let xpkg_gen_src = SourceFile::{
+    rel_path: "xpkg_gen.mbt",
+    content: "pub fn run(b : @dep.B) -> Int {\n  let u = { ..@dep.Factory::keep(b), x: 1 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let xpkg_gen_res = transpile_package_with_abis([xpkg_gen_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("dep", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut xpkg_gen_ambig = false
+  for d in xpkg_gen_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      xpkg_gen_ambig = true
+    }
+  }
+  assert_true(xpkg_gen_ambig, "cross-pkg generic @dep.Factory::keep(b) -> T colliding with dep::T must fail closed")
+  for f in xpkg_gen_res.files {
+    assert_true(!str_has(f.content, "dep::T::{"), "cross-pkg generic Factory::keep must never fabricate dep::T::{")
+  }
+
+  // 3. Cross-package `--dep d=<dir>` alias (`d` != canonical pkg `dep`) non-generic `@d.Factory::make()` resolves cleanly
+  let xpkg_alias_src = SourceFile::{
+    rel_path: "xpkg_alias.mbt",
+    content: "pub fn run() -> Int {\n  let u = { ..@d.Factory::make(), x: 9 }\n  u.x + u.y\n}\n",
+    is_test: false,
+  }
+  let xpkg_alias_res = transpile_package_with_abis([xpkg_alias_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("d", dep_res.abi)], [], app_opts, [], false, noop_check)
+  assert_true(xpkg_alias_res.blockers == 0, "cross-pkg alias @d.Factory::make() struct update has 0 blockers")
+  let mut xpkg_alias_out = ""
+  for f in xpkg_alias_res.files {
+    if f.rel_path == "xpkg_alias.pion" {
+      xpkg_alias_out = f.content
+    }
+  }
+  assert_true(str_has(xpkg_alias_out, "d::B::{"), "cross-pkg alias @d.Factory::make() resolves to d::B::")
+
+  // 4. Blackbox test private static method `Only::make() -> C` resolves to `C::`
+  let bb_prod_src = SourceFile::{
+    rel_path: "prod.mbt",
+    content: "pub fn dummy() -> Int { 0 }\n",
+    is_test: false,
+  }
+  let bb_test_src = SourceFile::{
+    rel_path: "bb_test.mbt",
+    content: "struct C {\n  a : Int\n  b : Int\n}\n" +
+    "struct Only {\n  k : Int\n}\n" +
+    "fn Only::make() -> C {\n  { a: 1, b: 2 }\n}\n" +
+    "test \"bb static ctor\" {\n  let v = { ..Only::make(), a: 10 }\n  assert_eq(v.a + v.b, 12)\n}\n",
+    is_test: true,
+  }
+  let bb_res = transpile_package([bb_prod_src, bb_test_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(bb_res.blockers == 0, "blackbox private Only::make() -> C struct update has 0 blockers")
+  let mut bb_out = ""
+  for f in bb_res.files {
+    if f.rel_path == "bb_test.pion" {
+      bb_out = f.content
+    }
+  }
+  assert_true(str_has(bb_out, "C::{ ..Only::make(), a: 10 }"), "blackbox Only::make() resolves to C::")
 }
