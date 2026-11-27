@@ -1631,4 +1631,138 @@ PYEOF
   echo "(N2) -I${SYS_INC_N2} system header dirs do not pollute proj_hdr_dirs -> OK"
 fi
 
+# ============================================================================
+# Scenario O1: Sibling file creation in ancestor/project/-I dirs during compile
+#              MUST NOT false-trigger racy_* (cold publishes -> warm 100% cstub
+#              HIT + nativebin HIT), while genuine ordinary directory swap
+#              (mv inc inc_old && mv inc_v2 inc with preserved old mtime) MUST
+#              still be intercepted via pre/post (dev, ino) verification!
+# ============================================================================
+WS_O1="$TMP_DIR/ws_o1_ancestor"
+mkdir -p "$WS_O1/proj/src" "$WS_O1/proj/csrc" "$WS_O1/inc" "$WS_O1/inc_v2"
+cat > "$WS_O1/inc/o1.h" <<'EOF'
+#define O1_VAL 111
+EOF
+cat > "$WS_O1/inc_v2/o1.h" <<'EOF'
+#define O1_VAL 222
+EOF
+touch -t 202001010000 "$WS_O1/inc/o1.h" "$WS_O1/inc_v2/o1.h" "$WS_O1/inc" "$WS_O1/inc_v2"
+cat > "$WS_O1/proj/csrc/stub.c" <<'EOF'
+#include <stdint.h>
+#include "o1.h"
+int64_t o1_val(void) { return O1_VAL; }
+EOF
+cat > "$WS_O1/proj/pion.toml" <<'EOF'
+[package]
+name = "o1_app"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/stub.c"]
+cc_flags = ["-I../inc"]
+EOF
+cat > "$WS_O1/proj/src/main.pion" <<'EOF'
+extern "C" fn o1_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, o1_val().to_string()) }
+EOF
+
+O1_SIB_CC="$TMP_DIR/o1_sib_cc.sh"
+cat > "$O1_SIB_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+if [ "${TOUCH_SIBLINGS:-0}" = "1" ]; then
+  mkdir -p "${O1_ROOT}/out" "${O1_ROOT}/proj/out"
+  : > "${O1_ROOT}/sibling_file.tmp"
+  : > "${O1_ROOT}/proj/sibling_proj.tmp"
+  : > "${O1_ROOT}/inc/unrelated_sibling.tmp"
+fi
+exec "${REAL_CC_BIN}" "$@"
+EOF
+chmod +x "$O1_SIB_CC"
+
+CAS_O1="$WS_O1/cas_o1"
+mkdir -p "$CAS_O1"
+REAL_CC_BIN="$REAL_CC_ABS" O1_ROOT="$WS_O1" TOUCH_SIBLINGS=1 CC="$O1_SIB_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_O1" \
+  "$PIONC" build -o "$WS_O1/out/o1_bin1" "$WS_O1/proj" 2>"$TMP_DIR/o1_1.trace"
+[ "$("$WS_O1/out/o1_bin1")" = "111" ] || fail "Scenario O1 cold expected 111"
+if grep -q "(local:" "$TMP_DIR/o1_1.trace"; then
+  fail "Scenario O1 cold falsely fell back to local on sibling creation: $(cat "$TMP_DIR/o1_1.trace")"
+fi
+REAL_CC_BIN="$REAL_CC_ABS" O1_ROOT="$WS_O1" TOUCH_SIBLINGS=1 CC="$O1_SIB_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_O1" \
+  "$PIONC" build -o "$WS_O1/out/o1_bin2" "$WS_O1/proj" 2>"$TMP_DIR/o1_2.trace"
+[ "$("$WS_O1/out/o1_bin2")" = "111" ] || fail "Scenario O1 warm expected 111"
+grep -q "cstub=.*stub\.c HIT key=" "$TMP_DIR/o1_2.trace" || \
+  fail "Scenario O1 warm expected cstub HIT: $(cat "$TMP_DIR/o1_2.trace")"
+grep -q "\[cas\] bin=o1_app HIT key=" "$TMP_DIR/o1_2.trace" || \
+  fail "Scenario O1 warm expected nativebin HIT: $(cat "$TMP_DIR/o1_2.trace")"
+
+# Now test genuine ordinary directory swap during compile (preserved old mtime!)
+O1_SWAP_CC="$TMP_DIR/o1_swap_cc.sh"
+cat > "$O1_SWAP_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  exec "${REAL_CC_BIN}" --version
+fi
+"${REAL_CC_BIN}" "$@"
+RC=$?
+if [ "$RC" = "0" ] && [ "${INJECT_DIR_SWAP:-0}" = "1" ]; then
+  case "$*" in
+    *-c*stub.c*)
+      mv "${O1_ROOT}/inc" "${O1_ROOT}/inc_old"
+      mv "${O1_ROOT}/inc_v2" "${O1_ROOT}/inc"
+      ;;
+  esac
+fi
+exit "$RC"
+EOF
+chmod +x "$O1_SWAP_CC"
+
+CAS_O1_SWAP="$TMP_DIR/cas_o1_swap"
+mkdir -p "$CAS_O1_SWAP"
+REAL_CC_BIN="$REAL_CC_ABS" O1_ROOT="$WS_O1" INJECT_DIR_SWAP=1 CC="$O1_SWAP_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_O1_SWAP" \
+  "$PIONC" build -o "$TMP_DIR/o1_swap_1" "$WS_O1/proj" 2>"$TMP_DIR/o1_swap_1.trace"
+[ "$("$TMP_DIR/o1_swap_1")" = "111" ] || fail "Scenario O1 dir-swap run 1 expected 111"
+grep -q "cstub=.*stub\.c MISS key=.*(local: racy_" "$TMP_DIR/o1_swap_1.trace" || \
+  fail "Scenario O1 dir-swap run 1 expected (local: racy_*): $(cat "$TMP_DIR/o1_swap_1.trace")"
+O1_SWAP_OBJS="$(find "$CAS_O1_SWAP/obj" -maxdepth 1 -name 'cstub_*.o' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$O1_SWAP_OBJS" = "0" ] || fail "Scenario O1 dir-swap run 1 must not publish cstub_*.o (found $O1_SWAP_OBJS)"
+REAL_CC_BIN="$REAL_CC_ABS" O1_ROOT="$WS_O1" INJECT_DIR_SWAP=0 CC="$O1_SWAP_CC" \
+  PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_O1_SWAP" \
+  "$PIONC" build -o "$TMP_DIR/o1_swap_2" "$WS_O1/proj" 2>"$TMP_DIR/o1_swap_2.trace"
+grep -q "cstub=.*stub\.c MISS key=" "$TMP_DIR/o1_swap_2.trace" || \
+  fail "Scenario O1 dir-swap run 2 expected MISS: $(cat "$TMP_DIR/o1_swap_2.trace")"
+[ "$("$TMP_DIR/o1_swap_2")" = "222" ] || fail "Scenario O1 dir-swap run 2 expected 222 after self-heal"
+echo "(O1) sibling creation in ancestor/project/-I dirs -> 100% cstub+nativebin HIT; real dir swap -> racy caught -> OK"
+
+# ============================================================================
+# Scenario O2: Native `cc --version` disk memoization in $CAS/ccver/,
+#              TOOLCHAINS fail-closed bypass, and `cache stats` / `clean`
+# ============================================================================
+CAS_O2="$TMP_DIR/cas_o2"
+mkdir -p "$CAS_O2"
+# Non-empty TOOLCHAINS must fail-closed and NOT write $CAS/ccver/
+TOOLCHAINS=foo PION_CACHE_DIR="$CAS_O2" "$PIONC" build "$WS_O1/proj"
+O2_TC_COUNT="$(find "$CAS_O2/ccver" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$O2_TC_COUNT" = "0" ] || fail "Scenario O2 expected 0 ccver files when TOOLCHAINS=foo (got $O2_TC_COUNT)"
+
+# Normal build writes $CAS/ccver/*.txt, counted by `cache stats`, cleared by `clean`
+PION_CACHE_DIR="$CAS_O2" "$PIONC" build "$WS_O1/proj"
+O2_CCVER_COUNT="$(find "$CAS_O2/ccver" -maxdepth 1 -name '*.txt' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$O2_CCVER_COUNT" -ge 1 ] || fail "Scenario O2 expected native cc --version cache file in $CAS_O2/ccver"
+O2_STATS="$(PION_CACHE_DIR="$CAS_O2" "$PIONC" cache stats --json)"
+python3 - "$O2_STATS" <<'PYEOF'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["ok"] is True and d["ccver"]["files"] >= 1 and d["ccver"]["bytes"] > 0, d
+PYEOF
+PION_CACHE_DIR="$CAS_O2" "$PIONC" clean --json > /dev/null
+O2_AFTER_CLEAN="$(find "$CAS_O2/ccver" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+[ "$O2_AFTER_CLEAN" = "0" ] || fail "Scenario O2 expected pionc clean to remove ccver files (found $O2_AFTER_CLEAN)"
+echo "(O2) native cc --version disk memoization + TOOLCHAINS bypass + cache stats/clean -> OK"
+
 echo "PASS: cas_pin_and_cstub_deps"

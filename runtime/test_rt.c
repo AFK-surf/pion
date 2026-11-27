@@ -3584,11 +3584,41 @@ static void test_fs_lstat_kind(void) {
     assert(symlink(file, sym_chg) == 0);
     assert(pion_cli_path_change_ms(sym_chg) >= f_chg);
     assert(pion_cli_lpath_change_ms(sym_chg) > 0);
+    /* pion_cli_lpath_identity: dir identity stable across sibling creation, distinct across dirs/symlinks */
+    char *id_dir1 = pion_cli_lpath_identity(base);
+    char *id_file = pion_cli_lpath_identity(file);
+    char *id_sym  = pion_cli_lpath_identity(sym_chg);
+    assert(id_dir1 && id_dir1[0] == 'd');
+    assert(id_file && id_file[0] == 'f');
+    assert(id_sym  && id_sym[0]  == 'l');
+    assert(pion_cli_lpath_identity(missing) == NULL);
+    assert(pion_cli_lpath_identity(NULL) == NULL);
+    char sib[640];
+    snprintf(sib, sizeof(sib), "%s/sib.tmp", base);
+    FILE *sf = fopen(sib, "wb");
+    assert(sf != NULL);
+    fputs("#!/bin/sh\necho hi\n", sf);
+    fclose(sf);
+    char *id_dir2 = pion_cli_lpath_identity(base);
+    assert(id_dir2 && strcmp(id_dir1, id_dir2) == 0);
+    assert(pion_cli_is_native_exe(sib) == 0);
+    assert(pion_cli_is_native_exe(missing) == 0);
+    char *self_exe = pion_cli_self_exe_path();
+    if (self_exe) {
+        assert(pion_cli_is_native_exe(self_exe) == 1);
+        free(self_exe);
+    }
+    free(id_dir1);
+    free(id_dir2);
+    free(id_file);
+    free(id_sym);
+    assert(remove(sib) == 0);
     assert(remove(sym_chg) == 0);
 #endif
+    assert(pion_cli_lpath_is_coarse(missing) == 1);
     assert(remove(file) == 0);
     assert(pion_fs_rmdir(base) == 0);
-    printf("[PASS] pion_cli_sha256_file (boundaries 0..65537) + path_change_ms\n");
+    printf("[PASS] pion_cli_sha256_file (boundaries 0..65537) + path_change_ms + identity\n");
 }
 
 static const char *g_lock_path;

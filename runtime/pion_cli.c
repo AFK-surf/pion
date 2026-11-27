@@ -613,6 +613,113 @@ int64_t pion_cli_lpath_change_ms(const char *path) {
     return pion_cli_win_change_ms(path, FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
+char *pion_cli_lpath_identity(const char *path) {
+    if (!path || !*path) return NULL;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return NULL;
+    HANDLE h = CreateFileW(
+        wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    BY_HANDLE_FILE_INFORMATION fi;
+    BOOL ok = GetFileInformationByHandle(h, &fi);
+    if (!ok) {
+        CloseHandle(h);
+        return NULL;
+    }
+    char kind = (fi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? 'l'
+              : (fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 'd' : 'f';
+    char buf[128];
+    int n = 0;
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
+    FILE_ID_INFO fii;
+    if (GetFileInformationByHandleEx(h, FileIdInfo, &fii, sizeof(fii))) {
+        static const char hex[] = "0123456789abcdef";
+        char idhex[33];
+        for (int i = 0; i < 16; i++) {
+            unsigned char v = (unsigned char)fii.FileId.Identifier[i];
+            idhex[i * 2] = hex[(v >> 4) & 15u];
+            idhex[i * 2 + 1] = hex[v & 15u];
+        }
+        idhex[32] = '\0';
+        n = snprintf(buf, sizeof(buf), "%c:id:%llx:%s",
+                     kind,
+                     (unsigned long long)fii.VolumeSerialNumber,
+                     idhex);
+    }
+#endif
+    CloseHandle(h);
+    if (n <= 0) {
+        n = snprintf(buf, sizeof(buf), "%c:%lx:%lx:%lx",
+                     kind,
+                     (unsigned long)fi.dwVolumeSerialNumber,
+                     (unsigned long)fi.nFileIndexHigh,
+                     (unsigned long)fi.nFileIndexLow);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return NULL;
+    char *out = (char *)malloc((size_t)n + 1);
+    if (!out) return NULL;
+    memcpy(out, buf, (size_t)n + 1);
+    return out;
+}
+
+int32_t pion_cli_lpath_is_coarse(const char *path) {
+    if (!path || !*path) return 1;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return 1;
+    HANDLE h = CreateFileW(
+        wp,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    FILE_BASIC_INFO bi;
+    BOOL ok = GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi));
+    CloseHandle(h);
+    if (!ok) return 1;
+    int64_t w100 = bi.LastWriteTime.QuadPart - 116444736000000000LL;
+    int64_t c100 = bi.ChangeTime.QuadPart - 116444736000000000LL;
+    return ((w100 % 10000000LL) == 0 && (c100 % 10000000LL) == 0) ? 1 : 0;
+}
+
+int32_t pion_cli_is_native_exe(const char *path) {
+    if (!path || !*path) return 0;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return 0;
+    HANDLE h = CreateFileW(
+        wp,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    unsigned char b[4] = {0, 0, 0, 0};
+    DWORD got = 0;
+    BOOL ok = ReadFile(h, b, 4, &got, NULL);
+    CloseHandle(h);
+    if (!ok || got < 2) return 0;
+    if (b[0] == 'M' && b[1] == 'Z') return 1;
+    if (got < 4) return 0;
+    if (b[0] == 0x7fu && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') return 1;
+    return 0;
+}
+
 typedef struct {
     ULONG  ReparseTag;
     USHORT ReparseDataLength;
@@ -1471,6 +1578,53 @@ int64_t pion_cli_lpath_change_ms(const char *path) {
     struct stat st;
     if (lstat(path, &st) != 0) return -1;
     return pion_cli_stat_change_ms(&st);
+}
+
+char *pion_cli_lpath_identity(const char *path) {
+    if (!path || !*path) return NULL;
+    struct stat st;
+    if (lstat(path, &st) != 0) return NULL;
+    char kind = S_ISLNK(st.st_mode) ? 'l'
+              : S_ISDIR(st.st_mode) ? 'd'
+              : S_ISREG(st.st_mode) ? 'f' : 'o';
+    char buf[96];
+    int n = snprintf(buf, sizeof(buf), "%c:%llx:%llx",
+                     kind,
+                     (unsigned long long)st.st_dev,
+                     (unsigned long long)st.st_ino);
+    if (n <= 0 || (size_t)n >= sizeof(buf)) return NULL;
+    return pion_cli_strdup(buf);
+}
+
+int32_t pion_cli_lpath_is_coarse(const char *path) {
+    if (!path || !*path) return 1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return 1;
+#ifdef __APPLE__
+    return (st.st_mtimespec.tv_nsec == 0 && st.st_ctimespec.tv_nsec == 0) ? 1 : 0;
+#else
+    return (st.st_mtim.tv_nsec == 0 && st.st_ctim.tv_nsec == 0) ? 1 : 0;
+#endif
+}
+
+int32_t pion_cli_is_native_exe(const char *path) {
+    if (!path || !*path) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    unsigned char b[4] = {0, 0, 0, 0};
+    ssize_t got = read(fd, b, 4);
+    close(fd);
+    if (got < 2) return 0;
+    if (b[0] == 'M' && b[1] == 'Z') return 1;
+    if (got < 4) return 0;
+    if (b[0] == 0x7fu && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') return 1;
+    if ((b[0] == 0xfeu && b[1] == 0xedu && b[2] == 0xfau && (b[3] == 0xceu || b[3] == 0xcfu)) ||
+        ((b[0] == 0xceu || b[0] == 0xcfu) && b[1] == 0xfau && b[2] == 0xedu && b[3] == 0xfeu) ||
+        (b[0] == 0xcau && b[1] == 0xfeu && b[2] == 0xbau && b[3] == 0xbeu) ||
+        (b[0] == 0xbeu && b[1] == 0xbau && b[2] == 0xfeu && b[3] == 0xcau)) {
+        return 1;
+    }
+    return 0;
 }
 
 char *pion_fs_readlink(const char *path) {
