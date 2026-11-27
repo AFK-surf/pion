@@ -85,6 +85,7 @@ pub struct QbeArgVal {
 pub struct QbeBceGuard {
   arr : String
   kind : Int
+  scale : Int64
   offset : Int64
   vname : String
   key : String
@@ -803,6 +804,55 @@ fn qbe_store_arr_u8(g : QbeGen, val_reg : String, ep : String) -> Unit {
   let vw = qbe_tmp(g)
   qbe_emit(g, vw + " =w copy " + val_reg)
   qbe_emit(g, "storeb " + vw + ", " + ep)
+}
+
+///|
+/// Emit RHS for a direct 1-byte `storeb` write (`Bytes[i] = ...`, `Array[Byte][i] = ...`,
+/// `FixedArray[Byte][i] = ...`). For `expr.to_byte()` (including `(expr & 255).to_byte()`),
+/// feeds the `w` source value directly to `storeb`, eliminating redundant `extsw` + `and 255`.
+fn qbe_emit_storeb_rhs(g : QbeGen, rhs : Expr) -> String {
+  match rhs {
+    EMethodCall(inner, mname, margs, sp) =>
+      if mname == "to_byte" && margs.length() == 0 && !qbe_has_expected_trait(g, sp) {
+        match qbe_probe_expr_ty(g, inner) {
+          Some(TInt) => {
+            let core = match inner {
+              EBinary("&", a, EInt(mraw, _), _) =>
+                if (qbe_parse_int64_lit(mraw) & 255L) == 255L { a } else { inner }
+              EBinary("&", EInt(mraw, _), a, _) =>
+                if (qbe_parse_int64_lit(mraw) & 255L) == 255L { a } else { inner }
+              _ => inner
+            }
+            let iv = qbe_emit_expr(g, core, Some(TInt))
+            match iv.ty {
+              TInt | TUInt =>
+                if qbe_is_temp_reg(iv.reg) {
+                  return iv.reg
+                } else {
+                  return (qbe_parse_int64_lit(iv.reg) & 255L).to_string()
+                }
+              _ => {
+                let vw = qbe_tmp(g)
+                qbe_emit(g, vw + " =w copy " + iv.reg)
+                return vw
+              }
+            }
+          }
+          Some(TInt8) => {
+            let iv = qbe_emit_expr(g, inner, Some(TInt8))
+            let vw = qbe_tmp(g)
+            qbe_emit(g, vw + " =w copy " + iv.reg)
+            return vw
+          }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  let rv = qbe_emit_expr(g, rhs, Some(TByte))
+  let vw = qbe_tmp(g)
+  qbe_emit(g, vw + " =w copy " + rv.reg)
+  vw
 }
 
 ///|
@@ -13264,10 +13314,144 @@ fn qbe_invalidate_known_min_len_if_dyn(g : QbeGen, name : String) -> Unit {
   match qbe_lookup_local(g, name) {
     Some(loc) =>
       match loc.ty {
-        TFixedArray(_) | TImmArray(_) | TString | TBytes => ()
+        TFixedArray(_) | TImmArray(_) | TString | TBytes | TStrView | TBytesView => ()
         _ => g.known_min_len_arrs.remove(name)
       }
     None => g.known_min_len_arrs.remove(name)
+  }
+}
+
+///|
+fn qbe_clone_int_map(m : Map[String, Int]) -> Map[String, Int] {
+  let out : Map[String, Int] = Map([])
+  let ks = m.keys()
+  let mut i = 0
+  while i < ks.length() {
+    let k = ks[i]
+    match m.get(k) {
+      Some(v) => out.set(k, v)
+      None => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qbe_intersect_min_len_maps(a : Map[String, Int], b : Map[String, Int]) -> Map[String, Int] {
+  let out : Map[String, Int] = Map([])
+  if a.length() == 0 || b.length() == 0 {
+    return out
+  }
+  let ks = a.keys()
+  let mut i = 0
+  while i < ks.length() {
+    let k = ks[i]
+    match (a.get(k), b.get(k)) {
+      (Some(va), Some(vb)) => out.set(k, if va < vb { va } else { vb })
+      _ => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Compute the loop-invariant subset of `g.known_min_len_arrs` before entering a loop,
+/// removing any key reassigned, shadowed, or (for dynamic `TArray`) potentially shrunk/aliased
+/// inside `(cond_opt, step_opt, body)`. Sets `g.known_min_len_arrs` to a fresh clone of the
+/// invariant map and returns the invariant map to restore after the loop exits.
+fn qbe_prepare_loop_min_lens(
+  g : QbeGen,
+  cond_opt : Option[Expr],
+  step_opt : Option[Stmt],
+  body : Array[Stmt],
+) -> Map[String, Int] {
+  if g.known_min_len_arrs.length() == 0 {
+    return Map([])
+  }
+  let keys = g.known_min_len_arrs.keys()
+  let mut i = 0
+  while i < keys.length() {
+    let k = keys[i]
+    let mut unstable = false
+    match cond_opt {
+      Some(c) =>
+        if qbe_expr_assigns_ident(c, k) || qbe_expr_rebinds_ident(c, k) {
+          unstable = true
+        }
+      None => ()
+    }
+    if !unstable {
+      match step_opt {
+        Some(st) =>
+          if qbe_stmt_assigns_ident(st, k) || qbe_stmt_rebinds_ident(st, k) {
+            unstable = true
+          }
+        None => ()
+      }
+    }
+    if !unstable && (qbe_stmts_assigns_ident(body, k) || qbe_stmts_rebinds_ident(body, k)) {
+      unstable = true
+    }
+    if !unstable {
+      match qbe_lookup_local(g, k) {
+        Some(loc) =>
+          match loc.ty {
+            TArray(_) => {
+              match cond_opt {
+                Some(c) =>
+                  if !qbe_arr_is_stable_expr(c, k, true) {
+                    unstable = true
+                  }
+                None => ()
+              }
+              if !unstable {
+                match step_opt {
+                  Some(st) =>
+                    if !qbe_arr_is_stable_stmts([st], 0, k, true) {
+                      unstable = true
+                    }
+                  None => ()
+                }
+              }
+              if !unstable && !qbe_arr_is_stable_stmts(body, 0, k, true) {
+                unstable = true
+              }
+              if !unstable && !g.unfrozen_local_arrs.contains(k) {
+                let cond_no_calls = match cond_opt {
+                  Some(c) => qbe_loop_has_no_calls_expr(g, c)
+                  None => true
+                }
+                let step_no_calls = match step_opt {
+                  Some(st) => qbe_loop_has_no_calls_stmts(g, [st])
+                  None => true
+                }
+                if !cond_no_calls || !step_no_calls || !qbe_loop_has_no_calls_stmts(g, body) {
+                  unstable = true
+                }
+              }
+            }
+            _ => ()
+          }
+        None => unstable = true
+      }
+    }
+    if unstable {
+      g.known_min_len_arrs.remove(k)
+    }
+    i = i + 1
+  }
+  let inv = qbe_clone_int_map(g.known_min_len_arrs)
+  g.known_min_len_arrs = qbe_clone_int_map(inv)
+  inv
+}
+
+///|
+fn qbe_is_wide_int_ty(ty : Ty) -> Bool {
+  match ty {
+    TInt | TUInt | TInt64 | TUInt64 => true
+    _ => false
   }
 }
 
@@ -13338,7 +13522,7 @@ fn qbe_expr_as_len_target(g : QbeGen, e : Expr) -> String {
     Some(loc) =>
       if !loc.is_cell {
         match loc.ty {
-          TFixedArray(_) | TImmArray(_) | TArray(_) | TString | TBytes => cand
+          TFixedArray(_) | TImmArray(_) | TArray(_) | TString | TBytes | TStrView | TBytesView => cand
           _ => ""
         }
       } else {
@@ -13728,6 +13912,14 @@ fn qbe_const_nonneg_i64(g : QbeGen, e : Expr) -> Option[Int64] {
 fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
   match e {
     EByte(_, _) => Some(255L)
+    EInt(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      if v >= 0L && v <= 2147483647L {
+        Some(v)
+      } else {
+        None
+      }
+    }
     EIdent(vname, _) => {
       match g.u8_range_vars.get(vname) {
         Some(u) => return Some(u)
@@ -13745,7 +13937,7 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
     EMethodCall(obj, mname, margs, _) =>
       if mname == "code_unit_at" && margs.length() == 1 {
         match qbe_peek_expr_ty(g, obj) {
-          Some(TString) => Some(255L)
+          Some(TString) | Some(TStrView) => Some(255L)
           _ => None
         }
       } else if mname == "to_int" && margs.length() == 0 {
@@ -13755,7 +13947,11 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
             match obj {
               EIndex(inner, _, _) =>
                 match qbe_peek_expr_ty(g, inner) {
-                  Some(TBytes) => true
+                  Some(TBytes)
+                  | Some(TBytesView)
+                  | Some(TArray(TByte))
+                  | Some(TFixedArray(TByte))
+                  | Some(TImmArray(TByte)) => true
                   _ => false
                 }
               _ => false
@@ -13764,16 +13960,24 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
         if direct_byte {
           Some(255L)
         } else {
-          // Only propagate `.to_int()` when the inner value is proven to fit in signed non-negative Int32.
-          // Never grants bounds to `Char.to_int()` or `Int8.to_int()`.
-          match qbe_expr_max_u_bound(g, obj) {
-            Some(u) =>
-              if u >= 0L && u <= 2147483647L {
-                Some(u)
-              } else {
-                None
-              }
-            None => None
+          // Only propagate `.to_int()` when the inner value has wide integer type (never `Int8`/`Char`)
+          // and is proven to fit in signed non-negative Int32.
+          let obj_wide = match qbe_probe_expr_ty(g, obj) {
+            Some(ot) => qbe_is_wide_int_ty(ot)
+            None => false
+          }
+          if obj_wide {
+            match qbe_expr_max_u_bound(g, obj) {
+              Some(u) =>
+                if u >= 0L && u <= 2147483647L {
+                  Some(u)
+                } else {
+                  None
+                }
+              None => None
+            }
+          } else {
+            None
           }
         }
       } else {
@@ -13781,12 +13985,39 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
       }
     EIndex(obj, _, _) =>
       match qbe_peek_expr_ty(g, obj) {
-        Some(TString) | Some(TBytes) => Some(255L)
+        Some(TString)
+        | Some(TStrView)
+        | Some(TBytes)
+        | Some(TBytesView)
+        | Some(TArray(TByte))
+        | Some(TFixedArray(TByte))
+        | Some(TImmArray(TByte)) => Some(255L)
         _ => None
       }
     EBinary("&", l, r, _) => {
-      let lb = qbe_const_nonneg_i64(g, l)
-      let rb = qbe_const_nonneg_i64(g, r)
+      let ty_ok = match qbe_probe_expr_ty(g, e) {
+        Some(et) => qbe_is_wide_int_ty(et)
+        None => false
+      }
+      if !ty_ok {
+        return None
+      }
+      let lb = match qbe_const_nonneg_i64(g, l) {
+        Some(v) => Some(v)
+        None =>
+          match qbe_expr_max_u_bound(g, l) {
+            Some(u) => if u >= 0L && u <= 2147483647L { Some(u) } else { None }
+            None => None
+          }
+      }
+      let rb = match qbe_const_nonneg_i64(g, r) {
+        Some(v) => Some(v)
+        None =>
+          match qbe_expr_max_u_bound(g, r) {
+            Some(u) => if u >= 0L && u <= 2147483647L { Some(u) } else { None }
+            None => None
+          }
+      }
       match lb {
         Some(lv) =>
           match rb {
@@ -13797,15 +14028,13 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
       }
     }
     EBinary(">>", l, r, _) => {
-      // Strictly unsigned logical right shift (`TUInt` or `TUInt64`) only; never signed `Int`/`Int64`.
+      // Unsigned logical right shift (`TUInt` or `TUInt64`), OR provably non-negative 32-bit `TInt` `0 <= l <= u`.
       let width = match qbe_peek_expr_ty(g, l) {
         Some(TUInt) => 32
         Some(TUInt64) => 64
         _ => 0
       }
-      if width == 0 {
-        None
-      } else {
+      if width != 0 {
         match qbe_const_nonneg_i64(g, r) {
           Some(k) => {
             let s = (k & (width - 1).to_int64()).to_int()
@@ -13818,6 +14047,76 @@ fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
           }
           None => None
         }
+      } else {
+        let lhs_is_i32 = match qbe_probe_expr_ty(g, l) {
+          Some(TInt) => true
+          _ => false
+        }
+        if !lhs_is_i32 {
+          None
+        } else {
+          match qbe_expr_max_u_bound(g, l) {
+            Some(u) =>
+              if u >= 0L && u <= 2147483647L {
+                match qbe_const_nonneg_i64(g, r) {
+                  Some(k) =>
+                    if k >= 0L && k <= 30L {
+                      Some(u >> k.to_int())
+                    } else {
+                      None
+                    }
+                  None => None
+                }
+              } else {
+                None
+              }
+            None => None
+          }
+        }
+      }
+    }
+    EBinary("<<", l, r, _) => {
+      let ty_ok = match qbe_probe_expr_ty(g, e) {
+        Some(TInt) | Some(TUInt) => true
+        _ => false
+      }
+      if !ty_ok {
+        return None
+      }
+      match qbe_expr_max_u_bound(g, l) {
+        Some(u) =>
+          if u >= 0L && u <= 2147483647L {
+            match qbe_const_nonneg_i64(g, r) {
+              Some(k) =>
+                if k >= 0L && k <= 30L && u <= (2147483647L >> k.to_int()) {
+                  Some(u << k.to_int())
+                } else {
+                  None
+                }
+              None => None
+            }
+          } else {
+            None
+          }
+        None => None
+      }
+    }
+    EBinary("+", l, r, _) | EBinary("|", l, r, _) => {
+      let ty_ok = match qbe_probe_expr_ty(g, e) {
+        Some(TInt) | Some(TUInt) => true
+        _ => false
+      }
+      if !ty_ok {
+        return None
+      }
+      match (qbe_expr_max_u_bound(g, l), qbe_expr_max_u_bound(g, r)) {
+        (Some(ul), Some(ur)) =>
+          if ul >= 0L && ur >= 0L && ul <= 2147483647L - ur {
+            Some(ul + ur)
+          } else {
+            None
+          }
+        _ => None
       }
     }
     EBinary("%", l, r, _) => {
@@ -13894,6 +14193,67 @@ fn qbe_emit_bytes_writable_check(
 }
 
 ///|
+fn qbe_match_scaled_iv_any(e : Expr) -> Option[(String, Int64)] {
+  match e {
+    EBinary("<<", EIdent(iname, _), EInt(raw, _), _) => {
+      let sh = qbe_parse_int64_lit(raw)
+      if sh >= 1L && sh <= 30L {
+        Some((iname, 1L << sh.to_int()))
+      } else {
+        None
+      }
+    }
+    EBinary("*", EIdent(iname, _), EInt(raw, _), _)
+    | EBinary("*", EInt(raw, _), EIdent(iname, _), _) => {
+      let sc = qbe_parse_int64_lit(raw)
+      if sc >= 2L && sc <= 1073741824L {
+        Some((iname, sc))
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+///|
+fn qbe_match_affine_iv_any(idx : Expr) -> Option[(String, Int64, Int64)] {
+  match qbe_match_scaled_iv_any(idx) {
+    Some((iname, sc)) => return Some((iname, sc, 0L))
+    None => ()
+  }
+  match idx {
+    EBinary("+", lhs, EInt(raw, _), _) | EBinary("+", EInt(raw, _), lhs, _) => {
+      let off = qbe_parse_int64_lit(raw)
+      if off >= 0L && off <= 2147483647L {
+        match qbe_match_scaled_iv_any(lhs) {
+          Some((iname, sc)) => Some((iname, sc, off))
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+    EBinary("|", EBinary("<<", EIdent(iname, _), EInt(sh_raw, _), _), EInt(off_raw, _), _)
+    | EBinary("|", EInt(off_raw, _), EBinary("<<", EIdent(iname, _), EInt(sh_raw, _), _), _) => {
+      let sh = qbe_parse_int64_lit(sh_raw)
+      let off = qbe_parse_int64_lit(off_raw)
+      if sh >= 1L && sh <= 30L {
+        let sc = 1L << sh.to_int()
+        if off >= 0L && off < sc {
+          Some((iname, sc, off))
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+///|
 fn qbe_bce_expr_is_safe(g : QbeGen, arr : String, idx : Expr) -> Bool {
   let matched = match idx {
     EIdent(iname, _) =>
@@ -13915,7 +14275,14 @@ fn qbe_bce_expr_is_safe(g : QbeGen, arr : String, idx : Expr) -> Bool {
     }
     EBinary("-", EIdent(vname, _), EIdent(iname, _), _) =>
       g.bce_safe_exprs.contains(arr + ":v-iv:" + vname + ":" + iname)
-    _ => false
+    _ =>
+      match qbe_match_affine_iv_any(idx) {
+        Some((iname, sc, off)) =>
+          g.bce_safe_exprs.contains(
+            arr + ":aff:" + iname + ":" + sc.to_string() + ":" + off.to_string(),
+          )
+        None => false
+      }
   }
   if matched {
     return true
@@ -13976,28 +14343,28 @@ fn qbe_bce_try_add_guard(
         let key = arr + ":iv:" + iv
         if !seen.contains(key) {
           seen.set(key, true)
-          out.push(QbeBceGuard::{ arr: arr, kind: 0, offset: 0L, vname: "", key: key })
+          out.push(QbeBceGuard::{ arr: arr, kind: 0, scale: 1L, offset: 0L, vname: "", key: key })
         }
       }
     EBinary("+", EIdent(iname, _), EInt(raw, _), _) =>
       if iname == iv {
         let c = qbe_parse_int64_lit(raw)
-        if c > 0L && c <= 2147483647L {
+        if c >= 0L && c <= 2147483647L {
           let key = arr + ":iv+:" + iv + ":" + c.to_string()
           if !seen.contains(key) {
             seen.set(key, true)
-            out.push(QbeBceGuard::{ arr: arr, kind: 1, offset: c, vname: "", key: key })
+            out.push(QbeBceGuard::{ arr: arr, kind: 1, scale: 1L, offset: c, vname: "", key: key })
           }
         }
       }
     EBinary("+", EInt(raw, _), EIdent(iname, _), _) =>
       if iname == iv {
         let c = qbe_parse_int64_lit(raw)
-        if c > 0L && c <= 2147483647L {
+        if c >= 0L && c <= 2147483647L {
           let key = arr + ":iv+:" + iv + ":" + c.to_string()
           if !seen.contains(key) {
             seen.set(key, true)
-            out.push(QbeBceGuard::{ arr: arr, kind: 1, offset: c, vname: "", key: key })
+            out.push(QbeBceGuard::{ arr: arr, kind: 1, scale: 1L, offset: c, vname: "", key: key })
           }
         }
       }
@@ -14012,13 +14379,24 @@ fn qbe_bce_try_add_guard(
               let key = arr + ":v-iv:" + vname + ":" + iv
               if !seen.contains(key) {
                 seen.set(key, true)
-                out.push(QbeBceGuard::{ arr: arr, kind: 2, offset: 0L, vname: vname, key: key })
+                out.push(QbeBceGuard::{ arr: arr, kind: 2, scale: 1L, offset: 0L, vname: vname, key: key })
               }
             }
           None => ()
         }
       }
-    _ => ()
+    _ =>
+      match qbe_match_affine_iv_any(idx) {
+        Some((iname, sc, off)) =>
+          if iname == iv {
+            let key = arr + ":aff:" + iv + ":" + sc.to_string() + ":" + off.to_string()
+            if !seen.contains(key) {
+              seen.set(key, true)
+              out.push(QbeBceGuard::{ arr: arr, kind: 3, scale: sc, offset: off, vname: "", key: key })
+            }
+          }
+        None => ()
+      }
   }
 }
 
@@ -30558,16 +30936,20 @@ fn qbe_emit_int_dispatch(
   }
   let mut saw_untyped_none = false
   let mut all_term = true
+  let pre_kml = qbe_clone_int_map(g.known_min_len_arrs)
+  let mut merged_kml : Option[Map[String, Int]] = None
 
   i = 0
   while i < arms.length() {
     qbe_emit_lbl(g, arm_lbls[i])
     qbe_scope_push(g)
+    g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
     let av = match arms[i].expr_opt {
       Some(e) => qbe_emit_expr(g, e, if is_void { None } else { res_ty })
       None => qbe_emit_stmts(g, arms[i].stmts, if is_void { None } else { res_ty })
     }
-    if !g.block_term {
+    let arm_term = g.block_term
+    if !arm_term {
       all_term = false
       if is_void {
         qbe_rc_dec(g, av.reg, av.ty)
@@ -30601,6 +30983,12 @@ fn qbe_emit_int_dispatch(
       }
     }
     qbe_scope_pop(g)
+    if !arm_term {
+      merged_kml = match merged_kml {
+        None => Some(g.known_min_len_arrs)
+        Some(m) => Some(qbe_intersect_min_len_maps(m, g.known_min_len_arrs))
+      }
+    }
     qbe_emit_term(g, "jmp " + l_end)
     i = i + 1
   }
@@ -30609,12 +30997,14 @@ fn qbe_emit_int_dispatch(
   match default_expr_opt {
     Some(de) => {
       qbe_scope_push(g)
+      g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
       if default_bind_name != "" {
         let bloc = qbe_define_local(g, default_bind_name, TInt, false)
         qbe_store_local_slot(g, val_reg, bloc.slot, TInt)
       }
       let dv = qbe_emit_expr(g, de, if is_void { None } else { res_ty })
-      if !g.block_term {
+      let def_term = g.block_term
+      if !def_term {
         all_term = false
         if is_void {
           qbe_rc_dec(g, dv.reg, dv.ty)
@@ -30648,6 +31038,12 @@ fn qbe_emit_int_dispatch(
         }
       }
       qbe_scope_pop(g)
+      if !def_term {
+        merged_kml = match merged_kml {
+          None => Some(g.known_min_len_arrs)
+          Some(m) => Some(qbe_intersect_min_len_maps(m, g.known_min_len_arrs))
+        }
+      }
       qbe_emit_term(g, "jmp " + l_end)
     }
     None =>
@@ -30667,11 +31063,19 @@ fn qbe_emit_int_dispatch(
         qbe_emit_term(g, "jmp " + l_end)
       } else {
         all_term = false
+        merged_kml = match merged_kml {
+          None => Some(qbe_clone_int_map(pre_kml))
+          Some(m) => Some(qbe_intersect_min_len_maps(m, pre_kml))
+        }
         qbe_emit_term(g, "jmp " + l_end)
       }
   }
 
   qbe_emit_lbl(g, l_end)
+  g.known_min_len_arrs = match merged_kml {
+    Some(m) => m
+    None => Map([])
+  }
   if is_void {
     qval("0", TUnit)
   } else if all_term {
@@ -46792,12 +47196,8 @@ fn qbe_emit_expr_inner(
             }
             rpi = rpi + 1
           }
-          let saved_pos_vals : Array[Option[Int]] = []
-          let mut pni = 0
-          while pni < pos_names.length() {
-            saved_pos_vals.push(g.known_min_len_arrs.get(pos_names[pni]))
-            pni = pni + 1
-          }
+          let pre_kml = qbe_clone_int_map(g.known_min_len_arrs)
+          g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
           qbe_apply_min_lens(g, cond, pos_names, pos_mins)
           let win_keys : Array[String] = []
           if !has_is_bound {
@@ -46825,28 +47225,21 @@ fn qbe_emit_expr_inner(
             g.bce_safe_exprs.remove(added_win[wki])
             wki = wki + 1
           }
-          pni = pos_names.length() - 1
-          while pni >= 0 {
-            let nm = pos_names[pni]
-            if then_term || g.known_min_len_arrs.contains(nm) {
-              match saved_pos_vals[pni] {
-                Some(old_v) => g.known_min_len_arrs.set(nm, old_v)
-                None => g.known_min_len_arrs.remove(nm)
-              }
-            }
-            pni = pni - 1
-          }
           if !then_term {
             qbe_rc_dec(g, tv.reg, tv.ty)
           }
           qbe_scope_pop(g)
+          let then_post = g.known_min_len_arrs
           qbe_emit_term(g, "jmp " + l_end)
           qbe_emit_lbl(g, l_end)
           if then_term {
+            g.known_min_len_arrs = pre_kml
             let neg_names : Array[String] = []
             let neg_mins : Array[Int] = []
             qbe_collect_neg_min_lens(g, cond, neg_names, neg_mins)
             qbe_apply_min_lens(g, cond, neg_names, neg_mins)
+          } else {
+            g.known_min_len_arrs = qbe_intersect_min_len_maps(pre_kml, then_post)
           }
           qval("0", TUnit)
         }
@@ -46915,12 +47308,8 @@ fn qbe_emit_expr_inner(
             }
             rpi = rpi + 1
           }
-          let saved_pos_vals : Array[Option[Int]] = []
-          let mut pni = 0
-          while pni < pos_names.length() {
-            saved_pos_vals.push(g.known_min_len_arrs.get(pos_names[pni]))
-            pni = pni + 1
-          }
+          let pre_kml = qbe_clone_int_map(g.known_min_len_arrs)
+          g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
           qbe_apply_min_lens(g, cond, pos_names, pos_mins)
           let win_keys : Array[String] = []
           if !has_is_bound {
@@ -46948,20 +47337,6 @@ fn qbe_emit_expr_inner(
             g.bce_safe_exprs.remove(added_win[wki])
             wki = wki + 1
           }
-          let then_dropped : Array[Bool] = []
-          pni = 0
-          while pni < pos_names.length() {
-            then_dropped.push(!then_term && !g.known_min_len_arrs.contains(pos_names[pni]))
-            pni = pni + 1
-          }
-          pni = pos_names.length() - 1
-          while pni >= 0 {
-            match saved_pos_vals[pni] {
-              Some(old_v) => g.known_min_len_arrs.set(pos_names[pni], old_v)
-              None => g.known_min_len_arrs.remove(pos_names[pni])
-            }
-            pni = pni - 1
-          }
           let then_ty = match branch_exp {
             Some(et) => ty_prefer_concrete(et, tv.ty)
             None => tv.ty
@@ -46977,9 +47352,15 @@ fn qbe_emit_expr_inner(
             qbe_store_local_slot(g, qbe_coerce_val(g, tv, then_ty), res_slot, then_ty)
           }
           qbe_scope_pop(g)
+          let then_post = g.known_min_len_arrs
           qbe_emit_term(g, "jmp " + l_end)
           qbe_emit_lbl(g, l_else)
           qbe_scope_push(g)
+          g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
+          let neg_names : Array[String] = []
+          let neg_mins : Array[Int] = []
+          qbe_collect_neg_min_lens(g, cond, neg_names, neg_mins)
+          qbe_apply_min_lens(g, cond, neg_names, neg_mins)
           let else_exp : Option[Ty] = match branch_exp {
             Some(et) =>
               if !then_term {
@@ -47030,14 +47411,17 @@ fn qbe_emit_expr_inner(
             qbe_store_local_slot(g, qbe_coerce_val(g, ev, out_ty), res_slot, out_ty)
           }
           qbe_scope_pop(g)
+          let else_post = g.known_min_len_arrs
           qbe_emit_term(g, "jmp " + l_end)
           qbe_emit_lbl(g, l_end)
-          pni = 0
-          while pni < pos_names.length() {
-            if then_dropped[pni] {
-              g.known_min_len_arrs.remove(pos_names[pni])
-            }
-            pni = pni + 1
+          if !then_term && else_term {
+            g.known_min_len_arrs = then_post
+          } else if then_term && !else_term {
+            g.known_min_len_arrs = else_post
+          } else if then_term && else_term {
+            g.known_min_len_arrs = Map([])
+          } else {
+            g.known_min_len_arrs = qbe_intersect_min_len_maps(then_post, else_post)
           }
           if then_term && else_term {
             qval("0", TNever)
@@ -47931,6 +48315,8 @@ fn qbe_emit_expr_inner(
                     expected,
                   )
                   let mut saw_untyped_none = false
+                  let pre_kml = qbe_clone_int_map(g.known_min_len_arrs)
+                  let mut merged_kml : Option[Map[String, Int]] = None
                   k = 0
                   while k < var_tags.length() {
                     if !arm_emit[k] {
@@ -47940,6 +48326,7 @@ fn qbe_emit_expr_inner(
                     let arm = arms[var_arm_idxs[k]]
                     qbe_emit_lbl(g, arm_lbls[k])
                     qbe_scope_push(g)
+                    g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
                     if qbe_pat_has_binds(arm.pat) {
                       let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
                       qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, true, arm.body)
@@ -47966,7 +48353,8 @@ fn qbe_emit_expr_inner(
                         res_ty = Some(ty_prefer_concrete(rt, bv.ty))
                       }
                     }
-                    if !g.block_term {
+                    let arm_term = g.block_term
+                    if !arm_term {
                       let store_ty = match res_ty {
                         Some(t) => t
                         None => bv.ty
@@ -47987,6 +48375,12 @@ fn qbe_emit_expr_inner(
                       }
                     }
                     qbe_scope_pop(g)
+                    if !arm_term {
+                      merged_kml = match merged_kml {
+                        None => Some(g.known_min_len_arrs)
+                        Some(m) => Some(qbe_intersect_min_len_maps(m, g.known_min_len_arrs))
+                      }
+                    }
                     qbe_emit_term(g, "jmp " + l_end)
                     k = k + 1
                   }
@@ -47994,6 +48388,7 @@ fn qbe_emit_expr_inner(
                   if def_arm_idx >= 0 {
                     let arm = arms[def_arm_idx]
                     qbe_scope_push(g)
+                    g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
                     if qbe_pat_has_binds(arm.pat) {
                       let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
                       qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, true, arm.body)
@@ -48020,7 +48415,8 @@ fn qbe_emit_expr_inner(
                         res_ty = Some(ty_prefer_concrete(rt, bv.ty))
                       }
                     }
-                    if !g.block_term {
+                    let def_term = g.block_term
+                    if !def_term {
                       let store_ty = match res_ty {
                         Some(t) => t
                         None => bv.ty
@@ -48041,6 +48437,12 @@ fn qbe_emit_expr_inner(
                       }
                     }
                     qbe_scope_pop(g)
+                    if !def_term {
+                      merged_kml = match merged_kml {
+                        None => Some(g.known_min_len_arrs)
+                        Some(m) => Some(qbe_intersect_min_len_maps(m, g.known_min_len_arrs))
+                      }
+                    }
                     qbe_emit_term(g, "jmp " + l_end)
                   } else {
                     let file_id = qbe_intern_source_path(g, sp.file)
@@ -48058,6 +48460,10 @@ fn qbe_emit_expr_inner(
                     qbe_emit_term(g, "jmp " + l_end)
                   }
                   qbe_emit_lbl(g, l_end)
+                  g.known_min_len_arrs = match merged_kml {
+                    Some(m) => m
+                    None => Map([])
+                  }
                   qbe_scope_pop(g)
                   let final_ty = match res_ty {
                     Some(t) => t
@@ -48089,6 +48495,8 @@ fn qbe_emit_expr_inner(
       )
       let mut saw_untyped_none = false
       let mut exhaustive = false
+      let mut cur_entry_kml = qbe_clone_int_map(g.known_min_len_arrs)
+      let mut merged_kml : Option[Map[String, Int]] = None
       let mut i = 0
       while i < arms.length() {
         let mut grp_end = i + 1
@@ -48098,6 +48506,7 @@ fn qbe_emit_expr_inner(
         let arm = arms[i]
         let is_irref = grp_end == i + 1 && qbe_arm_is_irrefutable(arm)
         let l_next = if is_irref { "" } else { qbe_lbl(g, "match_next") }
+        g.known_min_len_arrs = qbe_clone_int_map(cur_entry_kml)
         if grp_end > i + 1 {
           let l_body = qbe_lbl(g, "match_arm")
           let mut gi = i
@@ -48140,6 +48549,14 @@ fn qbe_emit_expr_inner(
             } else {
               qbe_emit_cond_branch(g, ge, l_body, l_gfail)
             }
+            let guard_post = qbe_clone_int_map(g.known_min_len_arrs)
+            let top_sc = g.scopes[g.scopes.length() - 1]
+            let mut gsi = 0
+            while gsi < top_sc.locals.length() {
+              guard_post.remove(top_sc.locals[gsi].name)
+              gsi = gsi + 1
+            }
+            cur_entry_kml = qbe_intersect_min_len_maps(cur_entry_kml, guard_post)
             qbe_emit_lbl(g, l_gfail)
             qbe_release_scope_locals_range(g, 0, before_guard)
             qbe_emit_term(g, "jmp " + l_next)
@@ -48167,7 +48584,8 @@ fn qbe_emit_expr_inner(
             res_ty = Some(ty_prefer_concrete(rt, bv.ty))
           }
         }
-        if !g.block_term {
+        let arm_term = g.block_term
+        if !arm_term {
           let store_ty = match res_ty {
             Some(t) => t
             None => bv.ty
@@ -48183,6 +48601,12 @@ fn qbe_emit_expr_inner(
           }
         }
         qbe_scope_pop(g)
+        if !arm_term {
+          merged_kml = match merged_kml {
+            None => Some(g.known_min_len_arrs)
+            Some(m) => Some(qbe_intersect_min_len_maps(m, g.known_min_len_arrs))
+          }
+        }
         qbe_emit_term(g, "jmp " + l_end)
         if is_irref {
           exhaustive = true
@@ -48207,6 +48631,10 @@ fn qbe_emit_expr_inner(
         qbe_emit_term(g, "jmp " + l_end)
       }
       qbe_emit_lbl(g, l_end)
+      g.known_min_len_arrs = match merged_kml {
+        Some(m) => m
+        None => Map([])
+      }
       qbe_scope_pop(g)
       let final_ty = match res_ty {
         Some(t) => t
@@ -50548,14 +50976,18 @@ fn qbe_try_emit_while_bce_versioned(
   cond : Expr,
   body : Array[Stmt],
 ) -> Bool {
-  if body.length() == 0 || body.length() > 16 || qbe_stmts_has_nested_loop(body) {
+  if body.length() == 0 || body.length() > 32 || qbe_stmts_has_nested_loop(body) {
     return false
   }
   let mut iv = ""
+  let mut cond_is_le = false
+  let mut cond_k_lhs = 0L
+  let mut cond_k_rhs = 0L
   let mut bound_is_lit = false
   let mut bound_lit = 0L
   let mut bound_name = ""
   let mut bound_hoisted_reg = ""
+  let mut bound_hoisted_len_l = ""
   let mut extra_cond : Option[Expr] = None
   let lt_cond = match cond {
     EBinary("&&", lhs, rhs, _) => {
@@ -50564,28 +50996,82 @@ fn qbe_try_emit_while_bce_versioned(
     }
     _ => cond
   }
-  match lt_cond {
-    EBinary("<", EIdent(iv_n, _), bound_e, _) => {
-      iv = iv_n
-      match bound_e {
-        EInt(raw, _) => {
-          bound_is_lit = true
-          bound_lit = qbe_parse_int64_lit(raw).to_int().to_int64()
-        }
-        EIdent(bn, _) => bound_name = bn
-        EField(EIdent(bv, _), bf, _) =>
-          match g.hoisted_fields.get(bv + "." + bf) {
-            Some(hv) =>
-              if qbe_is_int32_ty(hv.ty) {
-                bound_hoisted_reg = hv.reg
-              } else {
-                return false
-              }
-            None => return false
+  let raw_bound_e = match lt_cond {
+    EBinary(op, lhs_e, rhs_e, _) =>
+      if op == "<" || op == "<=" {
+        cond_is_le = op == "<="
+        match lhs_e {
+          EIdent(iv_n, _) => iv = iv_n
+          EBinary("+", EIdent(iv_n, _), EInt(kraw, _), _)
+          | EBinary("+", EInt(kraw, _), EIdent(iv_n, _), _) => {
+            let k = qbe_parse_int64_lit(kraw)
+            if k >= 0L && k <= 2147483647L {
+              iv = iv_n
+              cond_k_lhs = k
+            } else {
+              return false
+            }
           }
-        _ => return false
+          _ => return false
+        }
+        match rhs_e {
+          EBinary("-", be, EInt(kraw, _), _) => {
+            let k = qbe_parse_int64_lit(kraw)
+            if k >= 0L && k <= 2147483647L {
+              cond_k_rhs = k
+              be
+            } else {
+              return false
+            }
+          }
+          _ => rhs_e
+        }
+      } else {
+        return false
       }
+    _ => return false
+  }
+  match raw_bound_e {
+    EInt(raw, _) => {
+      bound_is_lit = true
+      bound_lit = qbe_parse_int64_lit(raw).to_int().to_int64()
     }
+    EIdent(bn, _) => bound_name = bn
+    EField(EIdent(bv, _), bf, _) =>
+      match g.hoisted_fields.get(bv + "." + bf) {
+        Some(hv) =>
+          if qbe_is_int32_ty(hv.ty) {
+            bound_hoisted_reg = hv.reg
+          } else {
+            return false
+          }
+        None => return false
+      }
+    EMethodCall(recv_e, mn, ma, msp) =>
+      if qbe_is_builtin_len_call(g, recv_e, mn, ma, msp) {
+        let len_key = match recv_e {
+          EIdent(an, _) => an
+          EField(EIdent(vn, _), fnm, _) => vn + "." + fnm
+          _ => ""
+        }
+        if len_key == "" || qbe_stmts_rebinds_ident(body, len_key) {
+          return false
+        }
+        match g.hoisted_arr_len.get(len_key) {
+          Some(hl) => bound_hoisted_len_l = hl
+          None =>
+            match g.hoisted_str_len.get(len_key) {
+              Some(hsl) => bound_hoisted_len_l = hsl
+              None =>
+                match g.hoisted_bytes_len.get(len_key) {
+                  Some(hbl) => bound_hoisted_len_l = hbl
+                  None => return false
+                }
+            }
+        }
+      } else {
+        return false
+      }
     _ => return false
   }
   let iv_slot = match qbe_lookup_local(g, iv) {
@@ -50597,46 +51083,70 @@ fn qbe_try_emit_while_bce_versioned(
       }
     None => return false
   }
+  let mut const_step = 0L
   let mut step_name = ""
   let mut step_slot = ""
   let last_stmt = body[body.length() - 1]
-  if !qbe_stmt_is_inc_by_one(last_stmt, iv) {
-    step_name = match last_stmt {
-      SAssign(EIdent(lhs_n, _), EBinary("+", EIdent(rhs_n, _), EIdent(sn, _), _), _) =>
+  if qbe_stmt_is_inc_by_one(last_stmt, iv) {
+    const_step = 1L
+  } else {
+    const_step = match last_stmt {
+      SAssign(EIdent(lhs_n, _), EBinary("+", EIdent(rhs_n, _), EInt(raw, _), _), _)
+      | SAssign(EIdent(lhs_n, _), EBinary("+", EInt(raw, _), EIdent(rhs_n, _), _), _) =>
         if lhs_n == iv && rhs_n == iv {
-          sn
-        } else if lhs_n == iv && sn == iv {
-          rhs_n
+          let v = qbe_parse_int64_lit(raw)
+          if v >= 1L && v <= 2147483647L { v } else { 0L }
         } else {
-          ""
+          0L
         }
-      SCompoundAssign("+", EIdent(lhs_n, _), EIdent(sn, _), _) =>
-        if lhs_n == iv { sn } else { "" }
-      _ => ""
-    }
-    if step_name == "" ||
-      step_name == iv ||
-      qbe_stmts_assigns_ident(body, step_name) ||
-      qbe_stmts_rebinds_ident(body, step_name) {
-      return false
-    }
-    match extra_cond {
-      Some(ec) =>
-        if qbe_expr_assigns_ident(ec, step_name) || qbe_expr_rebinds_ident(ec, step_name) {
-          return false
-        }
-      None => ()
-    }
-    match qbe_lookup_local(g, step_name) {
-      Some(sloc) =>
-        if !sloc.is_cell && qbe_is_int32_ty(sloc.ty) {
-          step_slot = sloc.slot
+      SCompoundAssign("+", EIdent(lhs_n, _), EInt(raw, _), _) =>
+        if lhs_n == iv {
+          let v = qbe_parse_int64_lit(raw)
+          if v >= 1L && v <= 2147483647L { v } else { 0L }
         } else {
-          return false
+          0L
         }
-      None => return false
+      _ => 0L
+    }
+    if const_step == 0L {
+      step_name = match last_stmt {
+        SAssign(EIdent(lhs_n, _), EBinary("+", EIdent(rhs_n, _), EIdent(sn, _), _), _) =>
+          if lhs_n == iv && rhs_n == iv {
+            sn
+          } else if lhs_n == iv && sn == iv {
+            rhs_n
+          } else {
+            ""
+          }
+        SCompoundAssign("+", EIdent(lhs_n, _), EIdent(sn, _), _) =>
+          if lhs_n == iv { sn } else { "" }
+        _ => ""
+      }
+      if step_name == "" ||
+        step_name == iv ||
+        qbe_stmts_assigns_ident(body, step_name) ||
+        qbe_stmts_rebinds_ident(body, step_name) {
+        return false
+      }
+      match extra_cond {
+        Some(ec) =>
+          if qbe_expr_assigns_ident(ec, step_name) || qbe_expr_rebinds_ident(ec, step_name) {
+            return false
+          }
+        None => ()
+      }
+      match qbe_lookup_local(g, step_name) {
+        Some(sloc) =>
+          if !sloc.is_cell && qbe_is_int32_ty(sloc.ty) {
+            step_slot = sloc.slot
+          } else {
+            return false
+          }
+        None => return false
+      }
     }
   }
+  let is_simple_lt = !cond_is_le && cond_k_lhs == 0L && cond_k_rhs == 0L
   let mut bi = 0
   while bi < body.length() - 1 {
     if qbe_stmt_assigns_ident(body[bi], iv) || qbe_stmt_rebinds_ident(body[bi], iv) {
@@ -50652,7 +51162,7 @@ fn qbe_try_emit_while_bce_versioned(
     None => ()
   }
   let mut bound_slot = ""
-  if !bound_is_lit && bound_hoisted_reg == "" {
+  if !bound_is_lit && bound_hoisted_reg == "" && bound_hoisted_len_l == "" {
     if bound_name == iv ||
       qbe_stmts_assigns_ident(body, bound_name) ||
       qbe_stmts_rebinds_ident(body, bound_name) {
@@ -50694,7 +51204,7 @@ fn qbe_try_emit_while_bce_versioned(
   }
   qbe_collect_bce_guards_stmts(g, body, iv, body, guards, seen)
   let push_guards : Array[String] = []
-  if step_slot == "" && !qbe_stmts_has_cf(body, false, true, false) {
+  if is_simple_lt && const_step == 1L && step_slot == "" && !qbe_stmts_has_cf(body, false, true, false) {
     match extra_cond {
       None => {
         let pcands : Array[String] = []
@@ -50726,43 +51236,87 @@ fn qbe_try_emit_while_bce_versioned(
   let l_scond = qbe_lbl(g, "wh_sc")
   let l_end = qbe_lbl(g, "wh_e")
 
-  // Entry check: iv0 < bound (0 iterations -> skip directly to @wh_e)
-  let iv0_w = qbe_tmp(g)
-  qbe_emit(g, iv0_w + " =w loadsw " + iv_slot)
-  let bnd_w = if bound_is_lit {
-    bound_lit.to_string()
-  } else if bound_hoisted_reg != "" {
-    bound_hoisted_reg
+  // Entry check: exact 32-bit source condition (0 iterations -> skip directly to @wh_e)
+  let mut iv0_w = ""
+  let mut bnd_w = ""
+  if is_simple_lt && bound_hoisted_len_l == "" {
+    let iw = qbe_tmp(g)
+    qbe_emit(g, iw + " =w loadsw " + iv_slot)
+    iv0_w = iw
+    bnd_w = if bound_is_lit {
+      bound_lit.to_string()
+    } else if bound_hoisted_reg != "" {
+      bound_hoisted_reg
+    } else {
+      let bw = qbe_tmp(g)
+      qbe_emit(g, bw + " =w loadsw " + bound_slot)
+      bw
+    }
+    let enter_ok = qbe_tmp(g)
+    qbe_emit(g, enter_ok + " =w csltw " + iv0_w + ", " + bnd_w)
+    qbe_emit_term(g, "jnz " + enter_ok + ", " + l_vchk + ", " + l_end)
   } else {
-    let bw = qbe_tmp(g)
-    qbe_emit(g, bw + " =w loadsw " + bound_slot)
-    bw
+    qbe_emit_cond_branch(g, lt_cond, l_vchk, l_end)
   }
-  let enter_ok = qbe_tmp(g)
-  qbe_emit(g, enter_ok + " =w csltw " + iv0_w + ", " + bnd_w)
-  qbe_emit_term(g, "jnz " + enter_ok + ", " + l_vchk + ", " + l_end)
 
   // Single-branch 64-bit pre-loop bounds guard
   qbe_emit_lbl(g, l_vchk)
+  if iv0_w == "" {
+    let iw = qbe_tmp(g)
+    qbe_emit(g, iw + " =w loadsw " + iv_slot)
+    iv0_w = iw
+  }
   let iv0_l = qbe_tmp(g)
   qbe_emit(g, iv0_l + " =l extsw " + iv0_w)
-  let bnd_l = if bound_is_lit {
+  let bnd_l = if bound_hoisted_len_l != "" {
+    bound_hoisted_len_l
+  } else if bound_is_lit {
     let bl = qbe_tmp(g)
     qbe_emit(g, bl + " =l copy " + bound_lit.to_string())
     bl
   } else {
+    if bnd_w == "" {
+      bnd_w = if bound_hoisted_reg != "" {
+        bound_hoisted_reg
+      } else {
+        let bw = qbe_tmp(g)
+        qbe_emit(g, bw + " =w loadsw " + bound_slot)
+        bw
+      }
+    }
     let bl = qbe_tmp(g)
     qbe_emit(g, bl + " =l extsw " + bnd_w)
     bl
   }
+  // Effective exclusive 64-bit upper bound `eff_bnd_l` so fast loop satisfies `0 <= iv < eff_bnd_l`.
+  let cond_adj = cond_k_lhs + cond_k_rhs - (if cond_is_le { 1L } else { 0L })
+  let eff_bnd_l = if cond_adj == 0L {
+    bnd_l
+  } else if cond_adj > 0L {
+    let eb = qbe_tmp(g)
+    qbe_emit(g, eb + " =l sub " + bnd_l + ", " + cond_adj.to_string())
+    eb
+  } else {
+    let eb = qbe_tmp(g)
+    qbe_emit(g, eb + " =l add " + bnd_l + ", 1")
+    eb
+  }
   let mut all_ok = qbe_tmp(g)
   qbe_emit(g, all_ok + " =w csgel " + iv0_l + ", 0")
+  if !is_simple_lt || bound_hoisted_len_l != "" {
+    let c_lt_eb = qbe_tmp(g)
+    let nxt_eb = qbe_tmp(g)
+    qbe_emit(g, c_lt_eb + " =w csltl " + iv0_l + ", " + eff_bnd_l)
+    qbe_emit(g, nxt_eb + " =w and " + all_ok + ", " + c_lt_eb)
+    all_ok = nxt_eb
+  }
   let mut step_l_reg = ""
   if step_slot != "" {
     let st_w = qbe_tmp(g)
     let st_l = qbe_tmp(g)
     let c_pos = qbe_tmp(g)
     let bnd_plus_st = qbe_tmp(g)
+    let lim_st = 2147483648L - cond_k_lhs
     let c_noov = qbe_tmp(g)
     let t_st = qbe_tmp(g)
     let nxt_st = qbe_tmp(g)
@@ -50770,12 +51324,21 @@ fn qbe_try_emit_while_bce_versioned(
     qbe_emit(g, st_l + " =l extsw " + st_w)
     step_l_reg = st_l
     qbe_emit(g, c_pos + " =w csgtl " + st_l + ", 0")
-    qbe_emit(g, bnd_plus_st + " =l add " + bnd_l + ", " + st_l)
-    qbe_emit(g, c_noov + " =w cslel " + bnd_plus_st + ", 2147483648")
+    qbe_emit(g, bnd_plus_st + " =l add " + eff_bnd_l + ", " + st_l)
+    qbe_emit(g, c_noov + " =w cslel " + bnd_plus_st + ", " + lim_st.to_string())
     qbe_emit(g, t_st + " =w and " + c_pos + ", " + c_noov)
     qbe_emit(g, nxt_st + " =w and " + all_ok + ", " + t_st)
     all_ok = nxt_st
+  } else if const_step > 1L || cond_k_lhs > 0L || cond_is_le || bound_hoisted_len_l != "" {
+    // Ensure `max_iv + const_step + cond_k_lhs <= INT32_MAX` (i.e. `eff_bnd_l <= 2147483648 - const_step - cond_k_lhs`).
+    let max_eb = 2147483648L - const_step - cond_k_lhs
+    let c_noov = qbe_tmp(g)
+    let nxt_st = qbe_tmp(g)
+    qbe_emit(g, c_noov + " =w cslel " + eff_bnd_l + ", " + max_eb.to_string())
+    qbe_emit(g, nxt_st + " =w and " + all_ok + ", " + c_noov)
+    all_ok = nxt_st
   }
+  let mut max_iv_l = ""
   let mut gi = 0
   while gi < guards.length() {
     let gd = guards[gi]
@@ -50794,7 +51357,7 @@ fn qbe_try_emit_while_bce_versioned(
     if gd.kind == 0 {
       let c1 = qbe_tmp(g)
       let nxt = qbe_tmp(g)
-      qbe_emit(g, c1 + " =w cslel " + bnd_l + ", " + alen)
+      qbe_emit(g, c1 + " =w cslel " + eff_bnd_l + ", " + alen)
       qbe_emit(g, nxt + " =w and " + all_ok + ", " + c1)
       all_ok = nxt
     } else if gd.kind == 1 {
@@ -50803,9 +51366,33 @@ fn qbe_try_emit_while_bce_versioned(
       let c_len = qbe_tmp(g)
       let t1 = qbe_tmp(g)
       let nxt = qbe_tmp(g)
-      qbe_emit(g, bc + " =l add " + bnd_l + ", " + gd.offset.to_string())
+      qbe_emit(g, bc + " =l add " + eff_bnd_l + ", " + gd.offset.to_string())
       qbe_emit(g, c_ov + " =w cslel " + bc + ", 2147483648")
       qbe_emit(g, c_len + " =w cslel " + bc + ", " + alen)
+      qbe_emit(g, t1 + " =w and " + c_ov + ", " + c_len)
+      qbe_emit(g, nxt + " =w and " + all_ok + ", " + t1)
+      all_ok = nxt
+    } else if gd.kind == 3 {
+      if max_iv_l == "" {
+        let mi = qbe_tmp(g)
+        qbe_emit(g, mi + " =l sub " + eff_bnd_l + ", 1")
+        max_iv_l = mi
+      }
+      let scaled = qbe_tmp(g)
+      qbe_emit(g, scaled + " =l mul " + max_iv_l + ", " + gd.scale.to_string())
+      let max_idx = if gd.offset == 0L {
+        scaled
+      } else {
+        let midx = qbe_tmp(g)
+        qbe_emit(g, midx + " =l add " + scaled + ", " + gd.offset.to_string())
+        midx
+      }
+      let c_ov = qbe_tmp(g)
+      let c_len = qbe_tmp(g)
+      let t1 = qbe_tmp(g)
+      let nxt = qbe_tmp(g)
+      qbe_emit(g, c_ov + " =w cslel " + max_idx + ", 2147483647")
+      qbe_emit(g, c_len + " =w csltl " + max_idx + ", " + alen)
       qbe_emit(g, t1 + " =w and " + c_ov + ", " + c_len)
       qbe_emit(g, nxt + " =w and " + all_ok + ", " + t1)
       all_ok = nxt
@@ -50825,7 +51412,7 @@ fn qbe_try_emit_while_bce_versioned(
       let nxt = qbe_tmp(g)
       qbe_emit(g, vw + " =w loadsw " + v_slot)
       qbe_emit(g, vl + " =l extsw " + vw)
-      qbe_emit(g, vmb + " =l sub " + vl + ", " + bnd_l)
+      qbe_emit(g, vmb + " =l sub " + vl + ", " + eff_bnd_l)
       qbe_emit(g, vmin + " =l add " + vmb + ", 1")
       qbe_emit(g, vmax + " =l sub " + vl + ", " + iv0_l)
       qbe_emit(g, c_lo + " =w csgel " + vmin + ", 0")
@@ -50871,6 +51458,8 @@ fn qbe_try_emit_while_bce_versioned(
   let mut swar_cnt_slot = ""
   let mut swar_cnt_is_i64 = false
   if g.release &&
+    is_simple_lt &&
+    const_step == 1L &&
     step_slot == "" &&
     body.length() == 2 &&
     !qbe_stmts_has_cf(body, true, true, true) {
@@ -50939,7 +51528,11 @@ fn qbe_try_emit_while_bce_versioned(
     }
   }
   let do_swar = swar_dp != ""
-  let do_unroll4 = if do_swar { false } else { qbe_can_unroll4_fast_while(g, body, step_slot, extra_cond) }
+  let do_unroll4 = if do_swar || !is_simple_lt || (step_slot == "" && const_step != 1L) {
+    false
+  } else {
+    qbe_can_unroll4_fast_while(g, body, step_slot, extra_cond)
+  }
   let l_swar_chk = if do_swar { qbe_lbl(g, "wh_swc") } else { "" }
   let l_swar_pre = if do_swar { qbe_lbl(g, "wh_swp") } else { "" }
   let l_swar = if do_swar { qbe_lbl(g, "wh_sw") } else { "" }
@@ -51286,7 +51879,7 @@ fn qbe_try_emit_while_bce_versioned(
   }
   qbe_emit_lbl(g, l_fast)
   let loop_depth = g.scopes.length()
-  let exchanged = !do_swar && !do_unroll4 && step_slot == "" && extra_cond is None &&
+  let exchanged = !do_swar && !do_unroll4 && is_simple_lt && const_step == 1L && step_slot == "" && extra_cond is None &&
     qbe_emit_guarded_exchange(g, body, iv, bound_name, iv_slot, iv0_l, bnd_l, bnd_w,
       guards, l_fast, l_end)
   if !exchanged {
@@ -56521,13 +57114,35 @@ fn qbe_emit_stmt(
                   g.assign_idx_arr = arr_local_name
                   g.assign_idx_key = idx_key
                   g.assign_idx_ep = ep
-                  let rv = qbe_emit_expr(g, rhs, Some(elem))
-                  g.assign_idx_arr = prev_arr
-                  g.assign_idx_key = prev_key
-                  g.assign_idx_ep = prev_ep
-                  qbe_store_arr_elem(g, qbe_coerce_val(g, rv, elem), ep, elem)
+                  let is_byte_elem = match subst_ty(elem, g.cur_type_subst) {
+                    TByte => true
+                    _ => false
+                  }
+                  if is_byte_elem {
+                    let vw = qbe_emit_storeb_rhs(g, rhs)
+                    g.assign_idx_arr = prev_arr
+                    g.assign_idx_key = prev_key
+                    g.assign_idx_ep = prev_ep
+                    qbe_emit(g, "storeb " + vw + ", " + ep)
+                  } else {
+                    let rv = qbe_emit_expr(g, rhs, Some(elem))
+                    g.assign_idx_arr = prev_arr
+                    g.assign_idx_key = prev_key
+                    g.assign_idx_ep = prev_ep
+                    qbe_store_arr_elem(g, qbe_coerce_val(g, rv, elem), ep, elem)
+                  }
                 } else {
-                  let rv = qbe_emit_expr(g, rhs, Some(elem))
+                  let is_byte_elem = match subst_ty(elem, g.cur_type_subst) {
+                    TByte => true
+                    _ => false
+                  }
+                  let mut byte_vw = ""
+                  let mut rv = qval("0", elem)
+                  if is_byte_elem {
+                    byte_vw = qbe_emit_storeb_rhs(g, rhs)
+                  } else {
+                    rv = qbe_emit_expr(g, rhs, Some(elem))
+                  }
                   let bce_safe = if arr_local_name != "" {
                     qbe_bce_expr_is_safe(g, arr_local_name, idx)
                   } else {
@@ -56559,7 +57174,11 @@ fn qbe_emit_stmt(
                     }
                   }
                   let ep = qbe_emit_arr_ep_ty(g, dp, il, elem)
-                  qbe_store_arr_elem(g, qbe_coerce_val(g, rv, elem), ep, elem)
+                  if is_byte_elem {
+                    qbe_emit(g, "storeb " + byte_vw + ", " + ep)
+                  } else {
+                    qbe_store_arr_elem(g, qbe_coerce_val(g, rv, elem), ep, elem)
+                  }
                 }
               } else {
                 let rv = qbe_emit_expr(g, rhs, Some(elem))
@@ -56612,7 +57231,7 @@ fn qbe_emit_stmt(
             TBytes => {
               let iv = qbe_emit_expr(g, idx, Some(TInt))
               let il = qbe_as_l(g, iv)
-              let rv = qbe_emit_expr(g, rhs, Some(TByte))
+              let vw = qbe_emit_storeb_rhs(g, rhs)
               let bce_safe = if arr_local_name != "" {
                 qbe_bce_expr_is_safe(g, arr_local_name, idx)
               } else {
@@ -56649,9 +57268,7 @@ fn qbe_emit_stmt(
                 }
               }
               let ep = qbe_tmp(g)
-              let vw = qbe_tmp(g)
               qbe_emit(g, ep + " =l add " + dp + ", " + il)
-              qbe_emit(g, vw + " =w copy " + rv.reg)
               qbe_emit(g, "storeb " + vw + ", " + ep)
             }
             _ => ()
@@ -57152,8 +57769,10 @@ fn qbe_emit_stmt(
           None => break
         }
       }
+      let pre_kml = qbe_clone_int_map(g.known_min_len_arrs)
       qbe_emit_lbl(g, l_else)
       qbe_scope_push(g)
+      g.known_min_len_arrs = qbe_clone_int_map(pre_kml)
       let ev = qbe_emit_stmts(g, else_body, None)
       if !g.block_term {
         qbe_rc_dec(g, ev.reg, ev.ty)
@@ -57175,6 +57794,7 @@ fn qbe_emit_stmt(
         qbe_emit_term(g, "hlt")
       }
       qbe_emit_lbl(g, l_ok)
+      g.known_min_len_arrs = pre_kml
       // Restore newly bound guard locals in original order into enclosing scope
       let mut ni = new_locals.length() - 1
       while ni >= 0 {
@@ -57206,6 +57826,7 @@ fn qbe_emit_stmt(
     SWhile(cond, body, _) => {
       if qbe_expr_has_is(cond) {
         qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), None, body)
+        let loop_inv_kml = qbe_prepare_loop_min_lens(g, Some(cond), None, body)
         let l_cond = qbe_lbl(g, "wh_c")
         let l_body = qbe_lbl(g, "wh_b")
         let l_end = qbe_lbl(g, "wh_e")
@@ -57233,9 +57854,11 @@ fn qbe_emit_stmt(
         g.hot_loop_depth = g.hot_loop_depth - 1
         qbe_emit_term(g, "jmp " + l_cond)
         qbe_emit_lbl(g, l_end)
+        g.known_min_len_arrs = loop_inv_kml
         return qval("0", TUnit)
       }
       qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), None, body)
+      let loop_inv_kml = qbe_prepare_loop_min_lens(g, Some(cond), None, body)
       let loop_no_calls = qbe_loop_has_no_calls_expr(g, cond) &&
         qbe_loop_has_no_calls_stmts(g, body)
       // Loop-invariant Array header (len + data pointer) & String (len + data ptr) hoisting
@@ -57629,7 +58252,11 @@ fn qbe_emit_stmt(
         EBinary("&&", lhs, rhs, _) =>
           match lhs {
             EBinary("<", EIdent(iv0, _), _, _) | EBinary("<=", EIdent(iv0, _), _, _) =>
-              if !qbe_expr_assigns_ident(rhs, iv0) { lhs } else { cond }
+              if !qbe_expr_assigns_ident(rhs, iv0) && !qbe_expr_rebinds_ident(rhs, iv0) {
+                lhs
+              } else {
+                cond
+              }
             _ => cond
           }
         _ => cond
@@ -57669,7 +58296,7 @@ fn qbe_emit_stmt(
                 let mut other_write = false
                 let mut bi = 0
                 while bi < body.length() - 1 {
-                  if qbe_stmt_assigns_ident(body[bi], iv) {
+                  if qbe_stmt_assigns_ident(body[bi], iv) || qbe_stmt_rebinds_ident(body[bi], iv) {
                     other_write = true
                     break
                   }
@@ -57767,11 +58394,11 @@ fn qbe_emit_stmt(
             None => ()
           }
           if iv_ok && body.length() >= 1 && qbe_stmt_is_inc_by_one(body[body.length() - 1], iv) {
-            // Ensure `iv` is never assigned anywhere else in `body[0 .. len-2]`
+            // Ensure `iv` is never assigned or shadowed anywhere else in `body[0 .. len-2]`
             let mut other_write = false
             let mut bi = 0
             while bi < body.length() - 1 {
-              if qbe_stmt_assigns_ident(body[bi], iv) {
+              if qbe_stmt_assigns_ident(body[bi], iv) || qbe_stmt_rebinds_ident(body[bi], iv) {
                 other_write = true
                 break
               }
@@ -58032,6 +58659,7 @@ fn qbe_emit_stmt(
         g.hoisted_fields.remove(newly_hoisted_fields[hfi])
         hfi = hfi + 1
       }
+      g.known_min_len_arrs = loop_inv_kml
       qval("0", TUnit)
     }
     SFor(init_s, cond, step_s, body, _) => {
@@ -58055,6 +58683,7 @@ fn qbe_emit_stmt(
         }
       }
       qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), Some(step_s), body)
+      let loop_inv_kml = qbe_prepare_loop_min_lens(g, Some(cond), Some(step_s), body)
       let l_cond = qbe_lbl(g, "for_c")
       let l_body = qbe_lbl(g, "for_b")
       let l_step = qbe_lbl(g, "for_s")
@@ -58083,6 +58712,7 @@ fn qbe_emit_stmt(
       g.hot_loop_depth = g.hot_loop_depth - 1
       qbe_emit_term(g, "jmp " + l_cond)
       qbe_emit_lbl(g, l_end)
+      g.known_min_len_arrs = loop_inv_kml
       qbe_unpin_slot_list(g, for_dp_pinned)
       qbe_scope_pop(g)
       qval("0", TUnit)
@@ -58122,6 +58752,7 @@ fn qbe_emit_stmt(
         sp,
       )
       qbe_invalidate_escaping_unfrozen_arrs(g, None, None, body)
+      let loop_inv_kml = qbe_prepare_loop_min_lens(g, None, None, body)
       if inclusive {
         let l_body = qbe_lbl(g, "fori_b")
         let l_step = qbe_lbl(g, "fori_s")
@@ -58195,6 +58826,7 @@ fn qbe_emit_stmt(
           let _ = qbe_emit_stmt(g, SWhile(cond_e, wbody, sp), None, false)
         }
       }
+      g.known_min_len_arrs = loop_inv_kml
       qbe_scope_pop(g)
       qval("0", TUnit)
     }
@@ -58202,6 +58834,7 @@ fn qbe_emit_stmt(
       qbe_scope_push(g)
       let av = qbe_emit_expr(g, iter_e, None)
       qbe_invalidate_escaping_unfrozen_arrs(g, None, None, body)
+      let loop_inv_kml = qbe_prepare_loop_min_lens(g, None, None, body)
       let arr_name = "@pion_fa_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
       let arr_loc = qbe_define_local(g, arr_name, av.ty, qbe_is_obj_ty(g, av.ty))
@@ -58306,6 +58939,7 @@ fn qbe_emit_stmt(
         let _ = qbe_emit_stmt(g, SWhile(cond_e, wbody, sp), None, false)
       }
       g.len_aliases.remove(len_name)
+      g.known_min_len_arrs = loop_inv_kml
       qbe_scope_pop(g)
       qval("0", TUnit)
     }
