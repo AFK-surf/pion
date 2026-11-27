@@ -1861,6 +1861,16 @@ def main():
             "fn r25_opt_val(val? : (Int) -> Int = fn(_n) { 1 }) -> Int {\n"
             "  val_(0) * 10 + val(0)\n"
             "}\n"
+            "fn r25b_pos_val_clash(val : (Int) -> Int) -> Int {\n"
+            "  let val_1 = 7\n"
+            "  val_(0) * 100 + val(0) * 10 + val_1\n"
+            "}\n"
+            "fn r25b_wild_lbl_val(_ : Int, val~ : (Int) -> Int) -> Int {\n"
+            "  val_(0) * 10 + val(0)\n"
+            "}\n"
+            "fn r25b_def_val__lbl_val(x? : Int = val_(0), val~ : (Int) -> Int) -> Int {\n"
+            "  x * 10 + val(0)\n"
+            "}\n"
             'pub fn run_pure() -> String {\n'
             '  let a = if flag { 1 } else { 0 }\n'
             '  let b = if val1() { 1 } else { 0 }\n'
@@ -1872,7 +1882,10 @@ def main():
             '  let h = r25_pos_val(fn(_x) { 1 })\n'
             '  let i = r25_lbl_val(val=fn(_x) { 1 })\n'
             '  let j = r25_opt_val()\n'
-            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string() + "," + f.to_string() + "," + g.to_string() + "," + h.to_string() + "," + i.to_string() + "," + j.to_string()\n'
+            '  let k = r25b_pos_val_clash(fn(_x) { 1 })\n'
+            '  let l = r25b_wild_lbl_val(0, val=fn(_x) { 1 })\n'
+            '  let m = r25b_def_val__lbl_val(val=fn(_x) { 1 })\n'
+            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string() + "," + f.to_string() + "," + g.to_string() + "," + h.to_string() + "," + i.to_string() + "," + j.to_string() + "," + k.to_string() + "," + l.to_string() + "," + m.to_string()\n'
             '}\n'
         )
         for rel, txt in [
@@ -1886,7 +1899,7 @@ def main():
                 f.write(txt)
         pure_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=pure_m).stdout.strip()
         pure_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=pure_m).stdout.strip()
-        assert pure_mn == "0,0,5,1,991,991,100,991,991,991" and pure_mw == "0,0,5,1,991,991,100,991,991,991", f"R12-R25 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
+        assert pure_mn == "0,0,5,1,991,991,100,991,991,991,9917,991,991" and pure_mw == "0,0,5,1,991,991,100,991,991,991,9917,991,991", f"R12-R25b pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
 
         pure_pout = os.path.join(work, "pure_is_pion")
         os.makedirs(os.path.join(pure_pout, "src"))
@@ -1897,8 +1910,8 @@ def main():
             f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_pure())\n  0\n}\n")
         pure_pn = run_cmd([args.pionc, "run", pure_pout]).stdout.strip()
         pure_pw = run_cmd([args.pionc, "run", "--target", "wasm32", pure_pout]).stdout.strip()
-        assert pure_pn == "0,0,5,1,991,991,100,991,991,991" and pure_pw == "0,0,5,1,991,991,100,991,991,991", f"R12-R25 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
-        print("[f6-1-oracle] PASS R12-R25 pure pkg (val_ top-level): 4-target == 0,0,5,1,991,991,100,991,991,991")
+        assert pure_pn == "0,0,5,1,991,991,100,991,991,991,9917,991,991" and pure_pw == "0,0,5,1,991,991,100,991,991,991,9917,991,991", f"R12-R25b pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
+        print("[f6-1-oracle] PASS R12-R25b pure pkg (val_ top-level): 4-target == 0,0,5,1,991,991,100,991,991,991,9917,991,991")
 
         # 3a-9. R24/R25 4-target check: package-level `fn val` isolated from local `val_` / `val__1` / `val_~` / `val_?` / escaping recursive `fn val_`
         valkw_m = os.path.join(work, "valkw_moon")
