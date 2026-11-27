@@ -1457,8 +1457,10 @@ pub fn transpile_package_with_query_types_and_dep_dirs(
   let mut probes_instrumented = 0
   let mut probes_resolved = 0
   let mut pre_b_iters = 0
+  let mut post_b_total_iters = 0
+  let mut last_post_b_iters = 0
   let probe_dispositions : Array[ProbeDisposition] = []
-  let mut post_a5_qt = empty_pkg_query_types()
+  let mut diag_hist : Array[(String, Int)] = []
   if run_probes {
     let (pre_files, pre_it, _, pre_qt) = run_stage_b_with_ops_deps_and_qt(
       gen_files,
@@ -1486,56 +1488,244 @@ pub fn transpile_package_with_query_types_and_dep_dirs(
         None => ()
       }
     }
-    let (a5_files, pr, pi, pres, pkg_qt) = run_stage_a5_with_query_types_and_seed(
-      gen_files,
-      recipes,
-      api_map,
-      combined_val_fields,
-      ctx.val_probe_sites,
-      init_origins_by_file,
-      check_fn,
-      query_types_cb,
-      pre_qt,
-      ctx.diags,
-      ctx.drift_ledger,
-      probe_dispositions,
-      64,
-    )
-    gen_files = a5_files
-    post_a5_qt = pkg_qt
-    probe_rounds = pr
-    probes_instrumented = pi
-    probes_resolved = pres
-    // §D1-3: Active type-directed `Neg` (`-p`) lowering (zero overhead when no `Neg` impl exists)
-    if has_any_neg_impl(op_lookup) {
-      let (neg_files, neg_ch) = run_neg_probe_pass(gen_files, op_lookup, check_fn, ctx.diags)
-      gen_files = neg_files
-      if neg_ch {
-        post_a5_qt = empty_pkg_query_types()
+
+    let max_coupled_rounds = 8
+    let mut coupled_round = 0
+    let mut active_files : Option[Map[String, Bool]] = None
+    let mut seed_qt = pre_qt
+    let carried_init_used_slots : Map[String, Map[Int, Bool]] = Map()
+
+    let seen_diag_keys : Map[String, Bool] = Map()
+    for existing_d in ctx.diags {
+      let dk = existing_d.code + "\n" + existing_d.file + "\n" + existing_d.line.to_string() + "\n" + existing_d.col.to_string() + "\n" + existing_d.message
+      seen_diag_keys[dk] = true
+    }
+    let push_diag_dedup = fn(d : Diag) -> Unit {
+      let dk = d.code + "\n" + d.file + "\n" + d.line.to_string() + "\n" + d.col.to_string() + "\n" + d.message
+      if !seen_diag_keys.contains(dk) {
+        seen_diag_keys[dk] = true
+        ctx.diags.push(d)
       }
+    }
+    let seen_drift_keys : Map[String, Bool] = Map()
+    for existing_e in ctx.drift_ledger {
+      let ek = existing_e.category + "\n" + existing_e.file + "\n" + existing_e.line.to_string() + "\n" + existing_e.col.to_string() + "\n" + existing_e.expr + "\n" + existing_e.resolution + "\n" + existing_e.status
+      seen_drift_keys[ek] = true
+    }
+    let push_drift_dedup = fn(e : DriftEntry) -> Unit {
+      let ek = e.category + "\n" + e.file + "\n" + e.line.to_string() + "\n" + e.col.to_string() + "\n" + e.expr + "\n" + e.resolution + "\n" + e.status
+      if !seen_drift_keys.contains(ek) {
+        seen_drift_keys[ek] = true
+        ctx.drift_ledger.push(e)
+      }
+    }
+
+    let is_transient_undisposed_diag = fn(d : Diag) -> Bool {
+      (d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" && !str_has(d.message, "cannot resolve `.val` field mapping")) ||
+      d.code == "MBT2PION_UNDISPOSED_DIV_MOD"
+    }
+
+    while coupled_round < max_coupled_rounds {
+      let round_diags : Array[Diag] = []
+      let round_drift : Array[DriftEntry] = []
+      let round_perm_diags : Array[Diag] = []
+      let round_perm_drift : Array[DriftEntry] = []
+      let round_disps : Array[ProbeDisposition] = []
+      let (a5_files, pr, pi, pres, pkg_qt) = run_stage_a5_with_query_types_and_seed_ex(
+        gen_files,
+        recipes,
+        api_map,
+        combined_val_fields,
+        ctx.val_probe_sites,
+        init_origins_by_file,
+        check_fn,
+        query_types_cb,
+        seed_qt,
+        active_files,
+        carried_init_used_slots,
+        round_diags,
+        round_drift,
+        round_perm_diags,
+        round_perm_drift,
+        round_disps,
+        64,
+      )
+      probe_rounds = probe_rounds + pr
+
+      // Diagnostics and drift entries from `Some(...)`-consumed probe sites are permanent
+      // (their probe sites are rewritten out of source and will never re-fire); commit immediately.
+      for d in round_perm_diags { push_diag_dedup(d) }
+      for e in round_perm_drift { push_drift_dedup(e) }
+
+      let known_rels : Map[String, Bool] = Map()
+      let src_to_rel : Map[String, String] = Map()
+      for gf in a5_files {
+        known_rels[gf.rel_path] = true
+        src_to_rel[gf.source_file] = gf.rel_path
+      }
+      let unresolved_files : Map[String, Bool] = Map()
+      let mut has_unmapped_transient = false
+      for d in round_diags {
+        if is_transient_undisposed_diag(d) {
+          let mut mapped = false
+          if known_rels.contains(d.file) {
+            unresolved_files[d.file] = true
+            mapped = true
+          } else {
+            match src_to_rel.get(d.file) {
+              Some(rp) => {
+                unresolved_files[rp] = true
+                mapped = true
+              }
+              None => ()
+            }
+            for init_rel in ["00_init_order.pion", "00_init_order_test.pion"] {
+              if known_rels.contains(init_rel) {
+                match init_origins_by_file.get(init_rel) {
+                  Some(recs) => {
+                    for rec in recs {
+                      if rec.source_file == d.file {
+                        unresolved_files[init_rel] = true
+                        mapped = true
+                        break
+                      }
+                    }
+                  }
+                  None => ()
+                }
+              }
+            }
+          }
+          if !mapped {
+            has_unmapped_transient = true
+          }
+        }
+      }
+
+      let mut mid_files = a5_files
+      let mut post_a5_qt = pkg_qt
+      let round_neg_diags : Array[Diag] = []
+      // §D1-3: Active type-directed `Neg` (`-p`) lowering (zero overhead when no `Neg` impl exists)
+      if has_any_neg_impl(op_lookup) {
+        let (neg_files, neg_ch) = run_neg_probe_pass(mid_files, op_lookup, check_fn, round_neg_diags)
+        mid_files = neg_files
+        if neg_ch {
+          post_a5_qt = empty_pkg_query_types()
+        }
+      }
+
+      // Stage B: Type-Directed Fixpoint Pass (`pionc check --json`)
+      let round_b_diags : Array[Diag] = []
+      let round_b_drift : Array[DriftEntry] = []
+      let (b_files, pb_iters, pb_hist, _) = run_stage_b_with_ops_deps_and_qt(
+        mid_files,
+        api_map,
+        op_lookup,
+        symtab.dep_method_names,
+        check_fn,
+        Some(query_types_cb),
+        post_a5_qt,
+        round_b_diags,
+        round_b_drift,
+      )
+      post_b_total_iters = post_b_total_iters + pb_iters
+      last_post_b_iters = pb_iters
+      diag_hist = pb_hist
+
+      let a5_content_by_rel : Map[String, String] = Map()
+      for af in a5_files {
+        a5_content_by_rel[af.rel_path] = af.content
+      }
+      let post_b_modified_files : Map[String, Bool] = Map()
+      let mut post_b_changed = false
+      for bf in b_files {
+        let prev_c = match a5_content_by_rel.get(bf.rel_path) {
+          Some(c) => c
+          None => ""
+        }
+        if bf.content != prev_c {
+          post_b_modified_files[bf.rel_path] = true
+          post_b_changed = true
+        }
+      }
+
+      let continue_coupled = !has_unmapped_transient && unresolved_files.length() > 0 && post_b_changed && (coupled_round + 1 < max_coupled_rounds)
+      if !continue_coupled {
+        for d in round_diags { push_diag_dedup(d) }
+        for d in round_neg_diags { push_diag_dedup(d) }
+        for d in round_b_diags { push_diag_dedup(d) }
+        for e in round_drift { push_drift_dedup(e) }
+        for e in round_b_drift { push_drift_dedup(e) }
+        for pd in round_disps { probe_dispositions.push(pd) }
+        probes_instrumented = probes_instrumented + pi
+        probes_resolved = probes_resolved + pres
+        gen_files = b_files
+        break
+      }
+
+      let next_active_files : Map[String, Bool] = Map()
+      for k in unresolved_files.keys() { next_active_files[k] = true }
+      for k in post_b_modified_files.keys() { next_active_files[k] = true }
+
+      let active_init_src_files : Map[String, Bool] = Map()
+      for init_rel in ["00_init_order.pion", "00_init_order_test.pion"] {
+        if next_active_files.contains(init_rel) {
+          match init_origins_by_file.get(init_rel) {
+            Some(recs) => {
+              for rec in recs {
+                active_init_src_files[rec.source_file] = true
+              }
+            }
+            None => ()
+          }
+        }
+      }
+      let is_file_active_next = fn(fp : String) -> Bool {
+        next_active_files.contains(fp) || active_init_src_files.contains(fp)
+      }
+
+      // `round_diags`/`round_drift` contain only `None`-branch sites (still in source) and end audits:
+      // commit inactive files now, and let active files re-emit at their final post-rewrite coordinates.
+      for d in round_diags {
+        if !is_file_active_next(d.file) {
+          push_diag_dedup(d)
+        }
+      }
+      for e in round_drift {
+        if !is_file_active_next(e.file) {
+          push_drift_dedup(e)
+        }
+      }
+      let mut committed_disps = 0
+      for pd in round_disps {
+        if !is_file_active_next(pd.file) || pd.disposition == "rewritten" {
+          probe_dispositions.push(pd)
+          committed_disps = committed_disps + 1
+        }
+      }
+      // Stage B and Neg passes may emit fail-closed diagnostics while still rewriting the call
+      // (e.g., `arr_retain`/`arr_filter_map`/`arr_search_by`), so commit all of them immediately
+      // with deduplication to never drop a blocker across coupled rounds.
+      for d in round_neg_diags {
+        push_diag_dedup(d)
+      }
+      for d in round_b_diags {
+        push_diag_dedup(d)
+      }
+      for e in round_b_drift {
+        push_drift_dedup(e)
+      }
+      probes_instrumented = probes_instrumented + committed_disps
+      probes_resolved = probes_resolved + committed_disps
+      gen_files = b_files
+      active_files = Some(next_active_files)
+      seed_qt = empty_pkg_query_types()
+      coupled_round = coupled_round + 1
     }
   }
 
-  // Stage B: Type-Directed Fixpoint Pass (`pionc check --json`)
-  let (b_files, post_b_iters, init_diag_hist, _) = if run_probes {
-    run_stage_b_with_ops_deps_and_qt(
-      gen_files,
-      api_map,
-      op_lookup,
-      symtab.dep_method_names,
-      check_fn,
-      Some(query_types_cb),
-      post_a5_qt,
-      ctx.diags,
-      ctx.drift_ledger,
-    )
-  } else {
-    (gen_files, 0, [], empty_pkg_query_types())
-  }
-  let mut stage_b_iters = pre_b_iters + post_b_iters
-  let mut diag_hist = init_diag_hist
-  gen_files = b_files
-  if run_probes && post_b_iters > 1 && has_any_neg_impl(op_lookup) {
+  let mut stage_b_iters = pre_b_iters + post_b_total_iters
+  if run_probes && last_post_b_iters > 1 && has_any_neg_impl(op_lookup) {
     let (neg_files2, neg_changed2) = run_neg_probe_pass(gen_files, op_lookup, check_fn, ctx.diags)
     gen_files = neg_files2
     if neg_changed2 {
