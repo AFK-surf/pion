@@ -906,3 +906,145 @@ test "sig: emit_pion_stub AST round-trip fidelity (escapes, ECall(EField), SForI
   }
   assert_true(matched == 4, "expected 4 round-tripped generic bodies, got " + matched.to_string())
 }
+
+///|
+fn sigt_make_ho_id_cycle_src(
+  depth : Int,
+  double_id : Bool,
+  cyclic : Bool,
+  call_all : Bool,
+) -> String {
+  let ret_sb = StringBuilder()
+  let mut i = 0
+  while i < depth {
+    ret_sb.write_string("() -> ")
+    i = i + 1
+  }
+  ret_sb.write_string("Int")
+  let ret_ty = ret_sb.to_string()
+  let fn_ty = "() -> " + ret_ty
+  let mut body = if cyclic { "A" } else { "B" }
+  i = 0
+  while i < depth {
+    body = "fn() { " + body + " }"
+    i = i + 1
+  }
+  let calls_sb = StringBuilder()
+  let n_calls = if call_all { depth + 1 } else { depth }
+  i = 0
+  while i < n_calls {
+    calls_sb.write_string("()")
+    i = i + 1
+  }
+  let wrap = if double_id { "id(id(g))" } else { "id(g)" }
+  let call_expr = if call_all {
+    "h" + calls_sb.to_string()
+  } else {
+    "let _ = h" + calls_sb.to_string() + "; 1"
+  }
+  let extra = if cyclic { "" } else { "\nlet B : Int = 42" }
+  "fn g() -> " + ret_ty + " { " + body + " }\n" +
+  "fn id(f : " + fn_ty + ") -> " + fn_ty + " { f }\n" +
+  "fn run() -> Int { let h = " + wrap + "; " + call_expr + " }\n" +
+  "fn dead_ho() -> Int { 7 }\n" +
+  "let A : Int = run()" + extra + "\n"
+}
+
+///|
+test "issue58_higher_order_id_const_cycle_and_falias_ret_fold" {
+  // 1. Direct `id(g)` cycle detection across depths 1, 3, 9, 12, 20 (both eager & Stage 2 demand).
+  let depths : Array[Int] = [1, 3, 9, 12, 20]
+  let mut di = 0
+  while di < depths.length() {
+    let d = depths[di]
+    let src = sigt_make_ho_id_cycle_src(d, false, true, true)
+    let r = sigt_assert_demand_parity(
+      "ho_id_cyc_d" + d.to_string(),
+      ["ho_d" + d.to_string() + ".pion"],
+      [src],
+      [],
+    )
+    assert_true(r.plan.has_cycle, "id(g) depth=" + d.to_string() + " must detect E_CONST_CYCLE")
+    di = di + 1
+  }
+
+  // 2. Multi-layer higher-order wrapping: `id(id(g))` at depth 3 and 12, plus `id2(f) { id(f) }`.
+  let r_dbl3 = sigt_assert_demand_parity(
+    "ho_double_id_d3",
+    ["ho_dbl3.pion"],
+    [sigt_make_ho_id_cycle_src(3, true, true, true)],
+    [],
+  )
+  assert_true(r_dbl3.plan.has_cycle, "id(id(g)) depth=3 must detect E_CONST_CYCLE")
+  let r_dbl12 = sigt_assert_demand_parity(
+    "ho_double_id_d12",
+    ["ho_dbl12.pion"],
+    [sigt_make_ho_id_cycle_src(12, true, true, true)],
+    [],
+  )
+  assert_true(r_dbl12.plan.has_cycle, "id(id(g)) depth=12 must detect E_CONST_CYCLE")
+
+  let fwd_wrap_src =
+  #|fn g() -> () -> () -> () -> Int { fn() { fn() { fn() { A } } } }
+  #|fn id(f : () -> () -> () -> () -> Int) -> () -> () -> () -> () -> Int { let x = f; x }
+  #|fn id2(f : () -> () -> () -> () -> Int) -> () -> () -> () -> () -> Int { id(f) }
+  #|fn run() -> Int { let h = id2(g); h()()()() }
+  #|let A : Int = run()
+  let r_fwd = sigt_assert_demand_parity("ho_fwd_wrap", ["ho_fwd.pion"], [fwd_wrap_src], [])
+  assert_true(r_fwd.plan.has_cycle, "id2(g) forwarding to id(f) must detect E_CONST_CYCLE")
+
+  // 3. Cross-file same-package higher-order identity cycle.
+  let xf_a = "fn g() -> () -> () -> () -> Int { fn() { fn() { fn() { A } } } }\n"
+  let xf_b =
+  #|fn id(f : () -> () -> () -> () -> Int) -> () -> () -> () -> () -> Int { f }
+  #|fn run() -> Int { let h = id(g); h()()()() }
+  #|let A : Int = run()
+  let r_xf = sigt_assert_demand_parity("ho_xfile", ["a.pion", "b.pion"], [xf_a, xf_b], [])
+  assert_true(r_xf.plan.has_cycle, "cross-file id(g) must detect E_CONST_CYCLE")
+
+  // 4. Legitimate acyclic higher-order functions must NOT false-positive.
+  let r_ok = sigt_assert_demand_parity(
+    "ho_id_ok_d3",
+    ["ho_ok3.pion"],
+    [sigt_make_ho_id_cycle_src(3, false, false, true)],
+    [],
+  )
+  assert_true(!r_ok.plan.has_cycle, "acyclic id(g_ok) must not false-positive")
+  assert_true(
+    r_ok.plan.order.length() == 2 && r_ok.plan.order[0] == "B" && r_ok.plan.order[1] == "A",
+    "acyclic id(g_ok) must order B before A",
+  )
+
+  let r_part = sigt_assert_demand_parity(
+    "ho_id_partial_d3",
+    ["ho_part3.pion"],
+    [sigt_make_ho_id_cycle_src(3, false, true, false)],
+    [],
+  )
+  assert_true(!r_part.plan.has_cycle, "partial call h()()() not invoking innermost A must not false-positive")
+
+  let unused_src =
+  #|fn g() -> () -> () -> () -> Int { fn() { fn() { fn() { A } } } }
+  #|fn id(f : () -> () -> () -> () -> Int) -> () -> () -> () -> () -> Int { f }
+  #|fn run() -> Int { let _h = id(g); 1 }
+  #|let A : Int = run()
+  let r_unused = sigt_assert_demand_parity("ho_id_unused", ["ho_unused.pion"], [unused_src], [])
+  assert_true(!r_unused.plan.has_cycle, "unused id(g) must not false-positive")
+
+  // 5. Sub-item 2: `fn_aliases` over-depth `$ret:` fold must collect transitive return targets
+  //    consistently with `icalls`.
+  let falias_overdepth_sig =
+    "const A: Int\n" +
+    "#cdep A||trig@0\n" +
+    "fn trig() -> Int\n" +
+    "#fdep trig||$ret:al@0\n" +
+    "#falias al|$ret:$ret:$ret:$ret:$ret:$ret:$ret:$ret:$ret:mid\n" +
+    "#fret mid|leaf\n" +
+    "fn leaf() -> Int\n" +
+    "#fdep leaf|A|\n"
+  let plan_fa = compute_const_init_plan_from_sigs([falias_overdepth_sig])
+  assert_true(
+    plan_fa.has_cycle,
+    "fn_aliases over-depth $ret: fold must reach transitive return target leaf -> A",
+  )
+}

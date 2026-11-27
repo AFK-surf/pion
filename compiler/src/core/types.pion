@@ -798,6 +798,21 @@ pub struct TypeChecker {
   qt_expr_tys : Map[String, QtExprRec]
   qt_call_infos : Map[String, QtCallRec]
   qt_bindings : Map[String, QtBindRec]
+  /// Nesting depth of active generic-callback two-pass closure checks that may retry.
+  mut closure_retry_depth : Int
+  /// Memoized outer capture names per closure `span_key`.
+  closure_capture_names : Map[String, Array[String]]
+  /// Checked closure result cache keyed by `span_key + "\n" + signature/capture fingerprint`.
+  closure_check_cache : Map[String, ClosureCheckCacheEntry]
+}
+
+///|
+struct ClosureCheckCacheEntry {
+  clo_ty : Ty
+  diags : Array[Diagnostic]
+  eq_uses : Array[EqUse]
+  op_tparams : Array[String]
+  op_keys : Array[String]
 }
 
 ///|
@@ -17456,6 +17471,10 @@ fn check_fn_call(
           tc.in_imported_default_arg = true
         }
       }
+      let track_cl_retry = unbound_param_tps.length() > 0
+      if track_cl_retry {
+        tc.closure_retry_depth = tc.closure_retry_depth + 1
+      }
       let mut aty = check_call_arg(
         tc,
         arg_env,
@@ -17543,6 +17562,9 @@ fn check_fn_call(
             }
           }
           unify_tparams(finfo.param_tys[i], eff_aty, subst)
+        }
+        if track_cl_retry {
+          tc.closure_retry_depth = tc.closure_retry_depth - 1
         }
         let pty = subst_ty(finfo.param_tys[i], subst)
         if !into_errored &&
@@ -19534,6 +19556,10 @@ fn check_method_call(
                   tc.in_imported_default_arg = true
                 }
               }
+              let track_cl_retry = unbound_param_tps.length() > 0
+              if track_cl_retry {
+                tc.closure_retry_depth = tc.closure_retry_depth + 1
+              }
               let mut aty = check_call_arg(
                 tc,
                 arg_env,
@@ -19621,6 +19647,9 @@ fn check_method_call(
                     }
                   }
                   unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
+                }
+                if track_cl_retry {
+                  tc.closure_retry_depth = tc.closure_retry_depth - 1
                 }
                 let pty = subst_ty(minfo.param_tys[p_idx], subst)
                 if !into_errored &&
@@ -20543,6 +20572,210 @@ fn expr_needs_rhs_ty_hint(e : Expr) -> Bool {
     }
     _ => false
   }
+}
+
+///|
+fn closure_cached_capture_names(
+  tc : TypeChecker,
+  sp : Span,
+  params : Array[Param],
+  body : Array[Stmt],
+) -> Array[String] {
+  let sk = span_key(sp)
+  match tc.closure_capture_names.get(sk) {
+    Some(names) => names
+    None => {
+      let cl_locals : Map[String, Bool] = Map([])
+      let mut pi = 0
+      while pi < params.length() {
+        cl_locals.set(params[pi].name, true)
+        pi = pi + 1
+      }
+      let caps : Array[CaptureInfo] = []
+      collect_stmts_captures(body, cl_locals, caps)
+      let seen : Map[String, Bool] = Map([])
+      let names : Array[String] = []
+      let mut ci = 0
+      while ci < caps.length() {
+        let cn = caps[ci].name
+        if !seen.contains(cn) {
+          seen.set(cn, true)
+          names.push(cn)
+        }
+        ci = ci + 1
+      }
+      tc.closure_capture_names.set(sk, names)
+      names
+    }
+  }
+}
+
+///|
+fn closure_build_cache_key(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  params : Array[Param],
+  body : Array[Stmt],
+  expected : Option[Ty],
+) -> Option[String] {
+  if tc.closure_retry_depth <= 0 ||
+    tc.record_types ||
+    tc.in_default_arg_expansion ||
+    env.in_default_arg ||
+    env.in_default_expr ||
+    sp.line <= 0 {
+    return None
+  }
+  let cap_names = closure_cached_capture_names(tc, sp, params, body)
+  let sb = StringBuilder()
+  sb.write_string(span_key(sp))
+  sb.write_string("\n")
+  match expected {
+    Some(et) => sb.write_string(ty_to_string(et))
+    None => sb.write_string("<none>")
+  }
+  sb.write_string("\n")
+  sb.write_string(env.fn_key)
+  sb.write_string("|")
+  sb.write_string(if env.in_verify { "1" } else { "0" })
+  sb.write_string("|")
+  sb.write_string(if env.in_no_io { "1:" + env.no_io_fn_name } else { "0" })
+  sb.write_string("|")
+  sb.write_string(if tc.record_analyze { "1" } else { "0" })
+  sb.write_string("\n")
+  let mut ti = 0
+  while ti < env.type_params.length() {
+    if ti > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(env.type_params[ti])
+    ti = ti + 1
+  }
+  sb.write_string("\n")
+  let mut ci = 0
+  while ci < cap_names.length() {
+    let cn = cap_names[ci]
+    sb.write_string(cn)
+    sb.write_string("=")
+    match env_lookup(env, cn) {
+      Some(b) => {
+        if ty_has_unresolved(b.ty) {
+          return None
+        }
+        sb.write_string(ty_to_string(b.ty))
+        sb.write_string(":")
+        sb.write_string(if b.is_mut { "1" } else { "0" })
+        sb.write_string(":")
+        sb.write_string(b.decl_line.to_string())
+        sb.write_string(":")
+        let is_mp = env.mut_params.contains(cn) &&
+          b.is_mut &&
+          b.decl_span.line == 0 &&
+          env_lookup_depth(env, cn) == 0
+        sb.write_string(if is_mp { "M" } else { "N" })
+      }
+      None => sb.write_string("<none>")
+    }
+    sb.write_string(";")
+    ci = ci + 1
+  }
+  Some(sb.to_string())
+}
+
+///|
+fn closure_replay_cache_entry(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  entry : ClosureCheckCacheEntry,
+) -> Ty {
+  let mut di = 0
+  while di < entry.diags.length() {
+    tc.diagnostics.push(entry.diags[di])
+    di = di + 1
+  }
+  let mut ei = 0
+  while ei < entry.eq_uses.length() {
+    tc.eq_uses.push(entry.eq_uses[ei])
+    ei = ei + 1
+  }
+  if env.fn_key != "" && entry.op_tparams.length() > 0 {
+    let arr = match tc.op_tparams.get(env.fn_key) {
+      Some(a) => a
+      None => {
+        let fresh : Array[String] = []
+        tc.op_tparams.set(env.fn_key, fresh)
+        fresh
+      }
+    }
+    let mut oi = 0
+    while oi < entry.op_tparams.length() {
+      arr.push(entry.op_tparams[oi])
+      oi = oi + 1
+    }
+  }
+  let mut ki = 0
+  while ki < entry.op_keys.length() {
+    tc.op_keys.push(entry.op_keys[ki])
+    ki = ki + 1
+  }
+  tc.closure_infer.set(span_key(sp), entry.clo_ty)
+  entry.clo_ty
+}
+
+///|
+fn closure_store_cache_entry(
+  tc : TypeChecker,
+  env : Env,
+  cache_key : String,
+  clo_ty : Ty,
+  diag_mark : Int,
+  eq_uses_mark : Int,
+  op_cur_len : Int,
+  op_key_mark : Int,
+) -> Unit {
+  let diags : Array[Diagnostic] = []
+  let mut di = diag_mark
+  while di < tc.diagnostics.length() {
+    diags.push(tc.diagnostics[di])
+    di = di + 1
+  }
+  let eq_uses : Array[EqUse] = []
+  let mut ei = eq_uses_mark
+  while ei < tc.eq_uses.length() {
+    eq_uses.push(tc.eq_uses[ei])
+    ei = ei + 1
+  }
+  let op_tps : Array[String] = []
+  if env.fn_key != "" {
+    match tc.op_tparams.get(env.fn_key) {
+      Some(a) => {
+        let mut oi = op_cur_len
+        while oi < a.length() {
+          op_tps.push(a[oi])
+          oi = oi + 1
+        }
+      }
+      None => ()
+    }
+  }
+  let op_ks : Array[String] = []
+  let mut ki = op_key_mark
+  while ki < tc.op_keys.length() {
+    op_ks.push(tc.op_keys[ki])
+    ki = ki + 1
+  }
+  tc.closure_check_cache.set(
+    cache_key,
+    ClosureCheckCacheEntry::{
+      clo_ty: clo_ty,
+      diags: diags,
+      eq_uses: eq_uses,
+      op_tparams: op_tps,
+      op_keys: op_ks,
+    },
+  )
 }
 
 ///|
@@ -23984,6 +24217,27 @@ fn check_expr_inner(
       }
     }
     EClosure(params, ret_te, body, sp) => {
+      let cl_cache_key = closure_build_cache_key(tc, env, sp, params, body, expected)
+      match cl_cache_key {
+        Some(ck) =>
+          match tc.closure_check_cache.get(ck) {
+            Some(entry) => return closure_replay_cache_entry(tc, env, sp, entry)
+            None => ()
+          }
+        None => ()
+      }
+      let cl_diag_mark = tc.diagnostics.length()
+      let cl_eq_uses_mark = tc.eq_uses.length()
+      let cl_op_key_mark = tc.op_keys.length()
+      let cl_op_cur_len = if env.fn_key != "" {
+        match tc.op_tparams.get(env.fn_key) {
+          Some(a) => a.length()
+          None => 0
+        }
+      } else {
+        0
+      }
+      let cl_infer_pending_mark = tc.infer_pending.length()
       let exp_ptys : Array[Ty] = match expected {
         Some(TFn(ep, _)) => ep
         _ => []
@@ -24216,6 +24470,22 @@ fn check_expr_inner(
       }
       let clo_ty = TFn(ptys, final_ret)
       tc.closure_infer.set(span_key(sp), clo_ty)
+      match cl_cache_key {
+        Some(ck) =>
+          if tc.infer_pending.length() == cl_infer_pending_mark {
+            closure_store_cache_entry(
+              tc,
+              env,
+              ck,
+              clo_ty,
+              cl_diag_mark,
+              cl_eq_uses_mark,
+              cl_op_cur_len,
+              cl_op_key_mark,
+            )
+          }
+        None => ()
+      }
       clo_ty
     }
     EScope(w_expr, f_expr, sp) => {
@@ -24742,6 +25012,9 @@ fn check_package_with_imports_mapped_plan_qt(
     qt_expr_tys: Map([]),
     qt_call_infos: Map([]),
     qt_bindings: Map([]),
+    closure_retry_depth: 0,
+    closure_capture_names: Map([]),
+    closure_check_cache: Map([]),
   }
 
   let mut ipi = 0
