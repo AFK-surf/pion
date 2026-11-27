@@ -1300,6 +1300,25 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
+    (
+        "neg_r5_interp_shadow_outer_pure_map",
+        r'''
+struct InterpShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_shadow_interp(b : InterpShadowBox, ext : Map[Int, Int]) -> Unit {
+  let m : Map[Int, Int] = Map::new()
+  let _ = "\{{ let m = ext; b.m = m; 0 }}"
+  let _ = m
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpShadowBox::{ m: Map::new() }
+  taint_shadow_interp(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
 ]
 
 
@@ -1658,16 +1677,51 @@ def main():
                 "  }\n"
                 "  v\n"
                 "}\n"
+                "pub fn make_arr_json_1() -> Array[Json] {\n"
+                "  [Json::null()]\n"
+                "}\n"
+                "pub fn make_arr_json_30() -> Array[Json] {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(Json::null())\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
+                "pub fn make_small_json_5() -> Array[Json] {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 5 {\n"
+                "    xs.push(Json::string(\"item_0123456789\"))\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
+                "pub fn make_ints_30() -> Array[Int] {\n"
+                "  let xs : Array[Int] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(i)\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
             )
         wide_expected = "Array(\n  [\n" + ("    Null,\n" * 30) + "  ],\n)"
-        # In MoonBit core/debug, single-element bracket_seq_lines / comma_seq_lines
-        # keep a single-line child on one line (unpruned in debug_inspect).
         deep_expected = ("Array([" * 20) + "Null" + ("])" * 20)
+        arr_json_1_expected = "[Null]"
+        arr_json_30_expected = "[\n" + ("  Null,\n" * 30) + "]"
+        some_wide_expected = "Some(\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n)"
+        arr_wide_expected = "[\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n]"
+        small_json_5_expected = "[\n" + ('  String("item_0123456789"),\n' * 5) + "]"
+        ints_30_expected = "[\n" + "".join(f"  {i},\n" for i in range(30)) + "]"
+        tuple_wide_expected = "(\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n  1,\n)"
         def mbt_multiline_str(s: str) -> str:
             return "\n".join("    #|" + line for line in s.split("\n"))
         with open(os.path.join(di_src, "lib_test.mbt"), "w") as f:
             f.write(
-                'test "debug_inspect wide and deep json" {\n'
+                'test "debug_inspect wide, deep, and container json" {\n'
                 '  debug_inspect(\n'
                 '    make_wide_nulls(),\n'
                 '    content=(\n'
@@ -1678,6 +1732,48 @@ def main():
                 '    make_deep_arr(),\n'
                 '    content=(\n'
                 + mbt_multiline_str(deep_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_arr_json_1(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_json_1_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_arr_json_30(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_json_30_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    Some(make_wide_nulls()),\n'
+                '    content=(\n'
+                + mbt_multiline_str(some_wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    [make_wide_nulls()],\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_small_json_5(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(small_json_5_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_ints_30(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(ints_30_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    (make_wide_nulls(), 1),\n'
+                '    content=(\n'
+                + mbt_multiline_str(tuple_wide_expected) + "\n"
                 '    ),\n'
                 '  )\n'
                 '}\n'

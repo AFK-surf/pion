@@ -221,7 +221,10 @@ fn ms_is_mbt_compat_pure_ro(m : String) -> Bool {
   m == "checked_div_int" || m == "checked_mod_int" || m == "checked_div_int64" ||
   m == "checked_mod_int64" || m == "checked_div_uint" || m == "checked_mod_uint" ||
   m == "checked_div_uint64" || m == "checked_mod_uint64" || m == "ordered_map_size" ||
-  m == "str_split_first" || m == "mbt_json_debug" || m == "mbt_json_debug_unpruned"
+  m == "str_split_first" || m == "mbt_json_debug" || m == "mbt_json_debug_unpruned" ||
+  m == "mbt_debug_leaf" || m == "mbt_debug_unit" || m == "mbt_debug_some" ||
+  m == "mbt_debug_none" || m == "mbt_debug_array" || m == "mbt_debug_tuple" ||
+  m == "mbt_debug_repr_from_json" || m == "mbt_debug_render" || m == "mbt_debug_render_unpruned"
 }
 
 fn ms_is_mbt_compat_hof_ro(m : String) -> Bool {
@@ -1868,6 +1871,92 @@ fn ms_prune_pure_map_vars(pure_map_vars : Map[String, Bool], bad : Map[String, B
   }
 }
 
+fn ms_clone_str_map(m : Map[String, String]) -> Map[String, String] {
+  let out : Map[String, String] = Map()
+  for k in m.keys() {
+    match m.get(k) {
+      Some(v) => out[k] = v
+      None => ()
+    }
+  }
+  out
+}
+
+fn ms_remove_str_map_keys(m : Map[String, String], bad : Map[String, Bool]) -> Unit {
+  for nm in bad.keys() {
+    let _ = m.remove(nm)
+  }
+}
+
+///| Recursively check whether `[s, e)` or any nested string interpolation hole contains `return` or `guard`.
+///| Fails closed (`true`) when nesting depth exceeds 8.
+fn ms_tokens_have_return_or_guard(tokens : Array[Token], s : Int, e : Int, depth : Int) -> Bool {
+  if depth > 8 {
+    return true
+  }
+  let mut i = s
+  while i < e {
+    let tk = tokens[i]
+    let kk = tk.kind
+    if (tk.raw == "return" || tk.raw == "guard") &&
+    (kk == TokenKind::Keyword || kk == TokenKind::Ident) {
+      return true
+    }
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
+      let holes = interp_holes(tk.raw)
+      for sub in holes {
+        let sn = sub.length() - 1
+        if sn > 0 && ms_tokens_have_return_or_guard(sub, 0, sn, depth + 1) {
+          return true
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Collect all locally bound, pattern-bound, closure-parameter, and reassigned identifiers in `[s, e)`
+///| (recursing into nested string interpolation holes up to depth 8).
+fn ms_collect_all_bound_idents_in_span(
+  tokens : Array[Token],
+  s : Int,
+  e : Int,
+  out : Map[String, Bool],
+  depth : Int,
+) -> Unit {
+  if depth > 8 {
+    return
+  }
+  let mut i = s
+  while i < e {
+    let tk = tokens[i]
+    let kk = tk.kind
+    if tk.raw == "let" && (kk == TokenKind::Keyword || kk == TokenKind::Ident) {
+      let mut j = i + 1
+      if j < e && tokens[j].raw == "mut" && (tokens[j].kind == TokenKind::Keyword || tokens[j].kind == TokenKind::Ident) {
+        j = j + 1
+      }
+      if j < e && tokens[j].kind == TokenKind::Ident {
+        out[tokens[j].raw] = true
+      }
+    }
+    if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
+      let holes = interp_holes(tk.raw)
+      for sub in holes {
+        let sn = sub.length() - 1
+        if sn > 0 {
+          ms_collect_all_bound_idents_in_span(sub, 0, sn, out, depth + 1)
+        }
+      }
+    }
+    i = i + 1
+  }
+  ms_collect_pattern_bound_idents_in_span_ex(tokens, s, e, out, false)
+  ms_collect_closure_param_names(tokens, s, e, out)
+  ms_collect_reassigned_idents(tokens, s, e, out)
+}
+
 fn ms_clone_bool_map(m : Map[String, Bool]) -> Map[String, Bool] {
   let out : Map[String, Bool] = Map()
   for k in m.keys() {
@@ -2249,17 +2338,27 @@ fn ms_scan_span(
       }
     }
 
-    // Class 2: String interpolation `"\{expr}"` — scan holes + check Show purity
+    // Class 2: String interpolation `"\{expr}"` — scan holes with shadowed bindings pruned + check Show purity
     if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
       let holes = interp_holes(tk.raw)
-      for sub in holes {
-        let sn = sub.length() - 1
-        if sn > 0 {
-          ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, local_var_types, pure_map_vars, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
-          // Show dispatch: unless the hole expression is proven built-in scalar/String, mark unknown
-          let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, local_var_types)
-          if !ms_is_builtin_scalar_ty(hty) {
-            sum.unknown = true
+      if holes.length() > 0 && depth + 1 > 8 {
+        sum.unknown = true
+      } else {
+        for sub in holes {
+          let sn = sub.length() - 1
+          if sn > 0 {
+            let hole_vt = ms_clone_str_map(local_var_types)
+            let hole_pmv = ms_clone_bool_map(pure_map_vars)
+            let hole_shadowed : Map[String, Bool] = Map()
+            ms_collect_all_bound_idents_in_span(sub, 0, sn, hole_shadowed, depth + 1)
+            ms_remove_str_map_keys(hole_vt, hole_shadowed)
+            ms_prune_pure_map_vars(hole_pmv, hole_shadowed)
+            ms_scan_span(pkg, sub, 0, sn, fn_body_open, "", None, hole_vt, hole_pmv, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+            // Show dispatch: unless the hole expression is proven built-in scalar/String, mark unknown
+            let hty = ms_infer_expr_ty(pkg, sub, sn - 1, "", None, hole_vt)
+            if !ms_is_builtin_scalar_ty(hty) {
+              sum.unknown = true
+            }
           }
         }
       }
@@ -3963,16 +4062,10 @@ pub fn collect_pkg_mutation_summary(
             let mut bad_hole = false
             for sub in holes {
               let sn = sub.length() - 1
-              let mut hi = 0
-              while hi < sn {
-                if (sub[hi].raw == "return" || sub[hi].raw == "guard") &&
-                (sub[hi].kind == TokenKind::Keyword || sub[hi].kind == TokenKind::Ident) {
-                  bad_hole = true
-                  break
-                }
-                hi = hi + 1
+              if sn > 0 && ms_tokens_have_return_or_guard(sub, 0, sn, 1) {
+                bad_hole = true
+                break
               }
-              if bad_hole { break }
             }
             if bad_hole {
               all_ok = false
@@ -4053,7 +4146,7 @@ pub fn collect_pkg_mutation_summary(
     // 1. Single pass over top-level function / method bodies that mention a candidate field, `&`, or `..`
     for dc in decls {
       let ts = all_tokens[dc.file_idx]
-      if !ms_span_mentions_cand_field_or_risk(ts, dc.body_open + 1, dc.body_close, cand_field_names) {
+      if !ms_span_mentions_cand_field_or_risk(ts, dc.body_open + 1, dc.body_close, cand_field_names, 0) {
         continue
       }
       let fcontent = if dc.file_idx < contents.length() { contents[dc.file_idx] } else { "" }
@@ -4113,7 +4206,7 @@ pub fn collect_pkg_mutation_summary(
         if td == 0 && ts[ti].raw == "init" && ti + 1 < tn && ts[ti + 1].kind == TokenKind::LBrace {
           let init_rb = find_matching_delim(ts, ti + 1)
           if init_rb > ti + 1 && init_rb < tn {
-            if ms_span_mentions_cand_field_or_risk(ts, ti + 2, init_rb, cand_field_names) {
+            if ms_span_mentions_cand_field_or_risk(ts, ti + 2, init_rb, cand_field_names, 0) {
               ms_check_pure_map_field_writes_in_span(
                 pkg, cand_fields, ts, ti + 2, init_rb, fcontent, qfi_opt, Map(), Map(), Map(), empty_gen, cand_field_names, removed_once, field_deps, 0,
               )
@@ -4126,7 +4219,7 @@ pub fn collect_pkg_mutation_summary(
         (ts[ti + 1].raw == "init" || ts[ti + 1].raw == "main") && ts[ti + 2].kind == TokenKind::LBrace {
           let blk_rb = find_matching_delim(ts, ti + 2)
           if blk_rb > ti + 2 && blk_rb < tn {
-            if ms_span_mentions_cand_field_or_risk(ts, ti + 3, blk_rb, cand_field_names) {
+            if ms_span_mentions_cand_field_or_risk(ts, ti + 3, blk_rb, cand_field_names, 0) {
               ms_check_pure_map_field_writes_in_span(
                 pkg, cand_fields, ts, ti + 3, blk_rb, fcontent, qfi_opt, Map(), Map(), Map(), empty_gen, cand_field_names, removed_once, field_deps, 0,
               )
@@ -4143,7 +4236,7 @@ pub fn collect_pkg_mutation_summary(
           if lb_t < tn && ts[lb_t].kind == TokenKind::LBrace {
             let blk_rb = find_matching_delim(ts, lb_t)
             if blk_rb > lb_t && blk_rb < tn {
-              if ms_span_mentions_cand_field_or_risk(ts, lb_t + 1, blk_rb, cand_field_names) {
+              if ms_span_mentions_cand_field_or_risk(ts, lb_t + 1, blk_rb, cand_field_names, 0) {
                 ms_check_pure_map_field_writes_in_span(
                   pkg, cand_fields, ts, lb_t + 1, blk_rb, fcontent, qfi_opt, Map(), Map(), Map(), empty_gen, cand_field_names, removed_once, field_deps, 0,
                 )
@@ -4174,7 +4267,7 @@ pub fn collect_pkg_mutation_summary(
               }
             }
             if rhs_e > rhs_s {
-              if ms_span_mentions_cand_field_or_risk(ts, rhs_s, rhs_e, cand_field_names) {
+              if ms_span_mentions_cand_field_or_risk(ts, rhs_s, rhs_e, cand_field_names, 0) {
                 ms_check_pure_map_field_writes_in_span(
                   pkg, cand_fields, ts, rhs_s, rhs_e, fcontent, qfi_opt, Map(), Map(), Map(), empty_gen, cand_field_names, removed_once, field_deps, 0,
                 )
@@ -4355,7 +4448,11 @@ fn ms_span_mentions_cand_field_or_risk(
   s : Int,
   e : Int,
   cand_field_names : Map[String, Array[String]],
+  depth : Int,
 ) -> Bool {
+  if depth > 8 {
+    return true
+  }
   let mut i = s
   while i < e {
     let tk = tokens[i]
@@ -4370,7 +4467,7 @@ fn ms_span_mentions_cand_field_or_risk(
       let holes = interp_holes(tk.raw)
       for sub in holes {
         let sn = sub.length() - 1
-        if sn > 0 && ms_span_mentions_cand_field_or_risk(sub, 0, sn, cand_field_names) {
+        if sn > 0 && ms_span_mentions_cand_field_or_risk(sub, 0, sn, cand_field_names, depth + 1) {
           return true
         }
       }
@@ -4436,14 +4533,24 @@ fn ms_check_pure_map_field_writes_in_span(
   while i < e {
     let tk = tokens[i]
     let kk = tk.kind
-    // 0. String interpolation holes `\{ ... }` may mutate candidate fields or construct tainted structs
+    // 0. String interpolation holes `\{ ... }` may mutate candidate fields or shadow outer pure bindings
     if kk == TokenKind::InterpString || kk == TokenKind::InterpMultiline || kk == TokenKind::StringLit {
       let holes = interp_holes(tk.raw)
+      if holes.length() > 0 && depth + 1 > 8 {
+        ms_disqualify_all_fields(cand_fields, removed_out)
+        return
+      }
       for sub in holes {
         let sn = sub.length() - 1
         if sn > 0 {
+          let hole_vt = ms_clone_str_map(vt)
+          let hole_pmv = ms_clone_bool_map(pmv)
+          let hole_shadowed : Map[String, Bool] = Map()
+          ms_collect_all_bound_idents_in_span(sub, 0, sn, hole_shadowed, depth + 1)
+          ms_remove_str_map_keys(hole_vt, hole_shadowed)
+          ms_prune_pure_map_vars(hole_pmv, hole_shadowed)
           ms_check_pure_map_field_writes_in_span(
-            pkg, cand_fields, sub, 0, sn, "", None, vt, pmv, callables, active_gen, cand_field_names, removed_out, deps_out, depth + 1,
+            pkg, cand_fields, sub, 0, sn, "", None, hole_vt, hole_pmv, callables, active_gen, cand_field_names, removed_out, deps_out, depth + 1,
           )
         }
       }
