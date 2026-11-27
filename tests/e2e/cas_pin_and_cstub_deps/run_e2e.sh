@@ -1299,4 +1299,243 @@ M5_OBJS_HOT="$(find "$CAS_M5/obj" -maxdepth 1 -name 'cstub_*.o' | wc -l | tr -d 
   fail "Scenario M5 warm build bloated CAS/obj cstub_*.o count ($M5_OBJS_COLD -> $M5_OBJS_HOT)"
 echo "(M5) PION_RT_LIB in \$CAS/obj -> cold publish + 100% warm HIT + 0 obj/ bloat -> OK"
 
+# ============================================================================
+# Scenario N1: `pionc build -o <out>` warm `nativebin:` CAS HIT (0 link calls),
+#              exec mode 0755, invalidation (src/hdr/rt_lib/cc --version), and
+#              fail-closed `-L` / `search_paths` direct-link fallback.
+# ============================================================================
+WS_N1="$TMP_DIR/ws_n1"
+mkdir -p "$WS_N1/app/src"
+cat > "$WS_N1/app/stub.h" <<'EOF'
+#define N1_VAL 11
+EOF
+cat > "$WS_N1/app/stub.c" <<'EOF'
+#include <stdint.h>
+#include "stub.h"
+int64_t n1_stub_val(void) { return N1_VAL; }
+EOF
+cat > "$WS_N1/app/pion.toml" <<'EOF'
+[package]
+name = "n1_app"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+EOF
+cat > "$WS_N1/app/src/main.pion" <<'EOF'
+extern "C" fn n1_stub_val() -> Int64
+fn main(world : World) -> Unit {
+  io_println(world, "n1=" + n1_stub_val().to_string())
+}
+EOF
+
+N1_CC="$TMP_DIR/n1_cc.sh"
+cat > "$N1_CC" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  echo "n1_mockcc ${N1_CC_VER:-1.0}"
+  exit 0
+fi
+printf 'CALL %s\n' "$*" >> "${N1_CC_LOG}"
+exec "${REAL_CC_BIN}" "$@"
+EOF
+chmod +x "$N1_CC"
+
+# Prepare a copy of libpionrt.a with an extra marker object so we can swap its
+# content with identical size & mtime to test rt_lib SHA-256 invalidation.
+cat > "$TMP_DIR/n1_rt_m1.c" <<'EOF'
+const char n1_rt_marker_sym[] = "RT_MARK_V1";
+EOF
+cat > "$TMP_DIR/n1_rt_m2.c" <<'EOF'
+const char n1_rt_marker_sym[] = "RT_MARK_V2";
+EOF
+"${REAL_CC_ABS}" -c "$TMP_DIR/n1_rt_m1.c" -o "$TMP_DIR/n1_rt_m1.o"
+"${REAL_CC_ABS}" -c "$TMP_DIR/n1_rt_m2.c" -o "$TMP_DIR/n1_rt_m2.o"
+cp "$RT_LIB_SRC" "$TMP_DIR/n1_rt.a"
+ar rcs "$TMP_DIR/n1_rt.a" "$TMP_DIR/n1_rt_m1.o"
+cp -p "$TMP_DIR/n1_rt.a" "$TMP_DIR/n1_rt.ref"
+
+CAS_N1="$TMP_DIR/cas_n1"
+mkdir -p "$CAS_N1"
+N1_CC_LOG="$TMP_DIR/n1_cc.log"
+
+# 1) Cold build -o out1 -> MISS, 1 cstub compile + 1 link
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out1" "$WS_N1/app" 2>"$TMP_DIR/n1_1.trace"
+grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_1.trace" || \
+  fail "Scenario N1 cold expected bin MISS: $(cat "$TMP_DIR/n1_1.trace")"
+[ -x "$TMP_DIR/n1_out1" ] || fail "Scenario N1 cold out1 not executable"
+[ "$("$TMP_DIR/n1_out1")" = "n1=11" ] || fail "Scenario N1 cold out1 mismatch"
+N1_COLD_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
+[ "$N1_COLD_CALLS" -ge 1 ] || fail "Scenario N1 cold expected CC/link call, got $N1_COLD_CALLS"
+
+# 2) Warm build -o out2 (different -o path!) -> HIT, ZERO CC/link calls, executable!
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out2" "$WS_N1/app" 2>"$TMP_DIR/n1_2.trace"
+grep -q "\[cas\] bin=n1_app HIT key=" "$TMP_DIR/n1_2.trace" || \
+  fail "Scenario N1 warm expected bin HIT: $(cat "$TMP_DIR/n1_2.trace")"
+N1_WARM_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
+[ "$N1_WARM_CALLS" = "0" ] || fail "Scenario N1 warm expected 0 CC/link calls, got $N1_WARM_CALLS: $(cat "$N1_CC_LOG")"
+[ -x "$TMP_DIR/n1_out2" ] || fail "Scenario N1 warm out2 not executable"
+[ "$("$TMP_DIR/n1_out2")" = "n1=11" ] || fail "Scenario N1 warm out2 mismatch"
+
+# 3) Source edit -> MISS
+cat > "$WS_N1/app/src/main.pion" <<'EOF'
+extern "C" fn n1_stub_val() -> Int64
+fn main(world : World) -> Unit {
+  io_println(world, "n1_src=" + n1_stub_val().to_string())
+}
+EOF
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out3" "$WS_N1/app" 2>"$TMP_DIR/n1_3.trace"
+grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_3.trace" || \
+  fail "Scenario N1 src edit expected bin MISS"
+[ "$("$TMP_DIR/n1_out3")" = "n1_src=11" ] || fail "Scenario N1 src edit output mismatch"
+
+# 4) Header edit -> MISS
+cat > "$WS_N1/app/stub.h" <<'EOF'
+#define N1_VAL 22
+EOF
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out4" "$WS_N1/app" 2>"$TMP_DIR/n1_4.trace"
+grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_4.trace" || \
+  fail "Scenario N1 header edit expected bin MISS"
+[ "$("$TMP_DIR/n1_out4")" = "n1_src=22" ] || fail "Scenario N1 header edit output mismatch"
+
+# 5) Replace libpionrt.a content (preserving mtime) -> MISS
+cp "$RT_LIB_SRC" "$TMP_DIR/n1_rt.a"
+ar rcs "$TMP_DIR/n1_rt.a" "$TMP_DIR/n1_rt_m2.o"
+touch -r "$TMP_DIR/n1_rt.ref" "$TMP_DIR/n1_rt.a"
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out5" "$WS_N1/app" 2>"$TMP_DIR/n1_5.trace"
+grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_5.trace" || \
+  fail "Scenario N1 rt_lib content change expected bin MISS: $(cat "$TMP_DIR/n1_5.trace")"
+[ "$("$TMP_DIR/n1_out5")" = "n1_src=22" ] || fail "Scenario N1 rt_lib edit output mismatch"
+
+# 6) Linker driver --version change -> MISS
+: > "$N1_CC_LOG"
+REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="2.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
+  PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
+  "$PIONC" build -o "$TMP_DIR/n1_out6" "$WS_N1/app" 2>"$TMP_DIR/n1_6.trace"
+grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_6.trace" || \
+  fail "Scenario N1 cc --version change expected bin MISS: $(cat "$TMP_DIR/n1_6.trace")"
+[ "$("$TMP_DIR/n1_out6")" = "n1_src=22" ] || fail "Scenario N1 cc --version output mismatch"
+
+# 7) Package with `search_paths` (-L) falls back to direct link (never false-hits nativebin:)
+WS_N1L="$TMP_DIR/ws_n1_libpath"
+mkdir -p "$WS_N1L/app/src" "$WS_N1L/app/extlib"
+cat > "$WS_N1L/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_ext_val(void) { return 100; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1L/ext.c" -o "$WS_N1L/ext.o"
+ar rcs "$WS_N1L/app/extlib/libn1ext.a" "$WS_N1L/ext.o"
+cp -p "$WS_N1L/app/extlib/libn1ext.a" "$TMP_DIR/libn1ext.ref"
+cat > "$WS_N1L/app/pion.toml" <<'EOF'
+[package]
+name = "n1_libpath_app"
+version = "0.1.0"
+
+[link]
+search_paths = ["extlib"]
+libs = ["n1ext"]
+EOF
+cat > "$WS_N1L/app/src/main.pion" <<'EOF'
+extern "C" fn n1_ext_val() -> Int64
+fn main(world : World) -> Unit {
+  io_println(world, n1_ext_val().to_string())
+}
+EOF
+CAS_N1L="$TMP_DIR/cas_n1l"
+mkdir -p "$CAS_N1L"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1L" "$PIONC" build -o "$TMP_DIR/n1l_1" "$WS_N1L/app" 2>"$TMP_DIR/n1l_1.trace"
+[ "$("$TMP_DIR/n1l_1")" = "100" ] || fail "Scenario N1 -L run 1 expected 100"
+if grep -q "\[cas\] bin=n1_libpath_app" "$TMP_DIR/n1l_1.trace"; then
+  fail "Scenario N1 -L package must bypass nativebin CAS: $(cat "$TMP_DIR/n1l_1.trace")"
+fi
+cat > "$WS_N1L/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_ext_val(void) { return 200; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1L/ext.c" -o "$WS_N1L/ext.o"
+rm -f "$WS_N1L/app/extlib/libn1ext.a"
+ar rcs "$WS_N1L/app/extlib/libn1ext.a" "$WS_N1L/ext.o"
+touch -r "$TMP_DIR/libn1ext.ref" "$WS_N1L/app/extlib/libn1ext.a"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1L" "$PIONC" build -o "$TMP_DIR/n1l_2" "$WS_N1L/app" 2>"$TMP_DIR/n1l_2.trace"
+[ "$("$TMP_DIR/n1l_2")" = "200" ] || fail "Scenario N1 -L run 2 expected 200 after external .a rebuild"
+echo "(N1) nativebin: warm -o HIT (0 link calls, 0755) + src/hdr/rt_lib/ccver invalidation + -L fallback -> OK"
+
+# ============================================================================
+# Scenario N2: `-I/usr/include/...` system headers must NOT pollute `proj_hdr_dirs`
+#              and inflate `.deps` `absent:` entries.
+# ============================================================================
+SYS_INC_N2=""
+if [ -d /usr/include ]; then
+  SYS_INC_N2="/usr/include"
+elif command -v xcrun >/dev/null 2>&1; then
+  SDK_P="$(xcrun --show-sdk-path 2>/dev/null || true)"
+  if [ -n "$SDK_P" ] && [ -d "$SDK_P/usr/include" ]; then
+    SYS_INC_N2="$SDK_P/usr/include"
+  fi
+fi
+if [ -n "$SYS_INC_N2" ]; then
+  WS_N2="$TMP_DIR/ws_n2_sysinc"
+  mkdir -p "$WS_N2/pkg/src"
+  cat > "$WS_N2/pkg/local_n2.h" <<'EOF'
+#define N2_VAL 77
+EOF
+  cat > "$WS_N2/pkg/stub.c" <<'EOF'
+#include <stdint.h>
+#include <stdio.h>
+#include "local_n2.h"
+int64_t n2_val(void) { return N2_VAL; }
+EOF
+  cat > "$WS_N2/pkg/pion.toml" <<EOF
+[package]
+name = "n2_sysinc"
+version = "0.1.0"
+
+[link]
+c_sources = ["stub.c"]
+cc_flags = ["-I${SYS_INC_N2}"]
+EOF
+  cat > "$WS_N2/pkg/src/main.pion" <<'EOF'
+extern "C" fn n2_val() -> Int64
+fn main(world : World) -> Unit { io_println(world, n2_val().to_string()) }
+EOF
+  CAS_N2="$TMP_DIR/cas_n2"
+  mkdir -p "$CAS_N2"
+  PION_CACHE_DIR="$CAS_N2" "$PIONC" build -o "$TMP_DIR/n2_out" "$WS_N2/pkg"
+  [ "$("$TMP_DIR/n2_out")" = "77" ] || fail "Scenario N2 expected 77"
+  N2_DEPS="$(find "$CAS_N2/obj" -maxdepth 1 -name 'cstub_dep_*.deps' | head -n 1)"
+  [ -n "$N2_DEPS" ] && [ -f "$N2_DEPS" ] || fail "Scenario N2 expected .deps file"
+  python3 - "$N2_DEPS" "$SYS_INC_N2" <<'PYEOF'
+import sys
+deps_path, sys_inc = sys.argv[1], sys.argv[2].rstrip("/")
+in_absent = False
+bad = []
+for line in open(deps_path):
+    s = line.strip()
+    if s.startswith("absent:"):
+        in_absent = True
+        continue
+    if s.startswith("sha256:"):
+        break
+    if in_absent and s.startswith(sys_inc + "/") and s.endswith("/local_n2.h"):
+        bad.append(s)
+assert not bad, f"system header dir polluted proj_hdr_dirs/absent: {bad[:5]}"
+PYEOF
+  echo "(N2) -I${SYS_INC_N2} system header dirs do not pollute proj_hdr_dirs -> OK"
+fi
+
 echo "PASS: cas_pin_and_cstub_deps"

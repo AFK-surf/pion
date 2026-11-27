@@ -2882,6 +2882,15 @@ fn drv_cas_remove_entry(world : World, cache_dir : String, ek : String) -> Unit 
   if !cas_is_safe_key(ek) {
     return
   }
+  if drv_starts_with(ek, "nativebin:") {
+    drv_cas_remove_in_bucket(
+      world,
+      cache_dir,
+      "bin",
+      slice_str(ek, 10, ek.length()),
+    )
+    return
+  }
   if drv_starts_with(ek, "testbin:") {
     drv_cas_remove_in_bucket(
       world,
@@ -5640,16 +5649,7 @@ fn drv_cstub_shadow_candidates(
   let mut hi = 0
   while hi < hdrs.length() {
     let h = hdrs[hi]
-    let mut in_search = false
-    let mut di = 0
-    while di < search_dirs.length() {
-      if drv_cstub_path_has_prefix(h, search_dirs[di] + "/") {
-        in_search = true
-        break
-      }
-      di = di + 1
-    }
-    if in_search || !drv_cstub_is_system_header(h) {
+    if !drv_cstub_is_system_header(h) {
       let pd = drv_parent_dir(h)
       if pd.length() > 0 && !seen_hdir.contains(pd) {
         seen_hdir.set(pd, true)
@@ -5993,6 +5993,7 @@ fn drv_cstub_try_hit(
   base_key : String,
   trace_cas : Bool,
   file_hash_memo : Map[String, String],
+  absent_memo : Map[String, Bool],
 ) -> Option[String] {
   let dep_manifest_path = cache_dir + "/obj/cstub_dep_" + base_key + ".deps"
   let (hdrs, absent) = match drv_cstub_read_dep_manifest(world, dep_manifest_path) {
@@ -6002,7 +6003,15 @@ fn drv_cstub_try_hit(
   let mut ai = 0
   while ai < absent.length() {
     let cand = absent[ai]
-    if fs_exists(world, cand) && !fs_is_dir(world, cand) {
+    let exists_non_dir = match absent_memo.get(cand) {
+      Some(v) => v
+      None => {
+        let v = fs_exists(world, cand) && !fs_is_dir(world, cand)
+        absent_memo.set(cand, v)
+        v
+      }
+    }
+    if exists_non_dir {
       if trace_cas {
         io_eprintln(
           world,
@@ -6382,7 +6391,7 @@ fn drv_c_source_section_flags(
 /// `$PION_CACHE_DIR/obj/cstub_<key>.o` (ccache Direct Mode with real compiler
 /// header dependencies + compiler version fingerprint, atomic temp + rename,
 /// LRU-tracked).
-/// Returns `Ok(true)` if any compiled source is C++/ObjC++ (`.cc`/`.cpp`/`.mm`).
+/// Returns `Ok((any_cxx, any_kept_local))`.
 fn drv_compile_pkg_c_sources(
   world : World,
   node : PkgNodeInput,
@@ -6395,12 +6404,13 @@ fn drv_compile_pkg_c_sources(
   trace_cas : Bool,
   ver_cache : Map[String, String],
   file_hash_memo : Map[String, String],
+  absent_memo : Map[String, Bool],
   out_objs : Array[String],
   out_keys : Array[String],
   out_new_keys : Array[String],
   out_new_sizes : Array[Int64],
   pin : DrvCasPinSession,
-) -> Result[Bool, String] {
+) -> Result[(Bool, Bool), String] {
   let os = drv_target_os(qbe_target)
   let plat = if os == "macos" {
     node.link_macos
@@ -6430,7 +6440,7 @@ fn drv_compile_pkg_c_sources(
     i = i + 1
   }
   if c_sources.length() == 0 {
-    return Ok(false)
+    return Ok((false, false))
   }
   let user_cc_flags : Array[String] = []
   let mut user_has_opt = false
@@ -6528,7 +6538,7 @@ fn drv_compile_pkg_c_sources(
       src_hash,
     )
     let mut hit_final_key = ""
-    match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo) {
+    match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo, absent_memo) {
       Some(fk) => {
         let obj_path = cache_dir + "/obj/cstub_" + fk + ".o"
         if drv_cas_pin_and_verify(
@@ -6638,7 +6648,7 @@ fn drv_compile_pkg_c_sources(
       Ok(_) => ()
     }
   }
-  Ok(any_cxx)
+  Ok((any_cxx, keep_stage))
 }
 
 ///|
@@ -6901,6 +6911,9 @@ struct DrvWsBuilt {
   dep_pkg_names : Array[String]
   link_key : String
   link_opts : DrvLinkOpts
+  has_local_cstub : Bool
+  cc_ver_cache : Map[String, String]
+  file_hash_memo : Map[String, String]
 }
 
 ///|
@@ -7047,6 +7060,7 @@ fn drv_effective_link_context_key(
   qbe_target : String,
   sysroot : String,
   opts : DrvLinkOpts,
+  cc_ver_cache : Map[String, String],
 ) -> String {
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   if drv_use_direct_apple_ld(apple_tools, qbe_target, sysroot, opts) {
@@ -7065,6 +7079,7 @@ fn drv_effective_link_context_key(
       ver
   }
   let driver = drv_resolve_cc_driver(world, qbe_target, opts.has_cxx)
+  let drv_ver_fp = drv_cstub_cc_version_fp(world, driver, cc_ver_cache)
   let is_win_msvc = drv_is_windows_msvc_cc(world, qbe_target, driver)
   let eff : Array[String] = drv_target_cc_flags(world, qbe_target, sysroot)
   if drv_target_is_apple(qbe_target) {
@@ -7097,6 +7112,8 @@ fn drv_effective_link_context_key(
   qbe_target +
   "|linkmode:cc|drv:" +
   driver +
+  "|drvver:" +
+  drv_ver_fp +
   "|msvc:" +
   (if is_win_msvc { "1" } else { "0" }) +
   "|eff:" +
@@ -7189,16 +7206,81 @@ fn drv_push_msvc_link_tail(
 }
 
 ///|
+fn drv_flag_is_untracked_link_input(fl : String) -> Bool {
+  if drv_starts_with(fl, "-L") || drv_starts_with(fl, "-Wl,-L") {
+    return true
+  }
+  let low = drv_ascii_lower(fl)
+  if drv_starts_with(low, "/libpath:") ||
+    drv_ends_with(low, ".a") ||
+    drv_ends_with(low, ".o") ||
+    drv_ends_with(low, ".obj") ||
+    drv_ends_with(low, ".lib") {
+    return true
+  }
+  if drv_starts_with(fl, "-Wl,") {
+    let body = slice_str(fl, 4, fl.length())
+    let parts = drv_split_char(body, 44)
+    let mut pi = 0
+    while pi < parts.length() {
+      let p = parts[pi]
+      let pl = drv_ascii_lower(p)
+      if drv_starts_with(p, "-L") ||
+        drv_starts_with(pl, "/libpath:") ||
+        drv_ends_with(pl, ".a") ||
+        drv_ends_with(pl, ".o") ||
+        drv_ends_with(pl, ".obj") ||
+        drv_ends_with(pl, ".lib") {
+        return true
+      }
+      pi = pi + 1
+    }
+  }
+  false
+}
+
+///|
+/// Fail-closed guard for `nativebin:` linked executable CAS caching.
+/// Rejects link options that reference external search paths (`-L`, `/LIBPATH:`)
+/// or untracked archive/object paths embedded inside `opts.flags`.
+fn drv_bin_cache_eligible(opts : DrvLinkOpts) -> Bool {
+  if opts.search_paths.length() > 0 {
+    return false
+  }
+  let mut i = 0
+  while i < opts.flags.length() {
+    if drv_flag_is_untracked_link_input(opts.flags[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 fn drv_bin_key(
   world : World,
   qbe_target : String,
   sysroot : String,
+  rt_lib : String,
   key : String,
   opts : DrvLinkOpts,
+  cc_ver_cache : Map[String, String],
+  file_hash_memo : Map[String, String],
 ) -> String {
+  let rt_hash = match drv_sha256_file(rt_lib, file_hash_memo) {
+    Some(h) => h
+    None => "missing:" + rt_lib
+  }
   let suffix = drv_link_opts_key(world, opts)
-  let ctx = drv_effective_link_context_key(world, qbe_target, sysroot, opts)
-  sha256_hex(key + suffix + ctx)
+  let ctx = drv_effective_link_context_key(
+    world,
+    qbe_target,
+    sysroot,
+    opts,
+    cc_ver_cache,
+  )
+  sha256_hex(key + "|rt:" + rt_hash + suffix + ctx)
 }
 
 ///|
@@ -7224,6 +7306,236 @@ fn drv_copy_file(world : World, src : String, dst : String) -> Result[String, St
       }
   }
   drv_staged_result(res, drv_drop_out_stage(world, stage))
+}
+
+///|
+fn drv_copy_file_exec(
+  world : World,
+  src : String,
+  dst : String,
+  is_windows : Bool,
+) -> Result[String, String] {
+  drv_ensure_parent_dir(world, dst)
+  let b = match fs_read_bytes(world, src) {
+    Err(e) => return Err("failed to read " + src + ": " + e)
+    Ok(v) => v
+  }
+  let (dst_dir, dst_base) = drv_split_dir_base(world, dst)
+  let stage = match drv_make_out_stage(world, dst_dir) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let tmp = stage + "/" + dst_base
+  let res : Result[String, String] = match fs_write_bytes(world, tmp, b) {
+    Err(e) => Err("failed to write " + dst + ": " + e)
+    Ok(_) => {
+      if !is_windows {
+        let _ = fs_chmod(world, tmp, 493)
+      }
+      if drv_publish_tmp(world, tmp, dst, false) {
+        Ok(dst)
+      } else {
+        Err("failed to replace " + dst)
+      }
+    }
+  }
+  drv_staged_result(res, drv_drop_out_stage(world, stage))
+}
+
+///|
+fn drv_link_native_bin_cached(
+  world : World,
+  cache_dir : String,
+  qbe_target : String,
+  apple_tools : AppleTools,
+  ld_ver : String,
+  sysroot : String,
+  root_pkg : String,
+  link_key : String,
+  obj_paths : Array[String],
+  rt_lib : String,
+  link_opts : DrvLinkOpts,
+  out_bin_arg : String,
+  has_local_cstub : Bool,
+  cc_ver_cache : Map[String, String],
+  file_hash_memo : Map[String, String],
+  pin : DrvCasPinSession,
+) -> Result[String, String] {
+  let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1" ||
+    drv_env_str(world, "PION_TRACE_CAS") == "1"
+  let bin_key = drv_bin_key(
+    world,
+    qbe_target,
+    sysroot,
+    rt_lib,
+    link_key,
+    link_opts,
+    cc_ver_cache,
+    file_hash_memo,
+  )
+  let bin_key16 = drv_prefix16(bin_key)
+  let bin_name = drv_linked_exe_path(qbe_target, root_pkg + "_" + bin_key16)
+  let cached_bin = cache_dir + "/bin/" + bin_name
+  let bin_cas_key = "nativebin:" + bin_name
+  let eligible = drv_bin_cache_eligible(link_opts) &&
+    !has_local_cstub &&
+    cas_is_safe_key(bin_cas_key)
+  if eligible {
+    if drv_is_nonempty_regular_file(world, cached_bin) &&
+      drv_cas_pin_and_verify(world, cache_dir, pin, [bin_cas_key], [cached_bin]) {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] bin=" + root_pkg + " HIT key=" + bin_key16,
+        )
+      }
+      if out_bin_arg == "" {
+        drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+        return Ok(cached_bin)
+      }
+      let out_dst = drv_linked_exe_path(qbe_target, out_bin_arg)
+      let res = drv_copy_file_exec(
+        world,
+        cached_bin,
+        out_dst,
+        drv_target_is_windows(qbe_target),
+      )
+      drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+      return res
+    }
+    if trace_cas {
+      io_eprintln(
+        world,
+        "[cas] bin=" + root_pkg + " MISS key=" + bin_key16,
+      )
+    }
+    let bin_dir = cache_dir + "/bin"
+    let _ = fs_mkdir_p(world, bin_dir)
+    match drv_make_out_stage(world, bin_dir) {
+      Err(e) => {
+        if out_bin_arg != "" {
+          drv_ensure_parent_dir(world, out_bin_arg)
+          let res = drv_link_objects(
+            world,
+            qbe_target,
+            apple_tools,
+            ld_ver,
+            sysroot,
+            obj_paths,
+            rt_lib,
+            link_opts,
+            out_bin_arg,
+            false,
+            false,
+          )
+          drv_cas_post_run_evict(world, cache_dir, pin, [])
+          return res
+        }
+        drv_cas_pin_close(world, pin)
+        return Err(e)
+      }
+      Ok(stage) => {
+        let linked_tmp = stage + "/" + bin_name
+        match
+          drv_link_objects_to(
+            world,
+            qbe_target,
+            apple_tools,
+            ld_ver,
+            sysroot,
+            obj_paths,
+            rt_lib,
+            link_opts,
+            linked_tmp,
+            false,
+          )
+        {
+          Err(e) => {
+            let _ = fs_remove(world, linked_tmp)
+            let _ = drv_drop_out_stage(world, stage)
+            drv_cas_pin_close(world, pin)
+            return Err(e)
+          }
+          Ok(_) => ()
+        }
+        let published = drv_cas_publish_file_pinned(
+          world,
+          cache_dir,
+          pin,
+          [bin_cas_key],
+          linked_tmp,
+          cached_bin,
+        )
+        if published {
+          let sz = fs_size(world, cached_bin)
+          drv_cas_record_and_evict_pinned(
+            world,
+            cache_dir,
+            bin_cas_key,
+            if sz > 0L { sz } else { 0L },
+            pin,
+          )
+          let _ = drv_drop_out_stage(world, stage)
+          if out_bin_arg == "" {
+            drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+            return Ok(cached_bin)
+          }
+          let out_dst = drv_linked_exe_path(qbe_target, out_bin_arg)
+          let res = drv_copy_file_exec(
+            world,
+            cached_bin,
+            out_dst,
+            drv_target_is_windows(qbe_target),
+          )
+          drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+          return res
+        }
+        if out_bin_arg != "" {
+          let out_dst = drv_linked_exe_path(qbe_target, out_bin_arg)
+          let res = drv_copy_file_exec(
+            world,
+            linked_tmp,
+            out_dst,
+            drv_target_is_windows(qbe_target),
+          )
+          let _ = fs_remove(world, linked_tmp)
+          let _ = drv_drop_out_stage(world, stage)
+          drv_cas_post_run_evict(world, cache_dir, pin, [])
+          return res
+        }
+        let pub_res = drv_publish_tool_output(
+          world,
+          linked_tmp,
+          cached_bin,
+          true,
+          "linker",
+        )
+        let res = drv_staged_result(pub_res, drv_drop_out_stage(world, stage))
+        drv_cas_post_run_evict(world, cache_dir, pin, [])
+        return res
+      }
+    }
+  }
+  let default_bin = cache_dir + "/bin/" + root_pkg + "_" + bin_key16
+  let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+  if out_bin_arg != "" {
+    drv_ensure_parent_dir(world, out_bin_arg)
+  }
+  let res = drv_link_objects(
+    world,
+    qbe_target,
+    apple_tools,
+    ld_ver,
+    sysroot,
+    obj_paths,
+    rt_lib,
+    link_opts,
+    final_bin,
+    out_bin_arg == "",
+    false,
+  )
+  drv_cas_post_run_evict(world, cache_dir, pin, [])
+  res
 }
 
 ///|
@@ -10192,6 +10504,8 @@ fn drv_build_nodes_objects_entry(
   let cstub_new_sizes : Array[Int64] = []
   let cc_ver_cache : Map[String, String] = Map([])
   let file_hash_memo : Map[String, String] = Map([])
+  let absent_memo : Map[String, Bool] = Map([])
+  let mut has_local_cstub = false
   k = 0
   while k < n {
     let node = nodes[topo.order[k]]
@@ -10210,6 +10524,7 @@ fn drv_build_nodes_objects_entry(
       trace_cas,
       cc_ver_cache,
       file_hash_memo,
+      absent_memo,
       cstub_objs,
       cstub_keys,
       cstub_new_keys,
@@ -10217,10 +10532,14 @@ fn drv_build_nodes_objects_entry(
       pin,
     ) {
       Err(e) => return Err(e)
-      Ok(has_cxx) =>
+      Ok((has_cxx, kept_local_any)) => {
         if has_cxx {
           ws_link_opts.has_cxx = true
         }
+        if kept_local_any {
+          has_local_cstub = true
+        }
+      }
     }
     let mut ci = 0
     while ci < cstub_objs.length() {
@@ -10274,6 +10593,9 @@ fn drv_build_nodes_objects_entry(
     dep_pkg_names: dep_pkg_names,
     link_key: sha256_hex(link_key_sb.to_string()),
     link_opts: ws_link_opts,
+    has_local_cstub: has_local_cstub,
+    cc_ver_cache: cc_ver_cache,
+    file_hash_memo: file_hash_memo,
   })
 }
 
@@ -10901,20 +11223,6 @@ fn drv_build_targets(
           return res
         }
         let root_pkg = built.root_pkg_name
-        let default_bin = cache_dir +
-          "/bin/" +
-          root_pkg +
-          "_" +
-          drv_prefix16(drv_bin_key(world, qbe_target, sysroot, built.link_key, link_opts))
-        let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
-        let linked_bin = drv_linked_exe_path(qbe_target, final_bin)
-        if out_bin_arg == "" && drv_is_nonempty_regular_file(world, linked_bin) {
-          drv_cas_post_run_evict(world, cache_dir, pin, [])
-          return Ok(linked_bin)
-        }
-        if out_bin_arg != "" {
-          drv_ensure_parent_dir(world, out_bin_arg)
-        }
         let apple_tools = drv_probe_apple_tools(world, qbe_target)
         let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
           apple_tools.macos_ver
@@ -10922,21 +11230,24 @@ fn drv_build_targets(
           "15.0"
         }
         let ld_ver = qbe_macos_ver + ".0"
-        let res = drv_link_objects(
+        return drv_link_native_bin_cached(
           world,
+          cache_dir,
           qbe_target,
           apple_tools,
           ld_ver,
           sysroot,
+          root_pkg,
+          built.link_key,
           built.obj_paths,
           rt_lib,
           link_opts,
-          final_bin,
-          out_bin_arg == "",
-          false,
+          out_bin_arg,
+          built.has_local_cstub,
+          built.cc_ver_cache,
+          built.file_hash_memo,
+          pin,
         )
-        drv_cas_post_run_evict(world, cache_dir, pin, [])
-        return res
       }
       None => ()
     }
@@ -10988,6 +11299,8 @@ fn drv_build_targets(
   }
   let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
   let ld_ver = qbe_macos_ver + ".0"
+  let single_cc_ver_cache : Map[String, String] = Map([])
+  let single_file_hash_memo : Map[String, String] = Map([])
 
   // Multi-file unit-level parallel compilation + unit-level global CAS + incremental .sig/.stub skip
   if paths.length() > 1 &&
@@ -11139,18 +11452,47 @@ fn drv_build_targets(
       ui = ui + 1
     }
     let pkg_key = sha256_hex(pkg_key_sb.to_string())
-    let default_bin = cache_dir +
-      "/bin/" +
-      pkg_name +
-      "_" +
-      drv_prefix16(drv_bin_key(world, qbe_target, sysroot, pkg_key, link_opts))
-    let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
-
-    let linked_bin = drv_linked_exe_path(qbe_target, final_bin)
-    if miss_indices.length() == 0 &&
-      out_bin_arg == "" &&
-      drv_is_nonempty_regular_file(world, linked_bin) {
-      return Ok(linked_bin)
+    if miss_indices.length() == 0 {
+      let bin_key = drv_bin_key(
+        world,
+        qbe_target,
+        sysroot,
+        rt_lib_fp,
+        pkg_key,
+        link_opts,
+        single_cc_ver_cache,
+        single_file_hash_memo,
+      )
+      let bin_key16 = drv_prefix16(bin_key)
+      let bin_name = drv_linked_exe_path(qbe_target, pkg_name + "_" + bin_key16)
+      let cached_bin = cache_dir + "/bin/" + bin_name
+      let bin_cas_key = "nativebin:" + bin_name
+      if drv_bin_cache_eligible(link_opts) &&
+        cas_is_safe_key(bin_cas_key) &&
+        drv_is_nonempty_regular_file(world, cached_bin) &&
+        drv_cas_pin_and_verify(world, cache_dir, pin, [bin_cas_key], [cached_bin]) {
+        let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1" ||
+          drv_env_str(world, "PION_TRACE_CAS") == "1"
+        if trace_cas {
+          io_eprintln(
+            world,
+            "[cas] bin=" + pkg_name + " HIT key=" + bin_key16,
+          )
+        }
+        if out_bin_arg == "" {
+          drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+          return Ok(cached_bin)
+        }
+        let out_dst = drv_linked_exe_path(qbe_target, out_bin_arg)
+        let res = drv_copy_file_exec(
+          world,
+          cached_bin,
+          out_dst,
+          drv_target_is_windows(qbe_target),
+        )
+        drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+        return res
+      }
     }
 
     if miss_indices.length() > 0 {
@@ -11584,9 +11926,6 @@ fn drv_build_targets(
       return Ok(obj_paths[0])
     }
 
-    if out_bin_arg != "" {
-      drv_ensure_parent_dir(world, out_bin_arg)
-    }
     let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
       Err(e) => {
         drv_cas_pin_close(world, pin)
@@ -11594,21 +11933,24 @@ fn drv_build_targets(
       }
       Ok(p) => p
     }
-    let link_res = drv_link_objects(
+    return drv_link_native_bin_cached(
       world,
+      cache_dir,
       qbe_target,
       apple_tools,
       ld_ver,
       sysroot,
+      pkg_name,
+      pkg_key,
       obj_paths,
       rt_lib,
       link_opts,
-      final_bin,
-      out_bin_arg == "",
+      out_bin_arg,
       false,
+      single_cc_ver_cache,
+      single_file_hash_memo,
+      pin,
     )
-    drv_cas_post_run_evict(world, cache_dir, pin, [])
-    return link_res
   }
   let single_upstream : Array[String] = []
   if no_main {
@@ -11628,12 +11970,6 @@ fn drv_build_targets(
   let sig_path = cache_dir + "/sig/" + key + ".pionsig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
   let obj_path = cache_dir + "/obj/" + key + ".o"
-  let default_bin = cache_dir +
-    "/bin/" +
-    pkg_name +
-    "_" +
-    drv_prefix16(drv_bin_key(world, qbe_target, sysroot, key, link_opts))
-  let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
 
   let asm_only = emit_asm_path != "" &&
     out_bin_arg == "" &&
@@ -11717,19 +12053,51 @@ fn drv_build_targets(
     drv_cas_record_and_evict_pinned(world, cache_dir, key, total_sz, pin)
     if emit_obj_path == "" &&
       emit_staticlib_path == "" &&
-      emit_cdylib_path == "" &&
-      out_bin_arg == "" &&
-      drv_is_nonempty_regular_file(world, drv_linked_exe_path(qbe_target, final_bin)) {
-      drv_cas_post_run_evict(world, cache_dir, pin, [])
-      return Ok(drv_linked_exe_path(qbe_target, final_bin))
-    }
-    if emit_obj_path == "" &&
-      emit_staticlib_path == "" &&
-      emit_cdylib_path == "" &&
-      (emit_ssa_path != "" || emit_asm_path != "") &&
-      out_bin_arg == "" {
-      drv_cas_post_run_evict(world, cache_dir, pin, [key])
-      return Ok(obj_path)
+      emit_cdylib_path == "" {
+      if (emit_ssa_path != "" || emit_asm_path != "") && out_bin_arg == "" {
+        drv_cas_post_run_evict(world, cache_dir, pin, [key])
+        return Ok(obj_path)
+      }
+      let bin_key = drv_bin_key(
+        world,
+        qbe_target,
+        sysroot,
+        rt_lib_fp,
+        key,
+        link_opts,
+        single_cc_ver_cache,
+        single_file_hash_memo,
+      )
+      let bin_key16 = drv_prefix16(bin_key)
+      let bin_name = drv_linked_exe_path(qbe_target, pkg_name + "_" + bin_key16)
+      let cached_bin = cache_dir + "/bin/" + bin_name
+      let bin_cas_key = "nativebin:" + bin_name
+      if drv_bin_cache_eligible(link_opts) &&
+        cas_is_safe_key(bin_cas_key) &&
+        drv_is_nonempty_regular_file(world, cached_bin) &&
+        drv_cas_pin_and_verify(world, cache_dir, pin, [bin_cas_key], [cached_bin]) {
+        let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1" ||
+          drv_env_str(world, "PION_TRACE_CAS") == "1"
+        if trace_cas {
+          io_eprintln(
+            world,
+            "[cas] bin=" + pkg_name + " HIT key=" + bin_key16,
+          )
+        }
+        if out_bin_arg == "" {
+          drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+          return Ok(cached_bin)
+        }
+        let out_dst = drv_linked_exe_path(qbe_target, out_bin_arg)
+        let res = drv_copy_file_exec(
+          world,
+          cached_bin,
+          out_dst,
+          drv_target_is_windows(qbe_target),
+        )
+        drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
+        return res
+      }
     }
   } else {
     let j2_mask = drv_j2_disable_mask(world)
@@ -11930,24 +12298,24 @@ fn drv_build_targets(
     return Ok(active_obj_path)
   }
 
-  if out_bin_arg != "" {
-    drv_ensure_parent_dir(world, out_bin_arg)
-  }
-  let res = drv_link_objects(
+  drv_link_native_bin_cached(
     world,
+    cache_dir,
     qbe_target,
     apple_tools,
     ld_ver,
     sysroot,
+    pkg_name,
+    key,
     [active_obj_path],
     rt_lib,
     link_opts,
-    final_bin,
-    out_bin_arg == "",
+    out_bin_arg,
     false,
+    single_cc_ver_cache,
+    single_file_hash_memo,
+    pin,
   )
-  drv_cas_post_run_evict(world, cache_dir, pin, [])
-  res
 }
 
 ///|
@@ -12210,6 +12578,7 @@ fn drv_exec_test_jobs(
   let new_ssa : Array[String] = []
   // rcs[gi]: exit code of the gi-th selected test (job order, then index order).
   let rcs : Array[Int] = []
+  let link_cc_ver_cache : Map[String, String] = Map([])
   let mut gi_base = 0
   let mut j = 0
   while j < jobs_list.length() {
@@ -12253,7 +12622,9 @@ fn drv_exec_test_jobs(
       di = di + 1
     }
     dsb.write_string(drv_link_opts_key(world, job.link_opts))
-    dsb.write_string(drv_effective_link_context_key(world, qbe_target, "", job.link_opts))
+    dsb.write_string(
+      drv_effective_link_context_key(world, qbe_target, "", job.link_opts, link_cc_ver_cache),
+    )
     let bkey = sha256_hex(dsb.to_string())
     let obj_path = tb_dir + "/" + okey + ".o"
     let bkey_file = drv_linked_exe_path(qbe_target, bkey)
@@ -13102,6 +13473,7 @@ fn drv_compile_ws_c_sources_parallel(
   let cxx_bin = drv_resolve_cc_driver(world, qbe_target, true)
   let base_cc_flags = drv_target_cc_flags(world, qbe_target, "")
   let cc_ver_cache : Map[String, String] = Map([])
+  let absent_memo : Map[String, Bool] = Map([])
   let miss_specs : Array[String] = []
   let miss_src_paths : Array[String] = []
   let miss_norm_srcs : Array[String] = []
@@ -13222,7 +13594,7 @@ fn drv_compile_ws_c_sources_parallel(
             src_hash,
           )
           let mut hit_final_key = ""
-          match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo) {
+          match drv_cstub_try_hit(world, cache_dir, src_path, base_key, trace_cas, file_hash_memo, absent_memo) {
             Some(fk) => {
               let obj_path = cache_dir + "/obj/cstub_" + fk + ".o"
               if drv_cas_pin_and_verify(
