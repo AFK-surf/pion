@@ -563,7 +563,13 @@ fn pos_multiline_match_guard() -> String {
     _ => false
   }
   let guard_any = [1, 2, 3].iter().any(fn(x) { km.contains(x) })
-  guard_ok.to_string() + "|" + guard_any.to_string()
+  let fxs = [3, 4]
+  let fseen : Array[Int] = []
+  let fout = fxs.filter_map(fn(x) {
+    fseen.push(x)
+    Some(x)
+  })
+  guard_ok.to_string() + "|" + guard_any.to_string() + "|" + (fout.length() + fseen.length()).to_string()
 }
 
 pub fn run_all() -> String {
@@ -1411,31 +1417,6 @@ pub fn choose(xs : Array[Int], m : Map[String, Json], log : Array[String]) -> Bo
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
-        "neg_shadowed_some_custom_eq_filter_map",
-        r'''
-enum Flag {
-  Some(Int)
-}
-struct EvilBox {
-  xs : Array[Int]
-}
-impl Eq for EvilBox with equal(self, _other) {
-  self.xs.push(9)
-  true
-}
-pub fn run(xs : Array[Int]) -> Array[Int] {
-  let b = EvilBox::{ xs }
-  let f = Flag::Some(1)
-  xs.filter_map(fn(x) {
-    let _ = b == b
-    let _ = match f { Flag::Some(n) => n }
-    Option::Some(x)
-  })
-}
-''',
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-    ),
-    (
         "neg_json_object_guard_rebind_array_search_by",
         r'''
 pub fn run(xs : Array[Json], k : Json) -> Int? {
@@ -1468,6 +1449,63 @@ pub fn run(xs : Array[Json], k : Json) -> Int? {
 }
 ''',
         "Array::search_by",
+    ),
+    (
+        "neg_impl_generic_shadow_struct_t_filter_map",
+        r'''
+struct T {
+  n : Int
+}
+struct Bucket[T] {
+  xs : Array[T]
+  ys : Array[Int]
+}
+impl[T] Eq for Bucket[T] with equal(a, _b) {
+  let xs : Array[T] = a.xs
+  let ys : Array[Int] = a.ys
+  xs.filter_map(fn(x) {
+    if ys.length() == 2 { ys.push(9) }
+    Some(x)
+  }).length() == 2
+}
+pub fn probe() -> Bool {
+  let a : Array[Int] = [3, 4]
+  let b = Bucket::{ xs: a, ys: a }
+  let _ = T::{ n: 0 }
+  b == b
+}
+''',
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+    ),
+    (
+        "neg_impl_generic_shadow_struct_t_iter_any",
+        r'''
+struct T {
+  n : Int
+}
+struct Bucket[T] {
+  xs : Array[T]
+  ys : Array[Int]
+}
+impl[T] Eq for Bucket[T] with equal(a, _b) {
+  let xs : Array[T] = a.xs
+  let ys : Array[Int] = a.ys
+  let mut count = 0
+  let _ = xs.iter().any(fn(_) {
+    count = count + 1
+    ys.clear()
+    false
+  })
+  count == 2
+}
+pub fn probe() -> Bool {
+  let a : Array[Int] = [3, 4]
+  let b = Bucket::{ xs: a, ys: a }
+  let _ = T::{ n: 0 }
+  b == b
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
 ]
 
