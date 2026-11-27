@@ -1372,20 +1372,20 @@ grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_1.trace" || \
 N1_COLD_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
 [ "$N1_COLD_CALLS" -ge 1 ] || fail "Scenario N1 cold expected CC/link call, got $N1_COLD_CALLS"
 
-# 2) Warm build -o n1_d2/n1_app (different dir, same basename!) -> HIT, ZERO CC/link calls, executable!
+# 2) Warm build -o n1_d2/n1_app_renamed (different dir AND different basename!) -> HIT, ZERO CC/link calls, executable!
 : > "$N1_CC_LOG"
 REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
   PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
-  "$PIONC" build -o "$TMP_DIR/n1_d2/n1_app" "$WS_N1/app" 2>"$TMP_DIR/n1_2.trace"
+  "$PIONC" build -o "$TMP_DIR/n1_d2/n1_app_renamed" "$WS_N1/app" 2>"$TMP_DIR/n1_2.trace"
 grep -q "\[cas\] bin=n1_app HIT key=" "$TMP_DIR/n1_2.trace" || \
   fail "Scenario N1 warm expected bin HIT: $(cat "$TMP_DIR/n1_2.trace")"
 N1_WARM_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
 [ "$N1_WARM_CALLS" = "0" ] || fail "Scenario N1 warm expected 0 CC/link calls, got $N1_WARM_CALLS: $(cat "$N1_CC_LOG")"
-[ -x "$TMP_DIR/n1_d2/n1_app" ] || fail "Scenario N1 warm out2 not executable"
-[ "$("$TMP_DIR/n1_d2/n1_app")" = "n1=11" ] || fail "Scenario N1 warm out2 mismatch"
+[ -x "$TMP_DIR/n1_d2/n1_app_renamed" ] || fail "Scenario N1 warm out2 not executable"
+[ "$("$TMP_DIR/n1_d2/n1_app_renamed")" = "n1=11" ] || fail "Scenario N1 warm out2 mismatch"
 if [ "$(uname -s)" = "Darwin" ]; then
-  N1_CS_ID="$(codesign -dv "$TMP_DIR/n1_d2/n1_app" 2>&1 | sed -n 's/^Identifier=//p')"
-  [ "$N1_CS_ID" = "n1_app" ] || fail "Scenario N1 warm Darwin codesign Identifier mismatch: '$N1_CS_ID'"
+  N1_CS_ID="$(codesign -dv "$TMP_DIR/n1_d2/n1_app_renamed" 2>&1 | sed -n 's/^Identifier=//p')"
+  [ "$N1_CS_ID" = "n1_app_renamed" ] || fail "Scenario N1 warm Darwin codesign Identifier mismatch: '$N1_CS_ID'"
 fi
 
 # 3) Source edit -> MISS

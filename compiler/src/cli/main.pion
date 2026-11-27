@@ -2891,15 +2891,6 @@ fn drv_cas_remove_entry(world : World, cache_dir : String, ek : String) -> Unit 
     )
     return
   }
-  if drv_starts_with(ek, "outbin:") {
-    drv_cas_remove_in_bucket(
-      world,
-      cache_dir,
-      "outbin",
-      slice_str(ek, 7, ek.length()),
-    )
-    return
-  }
   if drv_starts_with(ek, "testbin:") {
     drv_cas_remove_in_bucket(
       world,
@@ -5634,7 +5625,17 @@ fn drv_cstub_shadow_candidates(
   let mut hi = 0
   while hi < hdrs.length() {
     let h = hdrs[hi]
-    if !drv_cstub_is_system_header(h) {
+    let mut in_search = false
+    let mut di = 0
+    while di < search_dirs.length() {
+      if !cas_is_toolchain_include_root(search_dirs[di]) &&
+        drv_cstub_path_has_prefix(h, search_dirs[di] + "/") {
+        in_search = true
+        break
+      }
+      di = di + 1
+    }
+    if in_search || !drv_cstub_is_system_header(h) {
       let pd = drv_parent_dir(h)
       if pd.length() > 0 && !seen_hdir.contains(pd) {
         seen_hdir.set(pd, true)
@@ -7237,12 +7238,11 @@ fn drv_wl_token_safe(p : String) -> Bool {
 }
 
 ///|
-/// Strict fail-closed whitelist for linker flags eligible for `nativebin:` /
-/// `outbin:` CAS caching. Only pure flags without external paths, search dirs,
-/// response files, linker scripts, or object/archive inputs are accepted.
+/// Strict fail-closed whitelist for linker flags eligible for `nativebin:` CAS
+/// caching. Only pure flags without external paths, search dirs, response
+/// files, linker scripts, or object/archive inputs are accepted.
 fn drv_flag_is_safe_for_bin_cache(fl : String) -> Bool {
-  if fl == "-static" ||
-    fl == "-pthread" ||
+  if fl == "-pthread" ||
     fl == "-pthreads" ||
     fl == "-s" ||
     fl == "-rdynamic" ||
@@ -7311,7 +7311,7 @@ fn drv_flag_is_safe_for_bin_cache(fl : String) -> Bool {
 }
 
 ///|
-/// Fail-closed guard for `nativebin:` / `outbin:` linked executable CAS caching.
+/// Fail-closed guard for `nativebin:` linked executable CAS caching.
 fn drv_bin_cache_eligible(
   world : World,
   qbe_target : String,
@@ -7320,14 +7320,12 @@ fn drv_bin_cache_eligible(
   if opts.search_paths.length() > 0 {
     return false
   }
-  if opts.libs.length() > 0 {
-    if drv_target_is_windows(qbe_target) {
-      if drv_env_str(world, "LIB").length() > 0 {
-        return false
-      }
-    } else if drv_env_str(world, "LIBRARY_PATH").length() > 0 {
+  if drv_target_is_windows(qbe_target) {
+    if drv_env_str(world, "LIB").length() > 0 {
       return false
     }
+  } else if drv_env_str(world, "LIBRARY_PATH").length() > 0 {
+    return false
   }
   let mut i = 0
   while i < opts.flags.length() {
@@ -7347,18 +7345,12 @@ fn drv_bin_key(
   rt_lib : String,
   key : String,
   opts : DrvLinkOpts,
-  apple_out_base : String,
   cc_ver_cache : Map[String, String],
   file_hash_memo : Map[String, String],
 ) -> String {
   let rt_hash = match drv_sha256_file(rt_lib, file_hash_memo) {
     Some(h) => h
     None => "missing:" + rt_lib
-  }
-  let apple_part = if apple_out_base.length() > 0 {
-    "|apple_out_base:" + apple_out_base
-  } else {
-    ""
   }
   let suffix = drv_link_opts_key(world, opts)
   let ctx = drv_effective_link_context_key(
@@ -7368,7 +7360,7 @@ fn drv_bin_key(
     opts,
     cc_ver_cache,
   )
-  sha256_hex(key + "|rt:" + rt_hash + apple_part + suffix + ctx)
+  sha256_hex(key + "|rt:" + rt_hash + suffix + ctx)
 }
 
 ///|
@@ -7397,11 +7389,37 @@ fn drv_copy_file(world : World, src : String, dst : String) -> Result[String, St
 }
 
 ///|
+fn drv_macos_resign_adhoc(
+  world : World,
+  path : String,
+  ident : String,
+) -> Result[Unit, String] {
+  if !fs_exists(world, "/usr/bin/codesign") {
+    return Ok(())
+  }
+  match
+    proc_exec_capture(world, [
+      "/usr/bin/codesign",
+      "-f",
+      "-s",
+      "-",
+      "-i",
+      ident,
+      path,
+    ])
+  {
+    Ok(_) => Ok(())
+    Err(e) => Err("failed to ad-hoc codesign " + path + ": " + e)
+  }
+}
+
+///|
 fn drv_copy_file_exec(
   world : World,
   src : String,
   dst : String,
   is_windows : Bool,
+  is_apple : Bool,
 ) -> Result[String, String] {
   if !drv_is_nonempty_regular_file(world, src) {
     return Err("cached binary is missing or empty: " + src)
@@ -7426,10 +7444,22 @@ fn drv_copy_file_exec(
       if !is_windows {
         let _ = fs_chmod(world, tmp, 493)
       }
-      if drv_publish_tmp(world, tmp, dst, false) {
-        Ok(dst)
+      let sign_res = if is_apple {
+        drv_macos_resign_adhoc(world, tmp, dst_base)
       } else {
-        Err("failed to replace " + dst)
+        Ok(())
+      }
+      match sign_res {
+        Err(e) => {
+          let _ = fs_remove(world, tmp)
+          Err(e)
+        }
+        Ok(_) =>
+          if drv_publish_tmp(world, tmp, dst, false) {
+            Ok(dst)
+          } else {
+            Err("failed to replace " + dst)
+          }
       }
     }
   }
@@ -7437,17 +7467,17 @@ fn drv_copy_file_exec(
 }
 
 ///|
-/// Best-effort population of `cache_dir/<bin_bucket>/<bin_name>` from a freshly
-/// linked binary `src_bin`. Never blocks or fails publication of the user's `-o`.
+/// Best-effort population of `cache_dir/bin/<bin_name>` from a freshly linked
+/// binary `src_bin`. Never blocks or fails publication of the user's `-o`.
 fn drv_cas_populate_native_bin(
   world : World,
   cache_dir : String,
-  bin_bucket : String,
   bin_name : String,
   bin_cas_key : String,
   cached_bin : String,
   src_bin : String,
   is_windows : Bool,
+  is_apple : Bool,
   pin : DrvCasPinSession,
 ) -> Bool {
   if pin.lock_handle < 0L {
@@ -7463,9 +7493,9 @@ fn drv_cas_populate_native_bin(
   if b.length() == 0 {
     return false
   }
-  let bucket_dir = cache_dir + "/" + bin_bucket
-  let _ = fs_mkdir_p(world, bucket_dir)
-  let cas_stage = match drv_make_out_stage(world, bucket_dir) {
+  let bin_dir = cache_dir + "/bin"
+  let _ = fs_mkdir_p(world, bin_dir)
+  let cas_stage = match drv_make_out_stage(world, bin_dir) {
     Err(_) => return false
     Ok(d) => d
   }
@@ -7476,7 +7506,18 @@ fn drv_cas_populate_native_bin(
       if !is_windows {
         let _ = fs_chmod(world, cas_tmp, 493)
       }
-      if drv_cas_publish_file_pinned(
+      let signed = if is_apple {
+        match drv_macos_resign_adhoc(world, cas_tmp, bin_name) {
+          Ok(_) => true
+          Err(_) => false
+        }
+      } else {
+        true
+      }
+      if !signed {
+        let _ = fs_remove(world, cas_tmp)
+        false
+      } else if drv_cas_publish_file_pinned(
         world,
         cache_dir,
         pin,
@@ -7519,14 +7560,8 @@ fn drv_try_hit_native_bin(
   file_hash_memo : Map[String, String],
   pin : DrvCasPinSession,
 ) -> Option[Result[String, String]] {
-  let use_outbin = drv_target_is_apple(qbe_target) && out_bin_arg != ""
   let out_dst = if out_bin_arg != "" {
     drv_linked_exe_path(qbe_target, out_bin_arg)
-  } else {
-    ""
-  }
-  let apple_out_base = if use_outbin {
-    drv_split_dir_base(world, out_dst).1
   } else {
     ""
   }
@@ -7537,15 +7572,13 @@ fn drv_try_hit_native_bin(
     rt_lib,
     link_key,
     link_opts,
-    apple_out_base,
     cc_ver_cache,
     file_hash_memo,
   )
   let bin_key16 = drv_prefix16(bin_key)
   let bin_name = drv_linked_exe_path(qbe_target, root_pkg + "_" + bin_key16)
-  let bin_bucket = if use_outbin { "outbin" } else { "bin" }
-  let cached_bin = cache_dir + "/" + bin_bucket + "/" + bin_name
-  let bin_cas_key = (if use_outbin { "outbin:" } else { "nativebin:" }) + bin_name
+  let cached_bin = cache_dir + "/bin/" + bin_name
+  let bin_cas_key = "nativebin:" + bin_name
   let eligible = drv_bin_cache_eligible(world, qbe_target, link_opts) &&
     !has_local_cstub &&
     cas_is_safe_key(bin_cas_key)
@@ -7554,16 +7587,6 @@ fn drv_try_hit_native_bin(
   }
   if drv_is_nonempty_regular_file(world, cached_bin) &&
     drv_cas_pin_and_verify(world, cache_dir, pin, [bin_cas_key], [cached_bin]) {
-    if pin.lock_handle >= 0L {
-      let sz = fs_size(world, cached_bin)
-      drv_cas_record_and_evict_pinned(
-        world,
-        cache_dir,
-        bin_cas_key,
-        if sz > 0L { sz } else { 0L },
-        pin,
-      )
-    }
     let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1" ||
       drv_env_str(world, "PION_TRACE_CAS") == "1"
     if trace_cas {
@@ -7581,6 +7604,7 @@ fn drv_try_hit_native_bin(
       cached_bin,
       out_dst,
       drv_target_is_windows(qbe_target),
+      drv_target_is_apple(qbe_target),
     )
     drv_cas_post_run_evict(world, cache_dir, pin, [bin_cas_key])
     return Some(res)
@@ -7629,14 +7653,8 @@ fn drv_link_native_bin_cached(
   }
   let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1" ||
     drv_env_str(world, "PION_TRACE_CAS") == "1"
-  let use_outbin = drv_target_is_apple(qbe_target) && out_bin_arg != ""
   let out_dst = if out_bin_arg != "" {
     drv_linked_exe_path(qbe_target, out_bin_arg)
-  } else {
-    ""
-  }
-  let apple_out_base = if use_outbin {
-    drv_split_dir_base(world, out_dst).1
   } else {
     ""
   }
@@ -7647,15 +7665,13 @@ fn drv_link_native_bin_cached(
     rt_lib,
     link_key,
     link_opts,
-    apple_out_base,
     cc_ver_cache,
     file_hash_memo,
   )
   let bin_key16 = drv_prefix16(bin_key)
   let bin_name = drv_linked_exe_path(qbe_target, root_pkg + "_" + bin_key16)
-  let bin_bucket = if use_outbin { "outbin" } else { "bin" }
-  let cached_bin = cache_dir + "/" + bin_bucket + "/" + bin_name
-  let bin_cas_key = (if use_outbin { "outbin:" } else { "nativebin:" }) + bin_name
+  let cached_bin = cache_dir + "/bin/" + bin_name
+  let bin_cas_key = "nativebin:" + bin_name
   let eligible = drv_bin_cache_eligible(world, qbe_target, link_opts) &&
     !has_local_cstub &&
     cas_is_safe_key(bin_cas_key)
@@ -7712,12 +7728,12 @@ fn drv_link_native_bin_cached(
         drv_cas_populate_native_bin(
           world,
           cache_dir,
-          bin_bucket,
           bin_name,
           bin_cas_key,
           cached_bin,
           linked_tmp,
           drv_target_is_windows(qbe_target),
+          drv_target_is_apple(qbe_target),
           pin,
         )
       } else {
@@ -20513,7 +20529,6 @@ fn drv_cache_clear_impl(
   }
   let s_obj = drv_clear_dir_files(world, drv_join_path(cache_dir, "obj"))
   let s_bin = drv_clear_dir_files(world, drv_join_path(cache_dir, "bin"))
-  let s_obin = drv_clear_dir_files(world, drv_join_path(cache_dir, "outbin"))
   let s_tbin = drv_clear_dir_files(world, drv_join_path(cache_dir, "testbin"))
   let s_sig = drv_clear_dir_files(world, drv_join_path(cache_dir, "sig"))
   let s_ssa = drv_clear_dir_files(world, drv_join_path(cache_dir, "ssa"))
@@ -20522,14 +20537,12 @@ fn drv_cache_clear_impl(
   drv_cas_collect_peer_pins(world, cache_dir, "", stale_pins)
   let mut removed_files = s_obj.files +
     s_bin.files +
-    s_obin.files +
     s_tbin.files +
     s_sig.files +
     s_ssa.files +
     s_usig.files
   let mut removed_bytes = s_obj.bytes +
     s_bin.bytes +
-    s_obin.bytes +
     s_tbin.bytes +
     s_sig.bytes +
     s_ssa.bytes +
@@ -20622,13 +20635,12 @@ fn drv_run_cache_cmd(world : World, args : Array[String]) -> Int {
     let s_obj = drv_dir_stats(world, drv_join_path(cache_dir, "obj"))
     let s_bin1 = drv_dir_stats(world, drv_join_path(cache_dir, "bin"))
     let s_bin2 = drv_dir_stats(world, drv_join_path(cache_dir, "testbin"))
-    let s_bin3 = drv_dir_stats(world, drv_join_path(cache_dir, "outbin"))
     let s_sig1 = drv_dir_stats(world, drv_join_path(cache_dir, "sig"))
     let s_sig2 = drv_dir_stats(world, drv_join_path(cache_dir, "usig"))
     let s_sig3 = drv_dir_stats(world, drv_join_path(cache_dir, "ssa"))
     let s_git = drv_dir_stats(world, drv_git_cache_root(world))
-    let bin_files = s_bin1.files + s_bin2.files + s_bin3.files
-    let bin_bytes = s_bin1.bytes + s_bin2.bytes + s_bin3.bytes
+    let bin_files = s_bin1.files + s_bin2.files
+    let bin_bytes = s_bin1.bytes + s_bin2.bytes
     let sig_files = s_sig1.files + s_sig2.files + s_sig3.files
     let sig_bytes = s_sig1.bytes + s_sig2.bytes + s_sig3.bytes
     let total_files = s_obj.files + bin_files + sig_files + s_git.files
@@ -20892,7 +20904,6 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
   let cache_max_mb = drv_resolve_cache_max_bytes(world) / (1024L * 1024L)
   let st_obj = drv_dir_stats(world, drv_join_path(cache_dir, "obj"))
   let st_bin = drv_dir_stats(world, drv_join_path(cache_dir, "bin"))
-  let st_obin = drv_dir_stats(world, drv_join_path(cache_dir, "outbin"))
   let st_tbin = drv_dir_stats(world, drv_join_path(cache_dir, "testbin"))
   let st_sig = drv_dir_stats(world, drv_join_path(cache_dir, "sig"))
   let st_usig = drv_dir_stats(world, drv_join_path(cache_dir, "usig"))
@@ -20900,7 +20911,6 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
   let st_git = drv_dir_stats(world, drv_git_cache_root(world))
   let cache_files = st_obj.files +
     st_bin.files +
-    st_obin.files +
     st_tbin.files +
     st_sig.files +
     st_usig.files +
@@ -20908,7 +20918,6 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
     st_git.files
   let cache_bytes = st_obj.bytes +
     st_bin.bytes +
-    st_obin.bytes +
     st_tbin.bytes +
     st_sig.bytes +
     st_usig.bytes +
