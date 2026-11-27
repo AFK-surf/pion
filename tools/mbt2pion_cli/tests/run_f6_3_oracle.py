@@ -366,8 +366,23 @@ fn pos_f6_4a_scalar_sort_nan_signed_zero() -> String {
   out.join(",")
 }
 
+fn pos_f6_4a_newline_paren_bracket_stmt() -> String {
+  let xs : Array[Int] = [0, 1, 2]
+  let r1 = xs.search_by(fn(x) {
+    let m : Map[Int, Int] = { 1: 2 }
+    (m.contains(x))
+  })
+  let r2 = xs.search_by(fn(x) {
+    let m : Map[Int, Int] = { 1: 2 }
+    [m.contains(x)][0]
+  })
+  let s1 = match r1 { Some(i) => i.to_string(); None => "none" }
+  let s2 = match r2 { Some(i) => i.to_string(); None => "none" }
+  s1 + "|" + s2
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt()
 }
 '''
 

@@ -1564,9 +1564,14 @@ fn ms_clone_bool_map(m : Map[String, Bool]) -> Map[String, Bool] {
   out
 }
 
-///| True iff `tk` continues a preceding expression across a newline (e.g. `\n  |> f`, `\n  .m()`, `\n  + x`).
-fn ms_is_expr_continuation_tok(tk : Token) -> Bool {
-  let k = tk.kind
+///| True iff `next_tk` continues the expression ending at `prev_tk` (matching `p_parse_postfix_tail`:
+///| `LParen` / `LBracket` / `Question` do not continue across a newline).
+fn ms_is_expr_continuation_tok(prev_tk : Token, next_tk : Token) -> Bool {
+  let k = next_tk.kind
+  if (k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::Question) &&
+  next_tk.line > prev_tk.line {
+    return false
+  }
   k == TokenKind::PipeGt || k == TokenKind::Dot || k == TokenKind::DotDot ||
   k == TokenKind::DotDotLt || k == TokenKind::DotDotLtEq || k == TokenKind::DotDotEq ||
   k == TokenKind::ColonColon || k == TokenKind::LParen || k == TokenKind::LBracket ||
@@ -1578,7 +1583,7 @@ fn ms_is_expr_continuation_tok(tk : Token) -> Bool {
   k == TokenKind::Eq || k == TokenKind::EqEq || k == TokenKind::BangEq ||
   k == TokenKind::Lt || k == TokenKind::LtEq || k == TokenKind::Gt ||
   k == TokenKind::GtEq || k == TokenKind::AssignOp ||
-  tk.raw == "as" || tk.raw == "is"
+  next_tk.raw == "as" || next_tk.raw == "is"
 }
 
 ///| Collect local `let [mut] x [: T] = rhs` and simple `for x in expr { ... }` variable types in `[s, e)` into `out`,
@@ -1599,6 +1604,22 @@ fn ms_collect_local_var_types(
   let let_bound : Map[String, Bool] = Map()
   let mut i = s
   while i + 2 < e {
+    // Skip nested closure bodies `fn(...) [-> R] { ... }` so closure-local `let`/`for` bindings
+    // neither leak into the enclosing scope nor collide across sibling closures.
+    if tokens[i].raw == "fn" && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i + 1)
+      let mut lb = cp + 1
+      while lb < e && tokens[lb].kind != TokenKind::LBrace && !tokens[lb].newline_before {
+        lb = lb + 1
+      }
+      if lb < e && tokens[lb].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(tokens, lb)
+        if rb > lb {
+          i = rb + 1
+          continue
+        }
+      }
+    }
     if tokens[i].raw == "let" && (tokens[i].kind == TokenKind::Keyword || tokens[i].kind == TokenKind::Ident) {
       let mut ni = i + 1
       let mut is_mut = false
@@ -1629,12 +1650,12 @@ fn ms_collect_local_var_types(
             ms_record_local_var_ty(out, vname, ty_s)
             rhs_s = eq_i + 1
             rhs_e = statement_end(tokens, rhs_s, e)
-            rhs_continued = rhs_e < e && ms_is_expr_continuation_tok(tokens[rhs_e])
+            rhs_continued = rhs_e > rhs_s && rhs_e < e && ms_is_expr_continuation_tok(tokens[rhs_e - 1], tokens[rhs_e])
           }
         } else if ni + 2 < e && tokens[ni + 1].kind == TokenKind::Eq {
           rhs_s = ni + 2
           rhs_e = statement_end(tokens, rhs_s, e)
-          rhs_continued = rhs_e < e && ms_is_expr_continuation_tok(tokens[rhs_e])
+          rhs_continued = rhs_e > rhs_s && rhs_e < e && ms_is_expr_continuation_tok(tokens[rhs_e - 1], tokens[rhs_e])
           if rhs_e > rhs_s && !rhs_continued {
             // Check simple struct literal `Type::{ ... }` or `Type::new(...)` or `rhs` type
             if rhs_s + 2 < rhs_e && tokens[rhs_s].kind == TokenKind::UpperIdent &&
@@ -2486,7 +2507,24 @@ fn ms_scan_span(
                 // Recursive local closure -> fail-closed
                 sum.unknown = true
               } else {
-                ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+                let lc_vt : Map[String, String] = Map()
+                for k in local_var_types.keys() {
+                  match local_var_types.get(k) {
+                    Some(v) => lc_vt[k] = v
+                    None => ()
+                  }
+                }
+                let lc_pmv = ms_clone_bool_map(pure_map_vars)
+                ms_collect_local_var_types(pkg, tokens, lb + 1, rb, content, qfi_opt, lc_vt, lc_pmv, callables, active_generics)
+                let lc_sh : Map[String, Bool] = Map()
+                ms_collect_pattern_bound_idents_in_span_ex(tokens, lb + 1, rb, lc_sh, false)
+                ms_collect_closure_param_names(tokens, lb + 1, rb, lc_sh)
+                ms_mark_shadowed_ambig(lc_vt, lc_sh)
+                ms_prune_pure_map_vars(lc_pmv, lc_sh)
+                let lc_reass : Map[String, Bool] = Map()
+                ms_collect_reassigned_idents(tokens, lb + 1, rb, lc_reass)
+                ms_prune_pure_map_vars(lc_pmv, lc_reass)
+                ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, lc_vt, lc_pmv, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
               }
             } else if local_var_types.contains(name) {
               sum.unknown = true
@@ -2678,7 +2716,24 @@ fn ms_analyze_callback_arg_into(
     let lb = if fn_body_open >= 0 { local_closure_body(tokens, arg_s, nm) } else { -1 }
     if lb >= 0 {
       let rb = find_matching_delim(tokens, lb)
-      ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, parent_var_types, parent_pure_map_vars, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
+      let lc_vt : Map[String, String] = Map()
+      for k in parent_var_types.keys() {
+        match parent_var_types.get(k) {
+          Some(v) => lc_vt[k] = v
+          None => ()
+        }
+      }
+      let lc_pmv = ms_clone_bool_map(parent_pure_map_vars)
+      ms_collect_local_var_types(pkg, tokens, lb + 1, rb, content, qfi_opt, lc_vt, lc_pmv, callables, active_generics)
+      let lc_sh : Map[String, Bool] = Map()
+      ms_collect_pattern_bound_idents_in_span_ex(tokens, lb + 1, rb, lc_sh, false)
+      ms_collect_closure_param_names(tokens, lb + 1, rb, lc_sh)
+      ms_mark_shadowed_ambig(lc_vt, lc_sh)
+      ms_prune_pure_map_vars(lc_pmv, lc_sh)
+      let lc_reass : Map[String, Bool] = Map()
+      ms_collect_reassigned_idents(tokens, lb + 1, rb, lc_reass)
+      ms_prune_pure_map_vars(lc_pmv, lc_reass)
+      ms_scan_span(pkg, tokens, lb + 1, rb, fn_body_open, content, qfi_opt, lc_vt, lc_pmv, callables, active_generics, sum, callees_out, collect_edges, depth + 1)
       return
     }
     if parent_var_types.contains(nm) {
@@ -3417,7 +3472,7 @@ pub fn collect_pkg_mutation_summary(
         if ts[k].raw == "return" && (ts[k].kind == TokenKind::Keyword || ts[k].kind == TokenKind::Ident) {
           let ret_s = k + 1
           let ret_e = statement_end(ts, ret_s, dc.body_close)
-          let ret_cont = ret_e < dc.body_close && ms_is_expr_continuation_tok(ts[ret_e])
+          let ret_cont = ret_e > ret_s && ret_e < dc.body_close && ms_is_expr_continuation_tok(ts[ret_e - 1], ts[ret_e])
           if ret_e <= ret_s || ret_cont || !ms_is_pure_map_value_expr(pkg, ts, ret_s, ret_e, vt, pmv, pm_callables, active_gen) {
             all_ok = false
             break
@@ -3448,7 +3503,7 @@ pub fn collect_pkg_mutation_summary(
       if last_s < 0 || last_e <= last_s {
         continue
       }
-      let last_cont = last_e < dc.body_close && ms_is_expr_continuation_tok(ts[last_e])
+      let last_cont = last_e > last_s && last_e < dc.body_close && ms_is_expr_continuation_tok(ts[last_e - 1], ts[last_e])
       if ts[last_s].raw != "return" && (last_cont || !ms_is_pure_map_value_expr(pkg, ts, last_s, last_e, vt, pmv, pm_callables, active_gen)) {
         continue
       }
