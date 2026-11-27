@@ -99,7 +99,7 @@ def check_elf(path):
         fail('%s: .strtab still spells a private literal name' % path)
     lit_secs = {}
     for i, s in enumerate(secs):
-        m = re.fullmatch(rb'\.data\.(pion_str_[0-9]+_hdr|pion_cstr_[0-9]+)', s['name'])
+        m = re.fullmatch(rb'\.(?:ro)?data\.(pion_str_[0-9]+_hdr|pion_cstr_[0-9]+)', s['name'])
         if m:
             lit_secs[i] = m.group(1)
     kinds = {k[:9] for k in lit_secs.values()}
@@ -154,7 +154,7 @@ def relocs(path):
 
 def check_objcmp(a, b):
     ra, rb = relocs(a), relocs(b)
-    lit = re.compile(rb'\.data\.(pion_str_[0-9]+_hdr|pion_cstr_[0-9]+)')
+    lit = re.compile(rb'\.(?:ro)?data\.(pion_str_[0-9]+_hdr|pion_cstr_[0-9]+)')
     lits = [n for n in ra if lit.fullmatch(n)]
     if len(lits) < 2:
         fail('%s has %d literal sections' % (a, len(lits)))
@@ -199,9 +199,9 @@ def check_litsym(path, want):
     for i in range(st['size'] // 24):
         name, info, other, shndx, value, size = struct.unpack_from('<IBBHQQ', st['data'], i * 24)
         syms.append((cstr(strtab, name), info >> 4, info & 15, shndx, value))
-    lit = [i for i, s in enumerate(secs) if s['name'] == b'.data.pion_cstr_0']
+    lit = [i for i, s in enumerate(secs) if s['name'] in (b'.rodata.pion_cstr_0', b'.data.pion_cstr_0')]
     if len(lit) != 1:
-        fail('%s: no .data.pion_cstr_0 section' % path)
+        fail('%s: no .rodata.pion_cstr_0 or .data.pion_cstr_0 section' % path)
     named = [i for i, s in enumerate(syms) if s[0] == b'pion_cstr_0']
     sect = [i for i, s in enumerate(syms) if s[2] == STT_SECTION and s[3] == lit[0]]
     used = {}

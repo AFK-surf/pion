@@ -86,7 +86,7 @@ def check_ssa(prog, path, gen):
                 fail('%s: %s does not copy a word table' % (prog, name))
             if 'storew' in body:
                 fail('%s: %s still stores elements' % (prog, name))
-        words = re.findall(r'^data \$(\S*i32_literal_\d+)_words = align 4 \{ (.*) \}$', ssa, re.M)
+        words = re.findall(r'^(?:section "\.rodata" )?data \$(\S*i32_literal_\d+)_words = align 4 \{ (.*) \}$', ssa, re.M)
         descs = re.findall(r'^data \$(\S*i32_literal_\d+) = align 8 \{ l (\d+), l (\d+), w 0, w 4, l \$(\S+) \}$', ssa, re.M)
         if len(words) != len(names) or len(descs) != len(names):
             fail('%s: %d word tables / %d descriptors, want %d' % (prog, len(words), len(descs), len(names)))

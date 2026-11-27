@@ -2518,14 +2518,31 @@ is_literal_label(const char *name)
 }
 
 static int
+is_rodata_sec_str(const char *sec_str)
+{
+	if (!sec_str)
+		return 0;
+	return strcmp(sec_str, ".rodata") == 0 || strcmp(sec_str, "\".rodata\"") == 0;
+}
+
+static int
 dat_open_sec(int default_sec)
 {
 	int sec_idx = default_sec;
 	uint64_t al = E0.dat_lnk.align > 0 ? (uint64_t)E0.dat_lnk.align : 1ULL;
+	int use_default = 1;
 
 	if (E0.dat_sec_str) {
-		sec_idx = resolve_custom_sec(E0.dat_sec_str, E0.dat_secf_str);
-	} else if (!E0.dat_lnk.thread && !E0.dat_lnk.common && E0.nsecs < 28000 &&
+		if (!E0.dat_secf_str && !E0.dat_lnk.thread && !E0.dat_lnk.common &&
+		    is_rodata_sec_str(E0.dat_sec_str)) {
+			default_sec = SEC_RODATA;
+			sec_idx = SEC_RODATA;
+		} else {
+			sec_idx = resolve_custom_sec(E0.dat_sec_str, E0.dat_secf_str);
+			use_default = 0;
+		}
+	}
+	if (use_default && !E0.dat_lnk.thread && !E0.dat_lnk.common && E0.nsecs < 28000 &&
 	    E0.dat_name && E0.dat_name[0] != '\0' &&
 	    (default_sec == SEC_RODATA || default_sec == SEC_DATA || default_sec == SEC_BSS)) {
 		char sname[224];
@@ -2539,7 +2556,7 @@ dat_open_sec(int default_sec)
 			make_subsec_name(sname, sizeof sname, ".bss.", E0.dat_name);
 			sec_idx = add_sec(sname, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, al, 1);
 		}
-		if (default_sec == SEC_DATA && !E0.dat_lnk.export)
+		if ((default_sec == SEC_RODATA || default_sec == SEC_DATA) && !E0.dat_lnk.export)
 			E0.secs[sec_idx].private_literal = is_literal_label(E0.dat_name);
 	}
 

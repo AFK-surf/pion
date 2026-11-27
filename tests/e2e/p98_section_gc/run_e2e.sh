@@ -196,8 +196,8 @@ if [ "${PION_WIN_ABI:-}" = "msvc" ]; then
 else
   grep -q '^\.linkonce one_only$' "$WIN_ASM" || { echo "FAIL: amd64_win asm missing .linkonce one_only" >&2; exit 1; }
 fi
-if grep -q '\.section \.rdata' "$WIN_ASM"; then
-  echo "FAIL: amd64_win jump table must stay in function section, not .rdata" >&2
+if grep -qE '^\.section \.rdata($|[^$])' "$WIN_ASM"; then
+  echo "FAIL: amd64_win jump table must stay in function section, not bare .rdata" >&2
   exit 1
 fi
 if grep -q '^\.previous$' "$WIN_ASM"; then
@@ -216,8 +216,8 @@ found_local = False
 found_export = False
 found_jtbl = False
 for idx, line in enumerate(lines):
-    m = re.match(r'^\.section \.(?:text|data|bss)\$([^,]+),"[a-z]+"(,one_only,(\S+))?$', line)
-    if line.startswith('.section .text$') or line.startswith('.section .data$') or line.startswith('.section .bss$'):
+    m = re.match(r'^\.section \.(?:text|data|rdata|bss)\$([^,]+),"[a-z]+"(,one_only,(\S+))?$', line)
+    if line.startswith('.section .text$') or line.startswith('.section .data$') or line.startswith('.section .rdata$') or line.startswith('.section .bss$'):
         if not m:
             sys.exit(f"FAIL: unexpected COFF section syntax: {line!r}")
         sym = m.group(1)
