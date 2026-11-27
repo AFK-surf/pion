@@ -19475,3 +19475,144 @@ test "wave2_prd_adversarial_p0_soundness" {
     ni = ni + 1
   }
 }
+
+///|
+test "wave2_pr_e_wasm_size_opts_unit_checks" {
+  // 1. Constant `cast` of float/double literals folds into const_copies (zero 0xBC/0xBD reinterpret opcodes)
+  let ssa_cast =
+    #|export function l $cast_f64_zero() {
+    #|@start
+    #|  %a =l cast d_0.0
+    #|  %b =l cast d_1.5
+    #|  %c =l add %a, %b
+    #|  ret %c
+    #|}
+    #|export function w $cast_f32_lit() {
+    #|@start
+    #|  %a =w cast s_2.5
+    #|  ret %a
+    #|}
+  let parsed_cast = wasm_parse_ssa(ssa_cast)
+  let wasm_cast = emit_wasm_from_ssa(ssa_cast)
+  assert_true(wasm_cast.length() > 16, "valid wasm binary emitted")
+  // Verify cast_f64_zero and cast_f32_lit bodies have zero 0xBC/0xBD reinterpret opcodes and no trailing 0x0F before 0x0B
+  let ctx_cast = WasmModCtx::{
+    sigs: [],
+    sig_map: Map([]),
+    import_names: [],
+    import_sigs: [],
+    import_ret_tys: [],
+    import_map: Map([]),
+    internal_map: Map([]),
+    internal_ret_tys: Map([]),
+    data_addrs: Map([]),
+    fn_table_idx: Map([]),
+    fn_table_list: [],
+    slot_drop_masks: Map([]),
+  }
+  let body_f64 = wasm_compile_func(ctx_cast, parsed_cast.funcs[0], None)
+  let body_f32 = wasm_compile_func(ctx_cast, parsed_cast.funcs[1], None)
+  let mut i = 0
+  while i < body_f64.length() {
+    assert_true(body_f64[i] != 0xBD && body_f64[i] != 0x44, "cast d_0.0/d_1.5 must fold without f64.const or i64.reinterpret_f64")
+    i = i + 1
+  }
+  assert_true(body_f64[body_f64.length() - 1] == 0x0B, "ends with 0x0B")
+  assert_true(body_f64[body_f64.length() - 2] != 0x0F, "trailing return elided before end")
+  i = 0
+  while i < body_f32.length() {
+    assert_true(body_f32[i] != 0xBC && body_f32[i] != 0x43, "cast s_2.5 must fold without f32.const or i32.reinterpret_f32")
+    i = i + 1
+  }
+  assert_true(body_f32[body_f32.length() - 2] != 0x0F, "trailing return elided in f32 cast fn")
+
+  // 2. Structured CFG omits redundant `block` wrappers for fallthrough-only blocks
+  let ssa_fall =
+    #|export function w $linear_blocks(w %x) {
+    #|@b0
+    #|  %a =w add %x, 1
+    #|  jmp @b1
+    #|@b1
+    #|  %b =w add %a, 2
+    #|  jmp @b2
+    #|@b2
+    #|  %c =w add %b, 3
+    #|  ret %c
+    #|}
+  let parsed_fall = wasm_parse_ssa(ssa_fall)
+  let body_fall = wasm_compile_func(ctx_cast, parsed_fall.funcs[0], None)
+  let mut block_ops = 0
+  i = 0
+  while i < body_fall.length() {
+    if body_fall[i] == 0x02 && i + 1 < body_fall.length() && body_fall[i + 1] == 0x40 {
+      block_ops = block_ops + 1
+    }
+    i = i + 1
+  }
+  assert_eq(block_ops, 0)
+
+  // 3. Single-block local coloring reuses local slots across non-overlapping temporaries
+  let ssa_sb =
+    #|export function l $single_blk_reuse(l %x) {
+    #|@start
+    #|  %a =l add %x, 1
+    #|  %b =l mul %a, %a
+    #|  %c =l add %b, 2
+    #|  %d =l mul %c, %c
+    #|  %e =l add %d, 3
+    #|  %f =l mul %e, %e
+    #|  %g =l add %f, 4
+    #|  %h =l mul %g, %g
+    #|  ret %h
+    #|}
+  let parsed_sb = wasm_parse_ssa(ssa_sb)
+  let body_sb = wasm_compile_func(ctx_cast, parsed_sb.funcs[0], None)
+  // First byte is local decl group count; second byte (if group count == 1) is local count <= 2
+  assert_true(body_sb[0] <= 1, "single-block coloring keeps local decl groups compact")
+  if body_sb[0] == 1 {
+    assert_true(body_sb[1] <= 2, "non-overlapping single-block temps reuse <= 2 local slots")
+  }
+
+  // 4. Multi-round wasm_dedup_module converges across >2 call-chain levels
+  let ssa_dedup =
+    #|function w $leaf_a(w %x) {
+    #|@start
+    #|  %r =w add %x, 7
+    #|  ret %r
+    #|}
+    #|function w $leaf_b(w %x) {
+    #|@start
+    #|  %r =w add %x, 7
+    #|  ret %r
+    #|}
+    #|function w $mid_a(w %x) {
+    #|@start
+    #|  %r =w call $leaf_a(w %x)
+    #|  ret %r
+    #|}
+    #|function w $mid_b(w %x) {
+    #|@start
+    #|  %r =w call $leaf_b(w %x)
+    #|  ret %r
+    #|}
+    #|function w $top_a(w %x) {
+    #|@start
+    #|  %r =w call $mid_a(w %x)
+    #|  ret %r
+    #|}
+    #|function w $top_b(w %x) {
+    #|@start
+    #|  %r =w call $mid_b(w %x)
+    #|  ret %r
+    #|}
+    #|export function w $main() {
+    #|@start
+    #|  %a =w call $top_a(w 1)
+    #|  %b =w call $top_b(w 2)
+    #|  %c =w add %a, %b
+    #|  ret %c
+    #|}
+  let deduped = wasm_dedup_module(wasm_parse_ssa(ssa_dedup))
+  // leaf_a/b -> 1, mid_a/b -> 1, top_a/b -> 1, plus main = 4 functions total
+  assert_eq(deduped.funcs.length(), 4)
+}

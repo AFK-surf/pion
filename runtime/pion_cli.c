@@ -581,6 +581,15 @@ int32_t pion_fs_lstat_kind(const char *path) {
     return 1;
 }
 
+int32_t pion_cli_is_exec_file(const char *path) {
+    if (!path || !*path) return 0;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return 0;
+    DWORD attrs = GetFileAttributesW(wp);
+    free(wp);
+    return (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) ? 1 : 0;
+}
+
 static int64_t pion_cli_win_change_ms(const char *path, DWORD extra_flags) {
     if (!path || !*path) return -1;
     wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
@@ -1549,6 +1558,13 @@ int32_t pion_fs_lstat_kind(const char *path) {
     if (S_ISDIR(st.st_mode)) return 2;
     if (S_ISLNK(st.st_mode)) return 3;
     return 4;
+}
+
+int32_t pion_cli_is_exec_file(const char *path) {
+    if (!path || !*path) return 0;
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return (S_ISREG(st.st_mode) && access(path, X_OK) == 0) ? 1 : 0;
 }
 
 static int64_t pion_cli_stat_change_ms(const struct stat *st) {
