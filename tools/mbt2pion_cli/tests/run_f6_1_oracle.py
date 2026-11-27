@@ -806,6 +806,44 @@ fn pick_r22_def_bang_and_is(
   if x && !g { 1 } else { 0 }
 }
 
+fn r23_flip(b : Bool) -> Bool {
+  b
+}
+
+fn r23_keep(_a : Bool, b : Bool) -> Bool {
+  b
+}
+
+fn pick_r23_is_pipe_cmp(r23_flip : (Bool) -> Bool) -> Int {
+  fn rec(n : Int) -> Int {
+    if n == 0 {
+      let a = if (true is _ |> r23_flip) { 0 } else { 1 }
+      let b = if (true is _ > r23_flip(true)) { 1 } else { 0 }
+      let c = if (true is _ <= r23_flip(true)) { 0 } else { 1 }
+      a * 100 + b * 10 + c
+    } else {
+      rec(n - 1)
+    }
+  }
+  rec(1)
+}
+
+fn pick_r23_nested_parens_is_and(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  let b = (((Some(cb) is Some(walk)) && walk(0) == 9))
+  if b { 9 } else { 0 }
+}
+
+fn pick_r23_if_pipe_paren() -> Int {
+  if (true |> r23_keep(false, _)) { 9 } else { 0 }
+}
+
+fn pick_r23_if_pipe_bare() -> Int {
+  if (Some(1) is Some(_x)) && (true |> r23_keep(false, _)) { 9 } else { 0 }
+}
+
 fn pick_r19_ascribe_rec() -> Int {
   let r17_g = true
   fn walk(n : Int) -> Int {
@@ -1190,7 +1228,12 @@ fn case_r5_paren_and_guard() -> String {
   let p92 = pick_r22_or_and_is(fn(_x) { 9 })
   let p93 = pick_r22_is_and_if_rhs(fn(_x) { 9 })
   let p94 = pick_r22_def_bang_and_is(g=false)
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string() + "," + p78.to_string() + "," + p79.to_string() + "," + p80.to_string() + "," + p81.to_string() + "," + p82.to_string() + "," + p83.to_string() + "," + p84.to_string() + "," + p85.to_string() + "," + p86.to_string() + "," + p87.to_string() + "," + p88.to_string() + "," + p89.to_string() + "," + p90.to_string() + "," + p91.to_string() + "," + p92.to_string() + "," + p93.to_string() + "," + p94.to_string()
+  // R23: is-pattern terminator before |>/>/<=, multi-nested parens is-&&, if placeholder pipe (paren & bare)
+  let p95 = pick_r23_is_pipe_cmp(fn(b) { !b })
+  let p96 = pick_r23_nested_parens_is_and(fn(_x) { 9 })
+  let p97 = pick_r23_if_pipe_paren()
+  let p98 = pick_r23_if_pipe_bare()
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string() + "," + p78.to_string() + "," + p79.to_string() + "," + p80.to_string() + "," + p81.to_string() + "," + p82.to_string() + "," + p83.to_string() + "," + p84.to_string() + "," + p85.to_string() + "," + p86.to_string() + "," + p87.to_string() + "," + p88.to_string() + "," + p89.to_string() + "," + p90.to_string() + "," + p91.to_string() + "," + p92.to_string() + "," + p93.to_string() + "," + p94.to_string() + "," + p95.to_string() + "," + p96.to_string() + "," + p97.to_string() + "," + p98.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -1413,7 +1456,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31,9,9,91,91,91,9,91,9,91,84,9,17,91,9,9,9,1"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31,9,9,91,91,91,9,91,9,91,84,9,17,91,9,9,9,1,111,9,9,9"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -1765,12 +1808,21 @@ def main():
             "  fn val_(val : Int) -> Int { if val == 0 { 1 } else { val_(val - 1) } }\n"
             "  val_(1)\n"
             "}\n"
+            "fn r23_nonrec_val() -> Int {\n"
+            "  fn val(_n : Int) -> Int { 1 }\n"
+            "  val_(0) * 10 + val(1)\n"
+            "}\n"
+            "fn r23_is_val(cb : (Int) -> Int) -> Int {\n"
+            "  if Some(cb) is Some(val) { val_(0) * 10 + val(1) } else { 0 }\n"
+            "}\n"
             'pub fn run_pure() -> String {\n'
             '  let a = if flag { 1 } else { 0 }\n'
             '  let b = if val1() { 1 } else { 0 }\n'
             '  let c = "\\{false == true is _}".length()\n'
             '  let d = r19_val_selfrec()\n'
-            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string()\n'
+            '  let e = r23_nonrec_val()\n'
+            '  let f = r23_is_val(fn(_x) { 1 })\n'
+            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string() + "," + f.to_string()\n'
             '}\n'
         )
         for rel, txt in [
@@ -1784,7 +1836,7 @@ def main():
                 f.write(txt)
         pure_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=pure_m).stdout.strip()
         pure_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=pure_m).stdout.strip()
-        assert pure_mn == "0,0,5,1" and pure_mw == "0,0,5,1", f"R12/R19 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
+        assert pure_mn == "0,0,5,1,991,991" and pure_mw == "0,0,5,1,991,991", f"R12/R19/R23 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
 
         pure_pout = os.path.join(work, "pure_is_pion")
         os.makedirs(os.path.join(pure_pout, "src"))
@@ -1795,8 +1847,8 @@ def main():
             f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_pure())\n  0\n}\n")
         pure_pn = run_cmd([args.pionc, "run", pure_pout]).stdout.strip()
         pure_pw = run_cmd([args.pionc, "run", "--target", "wasm32", pure_pout]).stdout.strip()
-        assert pure_pn == "0,0,5,1" and pure_pw == "0,0,5,1", f"R12/R19 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
-        print("[f6-1-oracle] PASS R12/R19 pure no-error-keyword pkg (top-level let, default param, interp, val_/val self-rec): 4-target == 0,0,5,1")
+        assert pure_pn == "0,0,5,1,991,991" and pure_pw == "0,0,5,1,991,991", f"R12/R19/R23 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
+        print("[f6-1-oracle] PASS R12/R19/R23 pure no-error-keyword pkg (val_/val self-rec, nonrec val, is Some(val)): 4-target == 0,0,5,1,991,991")
 
         # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
