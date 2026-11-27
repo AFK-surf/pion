@@ -1,0 +1,570 @@
+///| Unit tests for mbt2pion interpolation, indexing, and mbt_compat gaps:
+///| 1. Stage B method-call rewrites inside `TokenKind::InterpString` `\{...}` (including `.__mbt_str_trim`,
+///|    isolation from outside methods on the same line, and single-round batching of 24+ holes & 24+ calls in 1 hole)
+///| 2. Structured `#alias("_[_]=_")` / `#alias("_[_]")` passed Stage A -> Stage B (immune to spoofed `// mbt-attr:` comments),
+///|    multiline `#alias`, & multiline index assignment/read with comma/comment/operator/`|>`/`#|` boundaries
+///| 3. JSON literal string wrapping must not wrap index keys (`o["k"] = ...`)
+///| 4. `println(expr,)` and `repr(expr,)` trailing comma stripped instead of forming a 1-tuple
+///| 5. Irrefutable tuple patterns drop redundant `if (match ...)` guards
+///| 6. `Bytes::from_array([...])` wraps only `0..=255` bare int literals, preserves spread `[..xs, ...]`, strips trailing comma
+///| 7. Tuple `ordered_set_from_array`, `repr(x)` fail-closed on unsupported types, `Array` -> `ArrayView` arg wrapping
+///|    (nested calls, parenthesized args, reordered named/punned args, structural mutation fail-closed),
+///|    and pure `OrderedMap`/`OrderedSet`-key generic bound relaxation with exact named-label matching.
+
+test "interp_index_compat: Stage B rewrites methods inside InterpString, isolates outside, batches 24 holes & 24 in 1 hole" {
+  let lines = ["let s = \"pre \\{said.__mbt_str_trim(chars=\" \\n\").escape()} post\""]
+  let ok1 = rewrite_method_call_at(lines, 0, 22, "__mbt_str_trim", "mbt_compat::str_trim")
+  assert_true(ok1, "rewrite __mbt_str_trim inside InterpString")
+  assert_true(
+    str_has(lines[0], "mbt_compat::str_trim(said, chars=\" \\n\").escape()"),
+    "trim rewritten cleanly inside interp: " + lines[0],
+  )
+  let ok2 = rewrite_method_call_at(lines, 0, 56, "escape", "mbt_compat::str_escape")
+  assert_true(ok2, "rewrite chained .escape() inside InterpString")
+  assert_true(
+    str_has(lines[0], "mbt_compat::str_escape(mbt_compat::str_trim(said, chars=\" \\n\"))"),
+    "chained escape rewritten inside interp: " + lines[0],
+  )
+
+  // Nested interpolation with nested strings and braces
+  let nested = ["let t = \"a \\{match x.get(\"k\").unwrap() { \"v\" => \"ok\", _ => \"no\" }} z\""]
+  let ok3 = rewrite_method_call_at(nested, 0, 31, "unwrap", "mbt_compat::opt_unwrap")
+  assert_true(ok3, "rewrite unwrap inside match in InterpString")
+  assert_true(
+    str_has(nested[0], "mbt_compat::opt_unwrap(x.get(\"k\"))"),
+    "unwrap rewritten cleanly inside match in interp: " + nested[0],
+  )
+
+  // Diagnostic inside `InterpString` MUST rewrite only the interp call, NEVER outside `b.escape()`!
+  let both = ["let pair = (\"\\{x.escape()}\", b.escape())"]
+  let ok4 = rewrite_method_call_at(both, 0, 17, "escape", "mbt_compat::str_escape")
+  assert_true(ok4, "rewrite inside interp when same-named method exists outside")
+  assert_true(
+    both[0] == "let pair = (\"\\{mbt_compat::str_escape(x)}\", b.escape())",
+    "outside b.escape() must remain untouched: " + both[0],
+  )
+
+  // 24 consecutive `\{x.escape()}` holes on one line batched in a single pass
+  let sb24 = StringBuilder()
+  sb24.write_string("let big = \"")
+  let cols24 : Array[Int] = []
+  let mut k = 0
+  while k < 24 {
+    let dot_col = sb24.to_string().length() + 4
+    cols24.push(dot_col)
+    sb24.write_string("\\{x.escape()}")
+    k = k + 1
+  }
+  sb24.write_string("\"")
+  let big_lines = [sb24.to_string()]
+  let big_src = big_lines[0]
+  let big_idx = build_method_rewrite_index(big_src, lex_moonbit(big_src), 1)
+  let eds : Array[(Int, Int, String)] = []
+  for c in cols24 {
+    let cov = find_covering_interp_token(big_idx, 0, c - 1)
+    assert_true(cov >= 0, "covering interp token found in O(1)")
+    match compute_interp_hole_edit(big_idx, big_lines, 0, c, cov, "escape", "mbt_compat::str_escape") {
+      Some(ed) => eds.push(ed)
+      None => assert_true(false, "hole edit must succeed for all 24 holes")
+    }
+  }
+  assert_true(eds.length() == 24, "all 24 disjoint holes collected in one round")
+  let mut cur = big_lines[0]
+  let mut ei = eds.length() - 1
+  while ei >= 0 {
+    let ed = eds[ei]
+    cur = cur.slice(0, ed.0) + ed.2 + cur.slice(ed.1, cur.length())
+    ei = ei - 1
+  }
+  assert_true(!str_has(cur, ".escape()"), "all 24 holes rewritten in one pass: " + cur)
+
+  // P2-2: 24 consecutive `x.escape()` inside ONE single interpolation hole batched in 1 pass
+  let sh_sb = StringBuilder()
+  sh_sb.write_string("let one_hole = \"\\{")
+  let sh_cols : Array[Int] = []
+  let mut sk = 0
+  while sk < 24 {
+    if sk > 0 { sh_sb.write_string(" + ") }
+    let dot_col = sh_sb.to_string().length() + 2
+    sh_cols.push(dot_col)
+    sh_sb.write_string("x.escape()")
+    sk = sk + 1
+  }
+  sh_sb.write_string("}\"")
+  let sh_lines = [sh_sb.to_string()]
+  let sh_src = sh_lines[0]
+  let sh_idx = build_method_rewrite_index(sh_src, lex_moonbit(sh_src), 1)
+  let sh_eds : Array[(Int, Int, String)] = []
+  for c in sh_cols {
+    let cov = find_covering_interp_token(sh_idx, 0, c - 1)
+    assert_true(cov >= 0, "covering interp token found for single-hole multi-call")
+    match compute_interp_hole_edit(sh_idx, sh_lines, 0, c, cov, "escape", "mbt_compat::str_escape") {
+      Some(ed) => {
+        for prev in sh_eds {
+          assert_true(ed.1 <= prev.0 || ed.0 >= prev.1, "single-hole edits must be strictly disjoint")
+        }
+        sh_eds.push(ed)
+      }
+      None => assert_true(false, "single-hole edit must succeed for all 24 calls")
+    }
+  }
+  assert_true(sh_eds.length() == 24, "all 24 calls inside one hole collected in 1 round")
+  let mut sh_cur = sh_lines[0]
+  let mut sei = sh_eds.length() - 1
+  while sei >= 0 {
+    let ed = sh_eds[sei]
+    sh_cur = sh_cur.slice(0, ed.0) + ed.2 + sh_cur.slice(ed.1, sh_cur.length())
+    sei = sei - 1
+  }
+  assert_true(!str_has(sh_cur, ".escape()"), "all 24 calls inside one hole rewritten in 1 pass")
+}
+
+test "interp_index_compat: structured #alias immune to spoofed comments, multiline #alias, and index op boundaries" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  // P1-1: Real `#alias("_[_]=_")` & multiline `#alias(\n "_[_]"\n)` followed by a SPOOFED literal
+  // `// mbt-attr: #alias("_[_]")` comment before `Grid::other`: Stage B MUST rewrite `g[0]` to `g.at(0)`!
+  let src = SourceFile::{
+    rel_path: "box.mbt",
+    content: "pub struct Grid {\n  mut val : Int\n}\n" +
+    "#alias(\"_[_]=_\")\n" +
+    "pub fn Grid::put(self : Grid, i : Int, v : Int) -> Unit {\n  self.val = i + v\n}\n" +
+    "#alias(\n  \"_[_]\"\n)\n" +
+    "pub fn Grid::at(self : Grid, i : Int) -> Int {\n  self.val + i\n}\n" +
+    "// mbt-attr: #alias(\"_[_]\")\n" +
+    "// mbt-attr: #alias(\"_[_]=_\")\n" +
+    "pub fn Grid::other(self : Grid, i : Int) -> Int {\n  self.val + i + 1\n}\n" +
+    "pub fn use_grid(g : Grid) -> Int {\n  g[0] = 7\n  g[0]\n}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    for fp in files {
+      if fp.0 == "box.pion" {
+        let ls = fp.1.split("\n")
+        let mut li = 0
+        while li < ls.length() {
+          if str_has(ls[li], "g[0] = 7") {
+            let col = ls[li].index_of("[") + 1
+            return "{\"ok\":false,\"diagnostics\":[{\"file\":\"box.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + col.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot assign to indexed type `Grid`\"}]}"
+          }
+          if str_has(ls[li], "g[0]") && !str_has(ls[li], "=") {
+            let col = ls[li].index_of("[") + 1
+            return "{\"ok\":false,\"diagnostics\":[{\"file\":\"box.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + col.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot index into type `Grid`\"}]}"
+          }
+          li = li + 1
+        }
+      }
+    }
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  let mut diag_dbg = ""
+  for d in res.diagnostics {
+    diag_dbg = diag_dbg + d.code + ":" + d.message + " | "
+  }
+  assert_true(res.blockers == 0, "structured #alias transpiles with 0 blockers: " + diag_dbg)
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "box.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "g.put(0, 7)"), "structured #alias(_[_]=_) rewrites to g.put, ignoring spoofed comment: " + out)
+  assert_true(str_has(out, "g.at(0)") && !str_has(out, "g.other(0)"), "structured #alias(_[_]) rewrites to g.at, ignoring spoofed comment: " + out)
+
+  // Multiline index key assignment `m[k1 +\n k2] = v`
+  let ml_lines = [
+    "fn f(m : Grid, a : Int, b : Int) -> Unit {",
+    "  m[a +",
+    "    b] = 42",
+    "}",
+  ]
+  let ml_src = ml_lines.join("\n")
+  let ml_idx = build_method_rewrite_index(ml_src, lex_moonbit(ml_src), ml_lines.length())
+  let (rs, re) = rewrite_index_op_with_index(ml_idx, ml_lines, Map(), 1, 4, "put", "")
+  assert_true(rs == 1 && re == 2, "multiline index assign rewrites lines 1..=2")
+  assert_true(str_has(ml_lines.join("\n"), "m.put(a +\n    b, 42)"), "multiline index assign output")
+
+  // Single-line match arm comma boundary `match opt { Some(v) => m[k] = v, None => () }`
+  let cm_lines = ["match opt { Some(v) => m[k] = v, None => () }"]
+  let cm_idx = build_method_rewrite_index(cm_lines[0], lex_moonbit(cm_lines[0]), 1)
+  let (cs, _ce) = rewrite_index_op_with_index(cm_idx, cm_lines, Map(), 0, 25, "set", "")
+  assert_true(cs == 0 && cm_lines[0] == "match opt { Some(v) => m.set(k, v), None => () }", "comma stops RHS: " + cm_lines[0])
+
+  // Key with `//` line comment preserves newline before `, ` and `)`
+  let kc_lines = ["g[0 // key", "] = 1"]
+  let kc_src = kc_lines.join("\n")
+  let kc_idx = build_method_rewrite_index(kc_src, lex_moonbit(kc_src), 2)
+  let (ks, _ke) = rewrite_index_op_with_index(kc_idx, kc_lines, Map(), 0, 2, "put", "")
+  assert_true(ks == 0 && str_has(kc_lines.join("\n"), "g.put(0 // key\n, 1)"), "comment in key keeps newline: " + kc_lines.join("\n"))
+
+  let kr_lines = ["let x = g[0 // key", "]"]
+  let kr_src = kr_lines.join("\n")
+  let kr_idx = build_method_rewrite_index(kr_src, lex_moonbit(kr_src), 2)
+  let (krs, _kre) = rewrite_index_op_with_index(kr_idx, kr_lines, Map(), 0, 10, "", "at")
+  assert_true(krs == 0 && str_has(kr_lines.join("\n"), "g.at(0 // key\n)"), "comment in read key keeps newline: " + kr_lines.join("\n"))
+
+  // `==` continues multiline RHS, while newline-leading `-2` does NOT
+  let eq_lines = ["g[0] = 1 ==", "  2"]
+  let eq_src = eq_lines.join("\n")
+  let eq_idx = build_method_rewrite_index(eq_src, lex_moonbit(eq_src), 2)
+  let (eqs, eqe) = rewrite_index_op_with_index(eq_idx, eq_lines, Map(), 0, 2, "put", "")
+  assert_true(eqs == 0 && eqe == 1 && str_has(eq_lines.join("\n"), "g.put(0, 1 ==\n  2)"), "== continues RHS: " + eq_lines.join("\n"))
+
+  let un_lines = ["g[0] = 1", "-2"]
+  let un_src = un_lines.join("\n")
+  let un_idx = build_method_rewrite_index(un_src, lex_moonbit(un_src), 2)
+  let (uns, une) = rewrite_index_op_with_index(un_idx, un_lines, Map(), 0, 2, "put", "")
+  assert_true(uns == 0 && une == 0 && un_lines[0] == "g.put(0, 1)" && un_lines[1] == "-2", "newline -2 not swallowed: " + un_lines.join("\n"))
+
+  // P2-1: `|>` pipe continuation and `#|` raw multiline string closing newline
+  let pipe_lines = ["g[0] = 1", "  |> succ"]
+  let pipe_src = pipe_lines.join("\n")
+  let pipe_idx = build_method_rewrite_index(pipe_src, lex_moonbit(pipe_src), 2)
+  let (ps, pe) = rewrite_index_op_with_index(pipe_idx, pipe_lines, Map(), 0, 2, "put", "")
+  assert_true(ps == 0 && pe == 1 && str_has(pipe_lines.join("\n"), "g.put(0, 1\n  |> succ)"), "|> continues RHS: " + pipe_lines.join("\n"))
+
+  let raw_lines = ["g[0] = #|one"]
+  let raw_idx = build_method_rewrite_index(raw_lines[0], lex_moonbit(raw_lines[0]), 1)
+  let (rws, _rwe) = rewrite_index_op_with_index(raw_idx, raw_lines, Map(), 0, 2, "put", "")
+  assert_true(rws == 0 && raw_lines[0] == "g.put(0, #|one\n)", "#| closes with newline before ): " + raw_lines[0])
+
+  // R4 P1-1 + R5 P1-3 & P2-1: consecutive `#|` / `$|` lines preserve trailing spaces and bridge blank/comment gaps
+  let raw_ml = ["s[\"k\"] =", "  #|line1", "  #|line2  "]
+  let raw_ml_src = raw_ml.join("\n")
+  let raw_ml_idx = build_method_rewrite_index(raw_ml_src, lex_moonbit(raw_ml_src), raw_ml.length())
+  let (rmls, rmle) = rewrite_index_op_with_index(raw_ml_idx, raw_ml, Map(), 0, 2, "set", "")
+  assert_true(
+    rmls == 0 && rmle == 2 && str_has(raw_ml.join("\n"), "s.set(\"k\", #|line1\n#|line2  \n)"),
+    "consecutive #| lines stay intact and keep trailing spaces: " + raw_ml.join("\n"),
+  )
+
+  let gap_ml = ["s[\"k\"] =", "  #|one", "  // comment between lines", "", "  #|two"]
+  let gap_ml_src = gap_ml.join("\n")
+  let gap_ml_idx = build_method_rewrite_index(gap_ml_src, lex_moonbit(gap_ml_src), gap_ml.length())
+  let (gmls, gmle) = rewrite_index_op_with_index(gap_ml_idx, gap_ml, Map(), 0, 2, "set", "")
+  assert_true(
+    gmls == 0 && gmle == 4 && str_has(gap_ml.join("\n"), "s.set(\"k\", #|one\n#|two\n)"),
+    "blank/comment between #| lines collapsed to adjacent #| tokens: " + gap_ml.join("\n"),
+  )
+
+  let interp_ml = ["s[\"k\"] =", "  $|line1", "  $|line\\{n}"]
+  let interp_ml_src = interp_ml.join("\n")
+  let interp_ml_idx = build_method_rewrite_index(interp_ml_src, lex_moonbit(interp_ml_src), interp_ml.length())
+  let (imls, imle) = rewrite_index_op_with_index(interp_ml_idx, interp_ml, Map(), 0, 2, "set", "")
+  assert_true(
+    imls == 0 && imle == 2 && str_has(interp_ml.join("\n"), "s.set(\"k\", $|line1\n$|line\\{n}\n)"),
+    "consecutive $| lines stay intact: " + interp_ml.join("\n"),
+  )
+
+  // R5 P1-2: cross-package `ext::Grid` must NEVER inherit local `Grid`'s `#alias("_[_]")` / `#alias("_[_]=_")`
+  let xpkg_src = SourceFile::{
+    rel_path: "xpkg.mbt",
+    content: "pub struct Grid {\n  mut val : Int\n}\n" +
+    "#alias(\"_[_]=_\")\n" +
+    "pub fn Grid::put(self : Grid, i : Int, v : Int) -> Unit {\n  self.val = i + v\n}\n" +
+    "#alias(\"_[_]\")\n" +
+    "pub fn Grid::at(self : Grid, i : Int) -> Int {\n  self.val + i\n}\n" +
+    "pub fn use_ext(eg : Int) -> Int {\n  eg[0] = 7\n  eg[0]\n}\n",
+    is_test: false,
+  }
+  let xpkg_mock = fn(files : Array[(String, String)]) -> String {
+    for fp in files {
+      if fp.0 == "xpkg.pion" {
+        let ls = fp.1.split("\n")
+        let mut li = 0
+        while li < ls.length() {
+          if str_has(ls[li], "eg[0] = 7") {
+            let col = ls[li].index_of("[") + 1
+            return "{\"ok\":false,\"diagnostics\":[{\"file\":\"xpkg.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + col.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot assign to indexed type `ext::Grid`\"}]}"
+          }
+          if str_has(ls[li], "eg[0]") && !str_has(ls[li], "=") {
+            let col = ls[li].index_of("[") + 1
+            return "{\"ok\":false,\"diagnostics\":[{\"file\":\"xpkg.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + col.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot index into type `ext::Grid`\"}]}"
+          }
+          li = li + 1
+        }
+      }
+    }
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let xpkg_res = transpile_package([xpkg_src], empty_api_map(), default_recipes(), [], [], opts, [], true, xpkg_mock)
+  let mut xpkg_out = ""
+  for f in xpkg_res.files {
+    if f.rel_path == "xpkg.pion" {
+      xpkg_out = f.content
+    }
+  }
+  assert_true(!str_has(xpkg_out, "eg.put(") && !str_has(xpkg_out, "eg.at("), "cross-pkg ext::Grid must not be rewritten by local Grid #alias: " + xpkg_out)
+}
+
+test "interp_index_compat: Stage A JSON index key, println/repr trailing comma, irrefutable tuple, Bytes::from_array" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "gaps.mbt",
+    content: "pub struct Wrap {\n  tup : (Int, Int, Int)\n}\n" +
+    "pub fn make_json() -> Json {\n" +
+    "  let o : Map[String, Json] = {}\n" +
+    "  o[\"gpu_only\"] = Json::boolean(true)\n" +
+    "  Json::object(o)\n" +
+    "}\n" +
+    "pub fn log_msg(s : String) -> Unit {\n" +
+    "  println(\n    \"hi \" + s,\n  )\n" +
+    "}\n" +
+    "pub fn unwrap_tup(w : Wrap) -> Int {\n" +
+    "  match w {\n    { tup: (_, x, _) } => x\n  }\n" +
+    "}\n" +
+    "pub fn esc_bytes(xs : Array[Byte]) -> (Bytes, Bytes, Bytes) {\n" +
+    "  let a = Bytes::from_array([0x1b, b'[', 0, 255],)\n" +
+    "  let b = Bytes::from_array([..xs, b'\\x03'])\n" +
+    "  let c = Bytes::from_array([0x1b, 256])\n" +
+    "  (a, b, c)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], false, noop_check)
+  assert_true(res.blockers == 0, "all Stage A gap cases transpile with 0 blockers")
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "gaps.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "o[\"gpu_only\"]"), "JSON index key stays plain String: " + out)
+  assert_true(!str_has(out, "o[mbt_compat::MbtJson::String(\"gpu_only\")]"), "JSON index key never wrapped as MbtJson::String")
+  assert_true(str_has(out, "mbt_compat::mbt_println((\"hi \" + s).to_string())"), "println trailing comma stripped: " + out)
+  assert_true(!str_has(out, "if (match"), "irrefutable tuple pattern emits no redundant if guard: " + out)
+  assert_true(str_has(out, "mbt_compat::bytes_from_array([(0x1b).to_byte(),") && str_has(out, "(0).to_byte(), (255).to_byte()])"), "Bytes::from_array wraps 0..=255 and strips trailing comma: " + out)
+  assert_true(!str_has(out, "[..xs"), "Bytes::from_array spread lowered, not left raw: " + out)
+  assert_true(str_has(out, "[(0x1b).to_byte(), 256]") && !str_has(out, "(256).to_byte()"), "out-of-range 256 stays bare Int (fail-closed): " + out)
+
+  // `repr(s,)` trailing comma lowers to `__mbt_repr_fmt(s)` and `mbt_repr_probe` fails closed on custom type
+  let repr_src = SourceFile::{
+    rel_path: "repr_only.mbt",
+    content: "pub fn fmt_repr(s : String) -> String {\n  \"val=\\{repr(s,)}\"\n}\n",
+    is_test: false,
+  }
+  let repr_res = transpile_package([repr_src], empty_api_map(), default_recipes(), [], [], opts, [], false, noop_check)
+  let mut repr_out = ""
+  for f in repr_res.files {
+    if f.rel_path == "repr_only.pion" {
+      repr_out = f.content
+    }
+  }
+  assert_true(str_has(repr_out, "mbt_compat::__mbt_repr_fmt(s)"), "repr(s,) trailing comma lowers to __mbt_repr_fmt: " + repr_out)
+
+  let fake_site = ProbeSite::{
+    probe_id: "p0",
+    file: "u.pion",
+    probe_kind: "mbt_repr_probe",
+    start_byte: 0,
+    end_byte: 10,
+    op_byte: 0,
+    line: 1,
+    col: 1,
+    lhs_expr: "u",
+    rhs_expr: "",
+    assign_op: "",
+    slice_hi: "",
+    divisor_is_zero: false,
+    rhs_has_lit: false,
+    rhs_is_neg: false,
+    rhs_u64: 0UL,
+    rhs_overflow: false,
+  }
+  let rdiags : Array[Diag] = []
+  let rdrift : Array[DriftEntry] = []
+  let rrep = rewrite_for_probe(fake_site, "CustomShowType", default_recipes(), rdiags, rdrift)
+  assert_true(rrep == Some("\"\""), "unsupported repr returns placeholder")
+  assert_true(rdiags.length() == 1 && rdiags[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "unsupported repr must fail-closed with MBT2PION_UNSUPPORTED_SYNTAX")
+}
+
+test "interp_index_compat: Stage B tuple ordered_set, Array->ArrayView safety guard, and pure OrderedMap/Set bound relaxation" {
+  // 1. Tuple ordered_set_from_array rewrite
+  let set_ln = "let s = mbt_compat::ordered_set_from_array([(1, true)])"
+  match rewrite_tuple_mapkey_call_at(
+    set_ln,
+    9,
+    "type `(Int, Bool)` does not implement trait `mbt_compat::MapKey` required by `ordered_set_from_array`",
+  ) {
+    Some(rw) => assert_true(str_has(rw, "ordered_set_from_array_pair("), "ordered_set_from_array pair rewrite: " + rw)
+    None => assert_true(false, "ordered_set_from_array pair rewrite must succeed")
+  }
+
+  // 2. R4 P1-2: Sound fresh-non-escaping allowlist for Array[T] -> ArrayView[T]
+  let av1 = ["fn f() -> Int {", "  let n = take(Array::make(7, 0))", "  n", "}"]
+  let av1_s = av1.join("\n")
+  let (s1, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av1_s, lex_moonbit(av1_s), av1.length()),
+    av1,
+    Map(),
+    1,
+    16,
+    "argument 1 type mismatch in call to `take`",
+  )
+  assert_true(s1 == 1 && av1[1] == "  let n = take(mbt_compat::arr_view(Array::make(7, 0)))", "fresh Array::make: " + av1[1])
+
+  let av_levels = [
+    "fn f() -> Int {",
+    "  let levels = Array::makei(4, fn(i) { i * 10 })",
+    "  let mut s = 0",
+    "  for l in levels { s = s + l }",
+    "  visual_order(levels) + s",
+    "}",
+  ]
+  let av_levels_s = av_levels.join("\n")
+  let (slv, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av_levels_s, lex_moonbit(av_levels_s), av_levels.length()),
+    av_levels,
+    Map(),
+    4,
+    16,
+    "argument 1 type mismatch in call to `visual_order`",
+  )
+  assert_true(slv == 4 && str_has(av_levels[4], "visual_order(mbt_compat::arr_view(levels))"), "fresh local levels with for-in allowed: " + av_levels[4])
+
+  let av2 = ["fn f() -> Int {", "  let xs = [1, 2]", "  let n = take((xs))", "  n", "}"]
+  let av2_s = av2.join("\n")
+  let (s2, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av2_s, lex_moonbit(av2_s), av2.length()),
+    av2,
+    Map(),
+    2,
+    16,
+    "argument 1 type mismatch in call to `take`",
+  )
+  assert_true(s2 == 2 && av2[2] == "  let n = take(mbt_compat::arr_view((xs)))", "parenthesized take((xs)): " + av2[2])
+
+  let av3 = ["fn f() -> Int {", "  let xs = [1, 2]", "  let n = foo(b=1, a=xs)", "  n", "}"]
+  let av3_s = av3.join("\n")
+  let (s3, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av3_s, lex_moonbit(av3_s), av3.length()),
+    av3,
+    Map(),
+    2,
+    22,
+    "argument 1 type mismatch in call to `foo`",
+  )
+  assert_true(s3 == 2 && av3[2] == "  let n = foo(b=1, a=mbt_compat::arr_view(xs))", "reordered named arg: " + av3[2])
+
+  let av4 = ["fn f() -> Int {", "  let xs = [1, 2]", "  let n = take(xs~, a=8)", "  n", "}"]
+  let av4_s = av4.join("\n")
+  let (s4, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av4_s, lex_moonbit(av4_s), av4.length()),
+    av4,
+    Map(),
+    2,
+    16,
+    "argument 2 type mismatch in call to `take`",
+  )
+  assert_true(s4 == 2 && av4[2] == "  let n = take(xs=mbt_compat::arr_view(xs), a=8)", "punned arg: " + av4[2])
+
+  // Direct in-place element write outside closures on fresh local array is allowed
+  let av_inplace = ["fn f() -> Int {", "  let xs = [7]", "  let v = keep(xs)", "  xs[0] = 23", "  v.get(0)", "}"]
+  let av_inplace_s = av_inplace.join("\n")
+  let (sip_s, _) = rewrite_array_to_view_arg_with_index(
+    build_method_rewrite_index(av_inplace_s, lex_moonbit(av_inplace_s), av_inplace.length()),
+    av_inplace,
+    Map(),
+    2,
+    16,
+    "argument 1 type mismatch in call to `keep`",
+  )
+  assert_true(sip_s == 2 && str_has(av_inplace[2], "mbt_compat::arr_view(xs)"), "non-escaping fresh local with xs[0]=23 allowed: " + av_inplace[2])
+
+  // R4 P1-2 fail-closed negatives: aliasing, arbitrary call rvalue, duplicate arg, closure capture, push/pop, param
+  let neg_cases : Array[(String, Array[String], Int, Int, String)] = [
+    ("xs.push()", ["fn f() -> Int {", "  let xs = [7]", "  let v = keep(xs)", "  xs.push(1)", "  v.get(0)", "}"], 2, 16, "argument 1 type mismatch in call to `keep`"),
+    ("xs.pop()", ["fn f() -> Int {", "  let xs = [7, 8]", "  let v = keep(xs)", "  let _ = xs.pop()", "  v.get(1)", "}"], 2, 16, "argument 1 type mismatch in call to `keep`"),
+    ("alias let ys = xs; ys.pop()", ["fn f() -> Int {", "  let xs = [7, 8]", "  let ys = xs", "  let v = keep(xs)", "  let _ = ys.pop()", "  v.get(0)", "}"], 3, 16, "argument 1 type mismatch in call to `keep`"),
+    ("arbitrary call keep(pass(xs))", ["fn f() -> Int {", "  let xs = [7]", "  let v = keep(pass(xs))", "  v.get(0)", "}"], 2, 16, "argument 1 type mismatch in call to `keep`"),
+    ("same-call alias read_after(xs, xs)", ["fn f() -> Int {", "  let xs = [7]", "  read_after(xs, xs)", "}"], 2, 14, "argument 1 type mismatch in call to `read_after`"),
+    ("closure shrink read_after(xs, fn() { shrink(xs) })", ["fn f() -> Int {", "  let xs = [7]", "  read_after(xs, fn() { shrink(xs) })", "}"], 2, 14, "argument 1 type mismatch in call to `read_after`"),
+    ("closure capture read_after(arr, fn() { arr[0] = 100 })", ["fn f() -> Int {", "  let arr = [1]", "  read_after(arr, fn() { arr[0] = 100 })", "}"], 2, 14, "argument 1 type mismatch in call to `read_after`"),
+    ("for-in pop mutation for x in xs.pop().unwrap()", ["fn f() -> Int {", "  let xs = [[1], [2]]", "  let v = keep(xs)", "  for x in xs.pop().unwrap() { let _ = x }", "  v.length()", "}"], 2, 16, "argument 1 type mismatch in call to `keep`"),
+    ("param array take(xs)", ["fn f(xs : Array[Int]) -> Int {", "  take(xs)", "}"], 1, 8, "argument 1 type mismatch in call to `take`"),
+  ]
+  for nc in neg_cases {
+    let nlines = nc.1
+    let nsrc = nlines.join("\n")
+    let (nrs, _) = rewrite_array_to_view_arg_with_index(
+      build_method_rewrite_index(nsrc, lex_moonbit(nsrc), nlines.length()),
+      nlines,
+      Map(),
+      nc.2,
+      nc.3,
+      nc.4,
+    )
+    assert_true(nrs < 0, "R4 P1-2 must fail-closed on " + nc.0)
+  }
+
+  // 3. P1-3 & R4 P2: Pure OrderedMap/OrderedSet key bound relaxation + mixed labeled/positional params + interp Hash::hash
+  let gf = GeneratedFile::{
+    rel_path: "g.pion",
+    content: "pub fn copy_keys[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, V](m : mbt_compat::OrderedMap[K, V]) -> Array[K] {\n" +
+    "  m.keys()\n}\n" +
+    "pub fn kept_set[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](s : mbt_compat::OrderedSet[K]) -> Int {\n" +
+    "  s.size()\n}\n" +
+    "pub fn make_fresh[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, V]() -> mbt_compat::OrderedMap[K, V] {\n" +
+    "  mbt_compat::ordered_map_new()\n}\n" +
+    "pub fn outer_named[A : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, B : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](a~ : A, b~ : B) -> Int {\n" +
+    "  let other = a\n  let _ = other\n  b.hash()\n}\n" +
+    "pub fn outer_method[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](s : S, k : K) -> Int {\n" +
+    "  s.next(k)\n}\n" +
+    "pub fn outer_hash_alias[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](k : K) -> Int {\n" +
+    "  let other = k\n  other.hash()\n}\n" +
+    "pub fn len_mixed[A : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, B : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](a~ : mbt_compat::OrderedMap[A, Int], b : mbt_compat::OrderedMap[B, Int]) -> Int {\n" +
+    "  a.length() + b.length()\n}\n" +
+    "pub fn interp_hash[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey](m : mbt_compat::OrderedMap[K, Int]) -> String {\n" +
+    "  let k = m.keys()[0]\n  \"\\{Hash::hash(k)}\"\n}\n",
+    source_file: "g.mbt",
+    anchors: [],
+  }
+  let pmap = collect_stage_b_pkg_fns([gf])
+  let reqs = [
+    BoundRelaxReq::{ fn_name: "copy_keys", tuple_args: [CallTupleArg::{ pos: 0, label: "" }] },
+    BoundRelaxReq::{ fn_name: "kept_set", tuple_args: [CallTupleArg::{ pos: 0, label: "" }] },
+    BoundRelaxReq::{ fn_name: "make_fresh", tuple_args: [] },
+    BoundRelaxReq::{ fn_name: "outer_named", tuple_args: [CallTupleArg::{ pos: -1, label: "a" }] },
+    BoundRelaxReq::{ fn_name: "outer_method", tuple_args: [CallTupleArg::{ pos: 1, label: "" }] },
+    BoundRelaxReq::{ fn_name: "outer_hash_alias", tuple_args: [CallTupleArg::{ pos: 0, label: "" }] },
+    // `len_mixed(bm, a=am)`: positional arg 0 targets `b` (skipping labeled `a~`), relaxing ONLY `B` and keeping `A`!
+    BoundRelaxReq::{ fn_name: "len_mixed", tuple_args: [CallTupleArg::{ pos: 0, label: "" }] },
+    BoundRelaxReq::{ fn_name: "interp_hash", tuple_args: [CallTupleArg::{ pos: 0, label: "" }] },
+  ]
+  let (out_files, changed_rels) = relax_redundant_fn_tuple_bounds([gf], pmap, reqs)
+  assert_true(changed_rels.length() == 1, "exactly one file relaxed")
+  let g_out = out_files[0].content
+  assert_true(str_has(g_out, "pub fn copy_keys[K : Eq, V]"), "copy_keys relaxed: " + g_out)
+  assert_true(str_has(g_out, "pub fn kept_set[K : Eq]"), "kept_set relaxed: " + g_out)
+  assert_true(str_has(g_out, "pub fn make_fresh[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, V]"), "make_fresh kept bounds")
+  assert_true(str_has(g_out, "pub fn outer_named[A : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, B : mbt_compat::MbtHash + Eq + mbt_compat::MapKey]"), "outer_named bare value params stay fail-closed: " + g_out)
+  assert_true(str_has(g_out, "pub fn outer_method[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey]"), "outer_method stays fail-closed")
+  assert_true(str_has(g_out, "pub fn outer_hash_alias[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey]"), "outer_hash_alias stays fail-closed")
+  assert_true(str_has(g_out, "pub fn len_mixed[A : mbt_compat::MbtHash + Eq + mbt_compat::MapKey, B : Eq]"), "len_mixed relaxes only positional B and keeps labeled A: " + g_out)
+  assert_true(str_has(g_out, "pub fn interp_hash[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey]"), "interp_hash stays fail-closed on \\{Hash::hash(k)}: " + g_out)
+
+  // R5 P2-2: tuple-VALUE map `OrderedMap[String, (Int, Int)]` must NOT be treated as tuple-KEY map
+  assert_true(!queried_ty_has_tuple_key("mbt_compat::OrderedMap[String, (Int, Int)]"), "tuple value in OrderedMap is not a tuple key")
+  assert_true(queried_ty_has_tuple_key("mbt_compat::OrderedMap[(Int, String), Int]"), "tuple key in OrderedMap detected")
+  assert_true(queried_ty_has_tuple_key("mbt_compat::OrderedSet[(Int, Bool)]"), "tuple key in OrderedSet detected")
+  assert_true(!queried_ty_has_tuple_key("mbt_compat::OrderedSet[String]"), "scalar key in OrderedSet is not a tuple key")
+}
