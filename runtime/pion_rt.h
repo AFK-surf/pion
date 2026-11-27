@@ -171,6 +171,7 @@ void*    pion_bytes_slice(void *b, int64_t start, int64_t end);
 void*    pion_bytes_concat(void *a, void *b);
 void*    pion_bytes_from_ptr(void *p, int64_t len);
 void     pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst, int64_t len);
+void     pion_bytes_blit(const uint8_t *src_data, int64_t src_len, int64_t src_off, void *dst_ptr, int64_t dst_off, int64_t len);
 
 /* StringBuilder */
 void*    pion_strbuf_new(int64_t cap);

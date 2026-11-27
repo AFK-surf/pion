@@ -1612,6 +1612,27 @@ PION_MINSIZE void pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst
     }
 }
 
+PION_MINSIZE void pion_bytes_blit(
+    const uint8_t *src_data, int64_t src_len, int64_t src_off,
+    void *dst_ptr, int64_t dst_off, int64_t len) {
+    PionBytes *dst = (PionBytes *)dst_ptr;
+    int64_t dlen = dst ? dst->len : 0;
+    if (__builtin_expect(
+            len < 0 || src_off < 0 || src_off > src_len || len > src_len - src_off, 0)) {
+        pion_panic_oob(src_off < 0 ? src_off : (len < 0 ? len : src_off + len), src_len);
+    }
+    if (__builtin_expect(
+            !dst || dst_off < 0 || dst_off > dlen || len > dlen - dst_off, 0)) {
+        pion_panic_oob(dst_off < 0 ? dst_off : dst_off + len, dlen);
+    }
+    if (__builtin_expect(dst->cap < 0, 0)) {
+        PION_FAIL(mmap_write);
+    }
+    if (len > 0) {
+        memmove(dst->data + dst_off, src_data + src_off, (size_t)len);
+    }
+}
+
 /* ============================================================================
  * 3. StringBuilder
  * ============================================================================ */
