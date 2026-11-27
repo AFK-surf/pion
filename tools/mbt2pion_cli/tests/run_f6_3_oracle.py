@@ -1379,32 +1379,45 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
-        "neg_aliased_filter_map_mut_cb",
+        "neg_generic_param_alias_search_by",
         r'''
-pub fn run(ats : Array[Int]) -> Array[Int] {
-  ats.filter_map(fn(at) {
-    ats.push(at)
-    Some(at)
+fn[T] walk(xs : Array[T], ys : Array[Int]) -> Int? {
+  xs.search_by(fn(_x) {
+    if ys.length() == 2 { ys.push(9) }
+    false
   })
 }
-''',
-        "MBT2PION_UNSUPPORTED_SYNTAX",
-    ),
-    (
-        "neg_generic_param_alias_filter_map",
-        r'''
-fn[T] walk(xs : Array[T], ys : Array[Int]) -> Int {
-  xs.filter_map(fn(x) {
-    if ys.length() == 2 { ys.push(9) }
-    Some(x)
-  }).length()
-}
-pub fn probe() -> Int {
+pub fn probe() -> Int? {
   let a : Array[Int] = [3, 4]
   walk(a, a)
 }
 ''',
-        "MBT2PION_UNSUPPORTED_SYNTAX",
+        "Array::search_by",
+    ),
+    (
+        "neg_shadowed_some_custom_eq_search_by",
+        r'''
+enum Flag {
+  Some(Int)
+}
+struct EvilBox {
+  xs : Array[Int]
+}
+impl Eq for EvilBox with equal(self, _other) {
+  self.xs.push(9)
+  true
+}
+pub fn run(xs : Array[Int]) -> Int? {
+  let b = EvilBox::{ xs }
+  let f = Flag::Some(1)
+  xs.search_by(fn(_x) {
+    let _ = b == b
+    let _ = match f { Flag::Some(n) => n }
+    false
+  })
+}
+''',
+        "Array::search_by",
     ),
     (
         "neg_param_json_map_contains",
@@ -1451,7 +1464,7 @@ pub fn run(xs : Array[Json], k : Json) -> Int? {
         "Array::search_by",
     ),
     (
-        "neg_impl_generic_shadow_struct_t_filter_map",
+        "neg_impl_generic_shadow_struct_t_search_by",
         r'''
 struct T {
   n : Int
@@ -1463,10 +1476,13 @@ struct Bucket[T] {
 impl[T] Eq for Bucket[T] with equal(a, _b) {
   let xs : Array[T] = a.xs
   let ys : Array[Int] = a.ys
-  xs.filter_map(fn(x) {
+  match xs.search_by(fn(_x) {
     if ys.length() == 2 { ys.push(9) }
-    Some(x)
-  }).length() == 2
+    false
+  }) {
+    Some(_) => true
+    None => false
+  }
 }
 pub fn probe() -> Bool {
   let a : Array[Int] = [3, 4]
@@ -1475,7 +1491,7 @@ pub fn probe() -> Bool {
   b == b
 }
 ''',
-        "MBT2PION_UNSUPPORTED_SYNTAX",
+        "Array::search_by",
     ),
     (
         "neg_impl_generic_shadow_struct_t_iter_any",
