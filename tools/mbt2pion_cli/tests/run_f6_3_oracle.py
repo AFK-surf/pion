@@ -551,8 +551,7 @@ fn pos_precision_and_compat() -> String {
     split_paren + "|" + split_idx + "|" + split_any.to_string() + "|" + j_str + "|" + wide_repr + "|" + deep_repr
 }
 
-// Wave F6-4c-2 positive cases: MbtJson::Object pure-map provenance, Gate D2 read-only slice arg,
-// and multiline match arm if-guard.
+// Positive cases: MbtJson::Object pure-map provenance and multiline match arm if-guard.
 struct JsonEv {
   out : Bool
   msg : Json
@@ -565,15 +564,7 @@ fn json_id_of(m : Map[String, Json]) -> Int? {
   }
 }
 
-fn scan_ro_slice_sum(run : ArrayView[Int]) -> Int {
-  let mut s = 0
-  for x in run {
-    s = s + x
-  }
-  s
-}
-
-fn pos_f6_4c_2_view_core_unblock() -> String {
+fn pos_json_map_and_match_guard() -> String {
   let o1 : Map[String, Json] = Map::new()
   o1["id"] = Json::number(7.0)
   o1["ok"] = Json::boolean(true)
@@ -585,7 +576,6 @@ fn pos_f6_4c_2_view_core_unblock() -> String {
     !e.out && e.msg is Object(m) && (m.contains("ok") || m.contains("error")) && json_id_of(m) == Some(7)
   })
   let nums : Array[Int] = [10, 20, 30, 40]
-  let sl_sum = scan_ro_slice_sum(nums[1:3])
   let km : Map[Int, Int] = Map::new()
   km[2] = 20
   km[4] = 40
@@ -595,11 +585,11 @@ fn pos_f6_4c_2_view_core_unblock() -> String {
     _ => false
   }
   let guard_any = [1, 2, 3].iter().any(fn(x) { km.contains(x) })
-  has_ans.to_string() + "|" + sl_sum.to_string() + "|" + guard_ok.to_string() + "|" + guard_any.to_string()
+  has_ans.to_string() + "|" + guard_ok.to_string() + "|" + guard_any.to_string()
 }
 
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat() + " :: " + pos_f6_4c_2_view_core_unblock()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat() + " :: " + pos_json_map_and_match_guard()
 }
 '''
 
@@ -1405,33 +1395,7 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
     (
-        "neg_f6_4c_2_gate_d2_mut_slice_callee",
-        r'''
-fn mut_backing_and_read(ops : Array[Int], run : ArrayView[Int]) -> Int {
-  ops[0] = 99
-  run[0]
-}
-pub fn run(ops : Array[Int]) -> Int {
-  mut_backing_and_read(ops, ops[0:1])
-}
-''',
-        "MBT2PION_BORROWED_ARRAY_SLICE",
-    ),
-    (
-        "neg_f6_4c_2_gate_d2_pub_slice_callee",
-        r'''
-pub fn pub_slice_cb(run : ArrayView[Int], cb : () -> Unit) -> Int {
-  cb()
-  run[0]
-}
-pub fn run(ops : Array[Int], cb : () -> Unit) -> Int {
-  pub_slice_cb(ops[0:1], cb)
-}
-''',
-        "MBT2PION_BORROWED_ARRAY_SLICE",
-    ),
-    (
-        "neg_f6_4c_2_aliased_filter_map_mut_cb",
+        "neg_aliased_filter_map_mut_cb",
         r'''
 pub fn run(ats : Array[Int]) -> Array[Int] {
   ats.filter_map(fn(at) {

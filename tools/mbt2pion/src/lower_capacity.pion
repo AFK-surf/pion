@@ -265,14 +265,11 @@ pub struct ShrinkPkg {
   // Last name of every path iterated (a `for .. in` body, an iteration callback, a kept iterator) where the
   // iteration may call a function of the package (which could shrink that array).
   iterated_tails : Map[String, String]
-  // Canonical ground `Array[...]` types observed for each iterated tail (from `query_types`),
-  // plus reserved sentinel keys `"#all"` (package-wide union) and `"#fn:<name>"` (per-iter-fn types).
+  // Canonical ground `Array[...]` types observed for each iterated tail (from `query_types`).
   iterated_tail_tys : Map[String, Map[String, Bool]]
-  // Tails where at least one iteration site lacked a ground unambiguous canonical type (fail-closed),
-  // plus reserved sentinel keys `"#all"` and `"#fn:<name>"`.
+  // Tails where at least one iteration site lacked a ground unambiguous canonical type (fail-closed).
   iterated_tail_unknown : Map[String, Bool]
-  // Package-declared nominal types (`struct`/`enum`) for ground canonical type checks;
-  // package-private nominal types are additionally tagged under `"#priv:<TypeName>"`.
+  // Package-declared nominal types (`struct`/`enum`) for ground canonical type checks.
   declared_types : Map[String, Bool]
   // `pub` functions / methods of the package (callers outside it may iterate what they are given).
   risky_fns : Map[String, String]
@@ -474,166 +471,6 @@ fn enclosing_fn_generic_params(tokens : Array[Token], body_open : Int) -> Map[St
   out
 }
 
-///| Collect package-private top-level nominal types (`struct`/`enum` not preceded by `pub`).
-fn collect_priv_nominal_types_tokens(all_tokens : Array[Array[Token]]) -> Map[String, Bool] {
-  let out : Map[String, Bool] = Map()
-  let pub_set : Map[String, Bool] = Map()
-  for ts in all_tokens {
-    let n = ts.length()
-    let mut depth = 0
-    let mut i = 0
-    while i + 1 < n {
-      let k = ts[i].kind
-      if k == TokenKind::LBrace || k == TokenKind::LParen || k == TokenKind::LBracket {
-        depth = depth + 1
-      } else if k == TokenKind::RBrace || k == TokenKind::RParen || k == TokenKind::RBracket {
-        if depth > 0 { depth = depth - 1 }
-      } else if depth == 0 && k == TokenKind::Keyword &&
-      (ts[i].raw == "struct" || ts[i].raw == "enum") &&
-      (ts[i + 1].kind == TokenKind::UpperIdent || ts[i + 1].kind == TokenKind::Ident) {
-        let nm = ts[i + 1].raw
-        let is_pub = i > 0 && ts[i - 1].raw == "pub"
-        if is_pub {
-          pub_set[nm] = true
-        } else {
-          out[nm] = true
-        }
-      }
-      i = i + 1
-    }
-  }
-  for k in pub_set.keys() {
-    let _ = out.remove(k)
-  }
-  out
-}
-
-///| Ground canonical type check for shrink_to_fit type-disjointness: extends `qt_is_ground_canon_type`
-///| to also accept ground function types like `() -> Unit` or `(Int, Int, () -> Unit)` inside `Array[...]`,
-///| while staying strictly fail-closed on `<error>`, `?`, `dyn`, and active generic type parameters.
-fn shrink_is_ground_type(
-  ty_canon : String,
-  declared_types : Map[String, Bool],
-  active_generics : Map[String, Bool],
-) -> Bool {
-  let t = ty_canon.trim()
-  if t.length() == 0 || str_has(t, "<error>") || str_has(t, "?") || str_has(t, "dyn ") {
-    return false
-  }
-  if qt_is_ground_canon_type(t, declared_types, active_generics) {
-    return true
-  }
-  // Function type `(A, B) -> R` or `fn(A, B) -> R`
-  let arrow = t.index_of("->")
-  if arrow > 0 {
-    let mut lhs = t.slice(0, arrow).trim()
-    let rhs = t.slice(arrow + 2, t.length()).trim()
-    if lhs.starts_with("fn") {
-      lhs = lhs.slice(2, lhs.length()).trim()
-    }
-    if lhs.starts_with("(") && lhs.ends_with(")") && shrink_is_ground_type(rhs, declared_types, active_generics) {
-      let inner = lhs.slice(1, lhs.length() - 1).trim()
-      if inner.length() == 0 {
-        return true
-      }
-      let parts = qt_split_top_level_type_args(inner)
-      for p in parts {
-        if !shrink_is_ground_type(p, declared_types, active_generics) {
-          return false
-        }
-      }
-      return true
-    }
-    return false
-  }
-  // Tuple `(A, B, ...)`
-  if t.starts_with("(") && t.ends_with(")") {
-    let inner = t.slice(1, t.length() - 1).trim()
-    if inner.length() == 0 {
-      return true
-    }
-    let parts = qt_split_top_level_type_args(inner)
-    for p in parts {
-      if !shrink_is_ground_type(p, declared_types, active_generics) {
-        return false
-      }
-    }
-    return true
-  }
-  // Generic container `Head[A, B]` (e.g. `Array[() -> Unit]`, `Option[(Int, () -> Unit)]`)
-  let lb = t.index_of("[")
-  if lb > 0 && t.ends_with("]") {
-    let head = t.slice(0, lb).trim()
-    let head_ok = !active_generics.contains(head) && (
-      head == "Array" || head == "FixedArray" || head == "Option" || head == "Result" ||
-      head == "Map" || head == "Ref" || declared_types.contains(head) || str_has(head, "::")
-    )
-    if !head_ok {
-      return false
-    }
-    let parts = qt_split_top_level_type_args(t.slice(lb + 1, t.length() - 1).trim())
-    if parts.length() == 0 {
-      return false
-    }
-    for p in parts {
-      if !shrink_is_ground_type(p, declared_types, active_generics) {
-        return false
-      }
-    }
-    return true
-  }
-  false
-}
-
-///| True iff `ty_canon` mentions a package-private nominal type (tagged `"#priv:<Name>"` in `declared_types`).
-fn shrink_mentions_priv_type(ty_canon : String, declared_types : Map[String, Bool]) -> Bool {
-  if declared_types.length() == 0 || ty_canon.length() == 0 {
-    return false
-  }
-  let toks = lex_moonbit(ty_canon)
-  let tn = toks.length() - 1
-  let mut i = 0
-  while i < tn {
-    if (toks[i].kind == TokenKind::UpperIdent || toks[i].kind == TokenKind::Ident) &&
-    declared_types.contains("#priv:" + toks[i].raw) &&
-    !(i > 0 && toks[i - 1].kind == TokenKind::ColonColon) {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
-fn shrink_record_iter_fn_ty(
-  pkg : ShrinkPkg,
-  fname : String,
-  why : String,
-  ty_opt : Option[String],
-  declared_types : Map[String, Bool],
-  active_generics : Map[String, Bool],
-) -> Unit {
-  if !pkg.iter_fns.contains(fname) {
-    pkg.iter_fns[fname] = why
-  }
-  let fkey = "#fn:" + fname
-  match ty_opt {
-    Some(ty_c) =>
-    if shrink_is_ground_type(ty_c, declared_types, active_generics) {
-      match pkg.iterated_tail_tys.get(fkey) {
-        Some(m) => m[ty_c] = true
-        None => {
-          let m : Map[String, Bool] = Map()
-          m[ty_c] = true
-          pkg.iterated_tail_tys[fkey] = m
-        }
-      }
-    } else {
-      pkg.iterated_tail_unknown[fkey] = true
-    }
-    None => pkg.iterated_tail_unknown[fkey] = true
-  }
-}
-
 fn shrink_record_iterated_tail(
   pkg : ShrinkPkg,
   tail : String,
@@ -645,15 +482,7 @@ fn shrink_record_iterated_tail(
   pkg.iterated_tails[tail] = line_str
   match ty_opt {
     Some(ty_c) =>
-    if shrink_is_ground_type(ty_c, declared_types, active_generics) {
-      match pkg.iterated_tail_tys.get("#all") {
-        Some(m) => m[ty_c] = true
-        None => {
-          let m : Map[String, Bool] = Map()
-          m[ty_c] = true
-          pkg.iterated_tail_tys["#all"] = m
-        }
-      }
+    if qt_is_ground_canon_type(ty_c, declared_types, active_generics) {
       match pkg.iterated_tail_tys.get(tail) {
         Some(m) => m[ty_c] = true
         None => {
@@ -664,12 +493,8 @@ fn shrink_record_iterated_tail(
       }
     } else {
       pkg.iterated_tail_unknown[tail] = true
-      pkg.iterated_tail_unknown["#all"] = true
     }
-    None => {
-      pkg.iterated_tail_unknown[tail] = true
-      pkg.iterated_tail_unknown["#all"] = true
-    }
+    None => pkg.iterated_tail_unknown[tail] = true
   }
 }
 
@@ -924,75 +749,6 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
   shrink_snapshot_hazard_with_qt(tokens, name_i, pkg, "", None)
 }
 
-///| If `idx` is inside one or more `for .. in` loops (and NOT inside any iteration callback like `.each`/`.iter()`),
-///| return true iff EVERY enclosing `for .. in` loop's iterable has a ground canonical type distinct from `recv_ty_c`.
-fn enclosing_for_loops_disjoint_from_ty(
-  tokens : Array[Token],
-  idx : Int,
-  body_open : Int,
-  content : String,
-  qfi_opt : Option[QtFileIndex],
-  recv_ty_c : String,
-  declared_types : Map[String, Bool],
-  active_gen : Map[String, Bool],
-) -> Bool {
-  if recv_ty_c.length() == 0 {
-    return false
-  }
-  let qfi = match qfi_opt {
-    Some(q) => q
-    None => return false
-  }
-  // Never bypass an enclosing iteration callback (`arr.each(fn(..) { ... })`, etc.).
-  let mut p = idx
-  while true {
-    let op = enclosing_open(tokens, p, body_open, TokenKind::LParen)
-    if op <= body_open {
-      break
-    }
-    if op >= 2 && tokens[op - 1].kind == TokenKind::Ident && is_iteration_callee(tokens[op - 1].raw) {
-      return false
-    }
-    p = op
-  }
-  let mut b = idx
-  let mut checked_any = false
-  while true {
-    let o = enclosing_open(tokens, b, body_open, TokenKind::LBrace)
-    if o <= body_open {
-      break
-    }
-    let mut k = o - 1
-    let mut in_i = -1
-    let mut for_i = -1
-    while k > body_open && !tokens[k].newline_before {
-      if tokens[k].raw == "in" && in_i < 0 { in_i = k }
-      if tokens[k].raw == "for" { for_i = k; break }
-      k = k - 1
-    }
-    if for_i >= 0 && in_i > for_i && in_i + 1 < o {
-      checked_any = true
-      let mut tail_i = o - 1
-      if tail_i >= 3 && tokens[tail_i].kind == TokenKind::RParen && tokens[tail_i - 1].kind == TokenKind::LParen &&
-      tokens[tail_i - 2].raw == "iter" && tokens[tail_i - 3].kind == TokenKind::Dot {
-        tail_i = tail_i - 4
-      }
-      if in_i + 1 > tail_i {
-        return false
-      }
-      match qt_lookup_expr_span_ty(qfi, content, tokens[in_i + 1].start_byte, tokens[tail_i].end_byte, true) {
-        Some(lty) =>
-        if !shrink_is_ground_type(lty, declared_types, active_gen) || lty == recv_ty_c {
-          return false
-        }
-        None => return false
-      }
-    }
-    b = o
-  }
-  checked_any
-}
-
 ///| Real-type-aware `shrink_snapshot_hazard`: when `qfi_opt` provides a ground unambiguous canonical type
 ///| for `recv` and all package iterations of `tail` have ground unambiguous canonical types that do not
 ///| include `recv`'s type, nominal type disjointness rules out cross-type tail collisions (fail-closed otherwise).
@@ -1009,18 +765,6 @@ pub fn shrink_snapshot_hazard_with_qt(
     return ""
   }
   let body_close = find_matching_delim(tokens, body_open)
-  let active_gen = enclosing_fn_generic_params(tokens, body_open)
-  let recv_ty_ground = match qfi_opt {
-    Some(qfi) => {
-      let rs = receiver_path_start_token(tokens, name_i - 2)
-      let rsb = if rs >= 0 { tokens[rs].start_byte } else { -1 }
-      match qt_lookup_receiver_ty_at_op(qfi, content, tokens[name_i].start_byte, rsb, -1, true) {
-        Some(rt) => if shrink_is_ground_type(rt, pkg.declared_types, active_gen) { rt } else { "" }
-        None => ""
-      }
-    }
-    None => ""
-  }
   // A private receiver: allocated here (`let a = [..]` / `Array::new(..)`), never handed out or stored in the
   // function: only an iteration over one of its names (`array_aliases`) can hold its buffer.
   let mut h0 = name_i - 2
@@ -1037,9 +781,7 @@ pub fn shrink_snapshot_hazard_with_qt(
   // 1. Inside a `for .. in` loop body or a closure given to an iteration helper.
   let in_iter = iteration_scope_reason(tokens, name_i, body_open, body_close, pkg.array_fields, private_names)
   if in_iter.length() > 0 {
-    if !enclosing_for_loops_disjoint_from_ty(tokens, name_i, body_open, content, qfi_opt, recv_ty_ground, pkg.declared_types, active_gen) {
-      return in_iter
-    }
+    return in_iter
   }
   // 2. An array iterator kept beyond the expression that creates it (of the private receiver's names, or of
   //    anything when the receiver is not private).
@@ -1073,11 +815,26 @@ pub fn shrink_snapshot_hazard_with_qt(
   match if private { None } else { pkg.iterated_tails.get(tail) } {
     Some(at) => {
       let mut disjoint_by_type = false
-      if !pkg.iterated_tail_unknown.contains(tail) && recv_ty_ground.length() > 0 {
-        match pkg.iterated_tail_tys.get(tail) {
-          Some(tys_map) =>
-          if !tys_map.contains(recv_ty_ground) {
-            disjoint_by_type = true
+      if !pkg.iterated_tail_unknown.contains(tail) {
+        match qfi_opt {
+          Some(qfi) => {
+            let active_gen = enclosing_fn_generic_params(tokens, body_open)
+            let rs = receiver_path_start_token(tokens, name_i - 2)
+            let rsb = if rs >= 0 { tokens[rs].start_byte } else { -1 }
+            let recv_ty_opt = qt_lookup_receiver_ty_at_op(qfi, content, tokens[name_i].start_byte, rsb, -1, true)
+            match recv_ty_opt {
+              Some(recv_ty_c) =>
+              if qt_is_ground_canon_type(recv_ty_c, pkg.declared_types, active_gen) {
+                match pkg.iterated_tail_tys.get(tail) {
+                  Some(tys_map) =>
+                  if !tys_map.contains(recv_ty_c) {
+                    disjoint_by_type = true
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
           }
           None => ()
         }
@@ -1126,40 +883,12 @@ pub fn shrink_snapshot_hazard_with_qt(
   // a parameter (`self` included), a field, `let buf = src`, a module-level or captured array.
   let fresh_local = !is_field && fresh_local_binding(tokens, head, body_open, name_i, false)
   let non_local = !fresh_local
-  let all_tys_has_recv = match pkg.iterated_tail_tys.get("#all") {
-    Some(m) => m.contains(recv_ty_ground)
-    None => false
-  }
-  let priv_never_iterated = recv_ty_ground.length() > 0 &&
-  shrink_mentions_priv_type(recv_ty_ground, pkg.declared_types) &&
-  !pkg.iterated_tail_unknown.contains("#all") &&
-  !all_tys_has_recv
   // Inside a closure the shrink runs whenever that closure is called -- from anywhere.
   let in_closure = enclosing_closure_open(tokens, name_i, body_open) >= 0
   let iter_why = if in_closure {
-    if priv_never_iterated {
-      None
-    } else {
-      Some("it runs in a closure, which may be called from anywhere")
-    }
+    Some("it runs in a closure, which may be called from anywhere")
   } else {
-    match pkg.iter_fns.get(fname) {
-      Some(why) => {
-        let mut disjoint_fn_ty = false
-        let fkey = "#fn:" + fname
-        if recv_ty_ground.length() > 0 && !pkg.iterated_tail_unknown.contains(fkey) {
-          match pkg.iterated_tail_tys.get(fkey) {
-            Some(ftys) =>
-            if !ftys.contains(recv_ty_ground) {
-              disjoint_fn_ty = true
-            }
-            None => ()
-          }
-        }
-        if disjoint_fn_ty || priv_never_iterated { None } else { Some(why) }
-      }
-      None => None
-    }
+    pkg.iter_fns.get(fname)
   }
   match iter_why {
     Some(why) =>
@@ -1168,7 +897,7 @@ pub fn shrink_snapshot_hazard_with_qt(
     }
     None => ()
   }
-  if non_local && !priv_never_iterated {
+  if non_local {
     match pkg.risky_fns.get(fname) {
       Some(why) =>
       return "its receiver comes from a caller and `" + fname + "` may run inside a caller's iteration: " + why
@@ -3232,122 +2961,6 @@ fn chain_callbacks_opacity(
 // Wave F6-3a: Mutation-summary-backed precision for Gate A & Gate C
 // ---------------------------------------------------------------------------
 
-///| Record all enclosing iteration receiver types around a call at `idx` into `pkg.iter_fn_tys` / `pkg.iter_fn_unknown`.
-fn shrink_record_call_enclosing_iters(
-  pkg : ShrinkPkg,
-  fname : String,
-  why : String,
-  tokens : Array[Token],
-  idx : Int,
-  body_open : Int,
-  body_close : Int,
-  content : String,
-  qfi_opt : Option[QtFileIndex],
-  active_gen : Map[String, Bool],
-) -> Unit {
-  if !pkg.iter_fns.contains(fname) {
-    pkg.iter_fns[fname] = why
-  }
-  let fkey = "#fn:" + fname
-  if pkg.iterated_tail_unknown.contains(fkey) {
-    return
-  }
-  let mut b = idx
-  let mut recorded_any = false
-  while true {
-    let o = enclosing_open(tokens, b, body_open, TokenKind::LBrace)
-    if o < 0 || o <= body_open {
-      break
-    }
-    let mut h = o - 1
-    let mut d = 0
-    let mut saw_in = false
-    let mut in_i = -1
-    let mut kind = ""
-    while h > body_open {
-      let hk = tokens[h].kind
-      if hk == TokenKind::RBrace && d == 0 {
-        if tokens[h].newline_before {
-          break
-        }
-        let ob = find_open_before(tokens, h, body_open)
-        if ob <= body_open {
-          break
-        }
-        h = ob - 1
-        continue
-      }
-      if hk == TokenKind::RParen || hk == TokenKind::RBracket || hk == TokenKind::RBrace {
-        d = d + 1
-      } else if hk == TokenKind::LParen || hk == TokenKind::LBracket || hk == TokenKind::LBrace {
-        if d == 0 {
-          break
-        }
-        d = d - 1
-      } else if d == 0 && tokens[h].raw == "in" {
-        saw_in = true
-        in_i = h
-      } else if d == 0 && tokens[h].raw == "for" {
-        if saw_in {
-          kind = "for"
-        }
-        break
-      } else if d == 0 && tokens[h].raw == "fn" {
-        kind = "fn"
-        break
-      } else if d == 0 && tokens[h].newline_before && (tokens[h].raw == "let" || tokens[h].raw == "if" ||
-        tokens[h].raw == "while" || tokens[h].raw == "match" || tokens[h].raw == "else") {
-        break
-      }
-      h = h - 1
-    }
-    if kind == "for" && loop_iterable_private_copy(tokens, body_open, body_close, in_i, o, pkg.array_fields) != 1 {
-      recorded_any = true
-      let mut tail_i = o - 1
-      if tail_i >= 3 && tokens[tail_i].kind == TokenKind::RParen && tokens[tail_i - 1].kind == TokenKind::LParen &&
-      tokens[tail_i - 2].raw == "iter" && tokens[tail_i - 3].kind == TokenKind::Dot {
-        tail_i = tail_i - 4
-      }
-      let ty_opt = match qfi_opt {
-        Some(qfi) =>
-        if in_i + 1 <= tail_i {
-          qt_lookup_expr_span_ty(qfi, content, tokens[in_i + 1].start_byte, tokens[tail_i].end_byte, true)
-        } else {
-          None
-        }
-        None => None
-      }
-      shrink_record_iter_fn_ty(pkg, fname, why, ty_opt, pkg.declared_types, active_gen)
-    } else if kind == "fn" {
-      let p = enclosing_open(tokens, h, body_open, TokenKind::LParen)
-      if p > 0 {
-        let callee_i = p - 1
-        let callee = tokens[callee_i].raw
-        let via_compat = callee_i >= 2 && tokens[callee_i - 1].kind == TokenKind::ColonColon &&
-        tokens[callee_i - 2].raw == "mbt_compat"
-        if via_compat || is_iteration_callee(callee) {
-          recorded_any = true
-          let ty_opt = if !via_compat && callee_i >= 2 && tokens[callee_i - 1].kind == TokenKind::Dot {
-            let rs = receiver_path_start_token(tokens, callee_i - 2)
-            let rsb = if rs >= 0 { tokens[rs].start_byte } else { -1 }
-            match qfi_opt {
-              Some(qfi) => qt_lookup_receiver_ty_at_op(qfi, content, tokens[callee_i].start_byte, rsb, -1, true)
-              None => None
-            }
-          } else {
-            None
-          }
-          shrink_record_iter_fn_ty(pkg, fname, why, ty_opt, pkg.declared_types, active_gen)
-        }
-      }
-    }
-    b = o
-  }
-  if !recorded_any {
-    pkg.iterated_tail_unknown["#fn:" + fname] = true
-  }
-}
-
 ///| Builds a `ShrinkPkg` using `PkgMutationSummary` to skip `for .. in` loops and
 ///| immediately-consumed iteration callbacks whose body is proven unable to reach
 ///| `shrink_to_fit` (`!unknown && !reaches_shrink`). Kept iterators, `pub` functions,
@@ -3380,10 +2993,6 @@ pub fn collect_shrink_pkg_tokens_with_summary(
   for k in decl_tys.keys() {
     pkg.declared_types[k] = true
   }
-  let priv_tys = collect_priv_nominal_types_tokens(all_tokens)
-  for k in priv_tys.keys() {
-    pkg.declared_types["#priv:" + k] = true
-  }
   let mut file_idx = 0
   while file_idx < all_tokens.length() {
     let ts = all_tokens[file_idx]
@@ -3393,7 +3002,6 @@ pub fn collect_shrink_pkg_tokens_with_summary(
     } else {
       None
     }
-    let fn_envs : Map[Int, MsFnEnv] = Map()
     let n = ts.length()
     let mut i = 0
     while i < n {
@@ -3426,31 +3034,15 @@ pub fn collect_shrink_pkg_tokens_with_summary(
       !(t >= 2 && ts[t - 1].kind == TokenKind::ColonColon && ts[t - 2].raw == "fn") {
         let is_call = ts[t + 1].kind == TokenKind::LParen
         let is_decl = t >= 2 && ts[t - 1].kind == TokenKind::ColonColon && t >= 3 && ts[t - 3].raw == "fn"
-        let is_field_or_binder = ts[t + 1].kind == TokenKind::Colon ||
-        (t > 0 && (ts[t - 1].raw == "let" || ts[t - 1].raw == "mut" || ts[t - 1].kind == TokenKind::Dot))
-        if !is_call && !is_decl && !is_field_or_binder {
-          if !pkg.iter_fns.contains(tk.raw) {
-            pkg.iter_fns[tk.raw] = "it is used as a function value"
-          }
-          pkg.iterated_tail_unknown["#fn:" + tk.raw] = true
-        } else if is_call && !pkg.iterated_tail_unknown.contains("#fn:" + tk.raw) {
+        if !is_call && !is_decl && !pkg.iter_fns.contains(tk.raw) &&
+        !(t > 0 && ts[t - 1].kind == TokenKind::Dot) {
+          pkg.iter_fns[tk.raw] = "it is used as a function value"
+        } else if is_call && !pkg.iter_fns.contains(tk.raw) {
           let bo = outermost_body_open(ts, t)
           if bo >= 0 {
             let bc = find_matching_delim(ts, bo)
             if iteration_scope_reason(ts, t, bo, bc, pkg.array_fields, Map()).length() > 0 {
-              let active_gen = enclosing_fn_generic_params(ts, bo)
-              shrink_record_call_enclosing_iters(
-                pkg,
-                tk.raw,
-                "it is called inside an iteration (line " + tk.line.to_string() + ")",
-                ts,
-                t,
-                bo,
-                bc,
-                fcontent,
-                qfi_opt,
-                active_gen,
-              )
+              pkg.iter_fns[tk.raw] = "it is called inside an iteration (line " + tk.line.to_string() + ")"
             }
           }
         }
@@ -3478,15 +3070,7 @@ pub fn collect_shrink_pkg_tokens_with_summary(
           let tail = path_tail(ts, tail_i)
           if !private && tail.length() > 0 && calls_package_fn(ts, j, close, fns) {
             let active_gen = enclosing_fn_generic_params(ts, bo)
-            let env = match fn_envs.get(bo) {
-              Some(e) => e
-              None => {
-                let e = ms_build_fn_env(mut_summary, ts, bo, fcontent, qfi_opt, active_gen)
-                fn_envs[bo] = e
-                e
-              }
-            }
-            let body_sum = summarize_expr_span_with_env(mut_summary, ts, j + 1, close, bo, env, fcontent, qfi_opt, Map(), active_gen)
+            let body_sum = summarize_expr_span(mut_summary, ts, j + 1, close, bo, fcontent, qfi_opt, Map(), active_gen)
             if body_sum.unknown || body_sum.reaches_shrink {
               let ty_opt = match qfi_opt {
                 Some(qfi) =>
@@ -3522,58 +3106,10 @@ pub fn collect_shrink_pkg_tokens_with_summary(
           let active_gen = enclosing_fn_generic_params(ts, bo)
           let mut must_record = true
           if !kept {
-            // Summarize each callback argument in the consumed chain `[t, chain_end]` using `summarize_callback_arg`,
-            // instead of scanning `.search_by(...)`/`.iter()...` as an opaque method call.
-            let rs_c = receiver_path_start_token(ts, t - 1)
-            let rsb_c = if rs_c >= 0 { ts[rs_c].start_byte } else { -1 }
-            let recv_ty_c = match qfi_opt {
-              Some(qfi) =>
-              match qt_lookup_receiver_ty_at_op(qfi, fcontent, ts[t + 1].start_byte, rsb_c, -1, true) {
-                Some(ty_s) => ty_s
-                None => ""
-              }
-              None => ""
-            }
-            let elem_ty_c = ms_extract_array_elem_ty(recv_ty_c)
-            let mut chain_safe = true
-            let mut cur_dot = t
-            while cur_dot + 2 < n && ts[cur_dot].kind == TokenKind::Dot &&
-            ts[cur_dot + 1].kind == TokenKind::Ident && ts[cur_dot + 2].kind == TokenKind::LParen {
-              let cm = ts[cur_dot + 1].raw
-              let c_lp = cur_dot + 2
-              let c_rp = find_matching_delim(ts, c_lp)
-              if c_rp <= c_lp || c_rp > chain_end {
-                chain_safe = false
-                break
-              }
-              if cm == "iter" || cm == "count" || cm == "collect" || cm == "to_array" ||
-              cm == "last" || cm == "head" || cm == "is_empty" || cm == "rev" {
-                if c_rp != c_lp + 1 {
-                  chain_safe = false
-                  break
-                }
-              } else if is_callback_method(cm) || is_iteration_callee(cm) {
-                let cargs = ms_split_call_args(ts, c_lp, c_rp)
-                if cargs.length() == 0 {
-                  chain_safe = false
-                  break
-                }
-                let last_a = cargs[cargs.length() - 1]
-                let cb_sum = summarize_callback_arg(mut_summary, ts, last_a.0, last_a.1, bo, fcontent, qfi_opt, elem_ty_c, active_gen)
-                if cb_sum.unknown || cb_sum.reaches_shrink {
-                  chain_safe = false
-                  break
-                }
-              } else {
-                chain_safe = false
-                break
-              }
-              if c_rp >= chain_end {
-                break
-              }
-              cur_dot = c_rp + 1
-            }
-            if chain_safe {
+            let rs_scan = receiver_path_start_token(ts, t - 1)
+            let scan_start = if rs_scan >= 0 { rs_scan } else { t + 2 }
+            let chain_sum = summarize_expr_span(mut_summary, ts, scan_start, chain_end + 1, bo, fcontent, qfi_opt, Map(), active_gen)
+            if !chain_sum.unknown && !chain_sum.reaches_shrink {
               must_record = false
             }
           }
@@ -3635,40 +3171,10 @@ pub fn collect_shrink_pkg_tokens_with_summary(
     changed = false
     for f in pkg.iter_fns.keys() {
       let list = match callees.get(f) { Some(l) => l, None => [] }
-      let fkey = "#fn:" + f
-      let f_unk = pkg.iterated_tail_unknown.contains(fkey)
       for g in list {
         if !pkg.iter_fns.contains(g) {
           pkg.iter_fns[g] = "it is reached from `" + f + "`, which may run inside an iteration"
           changed = true
-        }
-        let gkey = "#fn:" + g
-        if f_unk {
-          if !pkg.iterated_tail_unknown.contains(gkey) {
-            pkg.iterated_tail_unknown[gkey] = true
-            changed = true
-          }
-        } else if !pkg.iterated_tail_unknown.contains(gkey) {
-          match pkg.iterated_tail_tys.get(fkey) {
-            Some(ftys) => {
-              for ty in ftys.keys() {
-                match pkg.iterated_tail_tys.get(gkey) {
-                  Some(gtys) =>
-                  if !gtys.contains(ty) {
-                    gtys[ty] = true
-                    changed = true
-                  }
-                  None => {
-                    let gtys : Map[String, Bool] = Map()
-                    gtys[ty] = true
-                    pkg.iterated_tail_tys[gkey] = gtys
-                    changed = true
-                  }
-                }
-              }
-            }
-            None => ()
-          }
         }
       }
     }
@@ -3750,18 +3256,9 @@ fn ms_is_fresh_container_local(tokens : Array[Token], name : String, body_open :
   let rhs_s = eq_i + 1
   let is_mbt_arr_ctor = re >= rhs_s + 5 && tokens[rhs_s].raw == "mbt_compat" &&
   tokens[rhs_s + 1].kind == TokenKind::ColonColon &&
-  (tokens[rhs_s + 2].raw == "arr_make" || tokens[rhs_s + 2].raw == "arr_makei" ||
-    tokens[rhs_s + 2].raw == "arr_with_capacity" || tokens[rhs_s + 2].raw == "arr_copy" ||
-    tokens[rhs_s + 2].raw == "arr_filter" || tokens[rhs_s + 2].raw == "arr_map" ||
-    tokens[rhs_s + 2].raw == "arr_filter_map") &&
+  (tokens[rhs_s + 2].raw == "arr_make" || tokens[rhs_s + 2].raw == "arr_makei" || tokens[rhs_s + 2].raw == "arr_with_capacity") &&
   tokens[rhs_s + 3].kind == TokenKind::LParen && find_matching_delim(tokens, rhs_s + 3) == re - 1
-  let is_to_array_tail = re >= rhs_s + 4 && tokens[re - 1].kind == TokenKind::RParen &&
-  tokens[re - 2].kind == TokenKind::LParen && tokens[re - 4].kind == TokenKind::Dot &&
-  (tokens[re - 3].raw == "to_array" || tokens[re - 3].raw == "collect") &&
-  (tokens[rhs_s].raw == "mbt_compat" ||
-    (re >= rhs_s + 8 && tokens[re - 5].kind == TokenKind::RParen && tokens[re - 6].kind == TokenKind::LParen &&
-      tokens[re - 7].raw == "iter" && tokens[re - 8].kind == TokenKind::Dot))
-  if re > before || (!is_fresh_container_alloc(tokens, rhs_s, re) && !is_mbt_arr_ctor && !is_to_array_tail) {
+  if re > before || (!is_fresh_container_alloc(tokens, rhs_s, re) && !is_mbt_arr_ctor) {
     return false
   }
   // Must never be reassigned
