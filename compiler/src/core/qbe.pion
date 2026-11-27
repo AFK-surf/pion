@@ -11100,8 +11100,7 @@ fn qbe_collect_loop_idx_expr(
     }
     EMethodCall(obj, mname, args, _) => {
       if (mname == "code_unit_at" && args.length() == 1) ||
-        (mname == "read_i8" && args.length() == 1) ||
-        (mname == "read_f32_le" && args.length() == 1) ||
+        (is_bytes_read_method(mname) && args.length() == 1) ||
         (mname == "length" && args.length() == 0) ||
         (mname == "is_empty" && args.length() == 0) {
         match obj {
@@ -11517,17 +11516,289 @@ fn qbe_is_pure_builtin_method(recv_ty : Ty, mname : String, nargs : Int) -> Bool
       (mname == "code_unit_at" && nargs == 1)
     TBytes =>
       (mname == "length" && nargs == 0) ||
-      ((mname == "read_i8" || mname == "read_f32_le") && nargs == 1)
+      (is_bytes_read_method(mname) && nargs == 1)
     TStrView =>
       ((mname == "length" || mname == "is_empty") && nargs == 0) ||
       ((mname == "code_unit_at" || mname == "index_of_byte") && nargs == 1)
     TBytesView =>
       ((mname == "length" || mname == "is_empty") && nargs == 0) ||
-      ((mname == "read_i8" || mname == "read_f32_le") && nargs == 1)
+      (is_bytes_read_method(mname) && nargs == 1)
     TArray(_) | TFixedArray(_) | TImmArray(_) | TMap(_, _) =>
       (mname == "length" || mname == "is_empty") && nargs == 0
     _ => false
   }
+}
+
+///|
+fn bytes_read_ret_ty(method_name : String) -> Option[Ty] {
+  if method_name == "read_i8" {
+    Some(TInt8)
+  } else if method_name == "read_u8" ||
+    method_name == "read_i16_le" ||
+    method_name == "read_u16_le" ||
+    method_name == "read_i16_be" ||
+    method_name == "read_u16_be" ||
+    method_name == "read_i32_le" ||
+    method_name == "read_i32_be" {
+    Some(TInt)
+  } else if method_name == "read_u32_le" || method_name == "read_u32_be" {
+    Some(TUInt)
+  } else if method_name == "read_i64_le" || method_name == "read_i64_be" {
+    Some(TInt64)
+  } else if method_name == "read_u64_le" || method_name == "read_u64_be" {
+    Some(TUInt64)
+  } else if method_name == "read_f32_le" || method_name == "read_f32_be" {
+    Some(TFloat)
+  } else if method_name == "read_f64_le" || method_name == "read_f64_be" {
+    Some(TDouble)
+  } else {
+    None
+  }
+}
+
+///|
+fn is_bytes_read_method(method_name : String) -> Bool {
+  match bytes_read_ret_ty(method_name) {
+    Some(_) => true
+    None => false
+  }
+}
+
+///|
+fn qbe_emit_bswap32(g : QbeGen, raw : String) -> String {
+  let b0 = qbe_tmp(g)
+  let t1 = qbe_tmp(g)
+  let b1 = qbe_tmp(g)
+  let t2 = qbe_tmp(g)
+  let b2 = qbe_tmp(g)
+  let b3 = qbe_tmp(g)
+  let p01 = qbe_tmp(g)
+  let p23 = qbe_tmp(g)
+  let sw = qbe_tmp(g)
+  qbe_emit(g, b0 + " =w shl " + raw + ", 24")
+  qbe_emit(g, t1 + " =w and " + raw + ", 65280")
+  qbe_emit(g, b1 + " =w shl " + t1 + ", 8")
+  qbe_emit(g, t2 + " =w shr " + raw + ", 8")
+  qbe_emit(g, b2 + " =w and " + t2 + ", 65280")
+  qbe_emit(g, b3 + " =w shr " + raw + ", 24")
+  qbe_emit(g, p01 + " =w or " + b0 + ", " + b1)
+  qbe_emit(g, p23 + " =w or " + b2 + ", " + b3)
+  qbe_emit(g, sw + " =w or " + p01 + ", " + p23)
+  sw
+}
+
+///|
+fn qbe_emit_bytes_read(
+  g : QbeGen,
+  is_view : Bool,
+  obj_val : String,
+  obj_local_name : String,
+  obj_borrowed : Bool,
+  method_name : String,
+  arg0 : Expr,
+) -> Option[QbeVal] {
+  let rty = match bytes_read_ret_ty(method_name) {
+    Some(t) => t
+    None => return None
+  }
+  let width = if method_name == "read_i8" || method_name == "read_u8" {
+    1
+  } else if method_name == "read_i16_le" ||
+    method_name == "read_u16_le" ||
+    method_name == "read_i16_be" ||
+    method_name == "read_u16_be" {
+    2
+  } else if method_name == "read_i32_le" ||
+    method_name == "read_u32_le" ||
+    method_name == "read_i32_be" ||
+    method_name == "read_u32_be" ||
+    method_name == "read_f32_le" ||
+    method_name == "read_f32_be" {
+    4
+  } else {
+    8
+  }
+  let iv = qbe_emit_expr(g, arg0, Some(TInt))
+  let il = qbe_as_l(g, iv)
+  let pfx = if is_view { "bvr" } else { "br" }
+  if width == 1 {
+    let bce_safe = if is_view && obj_local_name != "" {
+      qbe_bce_expr_is_safe(g, obj_local_name, arg0)
+    } else {
+      false
+    }
+    if !bce_safe {
+      let blen = if is_view {
+        match g.hoisted_bytes_len.get(obj_local_name) {
+          Some(hl) => hl
+          None => {
+            let lp = qbe_tmp(g)
+            let t = qbe_tmp(g)
+            qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+            qbe_emit(g, t + " =l loadl " + lp)
+            t
+          }
+        }
+      } else {
+        let t = qbe_tmp(g)
+        qbe_emit(g, t + " =l loadl " + obj_val)
+        t
+      }
+      let oob = qbe_tmp(g)
+      let l_oob = qbe_lbl(g, pfx + "1_oob")
+      let l_ok = qbe_lbl(g, pfx + "1_ok")
+      qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
+      qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+      qbe_emit_lbl(g, l_oob)
+      qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
+      qbe_emit_term(g, "hlt")
+      qbe_emit_lbl(g, l_ok)
+    }
+  } else {
+    let blen = if is_view {
+      match g.hoisted_bytes_len.get(obj_local_name) {
+        Some(hl) => hl
+        None => {
+          let lp = qbe_tmp(g)
+          let t = qbe_tmp(g)
+          qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+          qbe_emit(g, t + " =l loadl " + lp)
+          t
+        }
+      }
+    } else {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =l loadl " + obj_val)
+      t
+    }
+    let ws = width.to_string()
+    let too_short = qbe_tmp(g)
+    let l_oob = qbe_lbl(g, pfx + ws + "_oob")
+    let l_chk = qbe_lbl(g, pfx + ws + "_chk")
+    let l_ok = qbe_lbl(g, pfx + ws + "_ok")
+    qbe_emit(g, too_short + " =w csltl " + blen + ", " + ws)
+    qbe_emit_term(g, "jnz " + too_short + ", " + l_oob + ", " + l_chk)
+    qbe_emit_lbl(g, l_chk)
+    let max_off = qbe_tmp(g)
+    let oob = qbe_tmp(g)
+    qbe_emit(g, max_off + " =l sub " + blen + ", " + ws)
+    qbe_emit(g, oob + " =w cugtl " + il + ", " + max_off)
+    qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+    qbe_emit_lbl(g, l_oob)
+    qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
+    qbe_emit_term(g, "hlt")
+    qbe_emit_lbl(g, l_ok)
+  }
+  let dp = if is_view {
+    match g.hoisted_bytes_dp.get(obj_local_name) {
+      Some(hd) => hd
+      None => {
+        let pp = qbe_tmp(g)
+        let t = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, t + " =l loadl " + pp)
+        t
+      }
+    }
+  } else {
+    let dp_p = qbe_tmp(g)
+    let t = qbe_tmp(g)
+    qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
+    qbe_emit(g, t + " =l loadl " + dp_p)
+    t
+  }
+  let ep = qbe_tmp(g)
+  qbe_emit(g, ep + " =l add " + dp + ", " + il)
+  let res = if method_name == "read_i8" {
+    let bw = qbe_tmp(g)
+    let bl = qbe_tmp(g)
+    qbe_emit(g, bw + " =w loadsb " + ep)
+    qbe_emit(g, bl + " =l extsw " + bw)
+    bl
+  } else if method_name == "read_u8" {
+    let bw = qbe_tmp(g)
+    qbe_emit(g, bw + " =w loadub " + ep)
+    bw
+  } else if method_name == "read_i16_le" {
+    let vw = qbe_tmp(g)
+    qbe_emit(g, vw + " =w loadsh " + ep)
+    vw
+  } else if method_name == "read_u16_le" {
+    let vw = qbe_tmp(g)
+    qbe_emit(g, vw + " =w loaduh " + ep)
+    vw
+  } else if method_name == "read_i16_be" || method_name == "read_u16_be" {
+    let raw = qbe_tmp(g)
+    let hi = qbe_tmp(g)
+    let lo = qbe_tmp(g)
+    let sw0 = qbe_tmp(g)
+    let vw = qbe_tmp(g)
+    qbe_emit(g, raw + " =w loaduh " + ep)
+    qbe_emit(g, hi + " =w shl " + raw + ", 8")
+    qbe_emit(g, lo + " =w shr " + raw + ", 8")
+    qbe_emit(g, sw0 + " =w or " + hi + ", " + lo)
+    if method_name == "read_i16_be" {
+      qbe_emit(g, vw + " =w extsh " + sw0)
+    } else {
+      qbe_emit(g, vw + " =w extuh " + sw0)
+    }
+    vw
+  } else if method_name == "read_i32_le" || method_name == "read_u32_le" {
+    let vw = qbe_tmp(g)
+    qbe_emit(g, vw + " =w loadw " + ep)
+    vw
+  } else if method_name == "read_i32_be" || method_name == "read_u32_be" {
+    let raw = qbe_tmp(g)
+    qbe_emit(g, raw + " =w loadw " + ep)
+    qbe_emit_bswap32(g, raw)
+  } else if method_name == "read_f32_le" {
+    let fv = qbe_tmp(g)
+    qbe_emit(g, fv + " =s loads " + ep)
+    fv
+  } else if method_name == "read_f32_be" {
+    let raw = qbe_tmp(g)
+    qbe_emit(g, raw + " =w loadw " + ep)
+    let sw = qbe_emit_bswap32(g, raw)
+    let fv = qbe_tmp(g)
+    qbe_emit(g, fv + " =s cast " + sw)
+    fv
+  } else if method_name == "read_i64_le" || method_name == "read_u64_le" {
+    let vl = qbe_tmp(g)
+    qbe_emit(g, vl + " =l loadl " + ep)
+    vl
+  } else if method_name == "read_f64_le" {
+    let dv = qbe_tmp(g)
+    qbe_emit(g, dv + " =d loadd " + ep)
+    dv
+  } else {
+    let lo32 = qbe_tmp(g)
+    let ep4 = qbe_tmp(g)
+    let hi32 = qbe_tmp(g)
+    qbe_emit(g, lo32 + " =w loadw " + ep)
+    qbe_emit(g, ep4 + " =l add " + ep + ", 4")
+    qbe_emit(g, hi32 + " =w loadw " + ep4)
+    let sw_lo = qbe_emit_bswap32(g, lo32)
+    let sw_hi = qbe_emit_bswap32(g, hi32)
+    let hi64 = qbe_tmp(g)
+    let hi_s = qbe_tmp(g)
+    let lo64 = qbe_tmp(g)
+    let sw64 = qbe_tmp(g)
+    qbe_emit(g, hi64 + " =l extuw " + sw_lo)
+    qbe_emit(g, hi_s + " =l shl " + hi64 + ", 32")
+    qbe_emit(g, lo64 + " =l extuw " + sw_hi)
+    qbe_emit(g, sw64 + " =l or " + hi_s + ", " + lo64)
+    if method_name == "read_f64_be" {
+      let dv = qbe_tmp(g)
+      qbe_emit(g, dv + " =d cast " + sw64)
+      dv
+    } else {
+      sw64
+    }
+  }
+  if !obj_borrowed {
+    qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+  }
+  Some(qval(res, rty))
 }
 
 ///|
@@ -27588,8 +27859,7 @@ fn qbe_ident_is_view_consumer_expr(
         let ok_method = mname == "length" ||
           mname == "is_empty" ||
           mname == "code_unit_at" ||
-          mname == "read_i8" ||
-          mname == "read_f32_le" ||
+          is_bytes_read_method(mname) ||
           mname == "starts_with" ||
           mname == "ends_with" ||
           mname == "eq_str" ||
@@ -34481,68 +34751,79 @@ fn qbe_emit_method_call_dispatch(
         }
         return qval(r, TString)
       }
-      if method_name == "read_i8" {
-        let iv = qbe_emit_expr(g, args[0], Some(TInt))
-        let il = qbe_as_l(g, iv)
-        let blen = qbe_tmp(g)
-        qbe_emit(g, blen + " =l loadl " + obj_val)
-        let oob = qbe_tmp(g)
-        let l_oob = qbe_lbl(g, "bri8_oob")
-        let l_ok = qbe_lbl(g, "bri8_ok")
-        qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
-        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
-        qbe_emit_lbl(g, l_oob)
-        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
-        qbe_emit_term(g, "hlt")
-        qbe_emit_lbl(g, l_ok)
-        let dp_p = qbe_tmp(g)
-        let dp = qbe_tmp(g)
-        let ep = qbe_tmp(g)
-        let bw = qbe_tmp(g)
-        let bl = qbe_tmp(g)
-        qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
-        qbe_emit(g, dp + " =l loadl " + dp_p)
-        qbe_emit(g, ep + " =l add " + dp + ", " + il)
-        qbe_emit(g, bw + " =w loadsb " + ep)
-        qbe_emit(g, bl + " =l extsw " + bw)
-        if !obj_borrowed {
-          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+      if is_bytes_read_method(method_name) && args.length() >= 1 {
+        match qbe_emit_bytes_read(g, false, obj_val, obj_local_name, obj_borrowed, method_name, args[0]) {
+          Some(v) => return v
+          None => ()
         }
-        return qval(bl, TInt8)
       }
-      if method_name == "read_f32_le" {
-        let iv = qbe_emit_expr(g, args[0], Some(TInt))
-        let il = qbe_as_l(g, iv)
-        let blen = qbe_tmp(g)
-        qbe_emit(g, blen + " =l loadl " + obj_val)
-        let too_short = qbe_tmp(g)
-        let l_oob = qbe_lbl(g, "brf32_oob")
-        let l_chk = qbe_lbl(g, "brf32_chk")
-        let l_ok = qbe_lbl(g, "brf32_ok")
-        qbe_emit(g, too_short + " =w csltl " + blen + ", 4")
-        qbe_emit_term(g, "jnz " + too_short + ", " + l_oob + ", " + l_chk)
-        qbe_emit_lbl(g, l_chk)
-        let max_off = qbe_tmp(g)
-        let oob = qbe_tmp(g)
-        qbe_emit(g, max_off + " =l sub " + blen + ", 4")
-        qbe_emit(g, oob + " =w cugtl " + il + ", " + max_off)
-        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
-        qbe_emit_lbl(g, l_oob)
-        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
-        qbe_emit_term(g, "hlt")
-        qbe_emit_lbl(g, l_ok)
-        let dp_p = qbe_tmp(g)
-        let dp = qbe_tmp(g)
-        let ep = qbe_tmp(g)
-        let fv = qbe_tmp(g)
-        qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
-        qbe_emit(g, dp + " =l loadl " + dp_p)
-        qbe_emit(g, ep + " =l add " + dp + ", " + il)
-        qbe_emit(g, fv + " =s loads " + ep)
+      if method_name == "blit_to" {
+        let dst_a = qbe_emit_arg_maybe_borrow(g, args[0], Some(TBytes), args_pure)
+        let soff = qbe_as_l(g, qbe_emit_expr(g, args[1], Some(TInt)))
+        let doff = qbe_as_l(g, qbe_emit_expr(g, args[2], Some(TInt)))
+        let blen = qbe_as_l(g, qbe_emit_expr(g, args[3], Some(TInt)))
+        let slen = qbe_tmp(g)
+        let sdp_p = qbe_tmp(g)
+        let sdp = qbe_tmp(g)
+        qbe_emit(g, slen + " =l loadl " + obj_val)
+        qbe_emit(g, sdp_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, sdp + " =l loadl " + sdp_p)
+        qbe_emit(
+          g,
+          "call $pion_bytes_blit(l " +
+          sdp +
+          ", l " +
+          slen +
+          ", l " +
+          soff +
+          ", l " +
+          dst_a.qv.reg +
+          ", l " +
+          doff +
+          ", l " +
+          blen +
+          ")",
+        )
+        if !dst_a.borrowed {
+          qbe_rc_dec(g, dst_a.qv.reg, dst_a.qv.ty)
+        }
         if !obj_borrowed {
           qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
         }
-        return qval(fv, TFloat)
+        return qval("0", TUnit)
+      }
+      if method_name == "copy_from_string" {
+        let doff = qbe_as_l(g, qbe_emit_expr(g, args[0], Some(TInt)))
+        let sa = qbe_emit_arg_maybe_borrow(g, args[1], Some(TString), args_pure)
+        let soff = qbe_as_l(g, qbe_emit_expr(g, args[2], Some(TInt)))
+        let blen = qbe_as_l(g, qbe_emit_expr(g, args[3], Some(TInt)))
+        let slen = qbe_tmp(g)
+        let sdp = qbe_tmp(g)
+        qbe_emit(g, slen + " =l loadl " + sa.qv.reg)
+        qbe_emit(g, sdp + " =l add " + sa.qv.reg + ", 8")
+        qbe_emit(
+          g,
+          "call $pion_bytes_blit(l " +
+          sdp +
+          ", l " +
+          slen +
+          ", l " +
+          soff +
+          ", l " +
+          obj_val +
+          ", l " +
+          doff +
+          ", l " +
+          blen +
+          ")",
+        )
+        if !sa.borrowed {
+          qbe_rc_dec(g, sa.qv.reg, sa.qv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval("0", TUnit)
       }
       if method_name == "as_view" {
         let blen = qbe_tmp(g)
@@ -35008,103 +35289,48 @@ fn qbe_emit_method_call_dispatch(
         qbe_emit(g, rl + " =l extuw " + eq)
         return qval(rl, TBool)
       }
-      if method_name == "read_i8" {
-        let iv = qbe_emit_expr(g, args[0], Some(TInt))
-        let il = qbe_as_l(g, iv)
-        let bce_safe = if obj_local_name != "" {
-          qbe_bce_expr_is_safe(g, obj_local_name, args[0])
-        } else {
-          false
+      if is_bytes_read_method(method_name) && args.length() >= 1 {
+        match qbe_emit_bytes_read(g, true, obj_val, obj_local_name, obj_borrowed, method_name, args[0]) {
+          Some(v) => return v
+          None => ()
         }
-        if !bce_safe {
-          let blen = match g.hoisted_bytes_len.get(obj_local_name) {
-            Some(hl) => hl
-            None => {
-              let lp = qbe_tmp(g)
-              let t = qbe_tmp(g)
-              qbe_emit(g, lp + " =l add " + obj_val + ", 16")
-              qbe_emit(g, t + " =l loadl " + lp)
-              t
-            }
-          }
-          let oob = qbe_tmp(g)
-          let l_oob = qbe_lbl(g, "bvri8_oob")
-          let l_ok = qbe_lbl(g, "bvri8_ok")
-          qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
-          qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
-          qbe_emit_lbl(g, l_oob)
-          qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
-          qbe_emit_term(g, "hlt")
-          qbe_emit_lbl(g, l_ok)
-        }
-        let dp = match g.hoisted_bytes_dp.get(obj_local_name) {
-          Some(hd) => hd
-          None => {
-            let pp = qbe_tmp(g)
-            let t = qbe_tmp(g)
-            qbe_emit(g, pp + " =l add " + obj_val + ", 8")
-            qbe_emit(g, t + " =l loadl " + pp)
-            t
-          }
-        }
-        let ep = qbe_tmp(g)
-        let bw = qbe_tmp(g)
-        let bl = qbe_tmp(g)
-        qbe_emit(g, ep + " =l add " + dp + ", " + il)
-        qbe_emit(g, bw + " =w loadsb " + ep)
-        qbe_emit(g, bl + " =l extsw " + bw)
-        if !obj_borrowed {
-          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
-        }
-        return qval(bl, TInt8)
       }
-      if method_name == "read_f32_le" {
-        let iv = qbe_emit_expr(g, args[0], Some(TInt))
-        let il = qbe_as_l(g, iv)
-        let blen = match g.hoisted_bytes_len.get(obj_local_name) {
-          Some(hl) => hl
-          None => {
-            let lp = qbe_tmp(g)
-            let t = qbe_tmp(g)
-            qbe_emit(g, lp + " =l add " + obj_val + ", 16")
-            qbe_emit(g, t + " =l loadl " + lp)
-            t
-          }
+      if method_name == "blit_to" {
+        let dst_a = qbe_emit_arg_maybe_borrow(g, args[0], Some(TBytes), args_pure)
+        let soff = qbe_as_l(g, qbe_emit_expr(g, args[1], Some(TInt)))
+        let doff = qbe_as_l(g, qbe_emit_expr(g, args[2], Some(TInt)))
+        let blen = qbe_as_l(g, qbe_emit_expr(g, args[3], Some(TInt)))
+        let sdp_p = qbe_tmp(g)
+        let sdp = qbe_tmp(g)
+        let slen_p = qbe_tmp(g)
+        let slen = qbe_tmp(g)
+        qbe_emit(g, sdp_p + " =l add " + obj_val + ", 8")
+        qbe_emit(g, sdp + " =l loadl " + sdp_p)
+        qbe_emit(g, slen_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, slen + " =l loadl " + slen_p)
+        qbe_emit(
+          g,
+          "call $pion_bytes_blit(l " +
+          sdp +
+          ", l " +
+          slen +
+          ", l " +
+          soff +
+          ", l " +
+          dst_a.qv.reg +
+          ", l " +
+          doff +
+          ", l " +
+          blen +
+          ")",
+        )
+        if !dst_a.borrowed {
+          qbe_rc_dec(g, dst_a.qv.reg, dst_a.qv.ty)
         }
-        let too_short = qbe_tmp(g)
-        let l_oob = qbe_lbl(g, "bvrf32_oob")
-        let l_chk = qbe_lbl(g, "bvrf32_chk")
-        let l_ok = qbe_lbl(g, "bvrf32_ok")
-        qbe_emit(g, too_short + " =w csltl " + blen + ", 4")
-        qbe_emit_term(g, "jnz " + too_short + ", " + l_oob + ", " + l_chk)
-        qbe_emit_lbl(g, l_chk)
-        let max_off = qbe_tmp(g)
-        let oob = qbe_tmp(g)
-        qbe_emit(g, max_off + " =l sub " + blen + ", 4")
-        qbe_emit(g, oob + " =w cugtl " + il + ", " + max_off)
-        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
-        qbe_emit_lbl(g, l_oob)
-        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
-        qbe_emit_term(g, "hlt")
-        qbe_emit_lbl(g, l_ok)
-        let dp = match g.hoisted_bytes_dp.get(obj_local_name) {
-          Some(hd) => hd
-          None => {
-            let pp = qbe_tmp(g)
-            let t = qbe_tmp(g)
-            qbe_emit(g, pp + " =l add " + obj_val + ", 8")
-            qbe_emit(g, t + " =l loadl " + pp)
-            t
-          }
-        }
-        let ep = qbe_tmp(g)
-        let fv = qbe_tmp(g)
-        qbe_emit(g, ep + " =l add " + dp + ", " + il)
-        qbe_emit(g, fv + " =s loads " + ep)
         if !obj_borrowed {
           qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
         }
-        return qval(fv, TFloat)
+        return qval("0", TUnit)
       }
       if method_name == "subview" {
         let a = qbe_emit_expr(g, args[0], Some(TInt))
@@ -40277,18 +40503,26 @@ fn qbe_probe_expr_ty_with(
         Some(TBytes) =>
           if mname == "length" {
             Some(TInt)
-          } else if mname == "read_i8" {
-            Some(TInt8)
-          } else if mname == "read_f32_le" {
-            Some(TFloat)
+          } else if is_bytes_read_method(mname) {
+            bytes_read_ret_ty(mname)
           } else if mname == "to_string" {
             Some(TString)
           } else {
             None
           }
-        Some(TStrView) | Some(TBytesView) =>
+        Some(TStrView) =>
           if mname == "length" {
             Some(TInt)
+          } else if mname == "to_string" {
+            Some(TString)
+          } else {
+            None
+          }
+        Some(TBytesView) =>
+          if mname == "length" {
+            Some(TInt)
+          } else if is_bytes_read_method(mname) {
+            bytes_read_ret_ty(mname)
           } else if mname == "to_string" {
             Some(TString)
           } else {

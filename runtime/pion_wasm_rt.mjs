@@ -1099,6 +1099,26 @@ export function createPionRuntime(options = {}) {
     if (n > 0 && dst && src) u8.copyWithin(dst, src + off, src + off + n);
   }
 
+  function pion_bytes_blit(srcData, srcLen, srcOff, dstObj, dstOff, len) {
+    const sl = BigInt(srcLen), so = BigInt(srcOff), doff = BigInt(dstOff), n = BigInt(len);
+    if (n < 0n || so < 0n || so > sl || n > sl - so) {
+      pion_panic_oob(so < 0n ? so : (n < 0n ? n : so + n), sl);
+    }
+    const pd = pNum(dstObj);
+    syncViews();
+    const dl = pd ? dv.getBigInt64(pd, true) : 0n;
+    if (!pd || doff < 0n || doff > dl || n > dl - doff) {
+      pion_panic_oob(doff < 0n ? doff : doff + n, dl);
+    }
+    if (dv.getBigInt64(pd + 8, true) < 0n) pionDie("cannot mutate read-only mmap Bytes");
+    const ni = Number(n);
+    if (ni > 0) {
+      const dst = Number(dv.getBigInt64(pd + 16, true));
+      const src = pNum(srcData);
+      u8.copyWithin(dst + Number(doff), src + Number(so), src + Number(so) + ni);
+    }
+  }
+
   // --- StringBuilder ---
   function pion_strbuf_new(cap) {
     const c = Math.max(Number(cap), 32);
@@ -2224,7 +2244,7 @@ export function createPionRuntime(options = {}) {
 
       // Bytes
       pion_bytes_new, pion_bytes_len, pion_bytes_get, pion_bytes_set,
-      pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr,
+      pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr, pion_bytes_blit,
 
       // StringBuilder
       pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_slice, pion_strbuf_push_byte,
