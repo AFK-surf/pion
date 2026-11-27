@@ -339,8 +339,35 @@ pub fn run_f63b() -> String {
     buf_len.to_string() + "|" + sib_ok.to_string()
 }
 
+fn pos_f6_4a_scalar_sort_nan_signed_zero() -> String {
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+  let ninf = -1.0 / 0.0
+  let xs : Array[Double] = [2.5, -0.0, nan, 0.0, -1.5, inf, ninf, -0.0, 0.0]
+  xs.sort()
+  let out : Array[String] = []
+  for x in xs {
+    if x.is_nan() {
+      out.push("nan")
+    } else if x == 0.0 {
+      if 1.0 / x < 0.0 {
+        out.push("-0")
+      } else {
+        out.push("+0")
+      }
+    } else if x == inf {
+      out.push("+inf")
+    } else if x == ninf {
+      out.push("-inf")
+    } else {
+      out.push(x.to_int().to_string())
+    }
+  }
+  out.join(",")
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero()
 }
 '''
 
@@ -813,6 +840,46 @@ pub fn run_pipe(xs : Array[Int]) -> Int? {
 }
 ''',
         "Array::search_by",
+    ),
+    (
+        "neg_f6_4a_block_iterable_shadow_param",
+        r'''
+struct Item {
+  xs : Array[Int]
+}
+impl Eq for Item with equal(self, _other) {
+  self.xs.clear()
+  true
+}
+fn bad_cmp(x : Int, items : Array[Item]) -> Bool {
+  for x in { let ys = items; ys } {
+    if x == x {
+      return true
+    }
+  }
+  false
+}
+pub fn run(xs : Array[Int], items : Array[Item]) -> Bool {
+  xs.iter().any(fn(x) { bad_cmp(x, items) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_f6_4a_for_map_param_new_by_callback",
+        r'''
+pub fn run(xs : Array[Int], ms : Array[Map[Int, Int]]) -> Bool {
+  xs.iter().any(fn(x) {
+    for m in ms {
+      if m.contains(x) {
+        return true
+      }
+    }
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
     ),
 ]
 
