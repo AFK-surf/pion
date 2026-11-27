@@ -75,63 +75,32 @@ fn fmt_write_indent(sb : StringBuilder, level : Int) -> Unit {
 }
 
 ///|
-/// Return the byte offset of the first unquoted, uncommented `#|` raw multiline
-/// string marker in `line[start..end)`, or `-1` if none exists.
-fn fmt_find_raw_multiline_pos(line : String, start : Int, end : Int) -> Int {
-  let mut i = start
-  while i < end {
-    let c = str_code_at(line, i)
-    if c == 47 && i + 1 < end && str_code_at(line, i + 1) == 47 {
-      return -1
-    }
-    if c == 34 || c == 39 {
-      i = i + 1
-      while i < end {
-        let sc = str_code_at(line, i)
-        i = i + 1
-        if sc == 92 && i < end {
-          i = i + 1
-        } else if sc == c {
-          break
-        }
-      }
-      continue
-    }
-    if c == 35 && i + 1 < end && str_code_at(line, i + 1) == 124 {
-      return i
-    }
-    i = i + 1
-  }
-  -1
-}
-
-///|
 /// Normalize intra-line horizontal whitespace outside string/char/byte literals
 /// and line comments (`//`), collapsing runs of spaces/tabs to a single space
-/// while preserving comments and literals verbatim.
-fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
+/// while preserving comments, literals, and `#|` raw multiline spans verbatim.
+/// Returns `(normalized_body, body_raw_pos)` where `body_raw_pos` is the byte
+/// offset of `#|` in `normalized_body` (or `-1` if the line has no `#|` span).
+fn fmt_normalize_line_body(
+  line : String,
+  start : Int,
+  end : Int,
+  raw_ml_pos : Int,
+) -> (String, Int) {
   let sb = StringBuilder()
   let utf8 = host_str_is_utf8()
+  let has_raw = raw_ml_pos >= start && raw_ml_pos < end
+  let norm_end = if has_raw { raw_ml_pos } else { end }
   let mut i = start
   let mut in_space = false
-  while i < end {
+  while i < norm_end {
     let c = str_code_at(line, i)
-    // Raw multiline string `#|...`: copy from `#|` to end of line verbatim
-    if c == 35 && i + 1 < end && str_code_at(line, i + 1) == 124 {
-      if in_space {
-        sb.write_char(' ')
-        in_space = false
-      }
-      sb_write_range(sb, line, i, end)
-      break
-    }
     // Line comment: copy rest of trimmed line verbatim
-    if c == 47 && i + 1 < end && str_code_at(line, i + 1) == 47 {
+    if c == 47 && i + 1 < norm_end && str_code_at(line, i + 1) == 47 {
       if in_space {
         sb.write_char(' ')
         in_space = false
       }
-      sb_write_range(sb, line, i, end)
+      sb_write_range(sb, line, i, norm_end)
       break
     }
     // String literal "..." or char / byte literal '...' (also covers the
@@ -143,10 +112,10 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
       }
       let lit_start = i
       i = i + 1
-      while i < end {
+      while i < norm_end {
         let sc = str_code_at(line, i)
         i = i + 1
-        if sc == 92 && i < end {
+        if sc == 92 && i < norm_end {
           i = i + 1
         } else if sc == c {
           break
@@ -172,7 +141,16 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
       i = i + str_scalar_len(line, i, utf8)
     }
   }
-  sb.to_string()
+  if has_raw {
+    if in_space {
+      sb.write_char(' ')
+    }
+    let body_raw_pos = sb.length()
+    sb_write_range(sb, line, raw_ml_pos, end)
+    (sb.to_string(), body_raw_pos)
+  } else {
+    (sb.to_string(), -1)
+  }
 }
 
 ///|
@@ -185,6 +163,30 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
 /// - strictly idempotent: `format_source(format_source(s)) == format_source(s)`
 pub fn format_source(source : String) -> String {
   let len = source.length()
+  // Single source of truth for `#|` raw multiline string spans: reuse lexer.pion directly
+  // so inline `#|` and nested string-interpolation `#|` (`"v=\{ #|... \n}"`) match lexer semantics.
+  let ls = lex_with_spans("<fmt>", source)
+  let raw_starts : Array[Int] = []
+  let raw_ends : Array[Int] = []
+  let mut ti = 0
+  let tlen = ls.tokens.length()
+  while ti < tlen {
+    let tok = ls.tokens[ti]
+    match tok.kind {
+      StringLit(_) =>
+        if tok.raw.length() >= 2 &&
+          str_code_at(tok.raw, 0) == 35 &&
+          str_code_at(tok.raw, 1) == 124 {
+          raw_starts.push(ls.starts[ti])
+          raw_ends.push(ls.ends[ti])
+        }
+      _ => ()
+    }
+    ti = ti + 1
+  }
+  let mut raw_idx = 0
+  let raw_count = raw_starts.length()
+
   let out = StringBuilder()
   let opener_indents : Array[Int] = []
   // 0 = delimiter `{`/`(`/`[`, 1 = JSX opening tag header `<Tag`, 2 = JSX element body `>...</Tag>`
@@ -208,7 +210,22 @@ pub fn format_source(source : String) -> String {
     while trim_start < line_end && fmt_is_hspace(str_code_at(source, trim_start)) {
       trim_start = trim_start + 1
     }
-    let raw_ml_pos = fmt_find_raw_multiline_pos(source, trim_start, line_end)
+    while raw_idx < raw_count && raw_ends[raw_idx] < line_start {
+      raw_idx = raw_idx + 1
+    }
+    let raw_ml_pos = if raw_idx < raw_count {
+      let ts = raw_starts[raw_idx]
+      let te = raw_ends[raw_idx]
+      if ts >= line_start && ts < line_end {
+        ts
+      } else if ts < line_start && te >= line_start {
+        trim_start
+      } else {
+        -1
+      }
+    } else {
+      -1
+    }
     if raw_ml_pos < 0 {
       // Strip trailing CR / spaces / tabs on non-`#|` lines
       while line_end > trim_start {
@@ -239,8 +256,9 @@ pub fn format_source(source : String) -> String {
       pending_blank = false
     }
 
-    let body = fmt_normalize_line_body(source, trim_start, line_end)
+    let (body, body_raw_pos) = fmt_normalize_line_body(source, trim_start, line_end, raw_ml_pos)
     let blen = body.length()
+    let scan_end = if body_raw_pos >= 0 { body_raw_pos } else { blen }
 
     // Consume leading closing delimiters (`}`, `)`, `]`, `</...>`, or multi-line JSX `>` / `/>`)
     let mut line_indent = cur_indent
@@ -297,24 +315,20 @@ pub fn format_source(source : String) -> String {
     let mut cur_base = line_indent
     let mut last_sig_char = if i > 0 { str_code_at(body, i - 1) } else { 0 }
     let mut last_sig_pos = if i > 0 { i - 1 } else { -1 }
-    while i < blen {
+    while i < scan_end {
       let c = str_code_at(body, i)
-      // Raw multiline string `#|...`: ignore rest of line for delimiter tracking
-      if c == 35 && i + 1 < blen && str_code_at(body, i + 1) == 124 {
-        break
-      }
       // Line comment: ignore rest of line for delimiter tracking
-      if c == 47 && i + 1 < blen && str_code_at(body, i + 1) == 47 {
+      if c == 47 && i + 1 < scan_end && str_code_at(body, i + 1) == 47 {
         break
       }
       // String literal
       if c == 34 {
         let start_q = i
         i = i + 1
-        while i < blen {
+        while i < scan_end {
           let sc = str_code_at(body, i)
           i = i + 1
-          if sc == 92 && i < blen {
+          if sc == 92 && i < scan_end {
             i = i + 1
           } else if sc == 34 {
             break
@@ -328,10 +342,10 @@ pub fn format_source(source : String) -> String {
       if c == 39 {
         let start_q = i
         i = i + 1
-        while i < blen {
+        while i < scan_end {
           let cc = str_code_at(body, i)
           i = i + 1
-          if cc == 92 && i < blen {
+          if cc == 92 && i < scan_end {
             i = i + 1
           } else if cc == 39 {
             break
