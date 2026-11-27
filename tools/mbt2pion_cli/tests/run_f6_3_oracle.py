@@ -383,11 +383,29 @@ fn pos_f6_4a_newline_paren_bracket_stmt() -> String {
 
 fn pos_f6_4a_mid_closure_local_map() -> String {
   let xs : Array[Int] = [0, 1, 2]
-  let mid = fn() -> Int? {
+  let ext : Map[Int, Int] = { 2: 9 }
+  let mid_local = fn() -> Int? {
     let m : Map[Int, Int] = { 1: 2 }
     xs.search_by(fn(x) { m.contains(x) })
   }
-  match mid() { Some(i) => i.to_string(); None => "none" }
+  let m_outer : Map[Int, Int] = { 1: 2 }
+  let mid_post = fn() -> Int? {
+    let found = xs.search_by(fn(x) { m_outer.contains(x) })
+    let m_outer : Map[Int, Int] = ext
+    let _ = m_outer.size()
+    found
+  }
+  let mid_closed_blk = fn(cond : Bool) -> Int? {
+    if cond {
+      let m_outer : Map[Int, Int] = ext
+      let _ = m_outer.size()
+    }
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let s1 = match mid_local() { Some(i) => i.to_string(); None => "none" }
+  let s2 = match mid_post() { Some(i) => i.to_string(); None => "none" }
+  let s3 = match mid_closed_blk(true) { Some(i) => i.to_string(); None => "none" }
+  s1 + "|" + s2 + "|" + s3
 }
 
 pub fn run_all() -> String {

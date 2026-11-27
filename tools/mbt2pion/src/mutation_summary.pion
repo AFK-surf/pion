@@ -3720,51 +3720,35 @@ fn ms_parse_fn_decl(
 // ---------------------------------------------------------------------------
 
 ///| Summarize any expression/block span `[s, e)` inside an enclosing function whose body opens at `fn_body_open`.
-///| Prune pattern-bound and reassigned idents at a single closure scope level `[s, e)`, skipping nested `fn(...) { ... }` bodies.
-fn ms_prune_scope_level(
+///| Flush one lexically visible prefix segment `[seg_s, seg_e)` inside an enclosing closure into `vt` and `pmv`.
+fn ms_flush_enclosing_prefix_seg(
+  pkg : PkgMutationSummary,
   tokens : Array[Token],
-  s : Int,
-  e : Int,
+  seg_s : Int,
+  seg_e : Int,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
   vt : Map[String, String],
   pmv : Map[String, Bool],
+  callables : Map[String, Bool],
+  active_generics : Map[String, Bool],
 ) -> Unit {
+  if seg_e <= seg_s {
+    return
+  }
+  ms_collect_local_var_types(pkg, tokens, seg_s, seg_e, content, qfi_opt, vt, pmv, callables, active_generics)
   let sh : Map[String, Bool] = Map()
-  let reass : Map[String, Bool] = Map()
-  let mut seg_s = s
-  let mut i = s
-  while i < e {
-    if tokens[i].raw == "fn" && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen {
-      let cp = find_matching_delim(tokens, i + 1)
-      let mut lb = cp + 1
-      while lb < e && tokens[lb].kind != TokenKind::LBrace && tokens[lb].kind != TokenKind::Semi && tokens[lb].kind != TokenKind::RBrace {
-        lb = lb + 1
-      }
-      if lb < e && tokens[lb].kind == TokenKind::LBrace {
-        let rb = find_matching_delim(tokens, lb)
-        if rb > lb {
-          if i > seg_s {
-            ms_collect_pattern_bound_idents_in_span_ex(tokens, seg_s, i, sh, false)
-            ms_collect_reassigned_idents(tokens, seg_s, i, reass)
-          }
-          i = rb + 1
-          seg_s = i
-          continue
-        }
-      }
-    }
-    i = i + 1
-  }
-  if e > seg_s {
-    ms_collect_pattern_bound_idents_in_span_ex(tokens, seg_s, e, sh, false)
-    ms_collect_reassigned_idents(tokens, seg_s, e, reass)
-  }
+  ms_collect_pattern_bound_idents_in_span_ex(tokens, seg_s, seg_e, sh, false)
   ms_mark_shadowed_ambig(vt, sh)
   ms_prune_pure_map_vars(pmv, sh)
+  let reass : Map[String, Bool] = Map()
+  ms_collect_reassigned_idents(tokens, seg_s, seg_e, reass)
   ms_prune_pure_map_vars(pmv, reass)
 }
 
 ///| Apply lexical bindings, params, shadowing, and reassignments from every intermediate closure
-///| strictly enclosing `[target_s, target_e)` inside `[fn_body_open + 1, body_close)` (outer to inner).
+///| strictly enclosing `[target_s, target_e)` inside `[fn_body_open + 1, body_close)` (outer to inner),
+///| scanning only lexically visible prefix segments before `target_s` (skipping closed blocks and post-call code).
 fn ms_apply_enclosing_closures(
   pkg : PkgMutationSummary,
   tokens : Array[Token],
@@ -3779,8 +3763,10 @@ fn ms_apply_enclosing_closures(
   callables : Map[String, Bool],
   active_generics : Map[String, Bool],
 ) -> Unit {
+  let mut in_closure = false
+  let mut seg_s = fn_body_open + 1
   let mut i = fn_body_open + 1
-  while i < body_close {
+  while i < target_s && i < body_close {
     if tokens[i].raw == "fn" && i + 1 < body_close && tokens[i + 1].kind == TokenKind::LParen {
       let cp = find_matching_delim(tokens, i + 1)
       let mut lb = cp + 1
@@ -3790,6 +3776,9 @@ fn ms_apply_enclosing_closures(
       if lb < body_close && tokens[lb].kind == TokenKind::LBrace {
         let rb = find_matching_delim(tokens, lb)
         if rb > lb {
+          if in_closure && i > seg_s {
+            ms_flush_enclosing_prefix_seg(pkg, tokens, seg_s, i, content, qfi_opt, vt, pmv, callables, active_generics)
+          }
           if lb < target_s && target_e <= rb {
             let pnames = collect_pion_fn_param_names(tokens, i + 1, cp)
             for pn in pnames {
@@ -3798,18 +3787,55 @@ fn ms_apply_enclosing_closures(
                 let _ = pmv.remove(pn)
               }
             }
-            ms_collect_local_var_types(pkg, tokens, lb + 1, rb, content, qfi_opt, vt, pmv, callables, active_generics)
-            ms_prune_scope_level(tokens, lb + 1, rb, vt, pmv)
+            in_closure = true
             i = lb + 1
+            seg_s = i
             continue
           } else {
             i = rb + 1
+            seg_s = i
             continue
           }
         }
       }
     }
+    if in_closure && tokens[i].kind == TokenKind::LBrace {
+      let blk_close = find_matching_delim(tokens, i)
+      if blk_close > i {
+        if blk_close < target_s {
+          // Expression literal `{ ... }` (e.g. `let m = { 1: 2 }`, `S::{ ... }`) stays in the current segment;
+          // closed control/statement blocks (`if c { let m = ext }`, `None => { ... }`) are skipped completely.
+          let is_expr_brace = i > seg_s && (
+            tokens[i - 1].kind == TokenKind::Eq ||
+            tokens[i - 1].kind == TokenKind::ColonColon ||
+            tokens[i - 1].kind == TokenKind::LParen ||
+            tokens[i - 1].kind == TokenKind::LBracket ||
+            tokens[i - 1].kind == TokenKind::Comma
+          )
+          if is_expr_brace {
+            i = blk_close + 1
+            continue
+          }
+          if i > seg_s {
+            ms_flush_enclosing_prefix_seg(pkg, tokens, seg_s, i, content, qfi_opt, vt, pmv, callables, active_generics)
+          }
+          i = blk_close + 1
+          seg_s = i
+          continue
+        } else if i < target_s && target_e <= blk_close {
+          if i > seg_s {
+            ms_flush_enclosing_prefix_seg(pkg, tokens, seg_s, i, content, qfi_opt, vt, pmv, callables, active_generics)
+          }
+          i = i + 1
+          seg_s = i
+          continue
+        }
+      }
+    }
     i = i + 1
+  }
+  if in_closure && target_s > seg_s {
+    ms_flush_enclosing_prefix_seg(pkg, tokens, seg_s, target_s, content, qfi_opt, vt, pmv, callables, active_generics)
   }
 }
 
