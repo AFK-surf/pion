@@ -810,8 +810,10 @@ fn r23_flip(b : Bool) -> Bool {
   b
 }
 
-fn r23_keep(_a : Bool, b : Bool) -> Bool {
-  b
+let r24_x : Int = 3
+
+fn r24_keep_eq(b : Bool, v : Int) -> Bool {
+  b && v == 42
 }
 
 fn pick_r23_is_pipe_cmp(r23_flip : (Bool) -> Bool) -> Int {
@@ -836,12 +838,40 @@ fn pick_r23_nested_parens_is_and(cb : (Int) -> Int) -> Int {
   if b { 9 } else { 0 }
 }
 
-fn pick_r23_if_pipe_paren() -> Int {
-  if (true |> r23_keep(false, _)) { 9 } else { 0 }
+fn pick_r24_pipe_after_is_and(r24_x : Int) -> Int {
+  fn rec(n : Int) -> Int {
+    if n == 0 {
+      r24_x
+    } else if n == 1 {
+      let b = (Some(7) is Some(r24_x)) && r24_x == 7 |> r24_keep_eq(r24_x)
+      if b { 9 } else { 0 }
+    } else {
+      rec(n - 1)
+    }
+  }
+  rec(2)
 }
 
-fn pick_r23_if_pipe_bare() -> Int {
-  if (Some(1) is Some(_x)) && (true |> r23_keep(false, _)) { 9 } else { 0 }
+fn pick_r24_if_pipe_after_is_and(r24_x : Int) -> Int {
+  fn rec(n : Int) -> Int {
+    if n == 0 {
+      r24_x
+    } else if n == 1 {
+      if ((Some(7) is Some(r24_x)) && r24_x == 7 |> r24_keep_eq(r24_x)) { 9 } else { 0 }
+    } else {
+      rec(n - 1)
+    }
+  }
+  rec(2)
+}
+
+fn pick_r24_tuple_is_and(cb : (Int) -> Int) -> Int {
+  fn walk(n : Int) -> Int {
+    if n == 0 { 1 } else { walk(n - 1) }
+  }
+  let a = ((Some(cb) is Some(walk)) && walk(0) == 9, true).0
+  let b = (true, (Some(cb) is Some(walk)) && walk(0) == 9).1
+  if a && b { 9 } else { 0 }
 }
 
 fn pick_r19_ascribe_rec() -> Int {
@@ -1228,12 +1258,13 @@ fn case_r5_paren_and_guard() -> String {
   let p92 = pick_r22_or_and_is(fn(_x) { 9 })
   let p93 = pick_r22_is_and_if_rhs(fn(_x) { 9 })
   let p94 = pick_r22_def_bang_and_is(g=false)
-  // R23: is-pattern terminator before |>/>/<=, multi-nested parens is-&&, if placeholder pipe (paren & bare)
+  // R23/R24: is-pattern terminator before |>/>/<=, multi-nested parens is-&&, pipe after is-&&, tuple element is-&&
   let p95 = pick_r23_is_pipe_cmp(fn(b) { !b })
   let p96 = pick_r23_nested_parens_is_and(fn(_x) { 9 })
-  let p97 = pick_r23_if_pipe_paren()
-  let p98 = pick_r23_if_pipe_bare()
-  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string() + "," + p78.to_string() + "," + p79.to_string() + "," + p80.to_string() + "," + p81.to_string() + "," + p82.to_string() + "," + p83.to_string() + "," + p84.to_string() + "," + p85.to_string() + "," + p86.to_string() + "," + p87.to_string() + "," + p88.to_string() + "," + p89.to_string() + "," + p90.to_string() + "," + p91.to_string() + "," + p92.to_string() + "," + p93.to_string() + "," + p94.to_string() + "," + p95.to_string() + "," + p96.to_string() + "," + p97.to_string() + "," + p98.to_string()
+  let p97 = pick_r24_pipe_after_is_and(42)
+  let p98 = pick_r24_if_pipe_after_is_and(42)
+  let p99 = pick_r24_tuple_is_and(fn(_x) { 9 })
+  p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + top_shadow_block.to_string() + "," + top_shadow_match.to_string() + "," + p4.to_string() + "," + p5.to_string() + "," + p6.to_string() + "," + p7.to_string() + "," + p8.to_string() + "," + p9.to_string() + "," + p10.to_string() + "," + p11.to_string() + "," + p12.to_string() + "," + p13.to_string() + "," + p14.to_string() + "," + p15.to_string() + "," + p16.to_string() + "," + p17.to_string() + "," + p18.to_string() + "," + p19.to_string() + "," + p20.to_string() + "," + p21.to_string() + "," + p22.to_string() + "," + p23.to_string() + "," + p24.to_string() + "," + p25.to_string() + "," + p26.to_string() + "," + p27.to_string() + "," + p28.to_string() + "," + p29.to_string() + "," + p30.to_string() + "," + p31.to_string() + "," + p32.to_string() + "," + p33.to_string() + "," + p34.to_string() + "," + p35.to_string() + "," + p36.to_string() + "," + p37.to_string() + "," + p38.to_string() + "," + p39.to_string() + "," + p40.to_string() + "," + p41.to_string() + "," + p42.to_string() + "," + p43.to_string() + "," + p44.to_string() + "," + p45.to_string() + "," + p46.to_string() + "," + p47.to_string() + "," + p48.to_string() + "," + p49.to_string() + "," + p50.to_string() + "," + p51.to_string() + "," + p52.to_string() + "," + p53.to_string() + "," + p54.to_string() + "," + p55.to_string() + "," + p56.to_string() + "," + p57.to_string() + "," + p58.to_string() + "," + p59.to_string() + "," + p60.to_string() + "," + p61.to_string() + "," + p62.to_string() + "," + p63.to_string() + "," + p64.to_string() + "," + p65.to_string() + "," + p66.to_string() + "," + p67.to_string() + "," + p68.to_string() + "," + p69.to_string() + "," + p70.to_string() + "," + p71.to_string() + "," + p72.to_string() + "," + p73.to_string() + "," + p74.to_string() + "," + p75.to_string() + "," + p76.to_string() + "," + p77.to_string() + "," + p78.to_string() + "," + p79.to_string() + "," + p80.to_string() + "," + p81.to_string() + "," + p82.to_string() + "," + p83.to_string() + "," + p84.to_string() + "," + p85.to_string() + "," + p86.to_string() + "," + p87.to_string() + "," + p88.to_string() + "," + p89.to_string() + "," + p90.to_string() + "," + p91.to_string() + "," + p92.to_string() + "," + p93.to_string() + "," + p94.to_string() + "," + p95.to_string() + "," + p96.to_string() + "," + p97.to_string() + "," + p98.to_string() + "," + p99.to_string()
 }
 
 pub fn case_r4_semantics() -> String {
@@ -1456,7 +1487,7 @@ def main():
         # 3. Run Pion native & Pion wasm32 and assert 4-target equality
         pion_nat = run_cmd([args.pionc, "run", p_dn]).stdout.strip()
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", p_dn]).stdout.strip()
-        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31,9,9,91,91,91,9,91,9,91,84,9,17,91,9,9,9,1,111,9,9,9"
+        expected = "X:31,-14,5,203,1,0\nR:50,40,60,50,209,5,103,7\nI:v=9|err|15:2\nH:24,12,6,11\nU:77,-21\nS:7,1,8,55,2|42,42,7,42,42,7,42,9,7,7,7,7,42,42,42,7,7,7,7,0,7,0,0,0,0,7,7,30,7,7,7,4,4,42,42,7,42,7,42,7,52,42,7,12,12,42,9,9,9,2,2,2,8,8,1,4,1,1,1,1,1,1,7,1,1,3,4,1,1,8,8,1,1,42,42,1,1,1,31,9,9,91,91,91,9,91,9,91,84,9,17,91,9,9,9,1,111,9,9,9,9"
         assert moon_nat == expected, f"Expected mismatch:\nGOT:\n{moon_nat}\nEXP:\n{expected}"
         assert pion_nat == moon_nat and pion_wasm == moon_nat, (
             f"4-target mismatch:\nMoon-nat:\n{moon_nat}\nMoon-wgc:\n{moon_wgc}\nPion-nat:\n{pion_nat}\nPion-wasm:\n{pion_wasm}"
@@ -1815,6 +1846,12 @@ def main():
             "fn r23_is_val(cb : (Int) -> Int) -> Int {\n"
             "  if Some(cb) is Some(val) { val_(0) * 10 + val(1) } else { 0 }\n"
             "}\n"
+            "fn r24_self_tramp_val() -> Int {\n"
+            "  fn val(n : Int) -> Int {\n"
+            "    if n == 0 { 1 } else { (val : (Int) -> Int)(n - 1) + val_(0) }\n"
+            "  }\n"
+            "  val(1)\n"
+            "}\n"
             'pub fn run_pure() -> String {\n'
             '  let a = if flag { 1 } else { 0 }\n'
             '  let b = if val1() { 1 } else { 0 }\n'
@@ -1822,7 +1859,8 @@ def main():
             '  let d = r19_val_selfrec()\n'
             '  let e = r23_nonrec_val()\n'
             '  let f = r23_is_val(fn(_x) { 1 })\n'
-            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string() + "," + f.to_string()\n'
+            '  let g = r24_self_tramp_val()\n'
+            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string() + "," + f.to_string() + "," + g.to_string()\n'
             '}\n'
         )
         for rel, txt in [
@@ -1836,7 +1874,7 @@ def main():
                 f.write(txt)
         pure_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=pure_m).stdout.strip()
         pure_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=pure_m).stdout.strip()
-        assert pure_mn == "0,0,5,1,991,991" and pure_mw == "0,0,5,1,991,991", f"R12/R19/R23 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
+        assert pure_mn == "0,0,5,1,991,991,100" and pure_mw == "0,0,5,1,991,991,100", f"R12/R19/R23/R24 pure pkg Moon mismatch: nat={pure_mn!r} wgc={pure_mw!r}"
 
         pure_pout = os.path.join(work, "pure_is_pion")
         os.makedirs(os.path.join(pure_pout, "src"))
@@ -1847,10 +1885,70 @@ def main():
             f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_pure())\n  0\n}\n")
         pure_pn = run_cmd([args.pionc, "run", pure_pout]).stdout.strip()
         pure_pw = run_cmd([args.pionc, "run", "--target", "wasm32", pure_pout]).stdout.strip()
-        assert pure_pn == "0,0,5,1,991,991" and pure_pw == "0,0,5,1,991,991", f"R12/R19/R23 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
-        print("[f6-1-oracle] PASS R12/R19/R23 pure no-error-keyword pkg (val_/val self-rec, nonrec val, is Some(val)): 4-target == 0,0,5,1,991,991")
+        assert pure_pn == "0,0,5,1,991,991,100" and pure_pw == "0,0,5,1,991,991,100", f"R12/R19/R23/R24 pure pkg Pion mismatch: nat={pure_pn!r} wasm={pure_pw!r}"
+        print("[f6-1-oracle] PASS R12/R19/R23/R24 pure pkg (val_ top-level): 4-target == 0,0,5,1,991,991,100")
 
-        # 3b. Legacy `try?` + `try!` publish & Pion native == Pion wasm32 execution check
+        # 3a-9. R24 4-target check: package-level `fn val` isolated from local `fn val_` / `let val_` / `Some(val_)` / param `val_` / self-trampoline
+        valkw_m = os.path.join(work, "valkw_moon")
+        for sub in ("vk", "cmd"):
+            os.makedirs(os.path.join(valkw_m, sub))
+        valkw_src = (
+            "fn val(_n : Int) -> Int { 9 }\n"
+            "fn r24_nonrec_val_() -> Int {\n"
+            "  fn val_(_n : Int) -> Int { 1 }\n"
+            "  val(0) * 10 + val_(1)\n"
+            "}\n"
+            "fn r24_let_val_() -> Int {\n"
+            "  let val_ = fn(_n : Int) { 1 }\n"
+            "  val(0) * 10 + val_(1)\n"
+            "}\n"
+            "fn r24_is_val_(cb : (Int) -> Int) -> Int {\n"
+            "  if Some(cb) is Some(val_) { val(0) * 10 + val_(1) } else { 0 }\n"
+            "}\n"
+            "fn r24_param_val_(val_ : (Int) -> Int) -> Int {\n"
+            "  val(0) * 10 + val_(1)\n"
+            "}\n"
+            "fn r24_self_tramp_val_() -> Int {\n"
+            "  fn val_(n : Int) -> Int {\n"
+            "    if n == 0 { 1 } else { (val_ : (Int) -> Int)(n - 1) + val(0) }\n"
+            "  }\n"
+            "  val_(1)\n"
+            "}\n"
+            'pub fn run_vk() -> String {\n'
+            '  let a = r24_nonrec_val_()\n'
+            '  let b = r24_let_val_()\n'
+            '  let c = r24_is_val_(fn(_x) { 1 })\n'
+            '  let d = r24_param_val_(fn(_x) { 1 })\n'
+            '  let e = r24_self_tramp_val_()\n'
+            '  a.to_string() + "," + b.to_string() + "," + c.to_string() + "," + d.to_string() + "," + e.to_string()\n'
+            '}\n'
+        )
+        for rel, txt in [
+            ("moon.mod", 'name = "f6/vk"\n'),
+            ("vk/moon.pkg", "\n"),
+            ("vk/vk.mbt", valkw_src),
+            ("cmd/moon.pkg", 'import { "f6/vk/vk" }\noptions("is-main": true)\n'),
+            ("cmd/main.mbt", "fn main { println(@vk.run_vk()) }\n"),
+        ]:
+            with open(os.path.join(valkw_m, rel), "w") as f:
+                f.write(txt)
+        vk_mn = run_cmd([args.moon, "run", "--target", "native", "cmd"], cwd=valkw_m).stdout.strip()
+        vk_mw = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd"], cwd=valkw_m).stdout.strip()
+        assert vk_mn == "91,91,91,91,10" and vk_mw == "91,91,91,91,10", f"R24 valkw Moon mismatch: nat={vk_mn!r} wgc={vk_mw!r}"
+
+        vk_pout = os.path.join(work, "valkw_pion")
+        os.makedirs(os.path.join(vk_pout, "src"))
+        with open(os.path.join(vk_pout, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "vk"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n')
+        run_cmd([bin_path, "--src", os.path.join(valkw_m, "vk"), "--out", os.path.join(vk_pout, "src"), "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc])
+        with open(os.path.join(vk_pout, "src", "main.pion"), "w") as f:
+            f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_vk())\n  0\n}\n")
+        vk_pn = run_cmd([args.pionc, "run", vk_pout]).stdout.strip()
+        vk_pw = run_cmd([args.pionc, "run", "--target", "wasm32", vk_pout]).stdout.strip()
+        assert vk_pn == "91,91,91,91,10" and vk_pw == "91,91,91,91,10", f"R24 valkw Pion mismatch: nat={vk_pn!r} wasm={vk_pw!r}"
+        print("[f6-1-oracle] PASS R24 pkg-level `fn val` vs local `val_` & self_trampoline: 4-target == 91,91,91,91,10")
+
+        # 3b. Legacy `try?` + `try!` + placeholder pipe `x |> f(..., _)` publish & Pion native == Pion wasm32 execution check
         tq_src = os.path.join(work, "tq_src")
         tq_out = os.path.join(work, "tq_out")
         os.makedirs(tq_src)
@@ -1861,11 +1959,23 @@ def main():
             f.write(
                 "priv suberror E { Bad(Int) }\n"
                 "fn check_e(x : Int) -> Int raise E { if x < 0 { raise Bad(x * -1) }; x + 1 }\n"
+                "fn r23_keep(_a : Bool, b : Bool) -> Bool { b }\n"
+                "let r24_px : Int = 3\n"
+                "fn r24_yes(r24_px~ : Int, b : Bool) -> Bool { b && r24_px == 42 }\n"
+                "fn pick_r24_pipe_shorthand(r24_px : Int) -> Int {\n"
+                "  fn rec(n : Int) -> Int {\n"
+                "    if n == 0 { r24_px } else if n == 1 { if (true |> r24_yes(r24_px~, _)) { 9 } else { 0 } } else { rec(n - 1) }\n"
+                "  }\n"
+                "  rec(2)\n"
+                "}\n"
                 "pub fn run_tq() -> String {\n"
                 "  let a = match (try? check_e(4)) { Ok(v) => v; Err(_) => -1 }\n"
                 "  let b = match (try? check_e(-3)) { Ok(v) => v; Err(Bad(n)) => n + 100 }\n"
                 "  let c = try! check_e(6)\n"
-                "  a.to_string() + \",\" + b.to_string() + \",\" + c.to_string()\n"
+                "  let d = if (true |> r23_keep(false, _)) { 9 } else { 0 }\n"
+                "  let e = if (Some(1) is Some(_x)) && (true |> r23_keep(false, _)) { 9 } else { 0 }\n"
+                "  let f = pick_r24_pipe_shorthand(42)\n"
+                "  a.to_string() + \",\" + b.to_string() + \",\" + c.to_string() + \",\" + d.to_string() + \",\" + e.to_string() + \",\" + f.to_string()\n"
                 "}\n"
             )
         with open(os.path.join(tq_out, "pion.toml"), "w") as f:
@@ -1875,8 +1985,8 @@ def main():
             f.write("pub fn main(w : World) -> Int {\n  io_println(w, run_tq())\n  0\n}\n")
         tq_nat = run_cmd([args.pionc, "run", tq_out]).stdout.strip()
         tq_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", tq_out]).stdout.strip()
-        assert tq_nat == "5,103,7" and tq_wasm == "5,103,7", f"try?/try! mismatch: nat={tq_nat!r} wasm={tq_wasm!r}"
-        print("[f6-1-oracle] PASS: legacy `try?` + `try!` publish (pion native == pion wasm32): " + tq_nat)
+        assert tq_nat == "5,103,7,9,9,9" and tq_wasm == "5,103,7,9,9,9", f"legacy try?/try!/pipe mismatch: nat={tq_nat!r} wasm={tq_wasm!r}"
+        print("[f6-1-oracle] PASS: legacy `try?` + `try!` + placeholder pipe publish (pion native == pion wasm32): " + tq_nat)
 
         # 4. Negative fail-closed cases: publish MUST exit non-0 and report MBT2PION_UNSUPPORTED_SYNTAX
         for name, src in NEGATIVE_CASES:
