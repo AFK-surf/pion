@@ -1689,16 +1689,52 @@ fn resolve_anon_struct_literal_name(
     if bi > 0 { raw_exp.slice(0, bi).trim() } else { raw_exp }
   }
   if has_spread {
-    let raw_base = if base_s > 0 && base_e > base_s {
+    let mut raw_base = if base_s > 0 && base_e > base_s {
       infer_simple_expr_type(ctx, tokens, base_s, base_e).trim()
     } else {
       ""
+    }
+    // Static constructor call base: `@pkg.Type::ctor(...)`, `pkg::Type::ctor(...)`, or `Type::ctor(...)`
+    // Only accepted when `Type` is a known local struct or verified `--dep` ABI struct whose fields
+    // contain all overridden fields (strictly fail-closed on unknown types or mismatched fields).
+    let mut base_from_static_ctor = false
+    if raw_base.length() == 0 && base_s > 0 && base_e > base_s {
+      let bt0 = tokens[base_s]
+      if bt0.kind == TokenKind::PkgRef && base_s + 5 < base_e &&
+      tokens[base_s + 1].kind == TokenKind::Dot &&
+      tokens[base_s + 2].kind == TokenKind::UpperIdent &&
+      tokens[base_s + 3].kind == TokenKind::ColonColon &&
+      tokens[base_s + 4].kind == TokenKind::Ident &&
+      tokens[base_s + 5].kind == TokenKind::LParen &&
+      find_matching_delim(tokens, base_s + 5) == base_e - 1 {
+        let raw_pkg = bt0.raw.slice(1, bt0.raw.length())
+        let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
+        raw_base = mapped_pkg + "::" + tokens[base_s + 2].raw
+        base_from_static_ctor = true
+      } else if bt0.kind == TokenKind::Ident && base_s + 5 < base_e &&
+      tokens[base_s + 1].kind == TokenKind::ColonColon &&
+      tokens[base_s + 2].kind == TokenKind::UpperIdent &&
+      tokens[base_s + 3].kind == TokenKind::ColonColon &&
+      tokens[base_s + 4].kind == TokenKind::Ident &&
+      tokens[base_s + 5].kind == TokenKind::LParen &&
+      find_matching_delim(tokens, base_s + 5) == base_e - 1 {
+        let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, bt0.raw)
+        raw_base = mapped_pkg + "::" + tokens[base_s + 2].raw
+        base_from_static_ctor = true
+      } else if bt0.kind == TokenKind::UpperIdent && base_s + 3 < base_e &&
+      tokens[base_s + 1].kind == TokenKind::ColonColon &&
+      tokens[base_s + 2].kind == TokenKind::Ident &&
+      tokens[base_s + 3].kind == TokenKind::LParen &&
+      find_matching_delim(tokens, base_s + 3) == base_e - 1 {
+        raw_base = bt0.raw
+        base_from_static_ctor = true
+      }
     }
     let base_name = {
       let bi = raw_base.index_of("[")
       if bi > 0 { raw_base.slice(0, bi).trim() } else { raw_base }
     }
-    let resolve_struct_cand = fn(raw_cand : String) -> String {
+    let resolve_struct_cand = fn(raw_cand : String, require_known_foreign : Bool) -> String {
       if raw_cand.length() == 0 {
         return ""
       }
@@ -1719,11 +1755,37 @@ fn resolve_anon_struct_literal_name(
           }
           cand
         }
-        None => if str_has(cand, "::") { cand } else { "" }
+        None =>
+        if str_has(cand, "::") {
+          if require_known_foreign {
+            match symtab_query_foreign_struct_update(ctx.symtab, cand) {
+              ForeignStructUpdateInfo::Expandable(schema) => {
+                for f in fields {
+                  let mut found_f = false
+                  for sf in schema.fields {
+                    if sf.src_name == f {
+                      found_f = true
+                      break
+                    }
+                  }
+                  if !found_f {
+                    return ""
+                  }
+                }
+                cand
+              }
+              _ => ""
+            }
+          } else {
+            cand
+          }
+        } else {
+          ""
+        }
       }
     }
-    let resolved_base = resolve_struct_cand(base_name)
-    let resolved_exp = resolve_struct_cand(exp_base)
+    let resolved_base = resolve_struct_cand(base_name, base_from_static_ctor)
+    let resolved_exp = resolve_struct_cand(exp_base, false)
     if resolved_base.length() > 0 && resolved_exp.length() > 0 && resolved_base != resolved_exp {
       return None
     }
@@ -4200,15 +4262,22 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       }
     }
   }
-  // Method `.last()` / `.get(...)` on local container -> `Option[T]`
+  // Method `.remove(...)` on local Array -> element type `T`; `.last()` / `.get(...)` / `.pop()` -> `Option[T]`
   if t.kind == TokenKind::Ident && start + 3 < end && tokens[start + 1].kind == TokenKind::Dot &&
-  (tokens[start + 2].raw == "last" || tokens[start + 2].raw == "get") &&
+  (tokens[start + 2].raw == "remove" || tokens[start + 2].raw == "last" || tokens[start + 2].raw == "get" || tokens[start + 2].raw == "pop") &&
   tokens[start + 3].kind == TokenKind::LParen && find_matching_delim(tokens, start + 3) == end - 1 {
     let base_ty = lookup_ident_static_type(ctx, t.raw)
     if base_ty.length() > 0 {
       let ety = extract_container_value_type(base_ty)
       if ety.length() > 0 {
-        return "Option[" + ety + "]"
+        if tokens[start + 2].raw == "remove" {
+          let base_clean = strip_type_args_sym(base_ty)
+          if base_clean == "Array" || base_clean == "ArrayBuf" || base_clean == "mbt_compat::ArrayBuf" {
+            return ety
+          }
+        } else {
+          return "Option[" + ety + "]"
+        }
       }
     }
   }
@@ -4233,11 +4302,18 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
           }
         }
         if start + 5 < end && tokens[start + 3].kind == TokenKind::Dot &&
-        (tokens[start + 4].raw == "last" || tokens[start + 4].raw == "get") &&
+        (tokens[start + 4].raw == "remove" || tokens[start + 4].raw == "last" || tokens[start + 4].raw == "get" || tokens[start + 4].raw == "pop") &&
         tokens[start + 5].kind == TokenKind::LParen && find_matching_delim(tokens, start + 5) == end - 1 {
           let ety = extract_container_value_type(cur_ty)
           if ety.length() > 0 {
-            return "Option[" + ety + "]"
+            if tokens[start + 4].raw == "remove" {
+              let cur_clean = strip_type_args_sym(cur_ty)
+              if cur_clean == "Array" || cur_clean == "ArrayBuf" || cur_clean == "mbt_compat::ArrayBuf" {
+                return ety
+              }
+            } else {
+              return "Option[" + ety + "]"
+            }
           }
         }
         if start + 5 < end && tokens[start + 3].kind == TokenKind::Dot && tokens[start + 4].raw == "values" {
@@ -12907,6 +12983,17 @@ fn lower_match_arms_with_ty(
           }
           if ee == ei + 1 && tokens[ei].kind == TokenKind::DotDot {
             if seen_rest { invalid_rest = true } else { seen_rest = true; has_rest = true }
+          } else if ee == ei + 2 && tokens[ei].kind == TokenKind::DotDot &&
+          (tokens[ei + 1].kind == TokenKind::Ident || tokens[ei + 1].kind == TokenKind::Underscore) {
+            if seen_rest {
+              invalid_rest = true
+            } else {
+              seen_rest = true
+              has_rest = true
+              if tokens[ei + 1].kind == TokenKind::Ident && tokens[ei + 1].raw != "_" {
+                rest_as_var = resolve_ident_in_scope(ctx, tokens[ei + 1].raw)
+              }
+            }
           } else if ee == ei + 3 && tokens[ei].kind == TokenKind::DotDot &&
           tokens[ei + 1].kind == TokenKind::Keyword && tokens[ei + 1].raw == "as" &&
           (tokens[ei + 2].kind == TokenKind::Ident || tokens[ei + 2].kind == TokenKind::Underscore) {
@@ -13925,6 +14012,17 @@ fn lower_match_arms_with_ty(
             } else {
               seen_rest = true
               has_rest = true
+            }
+          } else if ee == ei + 2 && tokens[ei].kind == TokenKind::DotDot &&
+          (tokens[ei + 1].kind == TokenKind::Ident || tokens[ei + 1].kind == TokenKind::Underscore) {
+            if seen_rest {
+              invalid_rest = true
+            } else {
+              seen_rest = true
+              has_rest = true
+              if tokens[ei + 1].kind == TokenKind::Ident && tokens[ei + 1].raw != "_" {
+                rest_as_var = resolve_ident_in_scope(ctx, tokens[ei + 1].raw)
+              }
             }
           } else if ee == ei + 3 && tokens[ei].kind == TokenKind::DotDot &&
           tokens[ei + 1].kind == TokenKind::Keyword && tokens[ei + 1].raw == "as" &&

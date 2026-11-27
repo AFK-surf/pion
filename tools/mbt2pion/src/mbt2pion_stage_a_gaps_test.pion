@@ -1,0 +1,241 @@
+///| Unit tests for Stage A & lower_error gap fixes:
+///| 1. Struct update `{ ..base, ... }` static constructor & `Array::remove` type propagation (fail-closed)
+///| 2. Array rest pattern `[step, .. rest] if guard => ...` (2-token rest binding without `as`)
+///| 3. Top-level `let` non-raising closure containing `try`/`catch` & stdlib raising calls with known `--dep` args
+
+///|
+test "stage_a_gaps: struct update via cross-pkg/local static ctor and Array::remove" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "optpkg",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  // 1. Cross-package verified `--dep` ABI v2 struct with static constructor `@optpkg.Options::default()`
+  let dep_src = SourceFile::{
+    rel_path: "opts.mbt",
+    content: "pub(all) struct Options {\n  fonts : Int\n  font_family : String\n}\npub fn Options::default() -> Options {\n  { fonts: 0, font_family: \"\" }\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep optpkg transpiles cleanly")
+
+  let user_src = SourceFile::{
+    rel_path: "use_opts.mbt",
+    content: "pub fn make_opts(fonts : Int, own : String) -> @optpkg.Options {\n  { ..@optpkg.Options::default(), fonts, font_family: own }\n}\n",
+    is_test: false,
+  }
+  let user_res = transpile_package_with_abis([user_src], empty_api_map(), default_recipes(), [], [], [], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  assert_true(user_res.blockers == 0, "cross-pkg static ctor struct update has 0 blockers")
+  let mut user_out = ""
+  for f in user_res.files {
+    if f.rel_path == "use_opts.pion" {
+      user_out = f.content
+    }
+  }
+  assert_true(str_has(user_out, "optpkg::Options::{"), "cross-pkg static ctor resolves to optpkg::Options::")
+
+  // 2. Fail-closed: unknown package static ctor without `--dep` ABI MUST emit MBT2PION_AMBIGUOUS_STRUCT_UPDATE
+  let bad_unk_src = SourceFile::{
+    rel_path: "bad_unk.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@missing.Options::default(), fonts: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_unk_res = transpile_package([bad_unk_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_unk = false
+  for d in bad_unk_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_unk = true
+    }
+  }
+  assert_true(saw_ambig_unk, "unknown pkg static ctor without --dep ABI must fail closed")
+
+  // 3. Fail-closed: cross-pkg static ctor with nonexistent overridden field MUST fail closed
+  let bad_fld_src = SourceFile::{
+    rel_path: "bad_fld.mbt",
+    content: "pub fn f() -> Int {\n  let o = { ..@optpkg.Options::default(), nonexistent: 1 }\n  let _ = o\n  0\n}\n",
+    is_test: false,
+  }
+  let bad_fld_res = transpile_package_with_abis([bad_fld_src], empty_api_map(), default_recipes(), [], [], [], [("optpkg", dep_res.abi)], [], app_opts, [], false, noop_check)
+  let mut saw_ambig_fld = false
+  for d in bad_fld_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" {
+      saw_ambig_fld = true
+    }
+  }
+  assert_true(saw_ambig_fld, "cross-pkg static ctor with unknown field must fail closed")
+
+  // 4. Local static ctor + `Array::remove` element type propagation (`let k = items.remove(at); { ..k, ... }`)
+  let local_src = SourceFile::{
+    rel_path: "local_upd.mbt",
+    content: "pub struct Item {\n  id : Int\n  state : String\n  wanted : Bool\n}\n" +
+    "pub fn Item::default() -> Item {\n  { id: 0, state: \"idle\", wanted: false }\n}\n" +
+    "pub fn promote(items : Array[Item], at : Int) -> Item {\n" +
+    "  let k = items.remove(at)\n" +
+    "  items.insert(0, { ..k, state: \"going\", wanted: true })\n" +
+    "  { ..Item::default(), id: 42 }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let local_res = transpile_package([local_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(local_res.blockers == 0, "local static ctor and Array::remove struct update have 0 blockers")
+  let mut local_out = ""
+  for f in local_res.files {
+    if f.rel_path == "local_upd.pion" {
+      local_out = f.content
+    }
+  }
+  assert_true(str_has(local_out, "Item::{ ..k, state: \"going\", wanted: true }"), "Array::remove propagates element struct type Item")
+  assert_true(str_has(local_out, "Item::{ ..Item::default(), id: 42 }"), "local static ctor resolves to Item::")
+}
+
+///|
+test "stage_a_gaps: array rest pattern [step, .. rest] with if guard and nested ctor" {
+  let noop_check = fn(_ : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let app_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+
+  let src = SourceFile::{
+    rel_path: "rest_pat.mbt",
+    content: "pub enum Wrap {\n  List(ArrayView[Int])\n}\n" +
+    "pub fn walk(path : ArrayView[String]) -> Int {\n" +
+    "  match path {\n" +
+    "    [step, .. rest] if step.length() > 0 => rest.length()\n" +
+    "    [\"*\", .. rest] => rest.length() + 1\n" +
+    "    [] => 0\n" +
+    "    _ => -1\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn head_tail(w : Wrap) -> Int {\n" +
+    "  match w {\n" +
+    "    List([h, .. tail]) if h > 0 => h + tail.length()\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  let mut has_stage_a_err = false
+  for d in res.diagnostics {
+    if d.code != "MBT2PION_PROBE_RESIDUAL" {
+      has_stage_a_err = true
+    }
+  }
+  assert_true(!has_stage_a_err, "[step, .. rest] with guard and nested ctor have 0 Stage A errors")
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "rest_pat.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "mbt_compat::__mbt_slice_borrow("), "2-token .. rest binds tail slice via __mbt_slice_borrow")
+
+  // Fail-closed: multiple `..` rest patterns in one array pattern
+  let bad_src = SourceFile::{
+    rel_path: "bad_rest.mbt",
+    content: "pub fn bad(xs : Array[Int]) -> Int {\n  match xs {\n    [a, .. r1, .. r2] => a + r1.length() + r2.length()\n    _ => 0\n  }\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], app_opts, [], false, noop_check)
+  assert_true(bad_res.blockers >= 1, "multiple .. rest patterns must fail closed")
+}
+
+///|
+test "stage_a_gaps: top-level let closure try/catch and stdlib raising call with dep arg" {
+  let cfg = default_error_lower_config()
+  let dep_abi = PackageAbi::{
+    package_name: "host",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    raising_fns: [],
+    ffi_shim_prefix: "",
+    publishable: true,
+    empty_target_pkg: false,
+    empty_target: "",
+  }
+  let st = empty_symbol_table()
+  symtab_load_dep_abi(st, "host", dep_abi)
+  let env = build_external_error_env(st, [("host", dep_abi)], Map())
+
+  // 1. Top-level `let` containing non-raising closure `fn(_) { try Some(@json.parse(@host.state())) catch { _ => None } }`
+  let src_ok = "let computed_val : Int = make_computed(fn(_) {\n" +
+  "  let v = try Some(@json.parse(@host.state())) catch { _ => None }\n" +
+  "  match v { Some(_) => 1; None => 0 }\n" +
+  "})\n" +
+  "pub fn read_limit() -> Int {\n" +
+  "  @string.parse_int(@host.env(\"LIMIT\")[:]) catch { _ => 16384 }\n" +
+  "}\n"
+  let d_ok : Array[Diag] = []
+  let out_ok = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "ok.mbt", content: src_ok, is_test: false }],
+    cfg,
+    env,
+    d_ok,
+  )
+  assert_true(d_ok.length() == 0, "top-level let closure try/catch and known-dep arg parse_int have 0 diags")
+  assert_true(str_has(out_ok[0].content, "mbt_compat::mbt_json_parse(@host.state())"), "top-level let closure json.parse lowered")
+  assert_true(str_has(out_ok[0].content, "mbt_compat::str_try_parse_int(@host.env(\"LIMIT\")[:])"), "parse_int with known-dep slice arg lowered")
+
+  // 2. Fail-closed: unknown external pkg inside `parse_int(...) catch` without `--dep`
+  let src_unk = "pub fn bad_limit() -> Int {\n  @string.parse_int(@unknown.env(\"LIMIT\")[:]) catch { _ => 16384 }\n}\n"
+  let d_unk : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "unk.mbt", content: src_unk, is_test: false }],
+    cfg,
+    env,
+    d_unk,
+  )
+  assert_true(d_unk.length() >= 1, "unknown external arg inside catch must fail closed")
+
+  // 3. Fail-closed: `const` initializer with closure containing `try`/`catch`
+  let src_const = "const BAD_C : Int = make_computed(fn(_) { @json.parse(\"1\") catch { _ => 0 } })\n"
+  let d_const : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_c.mbt", content: src_const, is_test: false }],
+    cfg,
+    env,
+    d_const,
+  )
+  assert_true(d_const.length() >= 1, "top-level const with closure try/catch must fail closed")
+
+  // 4. Fail-closed: top-level `let` closure with uncaught `raise`
+  let src_raise = "priv suberror E String\nlet bad_r : Int = make_computed(fn(_) { raise E(\"boom\") })\n"
+  let d_raise : Array[Diag] = []
+  let _ = lower_checked_errors_with_env(
+    [SourceFile::{ rel_path: "bad_r.mbt", content: src_raise, is_test: false }],
+    cfg,
+    env,
+    d_raise,
+  )
+  assert_true(d_raise.length() >= 1, "top-level let closure with uncaught raise must fail closed")
+}
