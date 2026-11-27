@@ -445,8 +445,114 @@ fn pos_f6_4a_mid_closure_local_map() -> String {
   s1 + "|" + s2 + "|" + s3 + "|" + s4 + "|" + s5 + "|" + s6 + "|" + s7
 }
 
+struct PureMapBox {
+  group_reads : Map[Int, (Bool, Array[Int])]
+}
+
+fn PureMapBox::new() -> PureMapBox {
+  PureMapBox::{ group_reads: Map::new() }
+}
+
+fn PureMapBox::set_group(self : PureMapBox, id : Int, g : Bool, hs : Array[Int]) -> Unit {
+  self.group_reads[id] = (g, hs)
+}
+
+fn PureMapBox::reads_under(self : PureMapBox, id : Int, depth : Int) -> Bool {
+  match self.group_reads.get(id) {
+    Some((glass, heads)) =>
+      glass || depth > 8 || heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })
+    None => false
+  }
+}
+
+let top_pure_set : Set[String] = Set::from_array(["alpha", "beta"])
+
+fn make_pure_key_map(keys : Array[Int]) -> Map[Int, Bool] {
+  let out : Map[Int, Bool] = Map::new()
+  for k in keys {
+    out[k] = true
+  }
+  out
+}
+
+enum CtxTag {
+  UseNode
+  PathNode
+} derive(Eq)
+
+struct Word {
+  raw : String
+}
+
+fn Word::get() -> String {
+  "  hello:world  "
+}
+
+fn pos_precision_and_compat() -> String {
+  let box = PureMapBox::new()
+  box.set_group(1, false, [2])
+  box.set_group(2, true, [])
+  let map_field_ok = box.reads_under(1, 0)
+  let ro_interp = "ro=\{box.reads_under(1, 0)}"
+
+  let words : Array[String] = ["gamma", "beta"]
+  let top_set_ok = words.iter().any(fn(w) { top_pure_set.contains(w) })
+
+  let km = make_pure_key_map([10, 20])
+  let ret_map_ok = [5, 20].iter().any(fn(k) { km.contains(k) })
+
+  let check_ctx = fn(ce : CtxTag?) -> Bool { ce == Some(UseNode) }
+  let ctx_ok = [None, Some(PathNode), Some(UseNode)].iter().any(fn(c) { check_ctx(c) })
+
+  let split_first = match "a::b::c".split("::").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_empty = match "".split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_static = match Word::get().split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_chain = match Word::get().trim().split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let base_s = "left"
+  let split_paren = match (base_s + ":z").split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let arr_s = ["k0:v0", "k1:v1"]
+  let split_idx = match arr_s[0].split(":").next() {
+    Some(v) => v.to_owned()
+    None => "none"
+  }
+  let split_any = "foo bar baz".split(" ").any(fn(v) { v.to_owned() == "bar" })
+
+  let j = Json::string("k:\{match true { true => "yes"; false => "no" }}")
+  let j_str = j.stringify()
+
+  let wide_obj : Map[String, Json] = Map::new()
+  wide_obj["short_arr"] = Json::array([Json::null(), Json::boolean(true)])
+  wide_obj["long_val"] = Json::string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  let wide_repr = Repr(Json::object(wide_obj)).to_string()
+
+  let mut deep_j = Json::null()
+  for i = 0; i < 20; i = i + 1 {
+    deep_j = Json::array([deep_j])
+  }
+  let deep_repr = Repr(deep_j).to_string()
+
+  map_field_ok.to_string() + "|" + ro_interp + "|" + top_set_ok.to_string() + "|" + ret_map_ok.to_string() + "|" +
+    ctx_ok.to_string() + "|" + split_first + "|" + split_empty + "|" + split_static + "|" + split_chain + "|" +
+    split_paren + "|" + split_idx + "|" + split_any.to_string() + "|" + j_str + "|" + wide_repr + "|" + deep_repr
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map() + " :: " + pos_precision_and_compat()
 }
 '''
 
@@ -1001,6 +1107,256 @@ pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Int? {
 ''',
         "Array::search_by",
     ),
+    (
+        "neg_pub_all_struct_map_field",
+        r'''
+pub(all) struct ExtMapBox {
+  m : Map[Int, Int]
+}
+pub fn run(b : ExtMapBox, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_pub_all_mut_field_map",
+        r'''
+pub(all) struct PubAllMutMapBox {
+  mut m : Map[Int, Int]
+}
+pub fn PubAllMutMapBox::new() -> PubAllMutMapBox {
+  PubAllMutMapBox::{ m: Map::new() }
+}
+pub fn PubAllMutMapBox::clear_ref(self : PubAllMutMapBox) -> Unit {
+  self.m = Map::new()
+}
+pub fn run(b : PubAllMutMapBox, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_field_assigned_from_param",
+        r'''
+struct ParamFieldBox {
+  mut m : Map[Int, Int]
+}
+fn ParamFieldBox::set_m(self : ParamFieldBox, ext : Map[Int, Int]) -> Unit {
+  self.m = ext
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = ParamFieldBox::{ m: Map::new() }
+  b.set_m(ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_struct_spread_external_override",
+        r'''
+struct SpreadBox {
+  x : Int
+  m : Map[Int, Int]
+}
+fn SpreadBox::replace(self : SpreadBox, ext : Map[Int, Int]) -> SpreadBox {
+  { ..self, m: ext }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = SpreadBox::{ x: 0, m: Map::new() }.replace(ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_top_level_ref_map_param",
+        r'''
+let g_map : Ref[Map[Int, Int]] = Ref::new(Map::new())
+pub fn set_g(ext : Map[Int, Int]) -> Unit {
+  g_map.val = ext
+}
+pub fn run(xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { g_map.val.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_pub_struct_non_priv_map_field",
+        r'''
+pub struct PubDefaultFieldMap {
+  mut m : Map[Int, Int]
+}
+pub fn PubDefaultFieldMap::new() -> PubDefaultFieldMap {
+  PubDefaultFieldMap::{ m: Map::new() }
+}
+pub fn PubDefaultFieldMap::reset(self : PubDefaultFieldMap) -> Unit {
+  self.m = Map::new()
+}
+pub fn run(b : PubDefaultFieldMap, xs : Array[Int]) -> Bool {
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_untyped_struct_if_field",
+        r'''
+struct CondMapBox {
+  m : Map[Int, Int]
+}
+fn make_box(flag : Bool, ext : Map[Int, Int]) -> CondMapBox {
+  let s : CondMapBox = { m: if flag { ext } else { Map::new() } }
+  s
+}
+pub fn run(flag : Bool, xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = make_box(flag, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_custom_eq_rhs_add_bypass",
+        r'''
+struct BadEq {
+  xs : Array[Int]
+  n : Int
+}
+impl Eq for BadEq with equal(self, other) {
+  self.xs.clear()
+  self.n == other.n
+}
+fn pick_bad(xs : Array[Int], n : Int) -> BadEq {
+  BadEq::{ xs, n }
+}
+pub fn run(xs : Array[Int]) -> Bool {
+  let a = BadEq::{ xs, n: 1 }
+  xs.iter().any(fn(x) { a == pick_bad(xs, x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_local_hop_tainted_field",
+        r'''
+struct BadHop {
+  mut m : Map[Int, Int]
+}
+struct GoodHop {
+  m : Map[Int, Int]
+}
+fn BadHop::taint(self : BadHop, ext : Map[Int, Int]) -> Unit {
+  self.m = ext
+}
+fn copy_via_local(b : BadHop) -> GoodHop {
+  let tmp = b.m
+  GoodHop::{ m: tmp }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = BadHop::{ m: Map::new() }
+  b.taint(ext)
+  let g = copy_via_local(b)
+  xs.iter().any(fn(x) { g.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r2_shorthand_untyped_struct_lit",
+        r'''
+struct PairSh {
+  m : Map[Int, Int]
+  x : Int
+}
+fn make_bad(m : Map[Int, Int], x : Int) -> PairSh {
+  { m, x }
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let p = make_bad(ext, 1)
+  let _ = p.x
+  xs.iter().any(fn(x) { p.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r3_interp_field_write",
+        r'''
+struct InterpTaintBox {
+  mut m : Map[Int, Int]
+}
+fn taint_in_interp(b : InterpTaintBox, ext : Map[Int, Int]) -> Unit {
+  let _ = "\{{ b.m = ext; 1 }}"
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpTaintBox::{ m: Map::new() }
+  taint_in_interp(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r5_interp_shadow_outer_pure_map",
+        r'''
+struct InterpShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_shadow_interp(b : InterpShadowBox, ext : Map[Int, Int]) -> Unit {
+  let m : Map[Int, Int] = Map::new()
+  let _ = "\{{ let m = ext; b.m = m; 0 }}"
+  let _ = m
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpShadowBox::{ m: Map::new() }
+  taint_shadow_interp(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r6_interp_shadow_global_pure_map",
+        r'''
+let g_pure : Map[Int, Int] = Map::new()
+struct InterpGlobShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_glob_shadow(b : InterpGlobShadowBox, ext : Map[Int, Int]) -> Unit {
+  let _ = g_pure.size()
+  let _ = "\{{ let g_pure = ext; b.m = g_pure; 0 }}"
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpGlobShadowBox::{ m: Map::new() }
+  taint_glob_shadow(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_r6_interp_for_shadow_local_pure_map",
+        r'''
+struct InterpForShadowBox {
+  mut m : Map[Int, Int]
+}
+fn taint_for_shadow(b : InterpForShadowBox, ext : Map[Int, Int]) -> Unit {
+  let m : Map[Int, Int] = Map::new()
+  let _ = "\{{ for m in [ext] { b.m = m }; 0 }}"
+  let _ = m
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let b = InterpForShadowBox::{ m: Map::new() }
+  taint_for_shadow(b, ext)
+  xs.iter().any(fn(x) { b.m.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
 ]
 
 
@@ -1324,6 +1680,161 @@ def main():
         run_cmd([pionc, "check", et_dep_pkg], cwd=REPO_ROOT)
         run_cmd([pionc, "check", et_app_pkg], cwd=REPO_ROOT)
         print("[E2E PASS] empty_target_pkg publish + downstream --dep + pionc check OK")
+
+        # 8. E2E: `--with-tests --mode publish` + `pionc test` for `debug_inspect` on
+        #    30-Null wide `Json::Array` and 20-deep nested `Json::Array` (cross-checked with `moon test`)
+        di_mod = os.path.join(tmp, "di_mod")
+        di_src = os.path.join(di_mod, "src")
+        di_pkg = os.path.join(tmp, "di_pkg")
+        di_out = os.path.join(di_pkg, "src")
+        os.makedirs(di_src, exist_ok=True)
+        os.makedirs(di_out, exist_ok=True)
+        with open(os.path.join(di_mod, "moon.mod"), "w") as f:
+            f.write('name = "test/di"\n')
+        with open(os.path.join(di_src, "moon.pkg"), "w") as f:
+            f.write("")
+        with open(os.path.join(di_src, "moon.pkg.json"), "w") as f:
+            f.write("{}\n")
+        with open(os.path.join(di_src, "lib.mbt"), "w") as f:
+            f.write(
+                "pub fn make_wide_nulls() -> Json {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(Json::null())\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  Json::array(xs)\n"
+                "}\n"
+                "pub fn make_deep_arr() -> Json {\n"
+                "  let mut v = Json::null()\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 20 {\n"
+                "    v = Json::array([v])\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  v\n"
+                "}\n"
+                "pub fn make_arr_json_1() -> Array[Json] {\n"
+                "  [Json::null()]\n"
+                "}\n"
+                "pub fn make_arr_json_30() -> Array[Json] {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(Json::null())\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
+                "pub fn make_small_json_5() -> Array[Json] {\n"
+                "  let xs : Array[Json] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 5 {\n"
+                "    xs.push(Json::string(\"item_0123456789\"))\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
+                "pub fn make_ints_30() -> Array[Int] {\n"
+                "  let xs : Array[Int] = []\n"
+                "  let mut i : Int = 0\n"
+                "  while i < 30 {\n"
+                "    xs.push(i)\n"
+                "    i = i + 1\n"
+                "  }\n"
+                "  xs\n"
+                "}\n"
+            )
+        wide_expected = "Array(\n  [\n" + ("    Null,\n" * 30) + "  ],\n)"
+        deep_expected = ("Array([" * 20) + "Null" + ("])" * 20)
+        arr_json_1_expected = "[Null]"
+        arr_json_30_expected = "[\n" + ("  Null,\n" * 30) + "]"
+        some_wide_expected = "Some(\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n)"
+        arr_wide_expected = "[\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n]"
+        small_json_5_expected = "[\n" + ('  String("item_0123456789"),\n' * 5) + "]"
+        ints_30_expected = "[\n" + "".join(f"  {i},\n" for i in range(30)) + "]"
+        tuple_wide_expected = "(\n  Array(\n    [\n" + ("      Null,\n" * 30) + "    ],\n  ),\n  1,\n)"
+        def mbt_multiline_str(s: str) -> str:
+            return "\n".join("    #|" + line for line in s.split("\n"))
+        with open(os.path.join(di_src, "lib_test.mbt"), "w") as f:
+            f.write(
+                'test "debug_inspect wide, deep, and container json" {\n'
+                '  debug_inspect(\n'
+                '    make_wide_nulls(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_deep_arr(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(deep_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_arr_json_1(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_json_1_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_arr_json_30(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_json_30_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    Some(make_wide_nulls()),\n'
+                '    content=(\n'
+                + mbt_multiline_str(some_wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    [make_wide_nulls()],\n'
+                '    content=(\n'
+                + mbt_multiline_str(arr_wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_small_json_5(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(small_json_5_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    make_ints_30(),\n'
+                '    content=(\n'
+                + mbt_multiline_str(ints_30_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '  debug_inspect(\n'
+                '    (make_wide_nulls(), 1),\n'
+                '    content=(\n'
+                + mbt_multiline_str(tuple_wide_expected) + "\n"
+                '    ),\n'
+                '  )\n'
+                '}\n'
+            )
+        run_cmd([moon, "test"], cwd=di_mod)
+        with open(os.path.join(di_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "di_pkg"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        run_cmd([
+            cli_bin,
+            "--src", di_src,
+            "--out", di_out,
+            "--with-tests",
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        run_cmd([pionc, "test", di_pkg], cwd=REPO_ROOT)
+        print("[E2E PASS] debug_inspect wide 30-Null + 20-deep Json::Array: moon test == pionc test OK")
 
     print(f"[PASS] Wave F6-3a/3b 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases + empty_target_pkg E2E: ALL OK")
 

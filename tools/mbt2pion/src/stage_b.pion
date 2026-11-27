@@ -1869,17 +1869,44 @@ pub fn run_stage_b_with_ops_deps_and_qt(
 
   let mut iter = 0
   let mut final_hist : Array[(String, Int)] = []
-  let mut round0_qt : PkgQueryTypes = if !any_boundary_changed && initial_qt.ok {
+  let mut qt_snap : PkgQueryTypes = if !any_boundary_changed && initial_qt.ok {
     initial_qt
   } else {
     empty_pkg_query_types()
   }
-  let mut any_round_changed = false
+  let qt_snap_vers : Map[String, Int] = Map()
+  if qt_snap.ok {
+    for cf in cur_files {
+      qt_snap_vers[cf.rel_path] = 0
+    }
+  }
+  // Invariant: per-file `QtFileIndex` reuse for unchanged files relies on Stage B rewrites
+  // never altering cross-file visible signatures or types; any future rewrite that changes
+  // exported signatures/types must invalidate the whole package snapshot (`qt_snap_dirty = true`).
+  let mut qt_snap_dirty = !qt_snap.ok
+  let mut has_unknown_pkg_diag = false
+  let mut qt_used_prev_round = false
+  let mut prev_round_changed_cap_file = false
+
+  let file_has_capacity_marker = fn(content : String) -> Bool {
+    str_has(content, "shrink_to_fit") || str_has(content, ".iter(") ||
+    str_has(content, "__mbt_slice_borrow") || str_has(content, ".search_by(")
+  }
+  let update_qt_snap = fn(parsed_qt : PkgQueryTypes) -> Unit {
+    qt_snap = parsed_qt
+    for cf in cur_files {
+      let v = match file_vers.get(cf.rel_path) {
+        Some(n) => n
+        None => 0
+      }
+      qt_snap_vers[cf.rel_path] = v
+    }
+    qt_snap_dirty = false
+  }
 
   let mut need_qt_for_capacity = false
   for f in cur_files {
-    if str_has(f.content, "shrink_to_fit") || str_has(f.content, ".iter(") ||
-    str_has(f.content, "__mbt_slice_borrow") || str_has(f.content, ".search_by(") {
+    if file_has_capacity_marker(f.content) {
       need_qt_for_capacity = true
       break
     }
@@ -1890,14 +1917,20 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     for f in cur_files {
       batch.push((f.rel_path, f.content))
     }
-    let raw_json = if iter == 0 && !round0_qt.ok && need_qt_for_capacity {
+    let should_top_qt = if iter == 0 {
+      !qt_snap.ok && need_qt_for_capacity
+    } else {
+      need_qt_for_capacity && qt_snap_dirty && !has_unknown_pkg_diag &&
+      (qt_used_prev_round || prev_round_changed_cap_file)
+    }
+    let raw_json = if should_top_qt {
       match query_types_cb {
         Some(qt_cb) => {
           let r = qt_cb(batch)
           if r.length() > 0 {
             let parsed_qt = parse_pkg_query_types_json(r)
             if parsed_qt.ok {
-              round0_qt = parsed_qt
+              update_qt_snap(parsed_qt)
             }
             r
           } else {
@@ -1910,6 +1943,12 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       check_fn(batch)
     }
     let pdiags = parse_pionc_diagnostics(raw_json)
+    for d in pdiags {
+      if d.code == "E_UNKNOWN_PACKAGE" {
+        has_unknown_pkg_diag = true
+        break
+      }
+    }
 
     let counts : Map[String, Int] = Map()
     for d in pdiags {
@@ -1938,13 +1977,18 @@ pub fn run_stage_b_with_ops_deps_and_qt(
     let mut round_pkg_fns : Option[Map[String, StageBPkgFn]] = None
     let round_file_tokens : Map[String, Array[Token]] = Map()
     let mut round_qt : Option[PkgQueryTypes] = None
+    let mut qt_used_this_round = false
     let mut round_shrink_pkg : Option[ShrinkPkg] = None
     let mut round_shrink_pkg_summary : Option[ShrinkPkg] = None
     let mut round_mut_summary : Option[PkgMutationSummary] = None
     let mut round_sort_key_env : Option[SortKeyEnv] = None
     let get_round_qt = fn() -> PkgQueryTypes {
-      if !any_round_changed && round0_qt.ok {
-        return round0_qt
+      qt_used_this_round = true
+      if qt_snap.ok && !qt_snap_dirty {
+        return qt_snap
+      }
+      if has_unknown_pkg_diag {
+        return empty_pkg_query_types()
       }
       match round_qt {
         Some(qt) => qt
@@ -1955,9 +1999,7 @@ pub fn run_stage_b_with_ops_deps_and_qt(
               if r.length() > 0 {
                 let parsed_qt = parse_pkg_query_types_json(r)
                 if parsed_qt.ok {
-                  if !any_round_changed {
-                    round0_qt = parsed_qt
-                  }
+                  update_qt_snap(parsed_qt)
                   parsed_qt
                 } else {
                   empty_pkg_query_types()
@@ -2084,6 +2126,20 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       let mutated_lines : Map[Int, Bool] = Map()
       let mut file_changed = false
       let get_file_qfi = fn() -> Option[QtFileIndex] {
+        qt_used_this_round = true
+        if qt_snap.ok {
+          let cur_v = match file_vers.get(f.rel_path) {
+            Some(v) => v
+            None => 0
+          }
+          let snap_v = match qt_snap_vers.get(f.rel_path) {
+            Some(v) => v
+            None => -1
+          }
+          if cur_v == snap_v {
+            return qt_snap.files.get(f.rel_path)
+          }
+        }
         let rqt = get_round_qt()
         if rqt.ok {
           rqt.files.get(f.rel_path)
@@ -2155,6 +2211,15 @@ pub fn run_stage_b_with_ops_deps_and_qt(
             Some((mname, rty)) =>
             if rty == "Int" && mname == "to_char" {
               match rewrite_int_to_char_at(lines[lidx], d.col, get_used_idents()) {
+                Some(new_ln) => {
+                  lines[lidx] = new_ln
+                  file_changed = true
+                  line_mutated = true
+                }
+                None => ()
+              }
+            } else if rty == "Array[String]" && mname == "next" {
+              match rewrite_split_next_at(lines[lidx], d.col) {
                 Some(new_ln) => {
                   lines[lidx] = new_ln
                   file_changed = true
@@ -3272,22 +3337,134 @@ pub fn run_stage_b_with_ops_deps_and_qt(
       }
     }
     cur_files = next_files
+    let changed_rel_set : Map[String, Bool] = Map()
     for rel in changed_rels {
+      changed_rel_set[rel] = true
       let prev_ver = match file_vers.get(rel) {
         Some(v) => v
         None => 0
       }
       file_vers[rel] = prev_ver + 1
     }
+    qt_used_prev_round = qt_used_this_round
+    prev_round_changed_cap_file = false
     if changed {
-      any_round_changed = true
+      qt_snap_dirty = true
+      need_qt_for_capacity = false
+      for cf in cur_files {
+        if file_has_capacity_marker(cf.content) {
+          need_qt_for_capacity = true
+          if changed_rel_set.contains(cf.rel_path) {
+            prev_round_changed_cap_file = true
+          }
+        }
+      }
     } else {
       break
     }
   }
 
-  let out_qt = if !any_round_changed { round0_qt } else { empty_pkg_query_types() }
+  let out_qt = if qt_snap.ok && !qt_snap_dirty { qt_snap } else { empty_pkg_query_types() }
   (cur_files, iter, final_hist, out_qt)
+}
+
+///| Rewrite `<recv>.split(<sep>).next()` on `Array[String]` -> `mbt_compat::str_split_first(<recv>, <sep>)`.
+///| Strictly fail-closed: only rewrites when the zero-arg `.next()` receiver lexically ends with `.split(<1 arg>)`.
+fn split_next_receiver_start_token(toks : Array[Token], end_i : Int) -> Int {
+  if end_i < 0 || end_i >= toks.length() {
+    return -1
+  }
+  let ek = toks[end_i].kind
+  if ek != TokenKind::Ident && ek != TokenKind::UpperIdent &&
+  ek != TokenKind::RParen && ek != TokenKind::RBracket &&
+  ek != TokenKind::StringLit && ek != TokenKind::InterpString &&
+  ek != TokenKind::RawMultiline && ek != TokenKind::InterpMultiline {
+    return -1
+  }
+  let mut cur = end_i
+  while cur >= 0 {
+    let ck = toks[cur].kind
+    if ck == TokenKind::RParen || ck == TokenKind::RBracket {
+      let op = find_open_before(toks, cur, 0)
+      if op < 0 {
+        return -1
+      }
+      cur = op
+      if cur > 0 {
+        let pk = toks[cur - 1].kind
+        if pk == TokenKind::Ident || pk == TokenKind::UpperIdent ||
+        pk == TokenKind::RParen || pk == TokenKind::RBracket {
+          cur = cur - 1
+          continue
+        }
+      }
+      break
+    }
+    if cur >= 2 && toks[cur - 1].kind == TokenKind::ColonColon &&
+    (toks[cur - 2].kind == TokenKind::UpperIdent || toks[cur - 2].kind == TokenKind::Ident) {
+      cur = cur - 2
+      continue
+    }
+    if cur >= 2 && toks[cur - 1].kind == TokenKind::Dot {
+      let pk = toks[cur - 2].kind
+      if pk == TokenKind::Ident || pk == TokenKind::UpperIdent || pk == TokenKind::IntLit ||
+      pk == TokenKind::RParen || pk == TokenKind::RBracket ||
+      pk == TokenKind::StringLit || pk == TokenKind::InterpString ||
+      pk == TokenKind::RawMultiline || pk == TokenKind::InterpMultiline {
+        cur = cur - 2
+        continue
+      }
+    }
+    break
+  }
+  cur
+}
+
+fn rewrite_split_next_at(line_text : String, col : Int) -> Option[String] {
+  let toks = lex_moonbit(line_text)
+  let tn = toks.length() - 1
+  let mut dot_i = -1
+  let mut best_dist = 1000000
+  let mut ti = 0
+  while ti + 3 < tn {
+    if toks[ti].kind == TokenKind::Dot && toks[ti + 1].kind == TokenKind::Ident &&
+    toks[ti + 1].raw == "next" && toks[ti + 2].kind == TokenKind::LParen &&
+    toks[ti + 3].kind == TokenKind::RParen {
+      let dist = if toks[ti + 1].col >= col { toks[ti + 1].col - col } else { col - toks[ti + 1].col }
+      if dist < best_dist {
+        best_dist = dist
+        dot_i = ti
+      }
+    }
+    ti = ti + 1
+  }
+  if dot_i < 5 || toks[dot_i - 1].kind != TokenKind::RParen {
+    return None
+  }
+  let split_lp = find_open_before(toks, dot_i - 1, 0)
+  if split_lp < 3 || toks[split_lp - 1].kind != TokenKind::Ident ||
+  toks[split_lp - 1].raw != "split" || toks[split_lp - 2].kind != TokenKind::Dot {
+    return None
+  }
+  let sargs = ms_split_call_args(toks, split_lp, dot_i - 1)
+  if sargs.length() != 1 || sargs[0].0 >= sargs[0].1 {
+    return None
+  }
+  let recv_start = split_next_receiver_start_token(toks, split_lp - 3)
+  if recv_start < 0 || recv_start > split_lp - 3 ||
+  (recv_start > 0 && (toks[recv_start - 1].kind == TokenKind::ColonColon || toks[recv_start - 1].kind == TokenKind::Dot)) {
+    return None
+  }
+  let recv_s = line_text.slice(toks[recv_start].start_byte, toks[split_lp - 3].end_byte).trim()
+  let sep_s = line_text.slice(toks[sargs[0].0].start_byte, toks[sargs[0].1 - 1].end_byte).trim()
+  if recv_s.length() == 0 || sep_s.length() == 0 || unsafe_index_arg_is_labelled(sep_s) {
+    return None
+  }
+  Some(
+    line_text.slice(0, toks[recv_start].start_byte) +
+    "mbt_compat::str_split_first(" + recv_s + ", " + sep_s + ")" +
+    line_text.slice(toks[dot_i + 3].end_byte, line_text.length()),
+  )
 }
 
 ///| Rewrite `<recv>.to_char()` on `Int` inline to MoonBit's exact Unicode scalar check
