@@ -381,8 +381,17 @@ fn pos_f6_4a_newline_paren_bracket_stmt() -> String {
   s1 + "|" + s2
 }
 
+fn pos_f6_4a_mid_closure_local_map() -> String {
+  let xs : Array[Int] = [0, 1, 2]
+  let mid = fn() -> Int? {
+    let m : Map[Int, Int] = { 1: 2 }
+    xs.search_by(fn(x) { m.contains(x) })
+  }
+  match mid() { Some(i) => i.to_string(); None => "none" }
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map()
 }
 '''
 
@@ -918,6 +927,21 @@ pub fn run(xs : Array[Int], s : Set[Int]) -> Int? {
     let _ = s.copy()
     x == 1
   })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_f6_4a_mid_closure_shadow_map",
+        r'''
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Int? {
+  let m : Map[Int, Int] = { 1: 2 }
+  let _ = m.size()
+  let mid = fn() -> Int? {
+    let m : Map[Int, Int] = ext
+    xs.search_by(fn(x) { m.contains(x) })
+  }
+  mid()
 }
 ''',
         "Array::search_by",
