@@ -464,3 +464,247 @@ test "F6-3a: R6/R7 labeled loop original line:col, top-level let, interp, #cfg, 
   }
   assert_true(kw_exact && kw_unsup, "keyword label `not~:` must report lib.mbt:2:3 and mark fn:probe unsupported")
 }
+
+test "F6-3b: mutation_summary physical_equal, pure derive(Eq), recursive .iter().any, pure String methods, and extern C boundary" {
+  // 1. Bare `physical_equal` is pure read-only, while param/local shadowing stays fail-closed
+  let pe_src =
+  "struct Node { id : Int }\n" +
+  "fn same_ref(a : Node, b : Node) -> Bool {\n" +
+  "  physical_equal(a, b)\n" +
+  "}\n" +
+  "fn shadowed_pe(a : Node, b : Node, physical_equal : (Node, Node) -> Bool) -> Bool {\n" +
+  "  physical_equal(a, b)\n" +
+  "}\n"
+  let pe_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(pe_src)])
+  match lookup_fn_mutation_summary(pe_ms, "same_ref") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "bare physical_equal must be pure")
+    None => assert_true(false, "same_ref summary missing")
+  }
+  match lookup_fn_mutation_summary(pe_ms, "shadowed_pe") {
+    Some(s) => assert_true(s.unknown, "shadowed physical_equal param must fail-closed")
+    None => assert_true(false, "shadowed_pe summary missing")
+  }
+
+  // 2. Pure `derive(Eq)` structs/enums vs custom `impl Eq` / generic / callback / non-pure fields
+  let eq_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) {\n" +
+  "  self.xs.clear()\n" +
+  "  other.xs.length() == 0\n" +
+  "}\n" +
+  "enum NodeKind { XElement; XText(String) } derive(Eq)\n" +
+  "struct Style { color : Int; bold : Bool; kind : NodeKind } derive(Eq)\n" +
+  "struct Cell { style : Style; kind : NodeKind }\n" +
+  "struct WrapEvil { e : Evil } derive(Eq)\n" +
+  "struct HasCb { cb : (Int) -> Bool } derive(Eq)\n" +
+  "struct GenBox[T] { v : T } derive(Eq)\n" +
+  "fn check_pure_eq(c : Array[Cell], i : Int, p : Style) -> Bool {\n" +
+  "  c[i].style == p && c[i].kind == XElement\n" +
+  "}\n" +
+  "fn check_evil_eq(a : WrapEvil, b : WrapEvil) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n" +
+  "fn check_cb_eq(a : HasCb, b : HasCb) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n" +
+  "fn check_gen_eq(a : GenBox[Int], b : GenBox[Int]) -> Bool {\n" +
+  "  a == b\n" +
+  "}\n"
+  let eq_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(eq_src)])
+  match lookup_fn_mutation_summary(eq_ms, "check_pure_eq") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "pure derive(Eq) struct & enum == must be pure")
+    None => assert_true(false, "check_pure_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_evil_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "derive(Eq) wrapping custom impl Eq must propagate mutation / fail-closed")
+    None => assert_true(false, "check_evil_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_cb_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "derive(Eq) with callback field must fail-closed")
+    None => assert_true(false, "check_cb_eq summary missing")
+  }
+  match lookup_fn_mutation_summary(eq_ms, "check_gen_eq") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Int"), "generic derive(Eq) must fail-closed")
+    None => assert_true(false, "check_gen_eq summary missing")
+  }
+
+  // 3. Recursive `.iter().any(...)` + `mbt_compat::arr_iter(...).any(...)` + pure String/Option methods
+  let rec_src =
+  "struct Evil { xs : Array[Int] }\n" +
+  "impl Eq for Evil with equal(self, other) { self.xs.clear(); false }\n" +
+  "struct Graph { heads : Array[Array[Int]]; labels : Array[String] }\n" +
+  "fn Graph::reads_under(self : Graph, id : Int, depth : Int) -> Bool {\n" +
+  "  if depth > 4 { return false }\n" +
+  "  let heads = self.heads[id]\n" +
+  "  let lbl = self.labels[id]\n" +
+  "  if lbl.trim().to_lower().contains(\"ok\") && lbl.starts_with(\"a\") { return true }\n" +
+  "  heads.iter().any(fn(g) { self.reads_under(g, depth + 1) })\n" +
+  "}\n" +
+  "fn Graph::reads_lowered(self : Graph, id : Int, depth : Int) -> Bool {\n" +
+  "  if depth > 4 { return false }\n" +
+  "  let heads = self.heads[id]\n" +
+  "  mbt_compat::arr_iter(heads).any(fn(g) { self.reads_lowered(g, depth + 1) })\n" +
+  "}\n"
+  let rec_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(rec_src)])
+  match lookup_fn_mutation_summary(rec_ms, "Graph::reads_under") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "recursive .iter().any + String::contains must converge pure")
+    None => assert_true(false, "Graph::reads_under summary missing")
+  }
+  match lookup_fn_mutation_summary(rec_ms, "Graph::reads_lowered") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "recursive mbt_compat::arr_iter().any must converge pure")
+    None => assert_true(false, "Graph::reads_lowered summary missing")
+  }
+
+  // 4. `extern "C" fn` must NOT swallow the following pure function body
+  let ext_src =
+  "extern \"C\" fn c_op() -> Unit = \"c_op\"\n" +
+  "fn helper() -> Int { 1 }\n" +
+  "fn call_c_op() -> Unit { c_op() }\n"
+  let ext_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(ext_src)])
+  assert_true(lookup_fn_mutation_summary(ext_ms, "c_op") is None, "extern C fn c_op must not be given a pure body summary")
+  match lookup_fn_mutation_summary(ext_ms, "call_c_op") {
+    Some(s) => assert_true(s.unknown, "calling extern C fn c_op must stay unknown=true fail-closed")
+    None => assert_true(false, "call_c_op summary missing")
+  }
+  match lookup_fn_mutation_summary(ext_ms, "helper") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array && s.mutated_elem_types.length() == 0, "helper after extern C fn must parse as pure")
+    None => assert_true(false, "helper summary missing")
+  }
+}
+
+test "F6-3b: empty_target_pkg ABI roundtrip, Buffer(capacity=...), sibling ctors, and lower_error main/nested catch" {
+  let empty_check = fn(_fs : Array[(String, String)]) -> String {
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // 1. Target-filtered empty package emits `empty_target_pkg: true` and placeholder `lib.pion`
+  let wasm_only_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(targets: { \"wasm_helper.mbt\": [\"wasm\"] })",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let empty_res = transpile_package(
+    [SourceFile::{ rel_path: "wasm_helper.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    wasm_only_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(empty_res.blockers == 0, "empty_res blockers: " + (if empty_res.diagnostics.length() > 0 { empty_res.diagnostics[0].code + ": " + empty_res.diagnostics[0].message } else { empty_res.blockers.to_string() }))
+  assert_true(empty_res.abi.empty_target_pkg, "all-target-filtered pkg must set empty_target_pkg=true")
+  assert_eq(empty_res.files.length(), 1)
+  assert_true(empty_res.files[0].rel_path == "lib.pion", "empty target pkg must emit placeholder lib.pion")
+  let empty_pairs : Array[(String, String)] = [(empty_res.files[0].rel_path, empty_res.files[0].content)]
+  let empty_abi_json = render_abi_json(empty_res.abi, empty_pairs)
+  assert_true(str_has(empty_abi_json, "\"empty_target_pkg\":true"), "abi json must record empty_target_pkg:true")
+  let vdiags1 : Array[Diag] = []
+  let parsed1 = verify_and_parse_dep_abi("wasm_only", "/tmp/wasm_only", empty_pairs, Some(empty_abi_json), vdiags1)
+  assert_true(parsed1 is Some(_) && vdiags1.length() == 0, "placeholder lib.pion + empty_target_pkg=true must verify")
+  // Also allow 0-file dep when `empty_target_pkg: true` and `files_sha256` matches 0 files
+  let zero_abi_json = render_abi_json(empty_res.abi, [])
+  let vdiags2 : Array[Diag] = []
+  let parsed2 = verify_and_parse_dep_abi("wasm_only", "/tmp/wasm_only", [], Some(zero_abi_json), vdiags2)
+  assert_true(parsed2 is Some(_) && vdiags2.length() == 0, "0-file dep with valid empty_target_pkg=true must verify")
+  // Normal non-empty-target package with 0 files MUST still fail closed!
+  let norm_abi = empty_package_abi("broken")
+  let norm_abi_json = render_abi_json(norm_abi, [])
+  let vdiags3 : Array[Diag] = []
+  let parsed3 = verify_and_parse_dep_abi("broken", "/tmp/broken", [], Some(norm_abi_json), vdiags3)
+  assert_true(parsed3 is None && vdiags3.length() > 0, "0-file dep without empty_target_pkg=true must fail closed")
+
+  // 2. `Buffer(capacity=...)` & `@buffer.new(size_hint=...)`
+  let buf_src =
+  "pub fn pack(v : BytesView) -> Bytes {\n" +
+  "  let whole = Buffer(capacity=16)\n" +
+  "  whole.write_bytesview(v)\n" +
+  "  whole.write_byte(b'!')\n" +
+  "  whole.to_bytes()\n" +
+  "}\n"
+  let buf_res = transpile_package(
+    [SourceFile::{ rel_path: "buf.mbt", content: buf_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(buf_res.blockers == 0, "buf_res blockers: " + (if buf_res.diagnostics.length() > 0 { buf_res.diagnostics[0].code + ": " + buf_res.diagnostics[0].message } else { buf_res.blockers.to_string() }))
+  let buf_out = buf_res.files[0].content
+  assert_true(str_has(buf_out, "mbt_compat::bytes_buf_new()"), "Buffer(capacity=16) must lower to mbt_compat::bytes_buf_new():\n" + buf_out)
+
+  // 3. Partial tuple sibling match arms & if/else sibling branch enum expected types
+  let sib_src =
+  "pub(all) enum AnchorSide { Above; Below; Left; Right }\n" +
+  "enum Align { Left; Right; Center }\n" +
+  "pub(all) enum HoldRead { Ready; Cancelled }\n" +
+  "enum JobState { Pending; Cancelled }\n" +
+  "pub fn flip(asked : AnchorSide) -> (Int, Int, Int, AnchorSide) {\n" +
+  "  let res = match asked {\n" +
+  "    Below => { let t = 1; (t, 2, 3, Above) }\n" +
+  "    Above => (2, 1, 3, Below)\n" +
+  "    Right => (4, 5, 6, Left)\n" +
+  "    Left => (5, 4, 6, Right)\n" +
+  "  }\n" +
+  "  res\n" +
+  "}\n" +
+  "pub fn pick_hold(cond : Bool) -> HoldRead {\n" +
+  "  let result = if cond { let _ = 1; Ready } else { Cancelled }\n" +
+  "  result\n" +
+  "}\n"
+  let sib_res = transpile_package(
+    [SourceFile::{ rel_path: "sib.mbt", content: sib_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(sib_res.blockers == 0, "sib_res blockers: " + (if sib_res.diagnostics.length() > 0 { sib_res.diagnostics[0].code + ": " + sib_res.diagnostics[0].message } else { sib_res.blockers.to_string() }))
+  let sib_out = sib_res.files[0].content
+  assert_true(str_has(sib_out, "AnchorSide::Left") && str_has(sib_out, "AnchorSide::Right"), "tuple match arms must infer AnchorSide:\n" + sib_out)
+  assert_true(str_has(sib_out, "HoldRead::Cancelled"), "if/else sibling branch must infer HoldRead:\n" + sib_out)
+
+  // 4. `lower_error`: bare `fn main { ... }` and nested controlled core `catch`
+  let err_src =
+  "fn main {\n" +
+  "  let a = Some(@json.parse(\"1\") catch { _ => @json.null() })\n" +
+  "  let b = Some(@string.parse_int(\"42\") catch { _ => -1 })\n" +
+  "  let c = Some(@string.parse_double(\"3.5\") catch { _ => 0.0 })\n" +
+  "  let d = Some(@utf8.decode(b\"hi\") catch { _ => \"\" })\n" +
+  "  let _ = (a, b, c, d)\n" +
+  "}\n"
+  let err_res = transpile_package(
+    [SourceFile::{ rel_path: "main.mbt", content: err_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(err_res.blockers == 0, "err_res blockers: " + (if err_res.diagnostics.length() > 0 { err_res.diagnostics[0].code + ": " + err_res.diagnostics[0].message } else { err_res.blockers.to_string() }))
+  let err_out = err_res.files[0].content
+  assert_true(
+    str_has(err_out, "mbt_compat::mbt_json_parse") &&
+    str_has(err_out, "mbt_compat::str_try_parse_int") &&
+    str_has(err_out, "mbt_compat::str_try_parse_double") &&
+    str_has(err_out, "mbt_compat::utf8_decode_strict"),
+    "bare fn main + nested core catch must lower cleanly:\n" + err_out,
+  )
+}

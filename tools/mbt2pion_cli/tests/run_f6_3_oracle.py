@@ -224,8 +224,123 @@ pub fn run_gate_d() -> String {
     seen9.join(",") + "|" + seen10.join(",")
 }
 
+// Wave F6-3b positive cases: physical_equal, pure derive(Eq) struct/enum,
+// recursive .iter().any + pure String methods, Buffer(capacity=...), and sibling enum ctors
+enum NodeKind {
+  XElement
+  XText(String)
+} derive(Eq)
+
+struct CellStyle {
+  color : Int
+  bold : Bool
+  kind : NodeKind
+} derive(Eq)
+
+struct DomNode {
+  style : CellStyle
+  kind : NodeKind
+}
+
+struct DepGraph {
+  heads : Array[Array[Int]]
+  labels : Array[String]
+}
+
+fn DepGraph::reads_under(self : DepGraph, id : Int, depth : Int) -> Bool {
+  if depth > 4 || id < 0 || id >= self.heads.length() {
+    return false
+  }
+  let lbl = self.labels[id]
+  if lbl.trim().to_lower().contains("hit") && lbl.starts_with("x") {
+    return true
+  }
+  let hs = self.heads[id]
+  hs.iter().any(fn(g) { self.reads_under(g, depth + 1) })
+}
+
+enum AnchorSide {
+  Above
+  Below
+  Left
+  Right
+} derive(Eq)
+
+enum AlignDir {
+  Left
+  Right
+  Center
+} derive(Eq)
+
+enum HoldRead {
+  Ready
+  Cancelled
+} derive(Eq)
+
+enum JobState {
+  Pending
+  Cancelled
+} derive(Eq)
+
+fn flip_anchor(asked : AnchorSide) -> (Int, Int, Int, AnchorSide) {
+  let out = match asked {
+    Below => {
+      let t = 1
+      (t, 2, 3, Above)
+    }
+    Above => (2, 1, 3, Below)
+    Right => (4, 5, 6, Left)
+    Left => (5, 4, 6, Right)
+  }
+  out
+}
+
+fn pick_hold(cond : Bool) -> HoldRead {
+  let res = if cond {
+    let _ = 1
+    Ready
+  } else {
+    Cancelled
+  }
+  res
+}
+
+pub fn run_f63b() -> String {
+  let target : Array[Int] = [7]
+  let views : Array[Array[Int]] = [[1], target]
+  let pe_ok = views.iter().any(fn(v) { physical_equal(v, target) })
+
+  let st_a = CellStyle::{ color: 3, bold: true, kind: XElement }
+  let st_b = CellStyle::{ color: 4, bold: false, kind: XText("hi") }
+  let nodes : Array[DomNode] = [
+    DomNode::{ style: st_b, kind: XText("hi") },
+    DomNode::{ style: st_a, kind: XElement },
+  ]
+  let eq_ok = nodes.iter().any(fn(n) { n.style == st_a && n.kind == XElement })
+
+  let dg = DepGraph::{
+    heads: [[1], [2], []],
+    labels: ["a", "b", "xHIT "],
+  }
+  let rec_ok = [0].iter().any(fn(root) { dg.reads_under(root, 0) })
+
+  let whole = Buffer(capacity=16)
+  whole.write_bytesview(b"ab"[:])
+  whole.write_byte(b'!')
+  let buf_len = whole.to_bytes().length()
+
+  let (_, _, _, s1) = flip_anchor(Right)
+  let h1 = pick_hold(false)
+  let sib_ok = s1 == AnchorSide::Left && h1 == HoldRead::Cancelled
+
+  let _ = AlignDir::Center
+  let _ = JobState::Pending
+  pe_ok.to_string() + "|" + eq_ok.to_string() + "|" + rec_ok.to_string() + "|" +
+    buf_len.to_string() + "|" + sib_ok.to_string()
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b()
 }
 '''
 
@@ -927,7 +1042,71 @@ def main():
                 )
         print(f"[NEG PASS] neg_class4_cross_pkg_dep_mut: moon check OK, fail-closed with MBT2PION_ARRAY_ITER_MUTATION (rc={p_xp.returncode})")
 
-    print(f"[PASS] Wave F6-3a 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases: ALL OK")
+        # 7. Wave F6-3b E2E: target-filtered empty dep package (`--mode publish` -> downstream `--dep`)
+        et_mod = os.path.join(tmp, "et_mod")
+        et_dep = os.path.join(et_mod, "wasm_dep")
+        et_app = os.path.join(et_mod, "app")
+        et_dep_pkg = os.path.join(tmp, "et_dep_pkg")
+        et_dep_out = os.path.join(et_dep_pkg, "src")
+        et_app_pkg = os.path.join(tmp, "et_app_pkg")
+        et_app_out = os.path.join(et_app_pkg, "src")
+        os.makedirs(et_dep, exist_ok=True)
+        os.makedirs(et_app, exist_ok=True)
+        os.makedirs(et_dep_out, exist_ok=True)
+        os.makedirs(et_app_out, exist_ok=True)
+        with open(os.path.join(et_dep_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "wasm_dep"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+            )
+        with open(os.path.join(et_app_pkg, "pion.toml"), "w") as f:
+            f.write(
+                '[package]\nname = "et_app"\nversion = "0.1.0"\n\n'
+                '[dependencies]\n'
+                f'mbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+                f'wasm_dep = {{ path = "{et_dep_pkg}" }}\n'
+            )
+        with open(os.path.join(et_mod, "moon.mod"), "w") as f:
+            f.write('name = "test/et"\n')
+        with open(os.path.join(et_dep, "moon.pkg"), "w") as f:
+            f.write('options(targets: { "wasm_only.mbt": ["wasm"] })\n')
+        with open(os.path.join(et_dep, "wasm_only.mbt"), "w") as f:
+            f.write("pub fn wasm_helper() -> Int { 42 }\n")
+        with open(os.path.join(et_app, "moon.pkg"), "w") as f:
+            f.write('import {\n  "test/et/wasm_dep" @wasm_dep,\n}\n')
+        with open(os.path.join(et_app, "lib.mbt"), "w") as f:
+            f.write("pub fn native_ok() -> Int { 7 }\n")
+        run_cmd([
+            cli_bin,
+            "--src", et_dep,
+            "--out", et_dep_out,
+            "--target", "native",
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        with open(os.path.join(et_dep_out, "mbt2pion_abi.json")) as af:
+            et_abi = json.load(af)
+        if et_abi.get("payload", {}).get("empty_target_pkg") is not True:
+            raise RuntimeError(f"Expected empty_target_pkg=true in ABI, got: {et_abi}")
+        run_cmd([
+            cli_bin,
+            "--src", et_app,
+            "--out", et_app_out,
+            "--target", "native",
+            "--dep", f"wasm_dep={et_dep_pkg}",
+            "--pionc", pionc,
+            "--mbt-compat", COMPAT_DIR,
+            "--no-fmt",
+            "--mode", "publish",
+        ], cwd=REPO_ROOT)
+        run_cmd([pionc, "check", et_dep_pkg], cwd=REPO_ROOT)
+        run_cmd([pionc, "check", et_app_pkg], cwd=REPO_ROOT)
+        print("[E2E PASS] empty_target_pkg publish + downstream --dep + pionc check OK")
+
+    print(f"[PASS] Wave F6-3a/3b 4-target oracle + {len(NEGATIVE_CASES) + 1} adversarial fail-closed cases + empty_target_pkg E2E: ALL OK")
 
 
 if __name__ == "__main__":
