@@ -13289,14 +13289,93 @@ fn drv_unit_sep() -> String {
 }
 
 ///|
-/// Builds and runs every job's tests. Test binaries live in the global CAS
-/// (`$PION_CACHE_DIR/testbin/`): the test object is keyed by the test SSA, the
-/// binary by that object plus every linked dependency object (CAS path, size
-/// and mtime: a dependency whose source or upstream interface changed has a
-/// new CAS path, so no stale binary can be reused) and the link libraries.
-/// Missing binaries are compiled and linked in parallel, then every selected
-/// test runs in its own process, also in parallel (bounded by `par`). Results
-/// are appended in job order, then test index order.
+struct DrvTestUnit {
+  args_usep : String
+  gi_start : Int
+  count : Int
+  is_batch : Bool
+}
+
+///|
+/// Plans execution units for one test job. Default mode uses a deterministic
+/// fixed batch size of 64 tests (independent of `--jobs`) so batch boundaries
+/// and `--json` output are byte-for-byte identical for any `--jobs` value.
+fn drv_plan_job_units(
+  job : DrvTestJob,
+  job_gi : Int,
+  isolate : Bool,
+  usep : String,
+) -> Array[DrvTestUnit] {
+  let units : Array[DrvTestUnit] = []
+  let n = job.run_idx.length()
+  if n == 0 {
+    return units
+  }
+  if isolate {
+    let mut ri = 0
+    while ri < n {
+      units.push(DrvTestUnit::{
+        args_usep: job.run_idx[ri].to_string(),
+        gi_start: job_gi + ri,
+        count: 1,
+        is_batch: false,
+      })
+      ri = ri + 1
+    }
+    return units
+  }
+  if n == 1 {
+    units.push(DrvTestUnit::{
+      args_usep: job.run_idx[0].to_string(),
+      gi_start: job_gi,
+      count: 1,
+      is_batch: false,
+    })
+    return units
+  }
+  let batch_chunk = 64
+  if n <= batch_chunk && n == job.names.length() {
+    units.push(DrvTestUnit::{
+      args_usep: "-1",
+      gi_start: job_gi,
+      count: n,
+      is_batch: true,
+    })
+    return units
+  }
+  let mut start = 0
+  while start < n {
+    let mut end = start + batch_chunk
+    if end > n {
+      end = n
+    }
+    let cnt = end - start
+    if cnt == 1 {
+      units.push(DrvTestUnit::{
+        args_usep: job.run_idx[start].to_string(),
+        gi_start: job_gi + start,
+        count: 1,
+        is_batch: false,
+      })
+    } else {
+      let chunk_args : Array[String] = []
+      let mut ci = start
+      while ci < end {
+        chunk_args.push(job.run_idx[ci].to_string())
+        ci = ci + 1
+      }
+      units.push(DrvTestUnit::{
+        args_usep: drv_join_char(chunk_args, usep),
+        gi_start: job_gi + start,
+        count: cnt,
+        is_batch: true,
+      })
+    }
+    start = end
+  }
+  units
+}
+
 ///|
 fn drv_exec_test_child(world : World, bin : String, idx : String, as_json : Bool) -> Int {
   if as_json {
@@ -13310,11 +13389,111 @@ fn drv_exec_test_child(world : World, bin : String, idx : String, as_json : Bool
 }
 
 ///|
+fn drv_strip_batch_token(out : String, tok : String) -> Option[String] {
+  let crlf = tok + "\r\n"
+  if out.length() >= crlf.length() &&
+    slice_str(out, out.length() - crlf.length(), out.length()) == crlf {
+    return Some(slice_str(out, 0, out.length() - crlf.length()))
+  }
+  let lf = tok + "\n"
+  if out.length() >= lf.length() &&
+    slice_str(out, out.length() - lf.length(), out.length()) == lf {
+    return Some(slice_str(out, 0, out.length() - lf.length()))
+  }
+  None
+}
+
+///|
+fn drv_exec_test_batch(
+  world : World,
+  bin : String,
+  args_usep : String,
+  as_json : Bool,
+) -> Int {
+  let tok = "__PION_BATCH_DONE_" +
+    sha256_hex(bin + "|" + args_usep + "|" + drv_tmp_tag(world, "btok"))
+  let argv : Array[String] = [bin, "-2", tok]
+  let parts = drv_split_char(args_usep, 31)
+  let mut pi = 0
+  while pi < parts.length() {
+    argv.push(parts[pi])
+    pi = pi + 1
+  }
+  match proc_exec_capture(world, argv) {
+    Ok(out) =>
+      match drv_strip_batch_token(out, tok) {
+        Some(rem) => {
+          if !as_json && rem.length() > 0 {
+            io_print(world, rem)
+          }
+          0
+        }
+        None => 1
+      }
+    Err(_) => 1
+  }
+}
+
+///|
+fn drv_exec_test_unit(
+  world : World,
+  bin : String,
+  args_usep : String,
+  is_batch : Bool,
+  as_json : Bool,
+) -> Int {
+  if is_batch {
+    drv_exec_test_batch(world, bin, args_usep, as_json)
+  } else {
+    drv_exec_test_child(world, bin, args_usep, as_json)
+  }
+}
+
+///|
+fn drv_record_test_unit_rc(
+  rcs : Array[Int],
+  gi_start : Int,
+  count : Int,
+  is_batch : Bool,
+  rc : Int,
+) -> Unit {
+  let rc_val = if rc == 0 {
+    0
+  } else if is_batch {
+    -2
+  } else {
+    1
+  }
+  let mut k = 0
+  while k < count {
+    let gi = gi_start + k
+    if gi >= 0 && gi < rcs.length() {
+      rcs[gi] = rc_val
+    }
+    k = k + 1
+  }
+}
+
+///|
+/// Builds and runs every job's tests. Test binaries live in the global CAS
+/// (`$PION_CACHE_DIR/testbin/`): the test object is keyed by `testobj_v2` plus
+/// the test SSA, and the linked binary by that object plus every linked
+/// dependency object's pure-content identity and link options. Missing binaries
+/// are compiled and linked in parallel (overlapping each binary's first planned
+/// execution unit). By default, tests run in deterministic fixed 64-test
+/// batches (independent of `--jobs`, sharing process state within a batch) with
+/// per-batch completion-token verification; any non-zero exit, crash, or early
+/// `exit(0)` (missing token) discards that batch's partial stdout and
+/// automatically falls back to isolated single-test child processes for that
+/// batch. `--isolate` or `PION_TEST_ISOLATE=1` forces strict per-test process
+/// isolation from the start. Results are appended in job order, then test index
+/// order.
 fn drv_exec_test_jobs(
   world : World,
   jobs_list : Array[DrvTestJob],
   par : Int,
   as_json : Bool,
+  isolate : Bool,
   active_target : String,
   out_pkgs : Array[String],
   out_names : Array[String],
@@ -13324,6 +13503,7 @@ fn drv_exec_test_jobs(
   if jobs_list.length() == 0 {
     return Ok(())
   }
+  let isolate_eff = isolate || drv_env_str(world, "PION_TEST_ISOLATE") == "1"
   let cache_dir = drv_resolve_cache_dir(world)
   let tb_dir = cache_dir + "/testbin"
   let _ = fs_mkdir_p(world, tb_dir)
@@ -13352,10 +13532,11 @@ fn drv_exec_test_jobs(
 
   let usep = drv_unit_sep()
   let bins : Array[String] = []
+  let all_units : Array[Array[DrvTestUnit]] = []
   let build_lines : Array[String] = []
   let new_keys : Array[String] = []
   let new_ssa : Array[String] = []
-  // rcs[gi]: exit code of the gi-th selected test (job order, then index order).
+  // rcs[gi]: -1 = pending, 0 = passed, 1 = failed (isolated), -2 = batch failed (needs isolated rerun).
   let rcs : Array[Int] = []
   let link_cc_ver_cache : Map[String, String] = Map([])
   let mut gi_base = 0
@@ -13369,9 +13550,11 @@ fn drv_exec_test_jobs(
       ri = ri + 1
     }
     gi_base = gi_base + job.run_idx.length()
+    let job_units = drv_plan_job_units(job, job_gi, isolate_eff, usep)
+    all_units.push(job_units)
     let okey = sha256_hex(
       compiler_fp +
-      "|testobj|" +
+      "|testobj_v2|" +
       qbe_target +
       "|" +
       qbe_macos_ver +
@@ -13451,6 +13634,11 @@ fn drv_exec_test_jobs(
       // The real file name (`.exe` on Windows), so size accounting and
       // `testbin:` eviction hit the binary the link produced.
       new_keys.push(bkey_file)
+      let has_u0 = job_units.length() > 0
+      let u0_args = if has_u0 { job_units[0].args_usep } else { "-" }
+      let u0_gi = if has_u0 { job_units[0].gi_start.to_string() } else { "0" }
+      let u0_cnt = if has_u0 { job_units[0].count.to_string() } else { "0" }
+      let u0_batch = if has_u0 && job_units[0].is_batch { "1" } else { "0" }
       build_lines.push(
         ssa_path +
         "\t" +
@@ -13464,9 +13652,9 @@ fn drv_exec_test_jobs(
         "\t" +
         drv_join_char(job.dep_objs, usep) +
         "\t" +
-        (if job.run_idx.length() > 0 { job.run_idx[0].to_string() } else { "-" }) +
+        u0_args +
         "\t" +
-        job_gi.to_string() +
+        u0_gi +
         "\t" +
         drv_join_char(job.link_opts.frameworks, usep) +
         "\t" +
@@ -13478,14 +13666,19 @@ fn drv_exec_test_jobs(
         "\t" +
         drv_join_char(job.link_opts.flags, usep) +
         "\t" +
-        (if job.link_opts.has_cxx { "1" } else { "0" }),
+        (if job.link_opts.has_cxx { "1" } else { "0" }) +
+        "\t" +
+        u0_cnt +
+        "\t" +
+        u0_batch,
       )
     }
     j = j + 1
   }
 
   // Phase 1: compile + link the missing test binaries in parallel; each worker
-  // runs its binary's first selected test right away, so the (macOS: ~150 ms
+  // runs its binary's first planned unit (whole-package batch in default mode,
+  // or first test in --isolate mode) right away, so the (macOS: ~150 ms
   // first-exec code-signing assessment of a new) binary overlaps other builds.
   let nb = build_lines.length()
   if nb > 0 {
@@ -13516,7 +13709,7 @@ fn drv_exec_test_jobs(
               break
             }
             let f = drv_split_char(items[bi], 9)
-            if f.length() < 14 {
+            if f.length() < 16 {
               let _ = err_ch.send(bi.to_string() + "\tmalformed test build spec")
               continue
             }
@@ -13552,8 +13745,8 @@ fn drv_exec_test_jobs(
               }
               Ok(_) => {
                 if f[6] != "-" {
-                  let rc = drv_exec_test_child(world, f[2], f[6], as_json)
-                  let _ = first_ch.send(f[7] + "\t" + rc.to_string())
+                  let rc = drv_exec_test_unit(world, f[2], f[6], f[15] == "1", as_json)
+                  let _ = first_ch.send(f[7] + "\t" + f[14] + "\t" + f[15] + "\t" + rc.to_string())
                 }
               }
             }
@@ -13567,9 +13760,13 @@ fn drv_exec_test_jobs(
     while true {
       match first_ch.recv() {
         Some(msg) => {
-          let gi = drv_msg_idx(msg)
-          if gi >= 0 && gi < rcs.length() {
-            rcs[gi] = if drv_msg_payload(msg) == "0" { 0 } else { 1 }
+          let rf = drv_split_char(msg, 9)
+          if rf.length() >= 4 {
+            let gi_start = drv_msg_idx(rf[0] + "\t")
+            let cnt = drv_msg_idx(rf[1] + "\t")
+            let is_b = rf[2] == "1"
+            let rc = if rf[3] == "0" { 0 } else { 1 }
+            drv_record_test_unit_rc(rcs, gi_start, cnt, is_b, rc)
           }
         }
         None => break
@@ -13626,20 +13823,30 @@ fn drv_exec_test_jobs(
   if trace_cas {
     io_eprintln(world, "[test] bins built=" + nb.to_string())
   }
-  // Phase 2: run every remaining selected test in its own process, in parallel.
+  // Phase 2: run every remaining planned unit (batches in default mode,
+  // individual tests in --isolate mode), in parallel.
   let t_run0 = clock_now_ms(world)
   let run_lines : Array[String] = []
-  let mut gi_run = 0
   j = 0
   while j < jobs_list.length() {
-    let job = jobs_list[j]
-    let mut ri = 0
-    while ri < job.run_idx.length() {
-      if rcs[gi_run] < 0 {
-        run_lines.push(bins[j] + "\t" + job.run_idx[ri].to_string() + "\t" + gi_run.to_string())
+    let units = all_units[j]
+    let mut ui = 0
+    while ui < units.length() {
+      let u = units[ui]
+      if rcs[u.gi_start] == -1 {
+        run_lines.push(
+          bins[j] +
+          "\t" +
+          u.args_usep +
+          "\t" +
+          u.gi_start.to_string() +
+          "\t" +
+          u.count.to_string() +
+          "\t" +
+          (if u.is_batch { "1" } else { "0" }),
+        )
       }
-      gi_run = gi_run + 1
-      ri = ri + 1
+      ui = ui + 1
     }
     j = j + 1
   }
@@ -13648,9 +13855,11 @@ fn drv_exec_test_jobs(
     let mut ri = 0
     while ri < nr {
       let f = drv_split_char(run_lines[ri], 9)
-      let gi = drv_msg_idx(f[2] + "\t")
-      let rc = drv_exec_test_child(world, f[0], f[1], as_json)
-      rcs[gi] = if rc == 0 { 0 } else { 1 }
+      let gi_start = drv_msg_idx(f[2] + "\t")
+      let cnt = drv_msg_idx(f[3] + "\t")
+      let is_b = f[4] == "1"
+      let rc = drv_exec_test_unit(world, f[0], f[1], is_b, as_json)
+      drv_record_test_unit_rc(rcs, gi_start, cnt, is_b, rc)
       ri = ri + 1
     }
   } else if nr > 1 {
@@ -13669,6 +13878,74 @@ fn drv_exec_test_jobs(
               break
             }
             let f = drv_split_char(items[ri], 9)
+            let is_b = f[4] == "1"
+            let rc = drv_exec_test_unit(world, f[0], f[1], is_b, as_json)
+            let _ = res_ch.send(f[2] + "\t" + f[3] + "\t" + f[4] + "\t" + rc.to_string())
+          }
+        })
+        wi = wi + 1
+      }
+    })
+    res_ch.close()
+    while true {
+      match res_ch.recv() {
+        Some(msg) => {
+          let rf = drv_split_char(msg, 9)
+          if rf.length() >= 4 {
+            let gi_start = drv_msg_idx(rf[0] + "\t")
+            let cnt = drv_msg_idx(rf[1] + "\t")
+            let is_b = rf[2] == "1"
+            let rc = if rf[3] == "0" { 0 } else { 1 }
+            drv_record_test_unit_rc(rcs, gi_start, cnt, is_b, rc)
+          }
+        }
+        None => break
+      }
+    }
+  }
+
+  // Phase 3: isolated fallback for any failed/crashed batch.
+  let fb_lines : Array[String] = []
+  let mut gi_fb = 0
+  j = 0
+  while j < jobs_list.length() {
+    let job = jobs_list[j]
+    let mut ri = 0
+    while ri < job.run_idx.length() {
+      if rcs[gi_fb] == -2 {
+        fb_lines.push(bins[j] + "\t" + job.run_idx[ri].to_string() + "\t" + gi_fb.to_string())
+      }
+      gi_fb = gi_fb + 1
+      ri = ri + 1
+    }
+    j = j + 1
+  }
+  let nf = fb_lines.length()
+  if nf == 1 || (nf > 1 && nw_max <= 1) {
+    let mut fi = 0
+    while fi < nf {
+      let f = drv_split_char(fb_lines[fi], 9)
+      let gi = drv_msg_idx(f[2] + "\t")
+      let rc = drv_exec_test_child(world, f[0], f[1], as_json)
+      rcs[gi] = if rc == 0 { 0 } else { 1 }
+      fi = fi + 1
+    }
+  } else if nf > 1 {
+    let spec = drv_join_char(fb_lines, "\n")
+    let nw = if nf < nw_max { nf } else { nw_max }
+    let cursor = AtomicInt::new(0)
+    let res_ch : Channel[String] = Channel::new(nf + 1)
+    scope(world, fn(s : Scope) -> Unit {
+      let mut wi = 0
+      while wi < nw {
+        spawn(s, fn() -> Unit {
+          let items = drv_split_char(spec, 10)
+          while true {
+            let fi = cursor.fetch_add(1)
+            if fi >= items.length() {
+              break
+            }
+            let f = drv_split_char(items[fi], 9)
             let rc = drv_exec_test_child(world, f[0], f[1], as_json)
             let _ = res_ch.send(f[2] + "\t" + rc.to_string())
           }
@@ -13691,7 +13968,15 @@ fn drv_exec_test_jobs(
   }
 
   if trace_cas {
-    io_eprintln(world, "[test] run=" + (clock_now_ms(world) - t_run0).to_string() + "ms tests=" + nr.to_string())
+    io_eprintln(
+      world,
+      "[test] run=" +
+      (clock_now_ms(world) - t_run0).to_string() +
+      "ms units=" +
+      nr.to_string() +
+      " fallbacks=" +
+      nf.to_string(),
+    )
   }
   let mut gi = 0
   j = 0
@@ -14774,6 +15059,7 @@ fn drv_run_ws_tests_collect(
   only_pkg : String,
   no_deps : Bool,
   jobs : Int,
+  isolate : Bool,
   locked : Bool,
   offline : Bool,
   active_target : String,
@@ -15614,7 +15900,7 @@ fn drv_run_ws_tests_collect(
     }
   }
   let t_checked = clock_now_ms(world)
-  match drv_exec_test_jobs(world, test_jobs, jobs, as_json, active_target, out_pkgs, out_names, out_oks, pin) {
+  match drv_exec_test_jobs(world, test_jobs, jobs, as_json, isolate, active_target, out_pkgs, out_names, out_oks, pin) {
     Err(e) => {
       drv_cas_pin_close(world, pin)
       return Err(e)
@@ -15650,6 +15936,7 @@ fn drv_run_ws_tests(
   only_pkg : String,
   no_deps : Bool,
   jobs : Int,
+  isolate : Bool,
   locked : Bool,
   offline : Bool,
   active_target : String,
@@ -15667,6 +15954,7 @@ fn drv_run_ws_tests(
     only_pkg,
     no_deps,
     jobs,
+    isolate,
     locked,
     offline,
     active_target,
@@ -15715,6 +16003,7 @@ fn drv_run_tests_cmd(
   only_pkg : String,
   no_deps : Bool,
   jobs : Int,
+  isolate : Bool,
   locked : Bool,
   offline : Bool,
   target_override : String,
@@ -15755,6 +16044,7 @@ fn drv_run_tests_cmd(
           only_pkg,
           no_deps,
           jobs,
+          isolate,
           locked,
           offline,
           active_target,
@@ -15806,6 +16096,7 @@ fn drv_run_tests_cmd(
             only_pkg,
             no_deps,
             jobs,
+            isolate,
             locked,
             offline,
             active_target,
@@ -15850,6 +16141,7 @@ fn drv_run_tests_cmd(
           only_pkg,
           no_deps,
           jobs,
+          isolate,
           locked,
           offline,
           active_target,
@@ -15932,6 +16224,7 @@ fn drv_run_tests_cmd(
       test_jobs,
       jobs,
       as_json,
+      isolate,
       active_target,
       out_pkgs,
       out_names,
@@ -21837,7 +22130,7 @@ fn drv_usage_text() -> String {
   "  pionc build [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--emit-web-rt [path]] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
   "  pionc run [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
-  "  pionc test [--json] [--locked] [--offline] [--target <target>] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
+  "  pionc test [--json] [--locked] [--offline] [--target <target>] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [--isolate] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--target <target>] [--json] [input1 ...]\n" +
   "  pionc extract-lean --out <dir> [--pkg <name>] [--json] [input]\n" +
   "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
@@ -22958,6 +23251,7 @@ fn drv_main_dispatch(world : World) -> Int {
     let mut explicit_deps = false
     let mut locked = false
     let mut offline = false
+    let mut isolate = false
     let mut jobs = drv_default_jobs(world)
     let libs : Array[String] = []
     let targets : Array[String] = []
@@ -22975,6 +23269,8 @@ fn drv_main_dispatch(world : World) -> Int {
         locked = true
       } else if a == "--offline" {
         offline = true
+      } else if a == "--isolate" {
+        isolate = true
       } else if a == "--deps" {
         explicit_deps = true
       } else if a == "--no-deps" || a == "--only-pkg" {
@@ -23075,6 +23371,7 @@ fn drv_main_dispatch(world : World) -> Int {
       only_pkg,
       no_deps,
       jobs,
+      isolate,
       locked,
       offline,
       target_override,

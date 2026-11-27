@@ -922,4 +922,404 @@ finally:
 PYEOF
 echo "(f) parallel C stub FIFO overlap + timeout + link order + lstat + no-rm PATH + same-key race -> OK"
 
+# ----------------------------------------------------------------------------
+# (h) Wave 3 PR G: single-process batch runner + crash/panic isolated fallback
+#     1) Multi-test all-pass package (>10 tests, stdout output, filtered subset):
+#        default batch vs --jobs 1 vs --isolate vs PION_TEST_ISOLATE=1 produce
+#        identical JSON and human output; warm batch spawns units=1 vs units=16;
+#        direct binary CLI guards reject missing/non-int/OOB/misplaced -1 args.
+#     2) Mixed package (pass + stdout + fake-ok stdout + debug_assert panic +
+#        SIGABRT abort() + _exit(42)): both cold (Phase 1) and warm (Phase 2)
+#        trigger Phase 3 isolated fallback with zero stdout duplication and
+#        byte-identical JSON vs --isolate.
+#     3) Subset chunking (>256 selected tests in a partial filter) splits into
+#        256-arg chunks cleanly (units=2, fallbacks=0).
+# ----------------------------------------------------------------------------
+BAT="$TMP_DIR/batch_pkg"
+mkdir -p "$BAT/src" "$BAT/csrc"
+cat > "$BAT/pion.toml" <<'EOF'
+[package]
+name = "batch_ok"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/helper.c"]
+EOF
+cat > "$BAT/csrc/helper.c" <<'EOF'
+#include <stdio.h>
+#include <stdint.h>
+void p91_emit_tag(int64_t id) {
+    printf("BAT_TAG_%lld\n", (long long)id);
+    fflush(stdout);
+}
+EOF
+cat > "$BAT/src/lib.pion" <<'EOF'
+extern "C" fn p91_emit_tag(id : Int64) -> Unit
+pub fn emit_tag(id : Int64) -> Unit { p91_emit_tag(id) }
+EOF
+python3 - "$BAT/src/batch_ok_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(16):
+        grp = "sub" if i < 12 else "tail"
+        f.write(f'test "{grp}_{i:02d}" {{\n')
+        if i % 4 == 0:
+            f.write(f'  emit_tag({i}L)\n')
+        f.write(f'  debug_assert({i} + 1 == {i + 1}, "ok_{i}")\n')
+        f.write('}\n')
+PYEOF
+
+CAS_BAT="$TMP_DIR/cas_bat"
+mkdir -p "$CAS_BAT"
+# Cold run (Phase 1 overlap batch)
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --json "$BAT" > "$TMP_DIR/bat_cold.json" 2>"$TMP_DIR/bat_cold.trace"
+# Warm runs: default batch, --jobs 1, --isolate, PION_TEST_ISOLATE=1
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --json "$BAT" > "$TMP_DIR/bat_warm.json" 2>"$TMP_DIR/bat_warm.trace"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --jobs 1 --json "$BAT" > "$TMP_DIR/bat_j1.json" 2>"$TMP_DIR/bat_j1.trace"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --isolate --json "$BAT" > "$TMP_DIR/bat_iso.json" 2>"$TMP_DIR/bat_iso.trace"
+PION_CAS_TRACE=1 PION_TEST_ISOLATE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --json "$BAT" > "$TMP_DIR/bat_env_iso.json" 2>"$TMP_DIR/bat_env_iso.trace"
+
+# Human output comparison (batch vs --jobs 1 vs --isolate vs PION_TEST_ISOLATE=1)
+PION_CACHE_DIR="$CAS_BAT" "$PIONC" test "$BAT" > "$TMP_DIR/bat_human_def.out"
+PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --jobs 1 "$BAT" > "$TMP_DIR/bat_human_j1.out"
+PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --jobs 1 --isolate "$BAT" > "$TMP_DIR/bat_human_iso.out"
+PION_TEST_ISOLATE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --jobs 1 "$BAT" > "$TMP_DIR/bat_human_env_iso.out"
+
+# Filtered subset (12 of 16)
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --filter sub_ --json "$BAT" > "$TMP_DIR/bat_sub_def.json" 2>"$TMP_DIR/bat_sub_def.trace"
+PION_CACHE_DIR="$CAS_BAT" "$PIONC" test --filter sub_ --isolate --json "$BAT" > "$TMP_DIR/bat_sub_iso.json"
+
+python3 - "$TMP_DIR" "$CAS_BAT/testbin" <<'PYEOF'
+import json, os, re, subprocess, sys
+td, tb = sys.argv[1], sys.argv[2]
+
+def rd(name):
+    return open(os.path.join(td, name)).read()
+
+j_cold = rd("bat_cold.json")
+j_warm = rd("bat_warm.json")
+j_j1 = rd("bat_j1.json")
+j_iso = rd("bat_iso.json")
+j_env = rd("bat_env_iso.json")
+assert j_cold == j_warm == j_j1 == j_iso == j_env, "batch/isolate JSON mismatch"
+d = json.loads(j_warm)
+assert d["ok"] is True and d["total"] == 16 and d["passed"] == 16 and d["failed"] == 0, d
+
+# Verify unit counts in trace: warm batch = 1 unit, isolate = 16 units
+assert "units=1 fallbacks=0" in rd("bat_warm.trace"), rd("bat_warm.trace")
+assert "units=16 fallbacks=0" in rd("bat_iso.trace"), rd("bat_iso.trace")
+assert "units=16 fallbacks=0" in rd("bat_env_iso.trace"), rd("bat_env_iso.trace")
+assert "units=1 fallbacks=0" in rd("bat_sub_def.trace"), rd("bat_sub_def.trace")
+
+# Filtered subset JSON matches isolate
+assert rd("bat_sub_def.json") == rd("bat_sub_iso.json")
+ds = json.loads(rd("bat_sub_def.json"))
+assert ds["ok"] is True and ds["total"] == 12 and ds["passed"] == 12, ds
+
+# Human output matches between batch, --jobs 1, --isolate, PION_TEST_ISOLATE=1
+h_def = rd("bat_human_def.out")
+assert h_def == rd("bat_human_j1.out") == rd("bat_human_iso.out") == rd("bat_human_env_iso.out"), (
+    f"human output mismatch:\ndef={h_def!r}\niso={rd('bat_human_iso.out')!r}"
+)
+for tag in ("BAT_TAG_0", "BAT_TAG_4", "BAT_TAG_8", "BAT_TAG_12"):
+    assert h_def.count(tag) == 1, f"expected {tag} once, got {h_def!r}"
+
+# Direct binary CLI contract checks
+bins = [
+    os.path.join(tb, f) for f in os.listdir(tb)
+    if not f.endswith(".o") and not f.endswith(".ssa") and os.access(os.path.join(tb, f), os.X_OK)
+]
+assert len(bins) == 1, f"expected 1 test binary in {tb}, got {bins}"
+b = bins[0]
+assert subprocess.run([b, "-1"], capture_output=True).returncode == 0
+assert subprocess.run([b, "0", "4", "15"], capture_output=True).returncode == 0
+assert subprocess.run([b, "0"], capture_output=True).returncode == 0
+for bad_args in ([], ["abc"], ["999"], ["-2"], ["-1", "0"], ["0", "-1"]):
+    r = subprocess.run([b] + bad_args, capture_output=True)
+    assert r.returncode != 0, f"expected non-zero for args {bad_args}, got 0"
+PYEOF
+
+# (h2) Mixed package: pass + stdout + fake-ok stdout + panic + SIGABRT + _exit(42)
+MIX="$TMP_DIR/batch_mix"
+mkdir -p "$MIX/src" "$MIX/csrc"
+cat > "$MIX/pion.toml" <<'EOF'
+[package]
+name = "batch_mix"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/crash.c"]
+EOF
+cat > "$MIX/csrc/crash.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+void p91_mix_print(int64_t id) {
+    printf("MIX_PASS_OUT_%lld\n", (long long)id);
+    fflush(stdout);
+}
+void p91_mix_fake_and_fail(void) {
+    printf("test batch_mix::t_fake ... ok\n{\"ok\":true}\n");
+    fflush(stdout);
+    _Exit(7);
+}
+void p91_mix_abort(void) {
+    abort();
+}
+void p91_mix_exit42(void) {
+    _Exit(42);
+}
+EOF
+cat > "$MIX/src/lib.pion" <<'EOF'
+extern "C" fn p91_mix_print(id : Int64) -> Unit
+extern "C" fn p91_mix_fake_and_fail() -> Unit
+extern "C" fn p91_mix_abort() -> Unit
+extern "C" fn p91_mix_exit42() -> Unit
+pub fn mix_print(id : Int64) -> Unit { p91_mix_print(id) }
+pub fn mix_fake_and_fail() -> Unit { p91_mix_fake_and_fail() }
+pub fn mix_abort() -> Unit { p91_mix_abort() }
+pub fn mix_exit42() -> Unit { p91_mix_exit42() }
+EOF
+cat > "$MIX/src/mix_test.pion" <<'EOF'
+test "t0_pass_stdout" {
+  mix_print(0L)
+  debug_assert(1 + 1 == 2, "t0")
+}
+test "t1_panic" {
+  debug_assert(1 == 2, "intentional panic")
+}
+test "t2_pass_after_panic" {
+  mix_print(2L)
+  debug_assert(2 + 2 == 4, "t2")
+}
+test "t3_abort_sigabrt" {
+  mix_abort()
+}
+test "t4_exit42" {
+  mix_exit42()
+}
+test "t5_fake_delimiter_fail" {
+  mix_fake_and_fail()
+}
+test "t6_pass_end" {
+  mix_print(6L)
+  debug_assert(3 + 3 == 6, "t6")
+}
+EOF
+
+CAS_MIX="$TMP_DIR/cas_mix"
+mkdir -p "$CAS_MIX"
+# Cold batch -> Phase 1 batch fails -> Phase 3 fallback
+if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_MIX" "$PIONC" test --json "$MIX" > "$TMP_DIR/mix_cold.json" 2>"$TMP_DIR/mix_cold.trace"; then
+  echo "FAIL: mix cold test unexpectedly exited 0" >&2
+  exit 1
+fi
+# Warm batch -> Phase 2 batch fails -> Phase 3 fallback
+if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_MIX" "$PIONC" test --json "$MIX" > "$TMP_DIR/mix_warm.json" 2>"$TMP_DIR/mix_warm.trace"; then
+  echo "FAIL: mix warm test unexpectedly exited 0" >&2
+  exit 1
+fi
+# Isolated reference
+if PION_CACHE_DIR="$CAS_MIX" "$PIONC" test --isolate --json "$MIX" > "$TMP_DIR/mix_iso.json" 2>"$TMP_DIR/mix_iso.err"; then
+  echo "FAIL: mix isolate test unexpectedly exited 0" >&2
+  exit 1
+fi
+# Human mode (jobs 1 for deterministic stdout ordering)
+if PION_CACHE_DIR="$CAS_MIX" "$PIONC" test --jobs 1 "$MIX" > "$TMP_DIR/mix_human.out" 2>"$TMP_DIR/mix_human.err"; then
+  echo "FAIL: mix human test unexpectedly exited 0" >&2
+  exit 1
+fi
+
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+def rd(name):
+    return open(os.path.join(td, name)).read()
+
+jc, jw, ji = rd("mix_cold.json"), rd("mix_warm.json"), rd("mix_iso.json")
+assert jc == jw == ji, f"mix JSON mismatch:\ncold={jc}\nwarm={jw}\niso={ji}"
+d = json.loads(jw)
+assert d["ok"] is False and d["total"] == 7 and d["passed"] == 3 and d["failed"] == 4, d
+got = {t["name"]: t["ok"] for t in d["tests"]}
+expected = {
+    "t0_pass_stdout": True,
+    "t1_panic": False,
+    "t2_pass_after_panic": True,
+    "t3_abort_sigabrt": False,
+    "t4_exit42": False,
+    "t5_fake_delimiter_fail": False,
+    "t6_pass_end": True,
+}
+assert got == expected, f"unexpected per-test results: {got}"
+assert "fallbacks=7" in rd("mix_cold.trace"), rd("mix_cold.trace")
+assert "fallbacks=7" in rd("mix_warm.trace"), rd("mix_warm.trace")
+
+# Human output: passing stdout appears ONCE (zero duplication from failed batch!)
+ho = rd("mix_human.out")
+for tag in ("MIX_PASS_OUT_0", "MIX_PASS_OUT_2", "MIX_PASS_OUT_6"):
+    assert ho.count(tag) == 1, f"expected {tag} once in human output, got {ho!r}"
+assert "test batch_mix::t0_pass_stdout ... ok" in ho, ho
+assert "test batch_mix::t1_panic ... FAILED" in ho, ho
+assert "test batch_mix::t3_abort_sigabrt ... FAILED" in ho, ho
+assert "test batch_mix::t4_exit42 ... FAILED" in ho, ho
+assert "test batch_mix::t5_fake_delimiter_fail ... FAILED" in ho, ho
+assert "test batch_mix::t6_pass_end ... ok" in ho, ho
+assert "test result: FAILED. 3 passed; 4 failed" in ho, ho
+PYEOF
+
+# (h3) Deterministic fixed 64-test batching (260 tests, filter selects 258 -> 5 units: 64*4 + 2 for ANY --jobs)
+#      plus batch-scoped fallback (70 tests -> 2 batches: 64 + 6; 1 panic in batch 1 -> only fallbacks=6!)
+CHK="$TMP_DIR/batch_chunk"
+mkdir -p "$CHK/src"
+cat > "$CHK/pion.toml" <<'EOF'
+[package]
+name = "batch_chunk"
+version = "0.1.0"
+EOF
+cat > "$CHK/src/lib.pion" <<'EOF'
+pub fn id(x : Int) -> Int { x }
+EOF
+python3 - "$CHK/src/chunk_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(260):
+        pfx = "sel" if i < 258 else "skip"
+        f.write(f'test "{pfx}_{i:03d}" {{ debug_assert(id({i}) == {i}, "ok") }}\n')
+PYEOF
+CAS_CHK="$TMP_DIR/cas_chk"
+mkdir -p "$CAS_CHK"
+PION_CACHE_DIR="$CAS_CHK" "$PIONC" test --jobs 1 --filter sel_ --json "$CHK" > "$TMP_DIR/chk_cold.json"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_CHK" "$PIONC" test --jobs 1 --filter sel_ --json "$CHK" > "$TMP_DIR/chk_j1.json" 2>"$TMP_DIR/chk_j1.trace"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_CHK" "$PIONC" test --jobs 4 --filter sel_ --json "$CHK" > "$TMP_DIR/chk_j4.json" 2>"$TMP_DIR/chk_j4.trace"
+python3 - "$TMP_DIR/chk_j1.json" "$TMP_DIR/chk_j1.trace" "$TMP_DIR/chk_j4.json" "$TMP_DIR/chk_j4.trace" <<'PYEOF'
+import json, sys
+j1 = open(sys.argv[1]).read()
+j4 = open(sys.argv[3]).read()
+assert j1 == j4
+d = json.loads(j1)
+assert d["ok"] is True and d["total"] == 258 and d["passed"] == 258 and d["failed"] == 0, d
+t1 = open(sys.argv[2]).read()
+t4 = open(sys.argv[4]).read()
+assert "units=5 fallbacks=0" in t1, t1
+assert "units=5 fallbacks=0" in t4, t4
+PYEOF
+
+# (h4) Batch-scoped fallback + --jobs determinism with shared top-level mutable state across 64-test boundary
+SHD="$TMP_DIR/batch_shard_fb"
+mkdir -p "$SHD/src"
+cat > "$SHD/pion.toml" <<'EOF'
+[package]
+name = "batch_shard_fb"
+version = "0.1.0"
+EOF
+cat > "$SHD/src/lib.pion" <<'EOF'
+pub let shared_counter : Array[Int] = [0]
+pub fn bump() -> Int {
+  shared_counter[0] = shared_counter[0] + 1
+  shared_counter[0]
+}
+EOF
+python3 - "$SHD/src/shard_test.pion" <<'PYEOF'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(70):
+        # Batch 0 = indices 0..63 (all pass, bumping shared_counter up to 64).
+        # Batch 1 = indices 64..69 (fresh process, counter starts at 1..6; index 68 fails).
+        if i == 68:
+            f.write(f'test "s_{i:02d}" {{ let _ = bump(); debug_assert(1 == 2, "fail_68") }}\n')
+        elif i >= 64:
+            # In batch 1 (size 6), bump() sees <= 6 (and in isolated fallback, sees 1).
+            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() <= 6, "batch1_{i}") }}\n')
+        else:
+            f.write(f'test "s_{i:02d}" {{ debug_assert(bump() == {i + 1}, "batch0_{i}") }}\n')
+PYEOF
+CAS_SHD="$TMP_DIR/cas_shd"
+mkdir -p "$CAS_SHD"
+for J in 1 2 4 8; do
+  if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_SHD" "$PIONC" test --jobs "$J" --json "$SHD" > "$TMP_DIR/shd_j${J}.json" 2>"$TMP_DIR/shd_j${J}.trace"; then
+    echo "FAIL: shard fallback test (--jobs $J) unexpectedly exited 0" >&2
+    exit 1
+  fi
+done
+python3 - "$TMP_DIR" <<'PYEOF'
+import json, os, sys
+td = sys.argv[1]
+j1 = open(os.path.join(td, "shd_j1.json")).read()
+for j in (2, 4, 8):
+    jj = open(os.path.join(td, f"shd_j{j}.json")).read()
+    assert jj == j1, f"--jobs {j} JSON differs from --jobs 1:\n{jj}\nvs\n{j1}"
+d = json.loads(j1)
+assert d["ok"] is False and d["total"] == 70 and d["passed"] == 69 and d["failed"] == 1, d
+failed = [t["name"] for t in d["tests"] if not t["ok"]]
+assert failed == ["s_68"], failed
+tr8 = open(os.path.join(td, "shd_j8.trace")).read()
+assert "units=2 fallbacks=6" in tr8, tr8
+PYEOF
+
+# (h5) Early _Exit(0) adversarial test: t0 calls _Exit(0) before t1 fails ->
+#      missing completion token triggers isolated fallback, reporting t0=ok, t1=FAIL, exit 1;
+#      also verify direct binary `-2` missing-arg guards exit non-zero.
+EX0="$TMP_DIR/batch_exit0"
+mkdir -p "$EX0/src" "$EX0/csrc"
+cat > "$EX0/pion.toml" <<'EOF'
+[package]
+name = "batch_exit0"
+version = "0.1.0"
+
+[link]
+c_sources = ["csrc/exit0.c"]
+EOF
+cat > "$EX0/csrc/exit0.c" <<'EOF'
+#include <stdlib.h>
+void p91_early_exit0(void) { _Exit(0); }
+EOF
+cat > "$EX0/src/lib.pion" <<'EOF'
+extern "C" fn p91_early_exit0() -> Unit
+pub fn early_exit0() -> Unit { p91_early_exit0() }
+EOF
+cat > "$EX0/src/exit0_test.pion" <<'EOF'
+test "t0_early_exit0" {
+  early_exit0()
+}
+test "t1_must_fail" {
+  debug_assert(1 == 2, "must fail")
+}
+test "t2_pass" {
+  debug_assert(2 + 2 == 4, "ok")
+}
+EOF
+CAS_EX0="$TMP_DIR/cas_ex0"
+mkdir -p "$CAS_EX0"
+if PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_EX0" "$PIONC" test --json "$EX0" > "$TMP_DIR/ex0_def.json" 2>"$TMP_DIR/ex0_def.trace"; then
+  echo "FAIL: _Exit(0) batch test unexpectedly exited 0 (false green!)" >&2
+  exit 1
+fi
+if PION_CACHE_DIR="$CAS_EX0" "$PIONC" test --isolate --json "$EX0" > "$TMP_DIR/ex0_iso.json" 2>"$TMP_DIR/ex0_iso.err"; then
+  echo "FAIL: _Exit(0) isolate test unexpectedly exited 0" >&2
+  exit 1
+fi
+python3 - "$TMP_DIR/ex0_def.json" "$TMP_DIR/ex0_iso.json" "$TMP_DIR/ex0_def.trace" "$CAS_EX0/testbin" <<'PYEOF'
+import json, os, subprocess, sys
+jd = open(sys.argv[1]).read()
+ji = open(sys.argv[2]).read()
+assert jd == ji, f"_Exit(0) JSON mismatch:\ndef={jd}\niso={ji}"
+d = json.loads(jd)
+assert d["ok"] is False and d["total"] == 3 and d["passed"] == 2 and d["failed"] == 1, d
+got = {t["name"]: t["ok"] for t in d["tests"]}
+assert got == {"t0_early_exit0": True, "t1_must_fail": False, "t2_pass": True}, got
+tr = open(sys.argv[3]).read()
+assert "fallbacks=3" in tr, tr
+tb = sys.argv[4]
+bins = [
+    os.path.join(tb, f) for f in os.listdir(tb)
+    if not f.endswith(".o") and not f.endswith(".ssa") and os.access(os.path.join(tb, f), os.X_OK)
+]
+assert len(bins) == 1, bins
+b = bins[0]
+for bad in (["-2"], ["-2", "tok"], ["-2", "tok", "-1", "0"], ["-2", "tok", "2", "-2"]):
+    r = subprocess.run([b] + bad, capture_output=True)
+    assert r.returncode != 0, f"expected non-zero for {bad}, got 0"
+PYEOF
+echo "(h) batch runner (fixed-64/determinism/token-guard/direct CLI) + panic/SIGABRT/exit42/_Exit(0) isolated fallback -> OK"
+
 echo "PASS: p91_test_runner_cli"
