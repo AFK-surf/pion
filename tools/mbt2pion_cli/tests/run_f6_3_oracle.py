@@ -339,8 +339,114 @@ pub fn run_f63b() -> String {
     buf_len.to_string() + "|" + sib_ok.to_string()
 }
 
+fn pos_f6_4a_scalar_sort_nan_signed_zero() -> String {
+  let nan = 0.0 / 0.0
+  let inf = 1.0 / 0.0
+  let ninf = -1.0 / 0.0
+  let xs : Array[Double] = [2.5, -0.0, nan, 0.0, -1.5, inf, ninf, -0.0, 0.0]
+  xs.sort()
+  let out : Array[String] = []
+  for x in xs {
+    if x.is_nan() {
+      out.push("nan")
+    } else if x == 0.0 {
+      if 1.0 / x < 0.0 {
+        out.push("-0")
+      } else {
+        out.push("+0")
+      }
+    } else if x == inf {
+      out.push("+inf")
+    } else if x == ninf {
+      out.push("-inf")
+    } else {
+      out.push(x.to_int().to_string())
+    }
+  }
+  out.join(",")
+}
+
+fn pos_f6_4a_newline_paren_bracket_stmt() -> String {
+  let xs : Array[Int] = [0, 1, 2]
+  let r1 = xs.search_by(fn(x) {
+    let m : Map[Int, Int] = { 1: 2 }
+    (m.contains(x))
+  })
+  let r2 = xs.search_by(fn(x) {
+    let m : Map[Int, Int] = { 1: 2 }
+    [m.contains(x)][0]
+  })
+  let s1 = match r1 { Some(i) => i.to_string(); None => "none" }
+  let s2 = match r2 { Some(i) => i.to_string(); None => "none" }
+  s1 + "|" + s2
+}
+
+fn pos_f6_4a_mid_closure_local_map() -> String {
+  let xs : Array[Int] = [0, 1, 2]
+  let ext : Map[Int, Int] = { 2: 9 }
+  let mid_local = fn() -> Int? {
+    let m : Map[Int, Int] = { 1: 2 }
+    xs.search_by(fn(x) { m.contains(x) })
+  }
+  let m_outer : Map[Int, Int] = { 1: 2 }
+  let mid_post = fn() -> Int? {
+    let found = xs.search_by(fn(x) { m_outer.contains(x) })
+    let m_outer : Map[Int, Int] = ext
+    let _ = m_outer.size()
+    found
+  }
+  let mid_closed_blk = fn(cond : Bool) -> Int? {
+    if cond {
+      let m_outer : Map[Int, Int] = ext
+      let _ = m_outer.size()
+    }
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let mid_expr_blk_sb = fn() -> Int? {
+    let tmp = {
+      let m_outer : Map[Int, Int] = ext
+      m_outer
+    }
+    let _ = tmp.size()
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let mid_expr_blk_sb_other = fn() -> Int? {
+    let tmp = {
+      let other : Map[Int, Int] = ext
+      other
+    }
+    let _ = tmp.size()
+    xs.search_by(fn(x) { m_outer.contains(x) })
+  }
+  let xs_one : Array[Int] = [1]
+  let mid_expr_blk_any = fn() -> Int {
+    let tmp = {
+      let m_outer : Map[Int, Int] = ext
+      m_outer
+    }
+    let _ = tmp.size()
+    if xs_one.iter().any(fn(x) { m_outer.contains(x) }) { 1 } else { 0 }
+  }
+  let mid_expr_blk_any_other = fn() -> Int {
+    let tmp = {
+      let other : Map[Int, Int] = ext
+      other
+    }
+    let _ = tmp.size()
+    if xs_one.iter().any(fn(x) { m_outer.contains(x) }) { 1 } else { 0 }
+  }
+  let s1 = match mid_local() { Some(i) => i.to_string(); None => "none" }
+  let s2 = match mid_post() { Some(i) => i.to_string(); None => "none" }
+  let s3 = match mid_closed_blk(true) { Some(i) => i.to_string(); None => "none" }
+  let s4 = match mid_expr_blk_sb() { Some(i) => i.to_string(); None => "none" }
+  let s5 = match mid_expr_blk_sb_other() { Some(i) => i.to_string(); None => "none" }
+  let s6 = mid_expr_blk_any().to_string()
+  let s7 = mid_expr_blk_any_other().to_string()
+  s1 + "|" + s2 + "|" + s3 + "|" + s4 + "|" + s5 + "|" + s6 + "|" + s7
+}
+
 pub fn run_all() -> String {
-  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b()
+  run_gate_a() + " :: " + run_gate_b() + " :: " + run_gate_c() + " :: " + run_gate_d() + " :: " + run_f63b() + " :: " + pos_f6_4a_scalar_sort_nan_signed_zero() + " :: " + pos_f6_4a_newline_paren_bracket_stmt() + " :: " + pos_f6_4a_mid_closure_local_map()
 }
 '''
 
@@ -810,6 +916,87 @@ pub fn run_pipe(xs : Array[Int]) -> Int? {
     touch_pipe(xs, Node::{ n: 0 })
     x == 1
   })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_f6_4a_block_iterable_shadow_param",
+        r'''
+struct Item {
+  xs : Array[Int]
+}
+impl Eq for Item with equal(self, _other) {
+  self.xs.clear()
+  true
+}
+fn bad_cmp(x : Int, items : Array[Item]) -> Bool {
+  for x in { let ys = items; ys } {
+    if x == x {
+      return true
+    }
+  }
+  false
+}
+pub fn run(xs : Array[Int], items : Array[Item]) -> Bool {
+  xs.iter().any(fn(x) { bad_cmp(x, items) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_f6_4a_for_map_param_new_by_callback",
+        r'''
+pub fn run(xs : Array[Int], ms : Array[Map[Int, Int]]) -> Bool {
+  xs.iter().any(fn(x) {
+    for m in ms {
+      if m.contains(x) {
+        return true
+      }
+    }
+    false
+  })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_f6_4a_multiline_pipe_map_init",
+        r'''
+fn wrap_ext(_m : Map[Int, Int], ext : Map[Int, Int]) -> Map[Int, Int] {
+  ext
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let v : Map[Int, Int] = { 1: 2 }
+    |> wrap_ext(ext)
+  xs.iter().any(fn(x) { v.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_f6_4a_ordered_set_copy_callback",
+        r'''
+pub fn run(xs : Array[Int], s : Set[Int]) -> Int? {
+  xs.search_by(fn(x) {
+    let _ = s.copy()
+    x == 1
+  })
+}
+''',
+        "Array::search_by",
+    ),
+    (
+        "neg_f6_4a_mid_closure_shadow_map",
+        r'''
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Int? {
+  let m : Map[Int, Int] = { 1: 2 }
+  let _ = m.size()
+  let mid = fn() -> Int? {
+    let m : Map[Int, Int] = ext
+    xs.search_by(fn(x) { m.contains(x) })
+  }
+  mid()
 }
 ''',
         "Array::search_by",

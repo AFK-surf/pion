@@ -1,0 +1,591 @@
+///| Wave F6-4a unit tests:
+///| 1. `__AMBIG__` local/pattern bindings fall back to `qfi_opt` byte-span types instead of short-circuiting.
+///| 2. Simple single-ident `for x in arr` element type inference (positive) + rebinding/shadowing/callable (negative).
+///| 3. `String` view methods (`exact_view`/`view`/`view_from`/`as_view`) -> `StrView` + shadowed `struct Str` negative.
+///| 4. `OrderedMap`/`OrderedSet`/`Map` provenance gate: local `MapKey`-only & pure helper returns allowed; param/for-in/`new_by`/custom Eq+Hash fail-closed; `size`/`ordered_map_size` pure.
+///| 5. Stage B Round 1+ lazy `round_qt` refresh with accurate post-Round-0 byte offsets + zero extra calls when unneeded.
+///| 6. `Array[Double/Float/UInt/UInt64/Byte/Char]::sort()` & `FixedArray` Stage B lowering + `mutation_summary` soundness.
+///| 7. `lower_capacity.pion` `xs.search_by(fn(x) { xs.shrink_to_fit(); true })` fail-closed negative.
+
+fn f64a_make_qt_json(rel : String, entries : Array[(Int, Int, String)]) -> String {
+  let parts : Array[String] = []
+  for e in entries {
+    parts.push("{\"start_byte\":" + e.0.to_string() + ",\"end_byte\":" + e.1.to_string() + ",\"ty\":\"" + e.2 + "\"}")
+  }
+  "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/" + rel + "\",\"expr_tys\":[" + parts.join(",") + "],\"call_targets\":[]}]}"
+}
+
+test "F6-4a: __AMBIG__ pattern bindings fall back to qfi_opt (match destructure & for-in enum Eq)" {
+  let src = "enum Pref { Light\n Dark } derive(Eq)\n\nstruct Custom { id : Int }\nimpl Eq for Custom {\n  fn op_eq(self : Custom, other : Custom) -> Bool { self.id == other.id }\n}\n\nfn check_match(opt : Option[(Int, Array[Int])]) -> Bool {\n  match opt {\n    Some((glass, heads)) => heads.iter().any(fn(h) { h == glass })\n    None => false\n  }\n}\n\nfn check_pref(prefs : Array[Pref], target : Pref) -> Bool {\n  for p in prefs {\n    if p == target {\n      return true\n    }\n  }\n  false\n}\n"
+  let rel = "main.pion"
+  let heads_off = src.index_of("heads.iter()")
+  let glass_off = src.index_of("h == glass") + 5
+  let h_off = src.index_of("h == glass")
+  let p_off = src.index_of("if p == target") + 3
+  assert_true(heads_off > 0 && glass_off > 0 && h_off > 0 && p_off > 0, "locate test spans")
+
+  let qt_json = f64a_make_qt_json(rel, [
+    (heads_off, heads_off + 5, "Array[Int]"),
+    (glass_off, glass_off + 5, "Int"),
+    (h_off, h_off + 1, "Int"),
+    (p_off, p_off + 1, "Pref"),
+  ])
+  let qt = parse_pkg_query_types_json(qt_json)
+  assert_true(qt.ok, "qt json must parse")
+
+  // With qfi_opt: `heads` and `glass` are marked __AMBIG__ by pattern binding, yet qfi_opt resolves them!
+  let pkg_qt = collect_pkg_mutation_summary([lex_moonbit(src)], [rel], [src], qt, Map(), Map())
+  match lookup_fn_mutation_summary(pkg_qt, "check_match") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "match destructure heads/glass resolved via qfi_opt")
+    None => assert_true(false, "check_match summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg_qt, "check_pref") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "for p in prefs resolved cleanly")
+    None => assert_true(false, "check_pref summary must exist")
+  }
+
+  // Without qfi_opt: match destructure `heads` stays __AMBIG__ and MUST fail closed (`unknown == true`)!
+  let pkg_noqt = collect_pkg_mutation_summary([lex_moonbit(src)], [rel], [src], empty_pkg_query_types(), Map(), Map())
+  match lookup_fn_mutation_summary(pkg_noqt, "check_match") {
+    Some(s) => assert_true(s.unknown, "without qfi_opt, pattern-bound heads must stay fail-closed")
+    None => assert_true(false, "check_match summary must exist without qt")
+  }
+}
+
+test "F6-4a: simple for-in element inference positive & rebinding/shadowing/callable negative" {
+  let src = "enum Kind { A\n B } derive(Eq)\n\nstruct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\n\nfn pure_for(ks : Array[Kind], t : Kind) -> Bool {\n  for k in ks {\n    if k == t { return true }\n  }\n  false\n}\n\nfn rebound_for(ks : Array[Kind], es : Array[Evil], t : Kind) -> Bool {\n  for x in ks {\n    if x == t { return true }\n  }\n  for x in es {\n    if x == es[0] { return true }\n  }\n  false\n}\n\nfn shadowed_let_for(ks : Array[Kind], t : Kind) -> Bool {\n  let x = Evil::{ xs: [] }\n  for x in ks {\n    if x == t { return true }\n  }\n  x == x\n}\n\nfn callable_for(fs : Array[() -> Unit]) -> Unit {\n  for f in fs {\n    f()\n  }\n}\n\nfn f() -> Unit {\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  match lookup_fn_mutation_summary(pkg, "pure_for") {
+    Some(s) => assert_true(!s.unknown && !s.mutates_any_array, "single-binding for k in Array[Kind] infers Kind without qfi_opt")
+    None => assert_true(false, "pure_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "rebound_for") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "rebound for x across two loops must fail-closed or report mutation")
+    None => assert_true(false, "rebound_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "shadowed_let_for") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "let x shadowed by for x must fail-closed or report mutation")
+    None => assert_true(false, "shadowed_let_for summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "callable_for") {
+    Some(s) => assert_true(s.unknown, "for f in Array[() -> Unit] must remain in callables and fail-closed even with top-level pure fn f")
+    None => assert_true(false, "callable_for summary must exist")
+  }
+}
+
+test "F6-4a: String view methods (exact_view/view/view_from/as_view) positive & shadowed struct Str negative" {
+  let pos_src = "fn slice_name(rest : String, i : Int) -> String {\n  rest.exact_view(start=i + 3).to_owned()\n}\n\nfn slice_view(rest : String) -> String {\n  rest.view().to_owned()\n}\n\nfn slice_as_view(rest : String) -> String {\n  rest.as_view().to_owned()\n}\n"
+  let pkg_pos = collect_pkg_mutation_summary_tokens([lex_moonbit(pos_src)])
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_name") { Some(s) => !s.unknown, None => false }, "rest.exact_view(...).to_owned() must be pure")
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_view") { Some(s) => !s.unknown, None => false }, "rest.view().to_owned() must be pure")
+  assert_true(match lookup_fn_mutation_summary(pkg_pos, "slice_as_view") { Some(s) => !s.unknown, None => false }, "rest.as_view().to_owned() must be pure")
+
+  // Negative: user-defined struct Str with custom exact_view returning something unknown -> must fail closed!
+  let neg_src = "struct Str { s : String }\nfn Str::exact_view(self : Str) -> String { self.s }\nfn call_user_str(x : Str) -> String {\n  x.exact_view().to_owned()\n}\nstruct String { xs : Array[Int] }\nfn String::exact_view(self : String) -> String { self.xs.clear(); self }\nfn String::to_owned(self : String) -> String { self }\nfn call_shadowed_string(x : String) -> String {\n  x.exact_view().to_owned()\n}\n"
+  let pkg_neg = collect_pkg_mutation_summary_tokens([lex_moonbit(neg_src)])
+  assert_true(
+    match lookup_fn_mutation_summary(pkg_neg, "call_shadowed_string") { Some(s) => summary_may_mutate_array(s, "Int") || s.unknown, None => false },
+    "shadowed String::exact_view must not be treated as pure builtin StrView",
+  )
+}
+
+test "F6-4a: Map/OrderedMap/OrderedSet provenance gate, real methods, and new_by fail-closed" {
+  let src = "struct BadKey { xs : Array[Int] }\nimpl Eq for BadKey {\n  fn op_eq(self : BadKey, other : BadKey) -> Bool { self.xs.clear(); true }\n}\nimpl Hash for BadKey {\n  fn hash(self : BadKey) -> Int { self.xs.clear(); 0 }\n}\n\nfn flip_key_set(ks : Array[String]) -> OrderedSet[String] {\n  let out : OrderedSet[String] = mbt_compat::ordered_set_new()\n  for k in ks {\n    out.add(k)\n  }\n  out\n}\n\nfn pure_local_map_and_helper(ks : Array[String], ys : Array[String]) -> Bool {\n  let m : OrderedMap[Int, String] = mbt_compat::ordered_map_new()\n  let n = mbt_compat::ordered_map_size(m)\n  let sz = m.size()\n  let emp = m.is_empty()\n  let has_k = m.contains(1)\n  let got = m.get(1)\n  let ks_set = flip_key_set(ks)\n  let any_missing = ys.iter().any(fn(k) { !ks_set.contains(k) })\n  n >= 0 && sz >= 0 && emp && !has_k && got.is_none() && any_missing\n}\n\nfn bad_param_map_contains(m : Map[Int, Int], k : Int) -> Bool {\n  m.contains(k)\n}\n\nfn bad_param_map_get(m : Map[Int, Int], k : Int) -> Option[Int] {\n  m.get(k)\n}\n\nfn bad_for_map_elem(ms : Array[Map[Int, Int]], x : Int) -> Bool {\n  for m in ms {\n    if m.contains(x) { return true }\n  }\n  false\n}\n\nfn bad_local_new_by(x : Int) -> Bool {\n  let m : OrderedMap[Int, Int] = OrderedMap::new_by(fn(k) { k }, fn(a, b) { a == b })\n  m.contains(x)\n}\n\nfn bad_local_custom_key(k : BadKey) -> Bool {\n  let m : Map[BadKey, Int] = Map::new()\n  m.contains(k)\n}\n\nfn bad_block_iterable_shadow_param(x : Int, items : Array[BadKey]) -> Bool {\n  for x in { let ys = items; ys } {\n    if x == x { return true }\n  }\n  false\n}\n\nfn bad_match_iterable_shadow_param(x : Int, ks : Array[Int], items : Array[BadKey]) -> Bool {\n  for x in match ks { _ => items } {\n    if x == x { return true }\n  }\n  false\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  assert_true(
+    match lookup_fn_mutation_summary(pkg, "pure_local_map_and_helper") { Some(s) => !s.unknown && !s.mutates_any_array, None => false },
+    "local MapKey-only map + pure helper return + .size()/ordered_map_size must be pure",
+  )
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_param_map_contains") { Some(s) => s.unknown, None => false }, "param Map::contains must fail-closed (may carry new_by)")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_param_map_get") { Some(s) => s.unknown, None => false }, "param Map::get must fail-closed (may carry new_by)")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_for_map_elem") { Some(s) => s.unknown, None => false }, "for m in Array[Map[Int, Int]] m.contains must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_local_new_by") { Some(s) => s.unknown, None => false }, "local OrderedMap::new_by m.contains must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_local_custom_key") { Some(s) => s.unknown, None => false }, "local Map::new with custom Eq/Hash key must fail-closed")
+  assert_true(
+    match lookup_fn_mutation_summary(pkg, "bad_block_iterable_shadow_param") { Some(s) => s.unknown || summary_may_mutate_array(s, "Int"), None => false },
+    "for x in { let ys = items; ys } shadowing param x : Int must fail-closed",
+  )
+  assert_true(
+    match lookup_fn_mutation_summary(pkg, "bad_match_iterable_shadow_param") { Some(s) => s.unknown || summary_may_mutate_array(s, "Int"), None => false },
+    "for x in match ks { _ => items } shadowing param x : Int must fail-closed",
+  )
+}
+
+test "F6-4a: Stage B Round 1+ refreshes round_qt with updated byte offsets" {
+  // Round 0 rewrites line 1 (`a.is_empty()` -> `mbt_compat::arr_is_empty(a)`), shifting byte offsets of line 2!
+  // Round 1 diagnoses `match opt { Some((g, heads)) => heads.iter().any(...) }` where `heads` is `__AMBIG__`
+  // and needs the refreshed Round 1 `round_qt` with the shifted byte offsets to allow `heads.iter()`.
+  let rel = "main.pion"
+  let init_src = "fn run(a : Array[Int], opt : Option[(Int, Array[Int])]) -> Bool {\n  let _e = a.is_empty()\n  match opt {\n    Some((g, heads)) => heads.iter().any(fn(h) { h == g })\n    None => false\n  }\n}\n"
+  let qt_calls : Array[Int] = [0]
+  let check_fn = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    if str_has(cur, "a.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":13,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else if str_has(cur, "heads.iter()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":4,\"col\":28,\"message\":\"unknown method `iter` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let qt_cb = fn(batch : Array[(String, String)]) -> String {
+    qt_calls[0] = qt_calls[0] + 1
+    let cur = batch[0].1
+    let heads_off = cur.index_of("heads.iter()")
+    let g_off = cur.index_of("h == g") + 5
+    let h_off = cur.index_of("h == g")
+    let diag_str = if str_has(cur, "a.is_empty()") {
+      "[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":13,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]"
+    } else {
+      "[]"
+    }
+    "{\"id\":1,\"ok\":true,\"diagnostics\":" + diag_str + ",\"types\":[{\"file\":\"src/main.pion\",\"expr_tys\":[{\"start_byte\":" +
+    heads_off.to_string() + ",\"end_byte\":" + (heads_off + 5).to_string() + ",\"ty\":\"Array[Int]\"},{\"start_byte\":" +
+    g_off.to_string() + ",\"end_byte\":" + (g_off + 1).to_string() + ",\"ty\":\"Int\"},{\"start_byte\":" +
+    h_off.to_string() + ",\"end_byte\":" + (h_off + 1).to_string() + ",\"ty\":\"Int\"}],\"call_targets\":[]}]}"
+  }
+  let files = [GeneratedFile::{ rel_path: rel, content: init_src, source_file: "main.mbt", anchors: [] }]
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let (out_files, _iters, _hist, _out_qt) = run_stage_b_with_ops_deps_and_qt(
+    files,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn,
+    Some(qt_cb),
+    empty_pkg_query_types(),
+    diags,
+    ledger,
+  )
+  assert_true(diags.length() == 0, "Round 1 refreshed round_qt must allow heads.iter() with 0 errors")
+  assert_true(str_has(out_files[0].content, "mbt_compat::arr_iter(heads)"), "heads.iter() must be lowered in Round 1")
+  assert_true(qt_calls[0] == 2, "query_types_cb must run once in Round 0 and once lazily in Round 1")
+
+  // Verify Round 1+ makes 0 extra query_types_cb calls when no gate needs qt.
+  let qt_calls2 : Array[Int] = [0]
+  let simple_src = "fn f(a : Array[Int], b : Array[Int]) -> Bool {\n  a.is_empty() && b.is_empty()\n}\n"
+  let check_fn2 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    if str_has(cur, "a.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":5,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else if str_has(cur, "b.is_empty()") {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":35,\"message\":\"unknown method `is_empty` on type `Array[Int]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let qt_cb2 = fn(_batch : Array[(String, String)]) -> String {
+    qt_calls2[0] = qt_calls2[0] + 1
+    "{\"diagnostics\":[],\"query_types\":[]}"
+  }
+  let files2 = [GeneratedFile::{ rel_path: rel, content: simple_src, source_file: "main.mbt", anchors: [] }]
+  let diags2 : Array[Diag] = []
+  let ledger2 : Array[DriftEntry] = []
+  let (_out2, _it2, _h2, _q2) = run_stage_b_with_ops_deps_and_qt(
+    files2,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn2,
+    Some(qt_cb2),
+    empty_pkg_query_types(),
+    diags2,
+    ledger2,
+  )
+  assert_true(qt_calls2[0] == 0, "packages not hitting qt gates must make 0 query_types_cb calls across rounds")
+}
+
+test "F6-4a: Array[Double/Float/UInt/UInt64/Byte/Char]::sort() & FixedArray Stage B lowering + mutation_summary" {
+  // 1. Lookup helpers for FixedArray[Double/Float/UInt/UInt64/Byte/Char]::sort
+  assert_true(lookup_missing_method_helper("FixedArray[Double]", "sort") == Some("mbt_compat::fixed_array_sort_double"), "FixedArray[Double]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Float]", "sort") == Some("mbt_compat::fixed_array_sort_float"), "FixedArray[Float]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[UInt]", "sort") == Some("mbt_compat::fixed_array_sort_uint"), "FixedArray[UInt]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[UInt64]", "sort") == Some("mbt_compat::fixed_array_sort_uint64"), "FixedArray[UInt64]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Byte]", "sort") == Some("mbt_compat::fixed_array_sort_byte"), "FixedArray[Byte]::sort")
+  assert_true(lookup_missing_method_helper("FixedArray[Char]", "sort") == Some("mbt_compat::fixed_array_sort_char"), "FixedArray[Char]::sort")
+
+  // 2. End-to-end Stage B lowering for Array[Double]::sort() and FixedArray[Double]::sort()
+  let rel = "src/main.pion"
+  let src = "fn do_sorts(xs : Array[Double], fa : FixedArray[Double]) -> Unit {\n  xs.sort()\n  fa.sort()\n}\n"
+  let check_fn = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let ds : Array[String] = []
+    if str_has(cur, "xs.sort()") {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":2,\"col\":6,\"found\":\"Array[Double]\",\"expected\":\"Array[Int], Array[Int64], or Array[String]\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    if str_has(cur, "fa.sort()") {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"src/main.pion\",\"line\":3,\"col\":6,\"message\":\"unknown method `sort` on type `FixedArray[Double]`\"}")
+    }
+    "{\"diagnostics\":[" + ds.join(",") + "]}"
+  }
+  let files = [GeneratedFile::{ rel_path: rel, content: src, source_file: "main.mbt", anchors: [] }]
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let (out_files, _iters, _hist, _out_qt) = run_stage_b_with_ops_deps_and_qt(
+    files,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check_fn,
+    None,
+    empty_pkg_query_types(),
+    diags,
+    ledger,
+  )
+  assert_true(diags.length() == 0, "Array[Double]::sort and FixedArray[Double]::sort lower with 0 errors")
+  assert_true(str_has(out_files[0].content, "mbt_compat::arr_sort_double(xs)"), "Array[Double]::sort lowered")
+  assert_true(str_has(out_files[0].content, "mbt_compat::fixed_array_sort_double(fa)"), "FixedArray[Double]::sort lowered")
+
+  // 3. mutation_summary must mark arr_sort_double / fixed_array_sort_double as mutating Array[Double]
+  let mut_src = "fn sort_d(xs : Array[Double]) -> Unit {\n  mbt_compat::arr_sort_double(xs)\n}\nfn sort_fd(fa : FixedArray[Double]) -> Unit {\n  mbt_compat::fixed_array_sort_double(fa)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(mut_src)])
+  match lookup_fn_mutation_summary(pkg, "sort_d") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Double") && !summary_may_mutate_array(s, "Int"), "arr_sort_double mutates Double array")
+    None => assert_true(false, "sort_d summary must exist")
+  }
+  match lookup_fn_mutation_summary(pkg, "sort_fd") {
+    Some(s) => assert_true(summary_may_mutate_array(s, "Double") && !summary_may_mutate_array(s, "Int"), "fixed_array_sort_double mutates Double array")
+    None => assert_true(false, "sort_fd summary must exist")
+  }
+}
+
+test "F6-4a: lower_capacity catches shrink_to_fit inside xs.search_by inline closure" {
+  let bad_src = "fn do_shrink(a : Array[Int]) -> Unit {\n  a.shrink_to_fit()\n}\n\nfn bad_search(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { do_shrink(xs); x > 0 })\n}\n"
+  let toks = lex_moonbit(bad_src)
+  let ms = collect_pkg_mutation_summary_tokens([toks])
+  let base = collect_shrink_pkg_tokens([toks])
+  let sp = collect_shrink_pkg_tokens_with_summary([toks], [], [], empty_pkg_query_types(), ms)
+  let mut shrink_i = -1
+  for idx, tk in toks {
+    if tk.raw == "shrink_to_fit" { shrink_i = idx }
+  }
+  assert_true(shrink_i > 0, "locate shrink_to_fit")
+  assert_true(sp.iterated_tails.contains("xs"), "search_by inline closure calling shrink_to_fit helper must taint xs in iterated_tails")
+  let (why, _allowed) = shrink_snapshot_hazard_with_summary(toks, shrink_i, base, sp, ms, bad_src, None)
+  assert_true(why.length() > 0, "shrink_to_fit reached from xs.search_by closure must fail closed")
+}
+
+test "F6-4a R2 P1-1: top-level binding shadowing & local struct Array shadowing fail closed" {
+  // (a) Top-level `let x : Evil` shadowed inside `for x in ks` must NOT pollute outer `x == x`!
+  let src_top = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\nlet x : Evil = Evil::{ xs: [] }\nfn f(ks : Array[Int]) -> Bool {\n  for x in ks {\n    let _ = x\n  }\n  x == x\n}\n"
+  let rel = "main.pion"
+  // Without qfi_opt: must fail closed (`unknown == true` or mutates Int array)
+  let pkg_noqt = collect_pkg_mutation_summary([lex_moonbit(src_top)], [rel], [src_top], empty_pkg_query_types(), Map(), Map())
+  match lookup_fn_mutation_summary(pkg_noqt, "f") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "top-level x shadowed by for x must fail-closed without qfi_opt")
+    None => assert_true(false, "f summary must exist without qfi_opt")
+  }
+  // With qfi_opt (inner `x` is Int, outer `x == x` is Evil): outer `x == x` MUST still catch Evil!
+  let inner_x_off = src_top.index_of("let _ = x") + 8
+  let outer_x1_off = src_top.index_of("x == x")
+  let outer_x2_off = outer_x1_off + 5
+  let qt_json = f64a_make_qt_json(rel, [
+    (inner_x_off, inner_x_off + 1, "Int"),
+    (outer_x1_off, outer_x1_off + 1, "Evil"),
+    (outer_x2_off, outer_x2_off + 1, "Evil"),
+  ])
+  let qt = parse_pkg_query_types_json(qt_json)
+  assert_true(qt.ok, "top-level shadow qt json must parse")
+  let pkg_qt = collect_pkg_mutation_summary([lex_moonbit(src_top)], [rel], [src_top], qt, Map(), Map())
+  match lookup_fn_mutation_summary(pkg_qt, "f") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "outer x == x with qfi_opt must catch Evil Eq mutation")
+    None => assert_true(false, "f summary must exist with qfi_opt")
+  }
+
+  // (b) Local `struct Array[T]` shadowing builtin `Array[T]` in `for x in xs` must fail closed!
+  let src_arr = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\nstruct Array[T] { v : T }\nfn scan_shadowed(xs : Array[Int]) -> Bool {\n  for x in xs {\n    if x == x { return true }\n  }\n  false\n}\n"
+  let pkg_arr = collect_pkg_mutation_summary_tokens([lex_moonbit(src_arr)])
+  match lookup_fn_mutation_summary(pkg_arr, "scan_shadowed") {
+    Some(s) => assert_true(s.unknown || summary_may_mutate_array(s, "Int"), "shadowed local struct Array[T] in for-in must fail closed")
+    None => assert_true(false, "scan_shadowed summary must exist")
+  }
+}
+
+test "F6-4a R2 P1-2: same-line multiple .sort() disambiguates receiver & column accurately" {
+  // Case 1: `a.sort(); b.sort()` with `a : Array[Float]`, `b : Array[Double]`, `d.found == ""` + `qfi_opt`
+  let rel = "main.pion"
+  let src1 = "fn both(a : Array[Float], b : Array[Double]) -> Unit {\n  a.sort(); b.sort()\n}\n"
+  let check1 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let line2 = cur.split("\n")[1]
+    let ds : Array[String] = []
+    let a_pos = line2.index_of("a.sort()")
+    if a_pos >= 0 {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (a_pos + 1).to_string() + ",\"found\":\"\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    let b_pos = line2.index_of("b.sort()")
+    if b_pos >= 0 {
+      ds.push("{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (b_pos + 1).to_string() + ",\"found\":\"\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}")
+    }
+    "{\"diagnostics\":[" + ds.join(",") + "]}"
+  }
+  let qt1 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let entries : Array[String] = []
+    let a_off = cur.index_of("a.sort()")
+    if a_off >= 0 {
+      entries.push("{\"start_byte\":" + a_off.to_string() + ",\"end_byte\":" + (a_off + 8).to_string() + ",\"op_byte\":" + (a_off + 2).to_string() + ",\"ty\":\"Unit\",\"receiver_ty\":\"Array[Float]\"}")
+    }
+    let b_off = cur.index_of("b.sort()")
+    if b_off >= 0 {
+      entries.push("{\"start_byte\":" + b_off.to_string() + ",\"end_byte\":" + (b_off + 8).to_string() + ",\"op_byte\":" + (b_off + 2).to_string() + ",\"ty\":\"Unit\",\"receiver_ty\":\"Array[Double]\"}")
+    }
+    "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"src/main.pion\",\"expr_tys\":[" + entries.join(",") + "],\"call_targets\":[]}]}"
+  }
+  let files1 = [GeneratedFile::{ rel_path: rel, content: src1, source_file: "main.mbt", anchors: [] }]
+  let diags1 : Array[Diag] = []
+  let ledger1 : Array[DriftEntry] = []
+  let (out1, _it1, _h1, _q1) = run_stage_b_with_ops_deps_and_qt(
+    files1,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check1,
+    Some(qt1),
+    empty_pkg_query_types(),
+    diags1,
+    ledger1,
+  )
+  assert_true(diags1.length() == 0, "same-line a.sort(); b.sort() must lower with 0 errors")
+  assert_true(
+    str_has(out1[0].content, "mbt_compat::arr_sort_float(a)") &&
+    str_has(out1[0].content, "mbt_compat::arr_sort_double(b)"),
+    "a.sort() must lower to arr_sort_float and b.sort() to arr_sort_double",
+  )
+
+  // Case 2: `a.sort(); self.very_long_receiver_name.sort()` where `d.col` points to `self`
+  // (`self` is closer to `a.sort()`'s `.sort` than to `self.very_long_receiver_name.sort()`'s `.sort`!)
+  let src2 = "fn second_only(a : Array[Int], self : Holder) -> Unit {\n  a.sort(); self.very_long_receiver_name.sort()\n}\n"
+  let check2 = fn(batch : Array[(String, String)]) -> String {
+    let cur = batch[0].1
+    let line2 = cur.split("\n")[1]
+    let self_pos = line2.index_of("self.very_long_receiver_name.sort()")
+    if self_pos >= 0 {
+      "{\"diagnostics\":[{\"code\":\"E_TYPE_MISMATCH\",\"file\":\"main.pion\",\"line\":2,\"col\":" + (self_pos + 1).to_string() + ",\"found\":\"Array[Double]\",\"message\":\"`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`\"}]}"
+    } else {
+      "{\"diagnostics\":[]}"
+    }
+  }
+  let files2 = [GeneratedFile::{ rel_path: rel, content: src2, source_file: "main.mbt", anchors: [] }]
+  let diags2 : Array[Diag] = []
+  let ledger2 : Array[DriftEntry] = []
+  let (out2, _it2, _h2, _q2) = run_stage_b_with_ops_deps_and_qt(
+    files2,
+    ApiMap::{ symbols: [], pkg_aliases: Map() },
+    Map(),
+    Map(),
+    check2,
+    None,
+    empty_pkg_query_types(),
+    diags2,
+    ledger2,
+  )
+  assert_true(diags2.length() == 0, "second_only must lower with 0 errors")
+  assert_true(
+    str_has(out2[0].content, "a.sort(); mbt_compat::arr_sort_double(self.very_long_receiver_name)"),
+    "must rewrite only self.very_long_receiver_name.sort() and leave a.sort() untouched",
+  )
+}
+
+test "F6-4a R4: 4 subtle soundness catches (block map, shadowed pure_map_ret_fn, summarize_expr_span inner_sh, u.copy() cross-branch)" {
+  let src = "struct Evil { xs : Array[Int] }\nimpl Eq for Evil {\n  fn op_eq(self : Evil, other : Evil) -> Bool { self.xs.clear(); true }\n}\n\nfn mk() -> Map[Int, Int] {\n  Map::new()\n}\n\nfn leak_param_map(p : Map[Int, Int]) -> Map[Int, Int] {\n  { let tmp = p; tmp }\n}\n\nfn bad_block_map(param_map : Map[Int, Int], x : Int) -> Bool {\n  let m = { param_map }\n  m.contains(x)\n}\n\nfn bad_leak_call(param_map : Map[Int, Int], x : Int) -> Bool {\n  let m = leak_param_map(param_map)\n  m.contains(x)\n}\n\nfn bad_shadowed_mk(mk : () -> Map[Int, Int], x : Int) -> Bool {\n  let m = mk()\n  m.contains(x)\n}\n\nfn bad_copy_cross_branch(opt : Option[Map[Int, Int]], x : Int) -> Bool {\n  if false { let u = Map::new(); let _ = u }\n  match opt {\n    Some(u) => {\n      let m = u.copy()\n      m.contains(x)\n    }\n    None => false\n  }\n}\n\nfn gate_d_inner_shadow(xs : Array[Int], opt : Option[Evil]) -> Bool {\n  for x in xs {\n    match opt {\n      Some(x) => if x == x { return true }\n      None => ()\n    }\n  }\n  false\n}\n"
+  let toks = lex_moonbit(src)
+  let pkg = collect_pkg_mutation_summary_tokens([toks])
+  assert_true(!pkg.pure_map_ret_fns.contains("leak_param_map"), "Catch 1: block { let tmp = p; tmp } must NOT enter pure_map_ret_fns")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_block_map") { Some(s) => s.unknown, None => false }, "Catch 1: let m = { param_map }; m.contains(x) must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_leak_call") { Some(s) => s.unknown, None => false }, "Catch 1: leak_param_map(param_map).contains(x) must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_shadowed_mk") { Some(s) => s.unknown, None => false }, "Catch 2: param mk : () -> Map[Int, Int] shadowing pure fn mk() must fail-closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_copy_cross_branch") { Some(s) => s.unknown, None => false }, "Catch 4: u.copy() cross-branch propagation must fail-closed")
+
+  // Catch 3: summarize_expr_span with fn_body_open >= 0 AND extra_var_types["x"] = "Int"
+  // MUST re-run inner_sh so `match opt { Some(x) => x == x }` fails closed!
+  let mut fn_bo = -1
+  let mut match_s = -1
+  let mut match_e = -1
+  let mut idx = 0
+  while idx < toks.length() {
+    if toks[idx].raw == "gate_d_inner_shadow" {
+      let mut k = idx + 1
+      while k < toks.length() && toks[k].kind != TokenKind::LBrace { k = k + 1 }
+      fn_bo = k
+    } else if fn_bo > 0 && toks[idx].raw == "match" && match_s < 0 {
+      match_s = idx
+      let mut k = idx + 1
+      while k < toks.length() && toks[k].kind != TokenKind::LBrace { k = k + 1 }
+      match_e = find_matching_delim(toks, k) + 1
+      break
+    }
+    idx = idx + 1
+  }
+  assert_true(fn_bo > 0 && match_s > fn_bo && match_e > match_s, "locate gate_d_inner_shadow match span")
+  let extra : Map[String, String] = Map()
+  extra["x"] = "Int"
+  let sum_d = summarize_expr_span(pkg, toks, match_s, match_e, fn_bo, src, None, extra, Map())
+  assert_true(sum_d.unknown || summary_may_mutate_array(sum_d, "Int"), "Catch 3: Some(x) inside summarize_expr_span must shadow extra_var_types[x]")
+}
+
+test "F6-4a R5: multiline pipe continuation, OrderedSet::copy, guard return, and 7-hop pure_map_ret_fns order independence" {
+  let src = "fn wrap_ext(_m : Map[Int, Int], ext : Map[Int, Int]) -> Map[Int, Int] { ext }\n\nfn bad_ml_pipe_let(ext : Map[Int, Int], x : Int) -> Bool {\n  let v : Map[Int, Int] = { 1: 2 }\n    |> wrap_ext(ext)\n  v.contains(x)\n}\n\nfn bad_sl_pipe_let(ext : Map[Int, Int], x : Int) -> Bool {\n  let v : Map[Int, Int] = { 1: 2 } |> wrap_ext(ext)\n  v.contains(x)\n}\n\nfn bad_ml_pipe_ret(ext : Map[Int, Int]) -> Map[Int, Int] {\n  return { 1: 2 }\n    |> wrap_ext(ext)\n}\n\nfn bad_guard_ret(ok : Bool, ext : Map[Int, Int]) -> Map[Int, Int] {\n  guard ok else { ext }\n  Map::new()\n}\n\nfn bad_oset_param_copy(s : OrderedSet[Int]) -> OrderedSet[Int] {\n  s.copy()\n}\n\nfn ok_oset_local_copy() -> OrderedSet[Int] {\n  let s : OrderedSet[Int] = mbt_compat::ordered_set_new()\n  s.copy()\n}\n\n// 7-hop reverse-declared pure_map_ret_fns chain\nfn h7() -> Map[Int, Int] { h6() }\nfn h6() -> Map[Int, Int] { h5() }\nfn h5() -> Map[Int, Int] { h4() }\nfn h4() -> Map[Int, Int] { h3() }\nfn h3() -> Map[Int, Int] { h2() }\nfn h2() -> Map[Int, Int] { h1() }\nfn h1() -> Map[Int, Int] { Map::new() }\nfn use_h7(x : Int) -> Bool {\n  let m = h7()\n  m.contains(x)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_ml_pipe_let") { Some(s) => s.unknown, None => false }, "multiline pipe let must fail closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_sl_pipe_let") { Some(s) => s.unknown, None => false }, "single-line pipe let must fail closed")
+  assert_true(!pkg.pure_map_ret_fns.contains("bad_ml_pipe_ret"), "multiline pipe return must not enter pure_map_ret_fns")
+  assert_true(!pkg.pure_map_ret_fns.contains("bad_guard_ret"), "guard ... else { ext } must not enter pure_map_ret_fns")
+  assert_true(match lookup_fn_mutation_summary(pkg, "bad_oset_param_copy") { Some(s) => s.unknown, None => false }, "external OrderedSet::copy must fail closed")
+  assert_true(match lookup_fn_mutation_summary(pkg, "ok_oset_local_copy") { Some(s) => !s.unknown && !s.mutates_any_array, None => false }, "local ordered_set_new().copy() must be pure")
+  assert_true(pkg.pure_map_ret_fns.contains("h7"), "7-hop reverse-declared pure_map_ret_fns must converge")
+  assert_true(match lookup_fn_mutation_summary(pkg, "use_h7") { Some(s) => !s.unknown && !s.mutates_any_array, None => false }, "7-hop pure_map_ret_fns caller must be pure")
+}
+
+test "F6-4a R6: newline-leading paren/bracket starts new statement (does not poison pure_map_vars)" {
+  let src = "fn wrap_ext(_m : Map[Int, Int], ext : Map[Int, Int]) -> Map[Int, Int] { ext }\n\nfn ok_nl_paren(x : Int) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  (m.contains(x))\n}\n\nfn ok_nl_bracket(x : Int) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  [m.contains(x)][0]\n}\n\nfn still_bad_nl_pipe(ext : Map[Int, Int], x : Int) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  |> wrap_ext(ext)\n  m.contains(x)\n}\n"
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(src)])
+  assert_true(match lookup_fn_mutation_summary(pkg, "ok_nl_paren") { Some(s) => !s.unknown && !s.mutates_any_array, None => false }, "newline-leading (m.contains(x)) must stay pure")
+  assert_true(match lookup_fn_mutation_summary(pkg, "ok_nl_bracket") { Some(s) => !s.unknown && !s.mutates_any_array, None => false }, "newline-leading [m.contains(x)][0] must stay pure")
+  assert_true(match lookup_fn_mutation_summary(pkg, "still_bad_nl_pipe") { Some(s) => s.unknown, None => false }, "newline-leading |> wrap_ext(ext) must still fail closed")
+}
+
+test "F6-4a R7: intermediate closure scoping in summarize_callback_arg and summarize_expr_span (4-way matrix)" {
+  let src = "fn case1_shadow_ext(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let m : Map[Int, Int] = ext\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn case2_mid_local_pure(xs : Array[Int]) -> Bool {\n  let mid = fn() -> Bool {\n    let m : Map[Int, Int] = { 1: 2 }\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn case3_outer_capture_pure(xs : Array[Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn case4_mid_ext_only(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let mid = fn() -> Bool {\n    let m : Map[Int, Int] = ext\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n"
+  let toks = lex_moonbit(src)
+  let pkg = collect_pkg_mutation_summary_tokens([toks])
+  let find_fn_and_inner_cb = fn(fname : String) -> (Int, Int, Int) {
+    let mut fn_bo = -1
+    let mut i = 0
+    while i < toks.length() {
+      if toks[i].raw == fname {
+        let mut k = i + 1
+        while k < toks.length() && toks[k].kind != TokenKind::LBrace { k = k + 1 }
+        fn_bo = k
+        let fn_bc = find_matching_delim(toks, fn_bo)
+        let mut j = fn_bo + 1
+        while j + 3 < fn_bc {
+          if toks[j].raw == "any" && toks[j + 1].kind == TokenKind::LParen {
+            let rp = find_matching_delim(toks, j + 1)
+            return (fn_bo, j + 2, rp)
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    (-1, -1, -1)
+  }
+  let (bo1, s1, e1) = find_fn_and_inner_cb("case1_shadow_ext")
+  assert_true(bo1 > 0, "locate case1")
+  let cb1 = summarize_callback_arg(pkg, toks, s1, e1, bo1, src, None, "Int", Map())
+  let sp1 = summarize_expr_span(pkg, toks, s1, e1, bo1, src, None, Map(), Map())
+  assert_true(cb1.unknown, "R7 P1: mid closure `let m = ext` shadowing outer pure `let m` must fail-closed in summarize_callback_arg")
+  let sp1_body = summarize_expr_span(pkg, toks, s1 + 5, e1 - 1, bo1, src, None, Map(), Map())
+  assert_true(sp1_body.unknown || sp1.unknown, "R7 P1: mid closure `let m = ext` must fail-closed in summarize_expr_span")
+
+  let (bo2, s2, e2) = find_fn_and_inner_cb("case2_mid_local_pure")
+  assert_true(bo2 > 0, "locate case2")
+  let cb2 = summarize_callback_arg(pkg, toks, s2, e2, bo2, src, None, "Int", Map())
+  assert_true(!cb2.unknown && !cb2.mutates_any_array, "R7 P2: mid closure `let m = { 1: 2 }` must be allowed in summarize_callback_arg")
+  let sp2_body = summarize_expr_span(pkg, toks, s2 + 5, e2 - 1, bo2, src, None, Map(), Map())
+  assert_true(!sp2_body.unknown && !sp2_body.mutates_any_array, "R7 P2: mid closure `let m = { 1: 2 }` must be allowed in summarize_expr_span")
+
+  let (bo3, s3, e3) = find_fn_and_inner_cb("case3_outer_capture_pure")
+  assert_true(bo3 > 0, "locate case3")
+  let cb3 = summarize_callback_arg(pkg, toks, s3, e3, bo3, src, None, "Int", Map())
+  assert_true(!cb3.unknown && !cb3.mutates_any_array, "R7 case3: outer pure `let m` captured through mid closure must be allowed")
+
+  let (bo4, s4, e4) = find_fn_and_inner_cb("case4_mid_ext_only")
+  assert_true(bo4 > 0, "locate case4")
+  let cb4 = summarize_callback_arg(pkg, toks, s4, e4, bo4, src, None, "Int", Map())
+  assert_true(cb4.unknown, "R7 case4: mid closure `let m = ext` (no outer m) must fail-closed")
+}
+
+test "F6-4a R8: lexical prefix scoping in intermediate closures (post-call, closed-block, enclosing-block)" {
+  let src = "fn r8_after_call(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let found = xs.iter().any(fn(x) { m.contains(x) })\n    let m : Map[Int, Int] = ext\n    let _ = m\n    found\n  }\n  mid()\n}\n\nfn r8_closed_if_block(xs : Array[Int], cond : Bool, ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    if cond {\n      let m : Map[Int, Int] = ext\n      let _ = m\n    }\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn r8_enclosing_if_block(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    if true {\n      let m : Map[Int, Int] = ext\n      xs.iter().any(fn(x) { m.contains(x) })\n    } else {\n      false\n    }\n  }\n  mid()\n}\n"
+  let toks = lex_moonbit(src)
+  let pkg = collect_pkg_mutation_summary_tokens([toks])
+  let find_fn_and_any_cb = fn(fname : String) -> (Int, Int, Int) {
+    let mut i = 0
+    while i < toks.length() {
+      if toks[i].raw == fname {
+        let mut k = i + 1
+        while k < toks.length() && toks[k].kind != TokenKind::LBrace { k = k + 1 }
+        let fn_bo = k
+        let fn_bc = find_matching_delim(toks, fn_bo)
+        let mut j = fn_bo + 1
+        while j + 3 < fn_bc {
+          if toks[j].raw == "any" && toks[j + 1].kind == TokenKind::LParen {
+            let rp = find_matching_delim(toks, j + 1)
+            return (fn_bo, j + 2, rp)
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    (-1, -1, -1)
+  }
+  let (bo1, s1, e1) = find_fn_and_any_cb("r8_after_call")
+  let cb1 = summarize_callback_arg(pkg, toks, s1, e1, bo1, src, None, "Int", Map())
+  let sp1 = summarize_expr_span(pkg, toks, s1 + 5, e1 - 1, bo1, src, None, Map(), Map())
+  assert_true(!cb1.unknown && !sp1.unknown, "R8: post-call `let m = ext` must not poison earlier search_by/iter().any")
+
+  let (bo2, s2, e2) = find_fn_and_any_cb("r8_closed_if_block")
+  let cb2 = summarize_callback_arg(pkg, toks, s2, e2, bo2, src, None, "Int", Map())
+  let sp2 = summarize_expr_span(pkg, toks, s2 + 5, e2 - 1, bo2, src, None, Map(), Map())
+  assert_true(!cb2.unknown && !sp2.unknown, "R8: closed prior `if` block `let m = ext` must not poison subsequent callback")
+
+  let (bo3, s3, e3) = find_fn_and_any_cb("r8_enclosing_if_block")
+  let cb3 = summarize_callback_arg(pkg, toks, s3, e3, bo3, src, None, "Int", Map())
+  let sp3 = summarize_expr_span(pkg, toks, s3 + 5, e3 - 1, bo3, src, None, Map(), Map())
+  assert_true(cb3.unknown && sp3.unknown, "R8: enclosing `if true { let m = ext; ... }` before call must still fail-closed")
+}
+
+test "F6-4a R9: closed expression blocks inside intermediate closures do not leak inner let bindings" {
+  let src = "fn touch_map(_m : Map[Int, Int]) -> Unit {}\n\nfn r9_let_block_shadow_m(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let tmp = { let m : Map[Int, Int] = ext; m }\n    let _ = tmp\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn r9_let_block_other(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let tmp = { let other : Map[Int, Int] = ext; other }\n    let _ = tmp\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn r9_call_arg_block_shadow_m(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    touch_map({ let m : Map[Int, Int] = ext; m })\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn r9_same_scope_block_rebind_m(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let m : Map[Int, Int] = { ext }\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n\nfn r9_same_scope_direct_rebind_m(xs : Array[Int], ext : Map[Int, Int]) -> Bool {\n  let m : Map[Int, Int] = { 1: 2 }\n  let mid = fn() -> Bool {\n    let m : Map[Int, Int] = ext\n    xs.iter().any(fn(x) { m.contains(x) })\n  }\n  mid()\n}\n"
+  let toks = lex_moonbit(src)
+  let pkg = collect_pkg_mutation_summary_tokens([toks])
+  let find_fn_and_any_cb = fn(fname : String) -> (Int, Int, Int) {
+    let mut i = 0
+    while i < toks.length() {
+      if toks[i].raw == fname {
+        let mut k = i + 1
+        while k < toks.length() && toks[k].kind != TokenKind::LBrace { k = k + 1 }
+        let fn_bo = k
+        let fn_bc = find_matching_delim(toks, fn_bo)
+        let mut j = fn_bo + 1
+        while j + 3 < fn_bc {
+          if toks[j].raw == "any" && toks[j + 1].kind == TokenKind::LParen {
+            let rp = find_matching_delim(toks, j + 1)
+            return (fn_bo, j + 2, rp)
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    (-1, -1, -1)
+  }
+  let (bo1, s1, e1) = find_fn_and_any_cb("r9_let_block_shadow_m")
+  let cb1 = summarize_callback_arg(pkg, toks, s1, e1, bo1, src, None, "Int", Map())
+  let sp1 = summarize_expr_span(pkg, toks, s1 + 5, e1 - 1, bo1, src, None, Map(), Map())
+  assert_true(!cb1.unknown && !sp1.unknown, "R9: `let tmp = { let m = ext; m }` must not poison outer pure m")
+
+  let (bo2, s2, e2) = find_fn_and_any_cb("r9_let_block_other")
+  let cb2 = summarize_callback_arg(pkg, toks, s2, e2, bo2, src, None, "Int", Map())
+  let sp2 = summarize_expr_span(pkg, toks, s2 + 5, e2 - 1, bo2, src, None, Map(), Map())
+  assert_true(!cb2.unknown && !sp2.unknown, "R9: `let tmp = { let other = ext; other }` control must be allowed")
+
+  let (bo3, s3, e3) = find_fn_and_any_cb("r9_call_arg_block_shadow_m")
+  let cb3 = summarize_callback_arg(pkg, toks, s3, e3, bo3, src, None, "Int", Map())
+  let sp3 = summarize_expr_span(pkg, toks, s3 + 5, e3 - 1, bo3, src, None, Map(), Map())
+  assert_true(!cb3.unknown && !sp3.unknown, "R9: `touch_map({ let m = ext; m })` must not poison outer pure m")
+
+  let (bo4, s4, e4) = find_fn_and_any_cb("r9_same_scope_block_rebind_m")
+  let cb4 = summarize_callback_arg(pkg, toks, s4, e4, bo4, src, None, "Int", Map())
+  let sp4 = summarize_expr_span(pkg, toks, s4 + 5, e4 - 1, bo4, src, None, Map(), Map())
+  assert_true(cb4.unknown && sp4.unknown, "R9: same-scope `let m = { ext }` must fail-closed")
+
+  let (bo5, s5, e5) = find_fn_and_any_cb("r9_same_scope_direct_rebind_m")
+  let cb5 = summarize_callback_arg(pkg, toks, s5, e5, bo5, src, None, "Int", Map())
+  let sp5 = summarize_expr_span(pkg, toks, s5 + 5, e5 - 1, bo5, src, None, Map(), Map())
+  assert_true(cb5.unknown && sp5.unknown, "R9: same-scope `let m = ext` must fail-closed")
+}
