@@ -1,0 +1,722 @@
+///| Unit tests for coupled Stage A.5 <-> Stage B fixpoint and `collect_probe_ident_spans` nested interpolation.
+
+test "coupled_a5_b: collect_probe_ident_spans handles nested interp quotes, escapes, and comments" {
+  let src1 = "let s = \"(\\{xs.mbt_show_probe().join(\", \")})\"\n"
+  let spans1 : Array[(Int, Int, String)] = []
+  collect_probe_ident_spans(src1, 0, spans1)
+  assert_true(spans1.length() == 1 && spans1[0].2 == "mbt_show_probe", "probe before quoted arg in interp")
+  assert_true(src1.slice(spans1[0].0, spans1[0].1) == "mbt_show_probe", "exact byte span 1")
+
+  let src2 = "let s = \"pre [\\{m.weights.map(fn(w) { \"(\\{w.0.mbt_show_probe()}, \\{w.1.mbt_show_probe()})\" }).join(\", \")}] post\"\n"
+  let spans2 : Array[(Int, Int, String)] = []
+  collect_probe_ident_spans(src2, 0, spans2)
+  assert_true(spans2.length() == 2, "both nested interp probes found, got " + spans2.length().to_string())
+  assert_true(src2.slice(spans2[0].0, spans2[0].1) == "mbt_show_probe", "exact byte span 2a")
+  assert_true(src2.slice(spans2[1].0, spans2[1].1) == "mbt_show_probe", "exact byte span 2b")
+
+  // Escaped backslash before `{` is NOT an interpolation hole
+  let src3 = "let s = \"\\\\{not_a_hole.mbt_show_probe()}\"\n"
+  let spans3 : Array[(Int, Int, String)] = []
+  collect_probe_ident_spans(src3, 0, spans3)
+  assert_true(spans3.length() == 0, "escaped backslash before brace must not be scanned as interp hole")
+}
+
+fn coupled_extract_probe_id(src : String, prefix : String) -> String {
+  let idx = src.index_of(prefix)
+  if idx < 0 {
+    return ""
+  }
+  let rest = src.slice(idx + prefix.length(), src.length())
+  let lp = rest.index_of("(")
+  if lp <= 0 {
+    return ""
+  }
+  rest.slice(0, lp)
+}
+
+test "coupled_a5_b: slice unlocks unsafe_substring which unlocks said.length() with 0 blockers and 0 duplicates" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "host",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "fake_host.mbt",
+    content: "pub fn parse_said(part : String, i : Int, k : Int) -> String {\n" +
+    "  let said = part[i + 1:]\n" +
+    "  said.unsafe_substring(start=k + 1, end=said.length())\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "fake_host.pion" {
+        content = fp.1
+      }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"fake_host.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      // 1. Slice probe on `part` (owned or borrow)
+      let sp_id = coupled_extract_probe_id(ln, ".mbt_slice_owned_probe__")
+      if sp_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_owned_probe__" + sp_id + "` on type `String`")
+      }
+      let sb_id = coupled_extract_probe_id(ln, ".mbt_slice_borrow_probe__")
+      if sb_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_borrow_probe__" + sb_id + "` on type `String`")
+      }
+      // 2. Once `part[i + 1:]` is lowered to `mbt_compat::utf16_slice`, `said` has type `String`.
+      //    If `.unsafe_substring(` is still present, `pionc` reports unknown method and does NOT check its args!
+      let said_is_str = str_has(content, "mbt_compat::utf16_slice(")
+      if said_is_str && str_has(ln, ".unsafe_substring(") {
+        let col = ln.index_of(".unsafe_substring(") + 1
+        add_diag(li + 1, col, "unknown method `unsafe_substring` on type `String`")
+      } else if said_is_str {
+        // Once `unsafe_substring` is lowered by post_b, `said.mbt_len_probe__...()` IS checked!
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag(li + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  assert_true(res.blockers == 0, "coupled slice -> unsafe_substring -> length must have 0 blockers")
+  for d in res.diagnostics {
+    assert_true(d.code != "MBT2PION_UNDISPOSED_PROBE_SITE", "no undisposed probe site diag: " + d.message)
+  }
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "fake_host.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "mbt_compat::str_unsafe_substring(said,"), "unsafe_substring rewritten:\n" + out)
+  assert_true(str_has(out, "mbt_compat::utf16_len(said)"), "said.length() lowered to utf16_len:\n" + out)
+  // No duplicate probe dispositions or drift entries
+  let seen_disp : Map[String, Bool] = Map()
+  for pd in res.probe_dispositions {
+    let key = pd.file + ":" + pd.line.to_string() + ":" + pd.col.to_string() + ":" + pd.probe_kind + ":" + pd.disposition
+    assert_true(!seen_disp.contains(key), "duplicate probe disposition: " + key)
+    seen_disp[key] = true
+  }
+}
+
+test "coupled_a5_b: OrderedMap index unlocks nested interp map.join and expanded form" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "hm",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "hand_moves.mbt",
+    content: "struct Move {\n  weights : Array[(Int, Int)]\n}\n" +
+    "pub fn fmt_nested(was : Map[String, Move], k : String) -> String {\n" +
+    "  let m = was[k]\n" +
+    "  \"w=[\" + \"\\{m.weights.map(fn(w) { \"(\\{w.0}, \\{w.1})\" }).join(\", \")}]\"\n" +
+    "}\n" +
+    "pub fn fmt_expanded(was : Map[String, Move], k : String) -> String {\n" +
+    "  let m = was[k]\n" +
+    "  let mw = m.weights.map(fn(w) { \"(\\{w.0}, \\{w.1})\" }).join(\", \")\n" +
+    "  \"w=[\\{mw}]\"\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "hand_moves.pion" {
+        content = fp.1
+      }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"hand_moves.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      let idx_id = coupled_extract_probe_id(ln, ".mbt_idx_probe__")
+      if idx_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_idx_probe__" + idx_id + "` on type `mbt_compat::OrderedMap[String, Move]`")
+      }
+      let m_unlocked = !str_has(content, "was[k]") && !str_has(content, "mbt_idx_probe")
+      if m_unlocked {
+        if str_has(ln, ".map(") {
+          let col = ln.index_of(".map(") + 1
+          add_diag(li + 1, col, "unknown method `map` on type `Array[(Int, Int)]`")
+        } else {
+          // Once `.map(` is rewritten by post_b, all show probes inside the lambda and on `mw` resolve!
+          let mut pos = 0
+          let needle = ".mbt_show_probe__"
+          while pos < ln.length() {
+            let sub = ln.slice(pos, ln.length())
+            let found = sub.index_of(needle)
+            if found < 0 { break }
+            let abs = pos + found
+            let id = coupled_extract_probe_id(ln.slice(abs, ln.length()), needle)
+            if id.length() > 0 {
+              let ty = if str_has(ln.slice(0, abs), "mw") && !str_has(ln.slice(0, abs), "w.0") && !str_has(ln.slice(0, abs), "w.1") {
+                "String"
+              } else {
+                "Int"
+              }
+              add_diag(li + 1, abs + 1, "unknown method `mbt_show_probe__" + id + "` on type `" + ty + "`")
+            }
+            pos = abs + needle.length()
+          }
+        }
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  assert_true(res.blockers == 0, "nested and expanded hand_moves patterns must have 0 blockers")
+  for d in res.diagnostics {
+    assert_true(d.code != "MBT2PION_UNDISPOSED_PROBE_SITE", "no undisposed probe site: " + d.message)
+  }
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "hand_moves.pion" {
+      out = f.content
+    }
+  }
+  assert_true(str_has(out, "mbt_compat::arr_map(m.weights,"), "m.weights.map lowered:\n" + out)
+  assert_true(!str_has(out, "mbt_show_probe"), "no residual show probes:\n" + out)
+}
+
+test "coupled_a5_b: cross-file cascade unlocks probe in file A after post_b rewrites file B" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "xfile",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let f_a = SourceFile::{
+    rel_path: "a.mbt",
+    content: "pub fn use_b(was : Map[String, Array[Int]], k : String) -> Int {\n  make_str(was, k).length()\n}\n",
+    is_test: false,
+  }
+  let f_b = SourceFile::{
+    rel_path: "b.mbt",
+    content: "pub fn make_str(was : Map[String, Array[Int]], k : String) -> String {\n  let xs = was[k]\n  xs.map(fn(x) { x.to_string() }).join(\",\")\n}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut ca = ""
+    let mut cb = ""
+    for fp in files {
+      if fp.0 == "a.pion" { ca = fp.1 }
+      if fp.0 == "b.pion" { cb = fp.1 }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(file : String, line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"")
+      diags_sb.write_string(file)
+      diags_sb.write_string("\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    // File B: first unlock `was[k]`, then post_b rewrites `xs.map(...)`
+    let b_lines = cb.split("\n")
+    let mut bi = 0
+    while bi < b_lines.length() {
+      let ln = b_lines[bi]
+      let idx_id = coupled_extract_probe_id(ln, ".mbt_idx_probe__")
+      if idx_id.length() > 0 {
+        add_diag("b.pion", bi + 1, 1, "unknown method `mbt_idx_probe__" + idx_id + "` on type `mbt_compat::OrderedMap[String, Array[Int]]`")
+      }
+      let xs_unlocked = !str_has(cb, "was[k]") && !str_has(cb, "mbt_idx_probe")
+      if xs_unlocked {
+        if str_has(ln, ".map(") {
+          let col = ln.index_of(".map(") + 1
+          add_diag("b.pion", bi + 1, col, "unknown method `map` on type `Array[Int]`")
+        } else {
+          let ts_id = coupled_extract_probe_id(ln, ".mbt_show_probe__")
+          if ts_id.length() > 0 {
+            add_diag("b.pion", bi + 1, 1, "unknown method `mbt_show_probe__" + ts_id + "` on type `Int`")
+          }
+        }
+      }
+      bi = bi + 1
+    }
+    // File A: `make_str(was, k).length()` only resolves once File B's `.map(` has been rewritten!
+    let b_ready = str_has(cb, "mbt_compat::arr_map(")
+    if b_ready {
+      let a_lines = ca.split("\n")
+      let mut ai = 0
+      while ai < a_lines.length() {
+        let ln = a_lines[ai]
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag("a.pion", ai + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+        ai = ai + 1
+      }
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([f_a, f_b], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  let mut dmsg = ""
+  for d in res.diagnostics { dmsg = dmsg + d.code + "@" + d.file + ":" + d.message + "; " }
+  assert_true(res.blockers == 0, "cross-file cascade must converge with 0 blockers: " + dmsg)
+  let mut out_a = ""
+  let mut out_b = ""
+  for f in res.files {
+    if f.rel_path == "a.pion" { out_a = f.content }
+    if f.rel_path == "b.pion" { out_b = f.content }
+  }
+  assert_true(str_has(out_a, "mbt_compat::utf16_len(make_str(was, k))"), "file A probe unlocked after file B post_b:\n" + out_a)
+  assert_true(str_has(out_b, "mbt_compat::arr_map(xs,"), "file B rewritten:\n" + out_b)
+}
+
+test "coupled_a5_b: fail-closed when post_b cannot resolve unknown method" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "fc",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "bad.mbt",
+    content: "pub fn f(s : String) -> Int {\n  s.nonexistent_method(s.length())\n}\n",
+    is_test: false,
+  }
+  let mut calls = 0
+  let mock_check = fn(_files : Array[(String, String)]) -> String {
+    calls = calls + 1
+    // `nonexistent_method` is unknown so `pionc` never checks `s.length()` and post_b cannot rewrite it
+    "{\"ok\":false,\"diagnostics\":[{\"file\":\"bad.pion\",\"line\":2,\"col\":4,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `nonexistent_method` on type `String`\"}]}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  assert_true(res.blockers > 0, "unresolvable probe must stay blocked (fail-closed)")
+  let mut has_undisposed = false
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" {
+      has_undisposed = true
+    }
+  }
+  assert_true(has_undisposed, "must emit MBT2PION_UNDISPOSED_PROBE_SITE")
+  assert_true(calls < 20, "must terminate immediately when post_b makes no progress, calls=" + calls.to_string())
+}
+
+test "coupled_a5_b: preserves and deduplicates non-probe diagnostics emitted during intermediate coupled rounds" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "diagkeep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  // Combine a coupled slice -> unsafe_substring -> length chain with a Stage A.5 unsupported-int-div
+  // diagnostic (Int16 / 2) in the same file so round 1 has BOTH a non-probe error AND an unresolved
+  // probe that triggers `continue_coupled == true`. The non-probe error MUST survive and appear once!
+  let src = SourceFile::{
+    rel_path: "mix.mbt",
+    content: "pub fn mix(part : String, i : Int, k : Int, x : Int16) -> (String, Int16) {\n" +
+    "  let said = part[i + 1:]\n" +
+    "  let sub = said.unsafe_substring(start=k + 1, end=said.length())\n" +
+    "  let q = x / 2\n" +
+    "  (sub, q)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "mix.pion" { content = fp.1 }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"mix.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      let sb_id = coupled_extract_probe_id(ln, ".mbt_slice_borrow_probe__")
+      if sb_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_borrow_probe__" + sb_id + "` on type `String`")
+      }
+      let div_id = coupled_extract_probe_id(ln, ".mbt_div_probe__")
+      if div_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_div_probe__" + div_id + "` on type `Int16`")
+      }
+      let said_is_str = str_has(content, "mbt_compat::utf16_slice(")
+      if said_is_str && str_has(ln, ".unsafe_substring(") {
+        let col = ln.index_of(".unsafe_substring(") + 1
+        add_diag(li + 1, col, "unknown method `unsafe_substring` on type `String`")
+      } else if said_is_str {
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag(li + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  let mut div_err_count = 0
+  let mut undisposed_count = 0
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_INT_DIV" {
+      div_err_count = div_err_count + 1
+    }
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" {
+      undisposed_count = undisposed_count + 1
+    }
+  }
+  assert_true(undisposed_count == 0, "coupled slice->unsafe_substring->length still resolves cleanly")
+  assert_true(div_err_count == 1, "non-probe error from coupled round 1 must be preserved exactly once, got " + div_err_count.to_string())
+}
+
+test "coupled_a5_b: preserves permanent blocked DriftEntry from consumed repr(BadStruct) across coupled rounds" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "driftkeep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "repr_mix.mbt",
+    content: "struct BadStruct {\n  v : Int\n}\n" +
+    "pub fn mix(part : String, i : Int, k : Int, b : BadStruct) -> (String, String) {\n" +
+    "  let said = part[i + 1:]\n" +
+    "  let sub = said.unsafe_substring(start=k + 1, end=said.length())\n" +
+    "  let r = repr(b)\n" +
+    "  (sub, r)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "repr_mix.pion" { content = fp.1 }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"repr_mix.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      let sb_id = coupled_extract_probe_id(ln, ".mbt_slice_borrow_probe__")
+      if sb_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_borrow_probe__" + sb_id + "` on type `String`")
+      }
+      let rp_id = coupled_extract_probe_id(ln, ".mbt_repr_probe__")
+      if rp_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_repr_probe__" + rp_id + "` on type `BadStruct`")
+      }
+      let said_is_str = str_has(content, "mbt_compat::utf16_slice(")
+      if said_is_str && str_has(ln, ".unsafe_substring(") {
+        let col = ln.index_of(".unsafe_substring(") + 1
+        add_diag(li + 1, col, "unknown method `unsafe_substring` on type `String`")
+      } else if said_is_str {
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag(li + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  assert_true(res.blockers > 0, "repr(BadStruct) must keep blockers > 0")
+  let mut unsup_diag_count = 0
+  let mut undisposed_count = 0
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" {
+      unsup_diag_count = unsup_diag_count + 1
+    }
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" {
+      undisposed_count = undisposed_count + 1
+    }
+  }
+  assert_true(undisposed_count == 0, "coupled slice->unsafe_substring->length still converges")
+  assert_true(unsup_diag_count == 1, "MBT2PION_UNSUPPORTED_SYNTAX from repr(BadStruct) preserved once, got " + unsup_diag_count.to_string())
+  let mut blocked_repr_drift = 0
+  for e in res.drift_ledger {
+    if e.resolution == "blocked" && e.status == "unresolved" && str_has(e.detail, "BadStruct") {
+      blocked_repr_drift = blocked_repr_drift + 1
+    }
+  }
+  assert_true(blocked_repr_drift == 1, "permanent blocked DriftEntry from repr(BadStruct) preserved once, got " + blocked_repr_drift.to_string())
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "repr_mix.pion" { out = f.content }
+  }
+  assert_true(str_has(out, "mbt_compat::utf16_len(said)"), "coupled said.length() still lowered to utf16_len:\n" + out)
+}
+
+test "coupled_a5_b: same-line column shift after post_b does not duplicate None-branch error or double blockers" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "colshift",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  // Same-line column shift repro: `unsafe_substring(...)` and `x / 2` (`Int16`) on the SAME line.
+  // Round 0 post_b expands `said.unsafe_substring(...)` to `mbt_compat::str_unsafe_substring(said, ...)`,
+  // shifting `x / 2` rightward to a new column on round 1. Must report 1 diag + 1 drift (blockers == 2, NOT 4).
+  let src = SourceFile::{
+    rel_path: "same_line.mbt",
+    content: "pub fn mix(part : String, i : Int, k : Int, x : Int16) -> (String, Int16) {\n" +
+    "  let said = part[i + 1:]\n" +
+    "  let sub = said.unsafe_substring(start=k + 1, end=said.length()); let q = x / 2\n" +
+    "  (sub, q)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "same_line.pion" { content = fp.1 }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"same_line.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      let sb_id = coupled_extract_probe_id(ln, ".mbt_slice_borrow_probe__")
+      if sb_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_borrow_probe__" + sb_id + "` on type `String`")
+      }
+      let div_id = coupled_extract_probe_id(ln, ".mbt_div_probe__")
+      if div_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_div_probe__" + div_id + "` on type `Int16`")
+      }
+      let said_is_str = str_has(content, "mbt_compat::utf16_slice(")
+      if said_is_str && str_has(ln, ".unsafe_substring(") {
+        let col = ln.index_of(".unsafe_substring(") + 1
+        add_diag(li + 1, col, "unknown method `unsafe_substring` on type `String`")
+      } else if said_is_str {
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag(li + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  let mut div_err_count = 0
+  let mut undisposed_count = 0
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_INT_DIV" {
+      div_err_count = div_err_count + 1
+    }
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" {
+      undisposed_count = undisposed_count + 1
+    }
+  }
+  let mut div_blocked_drift = 0
+  for e in res.drift_ledger {
+    if e.category == "int_div_zero" && e.resolution == "blocked" && e.status == "unresolved" {
+      div_blocked_drift = div_blocked_drift + 1
+    }
+  }
+  assert_true(undisposed_count == 0, "coupled said.length() resolves cleanly")
+  assert_true(div_err_count == 1, "MBT2PION_UNSUPPORTED_INT_DIV must appear exactly once, got " + div_err_count.to_string())
+  assert_true(div_blocked_drift == 1, "int_div_zero blocked drift must appear exactly once, got " + div_blocked_drift.to_string())
+  assert_true(res.blockers == 2, "blockers must be 2 (1 diag + 1 drift), not doubled to 4, got " + res.blockers.to_string())
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "same_line.pion" { out = f.content }
+  }
+  assert_true(str_has(out, "mbt_compat::utf16_len(said)"), "coupled said.length() lowered to utf16_len:\n" + out)
+}
+
+test "coupled_a5_b: preserves Stage B fail-closed diagnostic emitted alongside rewrite (retain) across coupled rounds" {
+  let opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "retkeep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let src = SourceFile::{
+    rel_path: "retain_mix.mbt",
+    content: "pub fn mix(part : String, i : Int, k : Int, xs : Array[Int]) -> String {\n" +
+    "  let said = part[i + 1:]\n" +
+    "  let sub = said.unsafe_substring(start=k + 1, end=said.length())\n" +
+    "  xs.retain(fn(x) { xs.push(x); true })\n" +
+    "  sub\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let mut content = ""
+    for fp in files {
+      if fp.0 == "retain_mix.pion" { content = fp.1 }
+    }
+    let diags_sb = StringBuilder()
+    diags_sb.write_string("[")
+    let mut first = true
+    let add_diag = fn(line : Int, col : Int, msg : String) -> Unit {
+      if !first { diags_sb.write_string(",") }
+      first = false
+      diags_sb.write_string("{\"file\":\"retain_mix.pion\",\"line\":")
+      diags_sb.write_string(line.to_string())
+      diags_sb.write_string(",\"col\":")
+      diags_sb.write_string(col.to_string())
+      diags_sb.write_string(",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"")
+      diags_sb.write_string(msg)
+      diags_sb.write_string("\"}")
+    }
+    let lines = content.split("\n")
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      let sb_id = coupled_extract_probe_id(ln, ".mbt_slice_borrow_probe__")
+      if sb_id.length() > 0 {
+        add_diag(li + 1, 1, "unknown method `mbt_slice_borrow_probe__" + sb_id + "` on type `String`")
+      }
+      let said_is_str = str_has(content, "mbt_compat::utf16_slice(")
+      if said_is_str && str_has(ln, ".unsafe_substring(") {
+        let col = ln.index_of(".unsafe_substring(") + 1
+        add_diag(li + 1, col, "unknown method `unsafe_substring` on type `String`")
+      } else if said_is_str {
+        let lp_id = coupled_extract_probe_id(ln, ".mbt_len_probe__")
+        if lp_id.length() > 0 {
+          add_diag(li + 1, 1, "unknown method `mbt_len_probe__" + lp_id + "` on type `String`")
+        }
+      }
+      // Report `xs.retain(...)` once Stage A.5 has rewritten `part[i + 1:]` so it fires during
+      // coupled round 0 `post_b` (when `continue_coupled == true`) and is rewritten to `arr_retain`.
+      if said_is_str && str_has(ln, ".retain(") {
+        let col = ln.index_of(".retain(") + 1
+        add_diag(li + 1, col, "unknown method `retain` on type `Array[Int]`")
+      }
+      li = li + 1
+    }
+    diags_sb.write_string("]")
+    "{\"ok\":" + (if first { "true" } else { "false" }) + ",\"diagnostics\":" + diags_sb.to_string() + "}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], opts, [], true, mock_check)
+  assert_true(res.blockers > 0, "mutating retain callback must keep blockers > 0 across coupled rounds")
+  let mut unsup_count = 0
+  let mut undisposed_count = 0
+  for d in res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" {
+      unsup_count = unsup_count + 1
+    }
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" {
+      undisposed_count = undisposed_count + 1
+    }
+  }
+  assert_true(undisposed_count == 0, "coupled said.length() resolves cleanly")
+  assert_true(unsup_count == 1, "MBT2PION_UNSUPPORTED_SYNTAX from retain must be preserved once, got " + unsup_count.to_string())
+  let mut out = ""
+  for f in res.files {
+    if f.rel_path == "retain_mix.pion" { out = f.content }
+  }
+  assert_true(str_has(out, "mbt_compat::arr_retain("), "retain rewritten to mbt_compat::arr_retain:\n" + out)
+  assert_true(str_has(out, "mbt_compat::utf16_len(said)"), "coupled said.length() lowered to utf16_len:\n" + out)
+}
