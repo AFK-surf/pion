@@ -2927,6 +2927,15 @@ fn drv_cas_remove_entry(world : World, cache_dir : String, ek : String) -> Unit 
     )
     return
   }
+  if drv_starts_with(ek, "testmeta:") {
+    drv_cas_remove_in_bucket(
+      world,
+      cache_dir,
+      "testmeta",
+      slice_str(ek, 9, ek.length()),
+    )
+    return
+  }
   if drv_starts_with(ek, "wasmbin:") {
     drv_cas_remove_in_bucket(
       world,
@@ -7303,6 +7312,15 @@ fn drv_pick_target(world : World, target_override : String) -> String {
 /// zero `mtime`) so rebuilt `.a`/`.o`/`.dylib` invalidate the linked binary while
 /// cross-runner cache restores keep 100% hit rate.
 fn drv_link_opts_key(world : World, opts : DrvLinkOpts) -> String {
+  drv_link_opts_key_memo(world, opts, Map([]))
+}
+
+///|
+fn drv_link_opts_key_memo(
+  world : World,
+  opts : DrvLinkOpts,
+  file_hash_memo : Map[String, String],
+) -> String {
   if opts.libs.length() == 0 &&
     opts.frameworks.length() == 0 &&
     opts.search_paths.length() == 0 &&
@@ -7330,7 +7348,6 @@ fn drv_link_opts_key(world : World, opts : DrvLinkOpts) -> String {
     sb.write_string(drv_join_char(opts.rpaths, ","))
   }
   if opts.objects.length() > 0 {
-    let file_hash_memo : Map[String, String] = Map([])
     sb.write_string("|obj:")
     let mut i = 0
     while i < opts.objects.length() {
@@ -13103,11 +13120,364 @@ fn drv_build_targets(
 struct DrvTestJob {
   label : String
   ssa : String
+  ssa_path : String
+  okey : String
+  cached_bin : String
+  test_src_key : String
   names : Array[String]
   run_idx : Array[Int]
   dep_objs : Array[String]
   dep_obj_keys : Array[String]
   link_opts : DrvLinkOpts
+}
+
+///|
+struct DrvTestMeta {
+  bkey_file : String
+  names : Array[String]
+}
+
+///|
+struct DrvTestJobDeps {
+  dep_objs : Array[String]
+  dep_obj_keys : Array[String]
+  link_opts : DrvLinkOpts
+}
+
+///|
+fn drv_remove_temp_files(world : World, paths : Array[String]) -> Unit {
+  let mut i = 0
+  while i < paths.length() {
+    if paths[i].length() > 0 {
+      let _ = fs_remove(world, paths[i])
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn drv_testmeta_escape(s : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = str_code_at(s, i)
+    if c == 92 {
+      sb.write_string("\\\\")
+    } else if c == 10 {
+      sb.write_string("\\n")
+    } else if c == 13 {
+      sb.write_string("\\r")
+    } else if c == 9 {
+      sb.write_string("\\t")
+    } else {
+      sb.write_string(slice_str(s, i, i + 1))
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_testmeta_unescape(s : String) -> Option[String] {
+  let sb = StringBuilder()
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = str_code_at(s, i)
+    if c == 92 {
+      if i + 1 >= n {
+        return None
+      }
+      let next = str_code_at(s, i + 1)
+      if next == 92 {
+        sb.write_char('\\')
+      } else if next == 110 {
+        sb.write_char('\n')
+      } else if next == 114 {
+        sb.write_char('\r')
+      } else if next == 116 {
+        sb.write_char('\t')
+      } else {
+        return None
+      }
+      i = i + 2
+    } else {
+      sb.write_string(slice_str(s, i, i + 1))
+      i = i + 1
+    }
+  }
+  Some(sb.to_string())
+}
+
+///|
+fn drv_testmeta_format(bkey_file : String, tnames : Array[String]) -> String {
+  let sb = StringBuilder()
+  sb.write_string(bkey_file)
+  sb.write_char('\n')
+  let mut i = 0
+  while i < tnames.length() {
+    sb.write_string(drv_testmeta_escape(tnames[i]))
+    sb.write_char('\n')
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_testmeta_parse(txt : String) -> Option[DrvTestMeta] {
+  if txt.length() == 0 {
+    return None
+  }
+  let raw_lines = drv_split_char(txt, 10)
+  let mut nlines = raw_lines.length()
+  if nlines > 0 && raw_lines[nlines - 1].length() == 0 {
+    nlines = nlines - 1
+  }
+  if nlines == 0 {
+    return None
+  }
+  let mut head = raw_lines[0]
+  if head.length() > 0 && str_code_at(head, head.length() - 1) == 13 {
+    head = slice_str(head, 0, head.length() - 1)
+  }
+  if head.length() == 0 {
+    return None
+  }
+  if head == "NONE" {
+    if nlines != 1 {
+      return None
+    }
+    return Some(DrvTestMeta::{ bkey_file: "NONE", names: [] })
+  }
+  if !cas_is_safe_key("testbin:" + head) {
+    return None
+  }
+  if nlines < 2 {
+    return None
+  }
+  let names : Array[String] = []
+  let mut i = 1
+  while i < nlines {
+    let mut line = raw_lines[i]
+    if line.length() > 0 && str_code_at(line, line.length() - 1) == 13 {
+      line = slice_str(line, 0, line.length() - 1)
+    }
+    match drv_testmeta_unescape(line) {
+      Some(nm) => names.push(nm)
+      None => return None
+    }
+    i = i + 1
+  }
+  Some(DrvTestMeta::{ bkey_file: head, names: names })
+}
+
+///|
+fn drv_write_testmeta_entry(
+  world : World,
+  cache_dir : String,
+  test_src_key : String,
+  bkey_file : String,
+  tnames : Array[String],
+  pin : DrvCasPinSession,
+  out_keys : Array[String],
+  out_sizes : Array[Int64],
+) -> Unit {
+  if test_src_key.length() == 0 {
+    return
+  }
+  let tm_dir = cache_dir + "/testmeta"
+  let _ = fs_mkdir_p(world, tm_dir)
+  let meta_file = test_src_key + ".tsv"
+  let meta_path = tm_dir + "/" + meta_file
+  let body = drv_testmeta_format(bkey_file, tnames)
+  if drv_write_cas_text_atomic(world, meta_path, body) {
+    let tkey = "testmeta:" + meta_file
+    drv_cas_pin_add(pin, tkey)
+    let sz = fs_size(world, meta_path)
+    out_keys.push(tkey)
+    out_sizes.push(if sz > 0L { sz } else { 0L })
+  }
+}
+
+///|
+fn drv_hash_field(sb : StringBuilder, s : String) -> Unit {
+  sb.write_string(s.length().to_string())
+  sb.write_char(':')
+  sb.write_string(s)
+  sb.write_char('\n')
+}
+
+///|
+fn drv_collect_test_job_deps(
+  nodes : Array[PkgNodeInput],
+  topo_order : Array[Int],
+  td : Array[Int],
+  node : PkgNodeInput,
+  tk : Int,
+  built : DrvNeededObjs,
+  pkg_cstub_objs : Array[Array[String]],
+  pkg_cstub_keys : Array[Array[String]],
+  pkg_cstub_cxx : Array[Bool],
+  pkg_rc_objs : Array[Array[String]],
+  qbe_target : String,
+  cli_libs : Array[String],
+) -> DrvTestJobDeps {
+  let dep_objs : Array[String] = []
+  let dep_obj_keys : Array[String] = []
+  let job_opts = drv_link_opts_empty()
+  let mut u = 0
+  while u < td.length() {
+    let tu = td[u]
+    let dn = nodes[topo_order[tu]]
+    dep_objs.push(built.obj_paths[tu])
+    dep_obj_keys.push(built.obj_keys[tu])
+    let dcstubs = pkg_cstub_objs[tu]
+    let dcstub_keys = pkg_cstub_keys[tu]
+    let mut ci = 0
+    while ci < dcstubs.length() {
+      dep_objs.push(dcstubs[ci])
+      dep_obj_keys.push(if ci < dcstub_keys.length() { dcstub_keys[ci] } else { "" })
+      ci = ci + 1
+    }
+    if pkg_cstub_cxx[tu] {
+      job_opts.has_cxx = true
+    }
+    drv_collect_node_link_opts(dn, qbe_target, job_opts)
+    let drcs = pkg_rc_objs[tu]
+    let mut rci = 0
+    while rci < drcs.length() {
+      push_unique_lib(job_opts.objects, drcs[rci])
+      rci = rci + 1
+    }
+    u = u + 1
+  }
+  let self_cstubs = pkg_cstub_objs[tk]
+  let self_cstub_keys = pkg_cstub_keys[tk]
+  let mut ci = 0
+  while ci < self_cstubs.length() {
+    dep_objs.push(self_cstubs[ci])
+    dep_obj_keys.push(if ci < self_cstub_keys.length() { self_cstub_keys[ci] } else { "" })
+    ci = ci + 1
+  }
+  if pkg_cstub_cxx[tk] {
+    job_opts.has_cxx = true
+  }
+  drv_collect_node_link_opts(node, qbe_target, job_opts)
+  let self_rcs = pkg_rc_objs[tk]
+  let mut rci = 0
+  while rci < self_rcs.length() {
+    push_unique_lib(job_opts.objects, self_rcs[rci])
+    rci = rci + 1
+  }
+  let mut li = 0
+  while li < cli_libs.length() {
+    push_unique_lib(job_opts.libs, cli_libs[li])
+    if drv_is_cxx_lib(cli_libs[li]) {
+      job_opts.has_cxx = true
+    }
+    li = li + 1
+  }
+  DrvTestJobDeps::{
+    dep_objs: dep_objs,
+    dep_obj_keys: dep_obj_keys,
+    link_opts: job_opts,
+  }
+}
+
+///|
+/// Computes the source-level CAS key for a workspace package's test binary and
+/// test list (`testmeta/<key>.tsv`). Intentionally excludes `--filter` so
+/// filtered runs share one `testmeta` + `testbin` entry.
+fn drv_compute_test_src_key(
+  world : World,
+  cache_dir : String,
+  compiler_fp : String,
+  qbe_target : String,
+  qbe_macos_ver : String,
+  node : PkgNodeInput,
+  pkg_root : String,
+  pkg_cwd : String,
+  tpaths : Array[String],
+  tsources : Array[String],
+  trans_names : Array[String],
+  trans_topo_names : Array[String],
+  sig_hashes : Map[String, String],
+  stub_hashes : Map[String, String],
+  dep_objs : Array[String],
+  dep_obj_keys : Array[String],
+  job_opts : DrvLinkOpts,
+  file_hash_memo : Map[String, String],
+  link_cc_ver_cache : Map[String, String],
+) -> String {
+  let sb = StringBuilder()
+  drv_hash_field(sb, "testsrc_v2")
+  drv_hash_field(sb, compiler_fp)
+  drv_hash_field(sb, qbe_target)
+  drv_hash_field(sb, qbe_macos_ver)
+  drv_hash_field(sb, node.name)
+  drv_hash_field(sb, pkg_root)
+  drv_hash_field(sb, pkg_cwd)
+  drv_hash_field(sb, tpaths.length().to_string())
+  let mut i = 0
+  while i < tpaths.length() {
+    drv_hash_field(sb, pkg_rebase_rel_path(node.dir, tpaths[i]))
+    drv_hash_field(sb, sha256_hex(tsources[i]))
+    i = i + 1
+  }
+  drv_hash_field(sb, trans_names.length().to_string())
+  i = 0
+  while i < trans_names.length() {
+    let un = trans_names[i]
+    let sh = match sig_hashes.get(un) {
+      Some(h) => h
+      None => ""
+    }
+    let stub_h = match stub_hashes.get(un) {
+      Some(h) => h
+      None => ""
+    }
+    drv_hash_field(sb, un + ":" + sh + ":" + stub_h)
+    i = i + 1
+  }
+  drv_hash_field(sb, trans_topo_names.length().to_string())
+  i = 0
+  while i < trans_topo_names.length() {
+    drv_hash_field(sb, trans_topo_names[i])
+    i = i + 1
+  }
+  let alias_sigs : Array[String] = []
+  drv_append_dep_alias_sigs(alias_sigs, node)
+  drv_hash_field(sb, alias_sigs.length().to_string())
+  i = 0
+  while i < alias_sigs.length() {
+    drv_hash_field(sb, alias_sigs[i])
+    i = i + 1
+  }
+  drv_hash_field(sb, dep_objs.length().to_string())
+  i = 0
+  while i < dep_objs.length() {
+    let dp = dep_objs[i]
+    if i < dep_obj_keys.length() && dep_obj_keys[i].length() > 0 {
+      drv_hash_field(sb, "cas:" + dep_obj_keys[i] + ":" + fs_size(world, dp).to_string())
+    } else {
+      drv_hash_field(sb, drv_cas_file_content_fp(world, dp, file_hash_memo))
+    }
+    i = i + 1
+  }
+  drv_hash_field(sb, drv_link_opts_key_memo(world, job_opts, file_hash_memo))
+  drv_hash_field(
+    sb,
+    drv_effective_link_context_key(
+      world,
+      cache_dir,
+      qbe_target,
+      "",
+      job_opts,
+      link_cc_ver_cache,
+    ),
+  )
+  sha256_hex(sb.to_string())
 }
 
 ///|
@@ -13504,6 +13874,14 @@ fn drv_exec_test_jobs(
     return Ok(())
   }
   let isolate_eff = isolate || drv_env_str(world, "PION_TEST_ISOLATE") == "1"
+  let all_temp_ssa : Array[String] = []
+  let mut init_j = 0
+  while init_j < jobs_list.length() {
+    if jobs_list[init_j].ssa_path.length() > 0 {
+      all_temp_ssa.push(jobs_list[init_j].ssa_path)
+    }
+    init_j = init_j + 1
+  }
   let cache_dir = drv_resolve_cache_dir(world)
   let tb_dir = cache_dir + "/testbin"
   let _ = fs_mkdir_p(world, tb_dir)
@@ -13514,7 +13892,10 @@ fn drv_exec_test_jobs(
   }
   let qbe_bin = drv_resolve_qbe_bin(world)
   let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, "", as_json, pin) {
-    Err(e) => return Err(e)
+    Err(e) => {
+      drv_remove_temp_files(world, all_temp_ssa)
+      return Err(e)
+    }
     Ok(p) => p
   }
   let file_hash_memo : Map[String, String] = Map([])
@@ -13535,7 +13916,9 @@ fn drv_exec_test_jobs(
   let all_units : Array[Array[DrvTestUnit]] = []
   let build_lines : Array[String] = []
   let new_keys : Array[String] = []
-  let new_ssa : Array[String] = []
+  let pending_meta_keys : Array[String] = []
+  let pending_meta_bkeys : Array[String] = []
+  let pending_meta_job_idx : Array[Int] = []
   // rcs[gi]: -1 = pending, 0 = passed, 1 = failed (isolated), -2 = batch failed (needs isolated rerun).
   let rcs : Array[Int] = []
   let link_cc_ver_cache : Map[String, String] = Map([])
@@ -13552,15 +13935,27 @@ fn drv_exec_test_jobs(
     gi_base = gi_base + job.run_idx.length()
     let job_units = drv_plan_job_units(job, job_gi, isolate_eff, usep)
     all_units.push(job_units)
-    let okey = sha256_hex(
-      compiler_fp +
-      "|testobj_v2|" +
-      qbe_target +
-      "|" +
-      qbe_macos_ver +
-      "|" +
-      sha256_hex(job.ssa),
-    )
+    if job.cached_bin.length() > 0 {
+      bins.push(job.cached_bin)
+      if trace_cas {
+        io_eprintln(world, "[cas] test=" + job.label + " HIT cached_bin")
+      }
+      j = j + 1
+      continue
+    }
+    let okey = if job.okey.length() > 0 {
+      job.okey
+    } else {
+      sha256_hex(
+        compiler_fp +
+        "|testobj_v2|" +
+        qbe_target +
+        "|" +
+        qbe_macos_ver +
+        "|" +
+        sha256_hex(job.ssa),
+      )
+    }
     let dsb = StringBuilder()
     dsb.write_string(compiler_fp)
     dsb.write_string("|testbin|")
@@ -13583,7 +13978,7 @@ fn drv_exec_test_jobs(
       }
       di = di + 1
     }
-    dsb.write_string(drv_link_opts_key(world, job.link_opts))
+    dsb.write_string(drv_link_opts_key_memo(world, job.link_opts, file_hash_memo))
     dsb.write_string(
       drv_effective_link_context_key(
         world,
@@ -13599,6 +13994,11 @@ fn drv_exec_test_jobs(
     let bkey_file = drv_linked_exe_path(qbe_target, bkey)
     let bin_path = drv_linked_exe_path(qbe_target, tb_dir + "/" + bkey)
     bins.push(bin_path)
+    if job.test_src_key.length() > 0 {
+      pending_meta_keys.push(job.test_src_key)
+      pending_meta_bkeys.push(bkey_file)
+      pending_meta_job_idx.push(j)
+    }
     let bin_hit = drv_is_nonempty_regular_file(world, bin_path) &&
       drv_cas_pin_and_verify(world, cache_dir, pin, ["testbin:" + bkey_file], [bin_path])
     if bin_hit {
@@ -13611,12 +14011,16 @@ fn drv_exec_test_jobs(
       let need_qbe = !obj_hit
       drv_cas_pin_add(pin, "testbin:" + okey + ".o")
       drv_cas_pin_add(pin, "testbin:" + bkey_file)
-      let ssa_path = tb_dir + "/" + okey + ".ssa." + drv_tmp_tag(world, okey + "_" + j.to_string())
+      let mut ssa_path = job.ssa_path
       if need_qbe {
-        if !drv_write_cas_text_atomic(world, ssa_path, job.ssa) {
-          return Err("failed to write test ssa: " + ssa_path)
+        if ssa_path.length() == 0 {
+          ssa_path = tb_dir + "/" + okey + ".ssa." + drv_tmp_tag(world, okey + "_" + j.to_string())
+          if !drv_write_cas_text_atomic(world, ssa_path, job.ssa) {
+            drv_remove_temp_files(world, all_temp_ssa)
+            return Err("failed to write test ssa: " + ssa_path)
+          }
+          all_temp_ssa.push(ssa_path)
         }
-        new_ssa.push(ssa_path)
         new_keys.push(okey + ".o")
       }
       if trace_cas {
@@ -13772,11 +14176,7 @@ fn drv_exec_test_jobs(
         None => break
       }
     }
-    let mut si = 0
-    while si < new_ssa.length() {
-      let _ = fs_remove(world, new_ssa[si])
-      si = si + 1
-    }
+    drv_remove_temp_files(world, all_temp_ssa)
     let mut has_err = false
     let mut first_idx = 0
     let mut first_msg = ""
@@ -13817,7 +14217,35 @@ fn drv_exec_test_jobs(
       pin,
     )
   } else {
+    drv_remove_temp_files(world, all_temp_ssa)
     let _ = drv_cas_pin_flush(world, pin)
+  }
+  if pending_meta_keys.length() > 0 {
+    let meta_keys : Array[String] = []
+    let meta_sizes : Array[Int64] = []
+    let mut mi = 0
+    while mi < pending_meta_keys.length() {
+      drv_write_testmeta_entry(
+        world,
+        cache_dir,
+        pending_meta_keys[mi],
+        pending_meta_bkeys[mi],
+        jobs_list[pending_meta_job_idx[mi]].names,
+        pin,
+        meta_keys,
+        meta_sizes,
+      )
+      mi = mi + 1
+    }
+    if meta_keys.length() > 0 {
+      drv_cas_record_batch_and_evict_pinned(
+        world,
+        cache_dir,
+        meta_keys,
+        meta_sizes,
+        pin,
+      )
+    }
   }
 
   if trace_cas {
@@ -14082,7 +14510,8 @@ struct DrvNeededObjs {
   obj_paths : Array[String]
   obj_keys : Array[String]
   stub_paths : Array[String]
-  loaded_imported : Array[Option[ImportedPkg]]
+  sig_hashes : Map[String, String]
+  stub_hashes : Map[String, String]
 }
 
 ///|
@@ -14126,7 +14555,8 @@ fn drv_build_needed_objects(
       obj_paths: obj_paths,
       obj_keys: obj_keys,
       stub_paths: stub_paths,
-      loaded_imported: loaded_imported,
+      sig_hashes: Map([]),
+      stub_hashes: Map([]),
     })
   }
   let cache_dir = drv_resolve_cache_dir(world)
@@ -14310,7 +14740,8 @@ fn drv_build_needed_objects(
     obj_paths: obj_paths,
     obj_keys: obj_keys,
     stub_paths: stub_paths,
-    loaded_imported: loaded_imported,
+    sig_hashes: sig_hashes,
+    stub_hashes: stub_hashes,
   })
 }
 
@@ -15102,26 +15533,26 @@ fn drv_run_ws_tests_collect(
     if fs_exists(world, root_mf_path) {
       match fs_read(world, root_mf_path) {
         Ok(mf_txt) =>
-          match parse_pion_toml(mf_txt) {
-            Ok(mf) =>
-              if mf.is_workspace {
-                is_virtual_ws = true
-                match drv_expand_workspace_members(world, root_abs, mf) {
-                  Ok(ms) => {
-                    let mut mi = 0
-                    while mi < ms.length() {
-                      no_deps_dirs.set(
-                        drv_canon_dir(world, ms[mi]),
-                        true,
-                      )
-                      mi = mi + 1
-                    }
-                  }
-                  Err(_) => ()
+        match parse_pion_toml(mf_txt) {
+          Ok(mf) =>
+          if mf.is_workspace {
+            is_virtual_ws = true
+            match drv_expand_workspace_members(world, root_abs, mf) {
+              Ok(ms) => {
+                let mut mi = 0
+                while mi < ms.length() {
+                  no_deps_dirs.set(
+                    drv_canon_dir(world, ms[mi]),
+                    true,
+                  )
+                  mi = mi + 1
                 }
               }
-            Err(_) => ()
+              Err(_) => ()
+            }
           }
+          Err(_) => ()
+        }
         Err(_) => ()
       }
     }
@@ -15441,9 +15872,187 @@ fn drv_run_ws_tests_collect(
       pin,
     )
   }
-  let test_jobs : Array[DrvTestJob] = []
+  let qbe_bin = drv_resolve_qbe_bin(world)
+  let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib, qbe_target, "")
+  let apple_tools = drv_probe_apple_tools(world, qbe_target)
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+    apple_tools.macos_ver
+  } else {
+    "15.0"
+  }
+  let tb_dir = cache_dir + "/testbin"
+  let tm_dir = cache_dir + "/testmeta"
+  let _ = fs_mkdir_p(world, tb_dir)
+  let ws_pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
+  let link_cc_ver_cache : Map[String, String] = Map([])
+  let nsel = selected.length()
+  let job_slots : Array[Option[DrvTestJob]] = []
+  si = 0
+  while si < nsel {
+    job_slots.push(None)
+    si = si + 1
+  }
+  let miss_si : Array[Int] = []
+  let miss_tpaths : Array[Array[String]] = []
+  let miss_tsources : Array[Array[String]] = []
+  let miss_deps : Array[DrvTestJobDeps] = []
+  let miss_src_keys : Array[String] = []
+  let miss_pkg_roots : Array[String] = []
+  si = 0
+  while si < nsel {
+    let node = nodes[selected[si]]
+    let tk = node_to_topo[selected[si]]
+    let tpaths : Array[String] = []
+    let tsources : Array[String] = []
+    let mut pi = 0
+    while pi < node.paths.length() {
+      tpaths.push(node.paths[pi])
+      tsources.push(node.sources[pi])
+      pi = pi + 1
+    }
+    match drv_append_test_sources_for(
+      world,
+      node.dir,
+      node.target_rules,
+      active_target,
+      tpaths,
+      tsources,
+    ) {
+      Err(msg) => {
+        drv_cas_pin_close(world, pin)
+        return Err(msg)
+      }
+      Ok(_) => ()
+    }
+    let deps = drv_collect_test_job_deps(
+      nodes,
+      topo.order,
+      trans.topo[tk],
+      node,
+      tk,
+      built,
+      pkg_cstub_objs,
+      pkg_cstub_keys,
+      pkg_cstub_cxx,
+      pkg_rc_objs,
+      qbe_target,
+      cli_libs,
+    )
+    let pkg_root = drv_normalize_path(drv_abs_path(world, node.dir))
+    let test_src_key = drv_compute_test_src_key(
+      world,
+      cache_dir,
+      compiler_fp,
+      qbe_target,
+      qbe_macos_ver,
+      node,
+      pkg_root,
+      ws_pkg_cwd,
+      tpaths,
+      tsources,
+      trans.names[tk],
+      trans.topo_names[tk],
+      built.sig_hashes,
+      built.stub_hashes,
+      deps.dep_objs,
+      deps.dep_obj_keys,
+      deps.link_opts,
+      file_hash_memo,
+      link_cc_ver_cache,
+    )
+    let meta_file = test_src_key + ".tsv"
+    let meta_path = tm_dir + "/" + meta_file
+    let mut meta_hit = false
+    if drv_is_nonempty_regular_file(world, meta_path) {
+      match fs_read(world, meta_path) {
+        Ok(meta_txt) =>
+        match drv_testmeta_parse(meta_txt) {
+          Some(meta) =>
+          if meta.bkey_file == "NONE" {
+            if drv_cas_pin_and_verify(
+              world,
+              cache_dir,
+              pin,
+              ["testmeta:" + meta_file],
+              [meta_path],
+            ) {
+              meta_hit = true
+              if trace {
+                io_eprintln(
+                  world,
+                  "[cas] testmeta=" +
+                  node.declared_name +
+                  " HIT none key=" +
+                  drv_prefix16(test_src_key),
+                )
+              }
+            }
+          } else {
+            let bin_path = tb_dir + "/" + meta.bkey_file
+            if drv_is_nonempty_regular_file(world, bin_path) &&
+            drv_cas_pin_and_verify(
+              world,
+              cache_dir,
+              pin,
+              ["testmeta:" + meta_file, "testbin:" + meta.bkey_file],
+              [meta_path, bin_path],
+            ) {
+              meta_hit = true
+              if trace {
+                io_eprintln(
+                  world,
+                  "[cas] testmeta=" +
+                  node.declared_name +
+                  " HIT bin=" +
+                  drv_prefix16(meta.bkey_file) +
+                  " key=" +
+                  drv_prefix16(test_src_key),
+                )
+              }
+              let run_idx = drv_filter_tests(meta.names, filter)
+              if run_idx.length() > 0 {
+                job_slots[si] = Some(DrvTestJob::{
+                  label: node.declared_name,
+                  ssa: "",
+                  ssa_path: "",
+                  okey: "",
+                  cached_bin: bin_path,
+                  test_src_key: test_src_key,
+                  names: meta.names,
+                  run_idx: run_idx,
+                  dep_objs: [],
+                  dep_obj_keys: [],
+                  link_opts: drv_link_opts_empty(),
+                })
+              }
+            }
+          }
+          None => ()
+        }
+        Err(_) => ()
+      }
+    }
+    if !meta_hit {
+      if trace {
+        io_eprintln(
+          world,
+          "[cas] testmeta=" + node.declared_name + " MISS key=" + drv_prefix16(test_src_key),
+        )
+      }
+      miss_si.push(si)
+      miss_tpaths.push(tpaths)
+      miss_tsources.push(tsources)
+      miss_deps.push(deps)
+      miss_src_keys.push(test_src_key)
+      miss_pkg_roots.push(pkg_root)
+    }
+    si = si + 1
+  }
   let nw_max = if jobs > 0 { jobs } else { drv_default_jobs(world) }
-  if selected.length() <= 1 || nw_max <= 1 {
+  let nmiss = miss_si.length()
+  let zero_meta_keys : Array[String] = []
+  let ssa_stamp = drv_tmp_tag(world, "test_ssa")
+  if nmiss > 0 && (nmiss <= 1 || nw_max <= 1) {
     // Use a fresh empty cache so serial and parallel branches share identical
     // stub-first dependency loading and produce identical test SSA / testobj keys.
     let serial_loaded : Array[Option[ImportedPkg]] = []
@@ -15452,29 +16061,14 @@ fn drv_run_ws_tests_collect(
       serial_loaded.push(None)
       k = k + 1
     }
-    si = 0
-    while si < selected.length() {
-      let node = nodes[selected[si]]
-      let tk = node_to_topo[selected[si]]
-      let tpaths : Array[String] = []
-      let tsources : Array[String] = []
-      let mut pi = 0
-      while pi < node.paths.length() {
-        tpaths.push(node.paths[pi])
-        tsources.push(node.sources[pi])
-        pi = pi + 1
-      }
-      match drv_append_test_sources_for(
-        world,
-        node.dir,
-        node.target_rules,
-        active_target,
-        tpaths,
-        tsources,
-      ) {
-        Err(msg) => return Err(msg)
-        Ok(_) => ()
-      }
+    let created_ssas : Array[String] = []
+    let mut mi = 0
+    while mi < nmiss {
+      let cur_si = miss_si[mi]
+      let node = nodes[selected[cur_si]]
+      let tk = node_to_topo[selected[cur_si]]
+      let tpaths = miss_tpaths[mi]
+      let tsources = miss_tsources[mi]
       let imports = drv_ensure_ws_imports(
         world,
         nodes,
@@ -15495,94 +16089,67 @@ fn drv_run_ws_tests_collect(
         false,
       )
       if cr.diagnostics.length() > 0 {
+        drv_remove_temp_files(world, created_ssas)
+        drv_cas_pin_close(world, pin)
         return Err(check_result_to_json(cr.diagnostics))
       }
-      cr.tc.pkg_root = drv_normalize_path(drv_abs_path(world, node.dir))
-      cr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
-      out_tested.push(node.declared_name)
+      cr.tc.pkg_root = miss_pkg_roots[mi]
+      cr.tc.pkg_cwd = ws_pkg_cwd
       let tnames = drv_test_names(cr.pkg)
       let run_idx = drv_filter_tests(tnames, filter)
-      if run_idx.length() > 0 {
-        let td = trans.topo[tk]
-        let dep_names : Array[String] = []
-        let dep_objs : Array[String] = []
-        let dep_obj_keys : Array[String] = []
-        let job_opts = drv_link_opts_empty()
-        let mut u = 0
-        while u < td.length() {
-          let tu = td[u]
-          let dn = nodes[topo.order[tu]]
-          dep_names.push(dn.name)
-          dep_objs.push(built.obj_paths[tu])
-          dep_obj_keys.push(built.obj_keys[tu])
-          let dcstubs = pkg_cstub_objs[tu]
-          let dcstub_keys = pkg_cstub_keys[tu]
-          let mut ci = 0
-          while ci < dcstubs.length() {
-            dep_objs.push(dcstubs[ci])
-            dep_obj_keys.push(if ci < dcstub_keys.length() { dcstub_keys[ci] } else { "" })
-            ci = ci + 1
-          }
-          if pkg_cstub_cxx[tu] {
-            job_opts.has_cxx = true
-          }
-          drv_collect_node_link_opts(dn, qbe_target, job_opts)
-          let drcs = pkg_rc_objs[tu]
-          let mut rci = 0
-          while rci < drcs.length() {
-            push_unique_lib(job_opts.objects, drcs[rci])
-            rci = rci + 1
-          }
-          u = u + 1
+      if tnames.length() == 0 {
+        zero_meta_keys.push(miss_src_keys[mi])
+      } else if run_idx.length() > 0 {
+        let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, trans.topo_names[tk], qbe_target)
+        let cleaned_ssa = cleanup_native_rc_ssa(test_res.ssa)
+        let okey = sha256_hex(
+          compiler_fp +
+          "|testobj_v2|" +
+          qbe_target +
+          "|" +
+          qbe_macos_ver +
+          "|" +
+          sha256_hex(cleaned_ssa),
+        )
+        let spath = tb_dir + "/" + okey + ".ssa.tmp." + ssa_stamp + "_" + cur_si.to_string()
+        if !drv_write_cas_text_atomic(world, spath, cleaned_ssa) {
+          drv_remove_temp_files(world, created_ssas)
+          drv_cas_pin_close(world, pin)
+          return Err("failed to write test ssa: " + spath)
         }
-        let self_cstubs = pkg_cstub_objs[tk]
-        let self_cstub_keys = pkg_cstub_keys[tk]
-        let mut ci = 0
-        while ci < self_cstubs.length() {
-          dep_objs.push(self_cstubs[ci])
-          dep_obj_keys.push(if ci < self_cstub_keys.length() { self_cstub_keys[ci] } else { "" })
-          ci = ci + 1
-        }
-        if pkg_cstub_cxx[tk] {
-          job_opts.has_cxx = true
-        }
-        drv_collect_node_link_opts(node, qbe_target, job_opts)
-        let self_rcs = pkg_rc_objs[tk]
-        let mut rci = 0
-        while rci < self_rcs.length() {
-          push_unique_lib(job_opts.objects, self_rcs[rci])
-          rci = rci + 1
-        }
-        let mut li = 0
-        while li < cli_libs.length() {
-          push_unique_lib(job_opts.libs, cli_libs[li])
-          if drv_is_cxx_lib(cli_libs[li]) {
-            job_opts.has_cxx = true
-          }
-          li = li + 1
-        }
-        let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qbe_target)
-        test_jobs.push(DrvTestJob::{
+        created_ssas.push(spath)
+        let deps = miss_deps[mi]
+        job_slots[cur_si] = Some(DrvTestJob::{
           label: node.declared_name,
-          ssa: cleanup_native_rc_ssa(test_res.ssa),
+          ssa: "",
+          ssa_path: spath,
+          okey: okey,
+          cached_bin: "",
+          test_src_key: miss_src_keys[mi],
           names: tnames,
           run_idx: run_idx,
-          dep_objs: dep_objs,
-          dep_obj_keys: dep_obj_keys,
-          link_opts: job_opts,
+          dep_objs: deps.dep_objs,
+          dep_obj_keys: deps.dep_obj_keys,
+          link_opts: deps.link_opts,
         })
       }
-      si = si + 1
+      mi = mi + 1
     }
-  } else {
+  } else if nmiss > 1 {
     // Parallel multi-package frontend `check+emit` bounded by `nw_max`.
+    // Workers receive the exact in-memory source snapshot hashed into
+    // `test_src_key` (preserving `manifest_apply_verify` injections with zero
+    // TOCTOU), dependency fallback sources are packed only when no stub path
+    // exists, and generated test SSA is streamed directly to disk so 0 bytes
+    // of SSA cross `res_ch`.
     let topo_entries : Array[String] = []
     k = 0
     while k < n {
       let unode = nodes[topo.order[k]]
       let sp = built.stub_paths[k]
-      let fb_paths = if need[k] { drv_pack_str_list(unode.paths) } else { "" }
-      let fb_sources = if need[k] { drv_pack_str_list(unode.sources) } else { "" }
+      let pack_fb = need[k] && (sp.length() == 0 || !drv_is_nonempty_regular_file(world, sp))
+      let fb_paths = if pack_fb { drv_pack_str_list(unode.paths) } else { "" }
+      let fb_sources = if pack_fb { drv_pack_str_list(unode.sources) } else { "" }
       topo_entries.push(
         drv_pack_str_list([
           unode.name,
@@ -15598,53 +16165,38 @@ fn drv_run_ws_tests_collect(
       k = k + 1
     }
     let topo_spec = drv_pack_str_list(topo_entries)
-    let ws_pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
     let work_items : Array[String] = []
-    si = 0
-    while si < selected.length() {
-      let node = nodes[selected[si]]
-      let tk = node_to_topo[selected[si]]
-      let tpaths : Array[String] = []
-      let tsources : Array[String] = []
-      let mut pi = 0
-      while pi < node.paths.length() {
-        tpaths.push(node.paths[pi])
-        tsources.push(node.sources[pi])
-        pi = pi + 1
-      }
-      match drv_append_test_sources_for(
-        world,
-        node.dir,
-        node.target_rules,
-        active_target,
-        tpaths,
-        tsources,
-      ) {
-        Err(msg) => return Err(msg)
-        Ok(_) => ()
-      }
+    let mut mi = 0
+    while mi < nmiss {
+      let cur_si = miss_si[mi]
+      let node = nodes[selected[cur_si]]
+      let tk = node_to_topo[selected[cur_si]]
       work_items.push(
         drv_pack_str_list([
-          si.to_string(),
+          mi.to_string(),
+          cur_si.to_string(),
           tk.to_string(),
           node.name,
-          drv_pack_str_list(tpaths),
-          drv_pack_str_list(tsources),
+          drv_pack_str_list(miss_tpaths[mi]),
+          drv_pack_str_list(miss_tsources[mi]),
           drv_pack_str_list(trans.topo_names[tk]),
-          drv_normalize_path(drv_abs_path(world, node.dir)),
+          miss_pkg_roots[mi],
           drv_pack_str_list(node.dep_aliases),
           drv_pack_str_list(node.deps),
         ]),
       )
-      si = si + 1
+      mi = mi + 1
     }
     let work_spec = drv_pack_str_list(work_items)
-    let nsel = selected.length()
-    let nw = if nsel < nw_max { nsel } else { nw_max }
+    let nw = if nmiss < nw_max { nmiss } else { nw_max }
     let cursor = AtomicInt::new(0)
-    let res_ch : Channel[String] = Channel::new(nsel + 1)
+    let res_ch : Channel[String] = Channel::new(nmiss + 1)
     let flt = filter
     let qt = qbe_target
+    let qmv = qbe_macos_ver
+    let w_cfp = compiler_fp
+    let w_tb_dir = tb_dir
+    let w_stamp = ssa_stamp
     scope(world, fn(s : Scope) -> Unit {
       let mut wi = 0
       while wi < nw {
@@ -15681,17 +16233,19 @@ fn drv_run_ws_tests_collect(
               break
             }
             let wf = drv_unpack_str_list(items[idx])
-            let cur_si = wf[0]
-            let cur_tk = drv_parse_nonneg_decimal(wf[1])
-            let pkg_name = wf[2]
-            let tpaths = drv_unpack_str_list(wf[3])
-            let tsources = drv_unpack_str_list(wf[4])
-            let dep_names = drv_unpack_str_list(wf[5])
-            let pkg_root = wf[6]
-            let w_dep_aliases = drv_unpack_str_list(wf[7])
-            let w_dep_targets = drv_unpack_str_list(wf[8])
+            let cur_mi = wf[0]
+            let cur_si = wf[1]
+            let cur_tk = drv_parse_nonneg_decimal(wf[2])
+            let pkg_name = wf[3]
+            let tpaths = drv_unpack_str_list(wf[4])
+            let tsources = drv_unpack_str_list(wf[5])
+            let dep_names = drv_unpack_str_list(wf[6])
+            let pkg_root = wf[7]
+            let w_dep_aliases = drv_unpack_str_list(wf[8])
+            let w_dep_targets = drv_unpack_str_list(wf[9])
             let deps_topo = t_deps[cur_tk]
             let imports : Array[ImportedPkg] = []
+            let mut dep_err = ""
             let mut di = 0
             while di < deps_topo.length() {
               let u = deps_topo[di]
@@ -15715,27 +16269,31 @@ fn drv_run_ws_tests_collect(
                   if sp.length() > 0 {
                     match fs_read(world, sp) {
                       Ok(stub_txt) =>
-                        if stub_txt.length() > 0 {
-                          let scr = check_source_files_with_imports_mapped_dep(
-                            t_names[u],
-                            [t_names[u] + ".pionstub"],
-                            [stub_txt],
-                            u_imports,
-                            u_da,
-                            u_dt,
-                            true,
-                            false,
-                          )
-                          if scr.diagnostics.length() == 0 {
-                            loaded_opt = Some(ImportedPkg::{ name: t_names[u], tc: scr.tc })
-                          }
+                      if stub_txt.length() > 0 {
+                        let scr = check_source_files_with_imports_mapped_dep(
+                          t_names[u],
+                          [t_names[u] + ".pionstub"],
+                          [stub_txt],
+                          u_imports,
+                          u_da,
+                          u_dt,
+                          true,
+                          false,
+                        )
+                        if scr.diagnostics.length() == 0 {
+                          loaded_opt = Some(ImportedPkg::{ name: t_names[u], tc: scr.tc })
                         }
+                      }
                       Err(_) => ()
                     }
                   }
-                  let ipkg = match loaded_opt {
-                    Some(v) => v
-                    None => {
+                  match loaded_opt {
+                    Some(ipkg) => {
+                      local_loaded[u] = Some(ipkg)
+                      imports.push(ipkg)
+                    }
+                    None =>
+                    if t_fb_paths[u].length() > 0 {
                       let fcr = check_source_files_with_imports_mapped_dep(
                         t_names[u],
                         drv_unpack_str_list(t_fb_paths[u]),
@@ -15748,14 +16306,21 @@ fn drv_run_ws_tests_collect(
                       )
                       fcr.tc.pkg_root = t_dirs[u]
                       fcr.tc.pkg_cwd = ws_pkg_cwd
-                      ImportedPkg::{ name: t_names[u], tc: fcr.tc }
+                      let ipkg = ImportedPkg::{ name: t_names[u], tc: fcr.tc }
+                      local_loaded[u] = Some(ipkg)
+                      imports.push(ipkg)
+                    } else {
+                      dep_err = "failed to load dependency stub for `" + t_names[u] + "`: " + sp
+                      break
                     }
                   }
-                  local_loaded[u] = Some(ipkg)
-                  imports.push(ipkg)
                 }
               }
               di = di + 1
+            }
+            if dep_err.length() > 0 {
+              let _ = res_ch.send(drv_pack_str_list([cur_mi, "E", dep_err]))
+              continue
             }
             let cr = check_source_files_with_imports_mapped(
               pkg_name,
@@ -15769,26 +16334,46 @@ fn drv_run_ws_tests_collect(
             )
             if cr.diagnostics.length() > 0 {
               let _ = res_ch.send(
-                drv_pack_str_list([cur_si, "E", check_result_to_json(cr.diagnostics)]),
+                drv_pack_str_list([cur_mi, "E", check_result_to_json(cr.diagnostics)]),
               )
             } else {
               cr.tc.pkg_root = pkg_root
               cr.tc.pkg_cwd = ws_pkg_cwd
               let tnames = drv_test_names(cr.pkg)
               let run_idx = drv_filter_tests(tnames, flt)
-              if run_idx.length() > 0 {
+              if tnames.length() == 0 {
+                let _ = res_ch.send(drv_pack_str_list([cur_mi, "Z"]))
+              } else if run_idx.length() > 0 {
                 let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qt)
-                let _ = res_ch.send(
-                  drv_pack_str_list([
-                    cur_si,
-                    "O",
-                    drv_pack_str_list(tnames),
-                    drv_pack_int_list(run_idx),
-                    cleanup_native_rc_ssa(test_res.ssa),
-                  ]),
+                let cleaned_ssa = cleanup_native_rc_ssa(test_res.ssa)
+                let okey = sha256_hex(
+                  w_cfp +
+                  "|testobj_v2|" +
+                  qt +
+                  "|" +
+                  qmv +
+                  "|" +
+                  sha256_hex(cleaned_ssa),
                 )
+                let spath = w_tb_dir + "/" + okey + ".ssa.tmp." + w_stamp + "_" + cur_si
+                if !drv_write_cas_text_atomic(world, spath, cleaned_ssa) {
+                  let _ = res_ch.send(
+                    drv_pack_str_list([cur_mi, "E", "failed to write test ssa: " + spath]),
+                  )
+                } else {
+                  let _ = res_ch.send(
+                    drv_pack_str_list([
+                      cur_mi,
+                      "O",
+                      drv_pack_str_list(tnames),
+                      drv_pack_int_list(run_idx),
+                      okey,
+                      spath,
+                    ]),
+                  )
+                }
               } else {
-                let _ = res_ch.send(drv_pack_str_list([cur_si, "N"]))
+                let _ = res_ch.send(drv_pack_str_list([cur_mi, "N"]))
               }
             }
           }
@@ -15798,106 +16383,115 @@ fn drv_run_ws_tests_collect(
     })
     res_ch.close()
     let results : Array[String] = []
-    si = 0
-    while si < nsel {
+    mi = 0
+    while mi < nmiss {
       results.push("")
-      si = si + 1
+      mi = mi + 1
     }
     while true {
       match res_ch.recv() {
         Some(msg) => {
           let rf = drv_unpack_str_list(msg)
           if rf.length() >= 2 {
-            let rsi = drv_parse_nonneg_decimal(rf[0])
-            if rsi >= 0 && rsi < nsel {
-              results[rsi] = msg
+            let rmi = drv_parse_nonneg_decimal(rf[0])
+            if rmi >= 0 && rmi < nmiss {
+              results[rmi] = msg
             }
           }
         }
         None => break
       }
     }
-    si = 0
-    while si < nsel {
-      let rf = drv_unpack_str_list(results[si])
+    let mut first_err = ""
+    let mut has_err = false
+    mi = 0
+    while mi < nmiss {
+      let rf = drv_unpack_str_list(results[mi])
       if rf.length() >= 3 && rf[1] == "E" {
-        return Err(rf[2])
+        has_err = true
+        first_err = rf[2]
+        break
       }
-      let node = nodes[selected[si]]
-      let tk = node_to_topo[selected[si]]
-      out_tested.push(node.declared_name)
-      if rf.length() >= 5 && rf[1] == "O" {
+      mi = mi + 1
+    }
+    if has_err {
+      mi = 0
+      while mi < nmiss {
+        let rf = drv_unpack_str_list(results[mi])
+        if rf.length() >= 6 && rf[1] == "O" {
+          let _ = fs_remove(world, rf[5])
+        }
+        mi = mi + 1
+      }
+      drv_cas_pin_close(world, pin)
+      return Err(first_err)
+    }
+    mi = 0
+    while mi < nmiss {
+      let rf = drv_unpack_str_list(results[mi])
+      let cur_si = miss_si[mi]
+      let node = nodes[selected[cur_si]]
+      if rf.length() >= 2 && rf[1] == "Z" {
+        zero_meta_keys.push(miss_src_keys[mi])
+      } else if rf.length() >= 6 && rf[1] == "O" {
         let tnames = drv_unpack_str_list(rf[2])
         let run_idx = drv_unpack_int_list(rf[3])
-        let ssa = rf[4]
-        let td = trans.topo[tk]
-        let dep_objs : Array[String] = []
-        let dep_obj_keys : Array[String] = []
-        let job_opts = drv_link_opts_empty()
-        let mut u = 0
-        while u < td.length() {
-          let tu = td[u]
-          let dn = nodes[topo.order[tu]]
-          dep_objs.push(built.obj_paths[tu])
-          dep_obj_keys.push(built.obj_keys[tu])
-          let dcstubs = pkg_cstub_objs[tu]
-          let dcstub_keys = pkg_cstub_keys[tu]
-          let mut ci = 0
-          while ci < dcstubs.length() {
-            dep_objs.push(dcstubs[ci])
-            dep_obj_keys.push(if ci < dcstub_keys.length() { dcstub_keys[ci] } else { "" })
-            ci = ci + 1
-          }
-          if pkg_cstub_cxx[tu] {
-            job_opts.has_cxx = true
-          }
-          drv_collect_node_link_opts(dn, qbe_target, job_opts)
-          let drcs = pkg_rc_objs[tu]
-          let mut rci = 0
-          while rci < drcs.length() {
-            push_unique_lib(job_opts.objects, drcs[rci])
-            rci = rci + 1
-          }
-          u = u + 1
-        }
-        let self_cstubs = pkg_cstub_objs[tk]
-        let self_cstub_keys = pkg_cstub_keys[tk]
-        let mut ci = 0
-        while ci < self_cstubs.length() {
-          dep_objs.push(self_cstubs[ci])
-          dep_obj_keys.push(if ci < self_cstub_keys.length() { self_cstub_keys[ci] } else { "" })
-          ci = ci + 1
-        }
-        if pkg_cstub_cxx[tk] {
-          job_opts.has_cxx = true
-        }
-        drv_collect_node_link_opts(node, qbe_target, job_opts)
-        let self_rcs = pkg_rc_objs[tk]
-        let mut rci = 0
-        while rci < self_rcs.length() {
-          push_unique_lib(job_opts.objects, self_rcs[rci])
-          rci = rci + 1
-        }
-        let mut li = 0
-        while li < cli_libs.length() {
-          push_unique_lib(job_opts.libs, cli_libs[li])
-          if drv_is_cxx_lib(cli_libs[li]) {
-            job_opts.has_cxx = true
-          }
-          li = li + 1
-        }
-        test_jobs.push(DrvTestJob::{
+        let okey = rf[4]
+        let spath = rf[5]
+        let deps = miss_deps[mi]
+        job_slots[cur_si] = Some(DrvTestJob::{
           label: node.declared_name,
-          ssa: ssa,
+          ssa: "",
+          ssa_path: spath,
+          okey: okey,
+          cached_bin: "",
+          test_src_key: miss_src_keys[mi],
           names: tnames,
           run_idx: run_idx,
-          dep_objs: dep_objs,
-          dep_obj_keys: dep_obj_keys,
-          link_opts: job_opts,
+          dep_objs: deps.dep_objs,
+          dep_obj_keys: deps.dep_obj_keys,
+          link_opts: deps.link_opts,
         })
       }
-      si = si + 1
+      mi = mi + 1
     }
+  }
+  if zero_meta_keys.length() > 0 {
+    let zkeys : Array[String] = []
+    let zsizes : Array[Int64] = []
+    let mut zi = 0
+    while zi < zero_meta_keys.length() {
+      drv_write_testmeta_entry(
+        world,
+        cache_dir,
+        zero_meta_keys[zi],
+        "NONE",
+        [],
+        pin,
+        zkeys,
+        zsizes,
+      )
+      zi = zi + 1
+    }
+    if zkeys.length() > 0 {
+      drv_cas_record_batch_and_evict_pinned(
+        world,
+        cache_dir,
+        zkeys,
+        zsizes,
+        pin,
+      )
+    }
+  }
+  let test_jobs : Array[DrvTestJob] = []
+  si = 0
+  while si < nsel {
+    out_tested.push(nodes[selected[si]].declared_name)
+    match job_slots[si] {
+      Some(job) => test_jobs.push(job)
+      None => ()
+    }
+    si = si + 1
   }
   let t_checked = clock_now_ms(world)
   match drv_exec_test_jobs(world, test_jobs, jobs, as_json, isolate, active_target, out_pkgs, out_names, out_oks, pin) {
@@ -16212,6 +16806,10 @@ fn drv_run_tests_cmd(
       test_jobs.push(DrvTestJob::{
         label: "",
         ssa: cleanup_native_rc_ssa(test_res.ssa),
+        ssa_path: "",
+        okey: "",
+        cached_bin: "",
+        test_src_key: "",
         names: tnames,
         run_idx: run_idx,
         dep_objs: [],
@@ -21364,6 +21962,7 @@ fn drv_cache_clear_impl(
   let s_obj = drv_clear_dir_files(world, drv_join_path(cache_dir, "obj"))
   let s_bin = drv_clear_dir_files(world, drv_join_path(cache_dir, "bin"))
   let s_tbin = drv_clear_dir_files(world, drv_join_path(cache_dir, "testbin"))
+  let s_tmeta = drv_clear_dir_files(world, drv_join_path(cache_dir, "testmeta"))
   let s_sig = drv_clear_dir_files(world, drv_join_path(cache_dir, "sig"))
   let s_ssa = drv_clear_dir_files(world, drv_join_path(cache_dir, "ssa"))
   let s_usig = drv_clear_dir_files(world, drv_join_path(cache_dir, "usig"))
@@ -21371,19 +21970,21 @@ fn drv_cache_clear_impl(
   let stale_pins : Array[String] = []
   drv_cas_collect_peer_pins(world, cache_dir, "", stale_pins)
   let mut removed_files = s_obj.files +
-    s_bin.files +
-    s_tbin.files +
-    s_sig.files +
-    s_ssa.files +
-    s_usig.files +
-    s_ccver.files
+  s_bin.files +
+  s_tbin.files +
+  s_tmeta.files +
+  s_sig.files +
+  s_ssa.files +
+  s_usig.files +
+  s_ccver.files
   let mut removed_bytes = s_obj.bytes +
-    s_bin.bytes +
-    s_tbin.bytes +
-    s_sig.bytes +
-    s_ssa.bytes +
-    s_usig.bytes +
-    s_ccver.bytes
+  s_bin.bytes +
+  s_tbin.bytes +
+  s_tmeta.bytes +
+  s_sig.bytes +
+  s_ssa.bytes +
+  s_usig.bytes +
+  s_ccver.bytes
   let index_kind = drv_lstat_kind(index_path)
   if index_kind != 0 && index_kind != 1 {
     c_fs_unlock(lk)
@@ -21472,13 +22073,14 @@ fn drv_run_cache_cmd(world : World, args : Array[String]) -> Int {
     let s_obj = drv_dir_stats(world, drv_join_path(cache_dir, "obj"))
     let s_bin1 = drv_dir_stats(world, drv_join_path(cache_dir, "bin"))
     let s_bin2 = drv_dir_stats(world, drv_join_path(cache_dir, "testbin"))
+    let s_tmeta = drv_dir_stats(world, drv_join_path(cache_dir, "testmeta"))
     let s_sig1 = drv_dir_stats(world, drv_join_path(cache_dir, "sig"))
     let s_sig2 = drv_dir_stats(world, drv_join_path(cache_dir, "usig"))
     let s_sig3 = drv_dir_stats(world, drv_join_path(cache_dir, "ssa"))
     let s_ccver = drv_dir_stats(world, drv_join_path(cache_dir, "ccver"))
     let s_git = drv_dir_stats(world, drv_git_cache_root(world))
-    let bin_files = s_bin1.files + s_bin2.files
-    let bin_bytes = s_bin1.bytes + s_bin2.bytes
+    let bin_files = s_bin1.files + s_bin2.files + s_tmeta.files
+    let bin_bytes = s_bin1.bytes + s_bin2.bytes + s_tmeta.bytes
     let sig_files = s_sig1.files + s_sig2.files + s_sig3.files
     let sig_bytes = s_sig1.bytes + s_sig2.bytes + s_sig3.bytes
     let total_files = s_obj.files + bin_files + sig_files + s_ccver.files + s_git.files
@@ -21758,24 +22360,27 @@ fn drv_run_doctor_cmd(world : World, args : Array[String]) -> Int {
   let st_obj = drv_dir_stats(world, drv_join_path(cache_dir, "obj"))
   let st_bin = drv_dir_stats(world, drv_join_path(cache_dir, "bin"))
   let st_tbin = drv_dir_stats(world, drv_join_path(cache_dir, "testbin"))
+  let st_tmeta = drv_dir_stats(world, drv_join_path(cache_dir, "testmeta"))
   let st_sig = drv_dir_stats(world, drv_join_path(cache_dir, "sig"))
   let st_usig = drv_dir_stats(world, drv_join_path(cache_dir, "usig"))
   let st_ssa = drv_dir_stats(world, drv_join_path(cache_dir, "ssa"))
   let st_git = drv_dir_stats(world, drv_git_cache_root(world))
   let cache_files = st_obj.files +
-    st_bin.files +
-    st_tbin.files +
-    st_sig.files +
-    st_usig.files +
-    st_ssa.files +
-    st_git.files
+  st_bin.files +
+  st_tbin.files +
+  st_tmeta.files +
+  st_sig.files +
+  st_usig.files +
+  st_ssa.files +
+  st_git.files
   let cache_bytes = st_obj.bytes +
-    st_bin.bytes +
-    st_tbin.bytes +
-    st_sig.bytes +
-    st_usig.bytes +
-    st_ssa.bytes +
-    st_git.bytes
+  st_bin.bytes +
+  st_tbin.bytes +
+  st_tmeta.bytes +
+  st_sig.bytes +
+  st_usig.bytes +
+  st_ssa.bytes +
+  st_git.bytes
   let ok = qbe_exists && rt_lib_exists && cc_exists
   if as_json {
     let sb = StringBuilder()
