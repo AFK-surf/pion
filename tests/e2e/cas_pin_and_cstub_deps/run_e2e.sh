@@ -1359,29 +1359,34 @@ CAS_N1="$TMP_DIR/cas_n1"
 mkdir -p "$CAS_N1"
 N1_CC_LOG="$TMP_DIR/n1_cc.log"
 
-# 1) Cold build -o out1 -> MISS, 1 cstub compile + 1 link
+# 1) Cold build -o n1_d1/n1_app -> MISS, 1 cstub compile + 1 link
+mkdir -p "$TMP_DIR/n1_d1" "$TMP_DIR/n1_d2"
 : > "$N1_CC_LOG"
 REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
   PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
-  "$PIONC" build -o "$TMP_DIR/n1_out1" "$WS_N1/app" 2>"$TMP_DIR/n1_1.trace"
+  "$PIONC" build -o "$TMP_DIR/n1_d1/n1_app" "$WS_N1/app" 2>"$TMP_DIR/n1_1.trace"
 grep -q "\[cas\] bin=n1_app MISS key=" "$TMP_DIR/n1_1.trace" || \
   fail "Scenario N1 cold expected bin MISS: $(cat "$TMP_DIR/n1_1.trace")"
-[ -x "$TMP_DIR/n1_out1" ] || fail "Scenario N1 cold out1 not executable"
-[ "$("$TMP_DIR/n1_out1")" = "n1=11" ] || fail "Scenario N1 cold out1 mismatch"
+[ -x "$TMP_DIR/n1_d1/n1_app" ] || fail "Scenario N1 cold out1 not executable"
+[ "$("$TMP_DIR/n1_d1/n1_app")" = "n1=11" ] || fail "Scenario N1 cold out1 mismatch"
 N1_COLD_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
 [ "$N1_COLD_CALLS" -ge 1 ] || fail "Scenario N1 cold expected CC/link call, got $N1_COLD_CALLS"
 
-# 2) Warm build -o out2 (different -o path!) -> HIT, ZERO CC/link calls, executable!
+# 2) Warm build -o n1_d2/n1_app (different dir, same basename!) -> HIT, ZERO CC/link calls, executable!
 : > "$N1_CC_LOG"
 REAL_CC_BIN="$REAL_CC_ABS" N1_CC_VER="1.0" N1_CC_LOG="$N1_CC_LOG" CC="$N1_CC" \
   PION_RT_LIB="$TMP_DIR/n1_rt.a" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1" \
-  "$PIONC" build -o "$TMP_DIR/n1_out2" "$WS_N1/app" 2>"$TMP_DIR/n1_2.trace"
+  "$PIONC" build -o "$TMP_DIR/n1_d2/n1_app" "$WS_N1/app" 2>"$TMP_DIR/n1_2.trace"
 grep -q "\[cas\] bin=n1_app HIT key=" "$TMP_DIR/n1_2.trace" || \
   fail "Scenario N1 warm expected bin HIT: $(cat "$TMP_DIR/n1_2.trace")"
 N1_WARM_CALLS="$(wc -l < "$N1_CC_LOG" | tr -d ' ')"
 [ "$N1_WARM_CALLS" = "0" ] || fail "Scenario N1 warm expected 0 CC/link calls, got $N1_WARM_CALLS: $(cat "$N1_CC_LOG")"
-[ -x "$TMP_DIR/n1_out2" ] || fail "Scenario N1 warm out2 not executable"
-[ "$("$TMP_DIR/n1_out2")" = "n1=11" ] || fail "Scenario N1 warm out2 mismatch"
+[ -x "$TMP_DIR/n1_d2/n1_app" ] || fail "Scenario N1 warm out2 not executable"
+[ "$("$TMP_DIR/n1_d2/n1_app")" = "n1=11" ] || fail "Scenario N1 warm out2 mismatch"
+if [ "$(uname -s)" = "Darwin" ]; then
+  N1_CS_ID="$(codesign -dv "$TMP_DIR/n1_d2/n1_app" 2>&1 | sed -n 's/^Identifier=//p')"
+  [ "$N1_CS_ID" = "n1_app" ] || fail "Scenario N1 warm Darwin codesign Identifier mismatch: '$N1_CS_ID'"
+fi
 
 # 3) Source edit -> MISS
 cat > "$WS_N1/app/src/main.pion" <<'EOF'
@@ -1473,7 +1478,95 @@ ar rcs "$WS_N1L/app/extlib/libn1ext.a" "$WS_N1L/ext.o"
 touch -r "$TMP_DIR/libn1ext.ref" "$WS_N1L/app/extlib/libn1ext.a"
 PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1L" "$PIONC" build -o "$TMP_DIR/n1l_2" "$WS_N1L/app" 2>"$TMP_DIR/n1l_2.trace"
 [ "$("$TMP_DIR/n1l_2")" = "200" ] || fail "Scenario N1 -L run 2 expected 200 after external .a rebuild"
-echo "(N1) nativebin: warm -o HIT (0 link calls, 0755) + src/hdr/rt_lib/ccver invalidation + -L fallback -> OK"
+
+# 8) LIBRARY_PATH + libs = ["n1ext"] (without search_paths) must also bypass nativebin CAS
+WS_N1ENV="$TMP_DIR/ws_n1_env"
+mkdir -p "$WS_N1ENV/app/src" "$WS_N1ENV/extlib"
+cat > "$WS_N1ENV/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_env_val(void) { return 100; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1ENV/ext.c" -o "$WS_N1ENV/ext.o"
+ar rcs "$WS_N1ENV/extlib/libn1env.a" "$WS_N1ENV/ext.o"
+cp -p "$WS_N1ENV/extlib/libn1env.a" "$TMP_DIR/libn1env.ref"
+cat > "$WS_N1ENV/app/pion.toml" <<'EOF'
+[package]
+name = "n1_env_app"
+version = "0.1.0"
+
+[link]
+libs = ["n1env"]
+EOF
+cat > "$WS_N1ENV/app/src/main.pion" <<'EOF'
+extern "C" fn n1_env_val() -> Int64
+fn main(world : World) -> Unit {
+  io_println(world, n1_env_val().to_string())
+}
+EOF
+CAS_N1ENV="$TMP_DIR/cas_n1env"
+mkdir -p "$CAS_N1ENV"
+LIBRARY_PATH="$WS_N1ENV/extlib" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1ENV" \
+  "$PIONC" build -o "$TMP_DIR/n1env_1" "$WS_N1ENV/app" 2>"$TMP_DIR/n1env_1.trace"
+[ "$("$TMP_DIR/n1env_1")" = "100" ] || fail "Scenario N1 LIBRARY_PATH run 1 expected 100"
+cat > "$WS_N1ENV/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_env_val(void) { return 200; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1ENV/ext.c" -o "$WS_N1ENV/ext.o"
+rm -f "$WS_N1ENV/extlib/libn1env.a"
+ar rcs "$WS_N1ENV/extlib/libn1env.a" "$WS_N1ENV/ext.o"
+touch -r "$TMP_DIR/libn1env.ref" "$WS_N1ENV/extlib/libn1env.a"
+LIBRARY_PATH="$WS_N1ENV/extlib" PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1ENV" \
+  "$PIONC" build -o "$TMP_DIR/n1env_2" "$WS_N1ENV/app" 2>"$TMP_DIR/n1env_2.trace"
+[ "$("$TMP_DIR/n1env_2")" = "200" ] || fail "Scenario N1 LIBRARY_PATH run 2 expected 200 after external .a rebuild"
+
+# 9) Non-whitelisted linker flag `-Wl,--library-path=<extlib>` (GNU ld) or `-Wl,-L,<extlib>` (Darwin) must bypass nativebin CAS
+WS_N1WL="$TMP_DIR/ws_n1_wl"
+mkdir -p "$WS_N1WL/app/src" "$WS_N1WL/extlib"
+cat > "$WS_N1WL/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_wl_val(void) { return 100; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1WL/ext.c" -o "$WS_N1WL/ext.o"
+ar rcs "$WS_N1WL/extlib/libn1wl.a" "$WS_N1WL/ext.o"
+cp -p "$WS_N1WL/extlib/libn1wl.a" "$TMP_DIR/libn1wl.ref"
+if [ "$(uname -s)" = "Darwin" ]; then
+  N1_WL_FLAG="-Wl,-L,$WS_N1WL/extlib"
+else
+  N1_WL_FLAG="-Wl,--library-path=$WS_N1WL/extlib"
+fi
+cat > "$WS_N1WL/app/pion.toml" <<EOF
+[package]
+name = "n1_wl_app"
+version = "0.1.0"
+
+[link]
+flags = ["$N1_WL_FLAG"]
+libs = ["n1wl"]
+EOF
+cat > "$WS_N1WL/app/src/main.pion" <<'EOF'
+extern "C" fn n1_wl_val() -> Int64
+fn main(world : World) -> Unit {
+  io_println(world, n1_wl_val().to_string())
+}
+EOF
+CAS_N1WL="$TMP_DIR/cas_n1wl"
+mkdir -p "$CAS_N1WL"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1WL" \
+  "$PIONC" build -o "$TMP_DIR/n1wl_1" "$WS_N1WL/app" 2>"$TMP_DIR/n1wl_1.trace"
+[ "$("$TMP_DIR/n1wl_1")" = "100" ] || fail "Scenario N1 -Wl,--library-path run 1 expected 100"
+cat > "$WS_N1WL/ext.c" <<'EOF'
+#include <stdint.h>
+int64_t n1_wl_val(void) { return 200; }
+EOF
+"${REAL_CC_ABS}" -c "$WS_N1WL/ext.c" -o "$WS_N1WL/ext.o"
+rm -f "$WS_N1WL/extlib/libn1wl.a"
+ar rcs "$WS_N1WL/extlib/libn1wl.a" "$WS_N1WL/ext.o"
+touch -r "$TMP_DIR/libn1wl.ref" "$WS_N1WL/extlib/libn1wl.a"
+PION_CAS_TRACE=1 PION_CACHE_DIR="$CAS_N1WL" \
+  "$PIONC" build -o "$TMP_DIR/n1wl_2" "$WS_N1WL/app" 2>"$TMP_DIR/n1wl_2.trace"
+[ "$("$TMP_DIR/n1wl_2")" = "200" ] || fail "Scenario N1 -Wl,--library-path run 2 expected 200 after external .a rebuild"
+echo "(N1) nativebin: warm -o HIT (0 link calls, 0755) + src/hdr/rt_lib/ccver invalidation + -L/LIBRARY_PATH/-Wl,--library-path fallback -> OK"
 
 # ============================================================================
 # Scenario N2: `-I/usr/include/...` system headers must NOT pollute `proj_hdr_dirs`
