@@ -6,17 +6,29 @@
 ///| - Direct scalar/pointer C-ABI declarations (`Int`, `Int64`, `UInt`, `UInt64`,
 ///|   `Byte`, `Int8`, `Bool`, `Double`, `Float`, `Float32`, `Ptr`, `Unit`) pass through with zero wrapper overhead.
 ///| - Bridged C-ABI declarations using explicit `#borrow(...)` attributes
-///|   and `String` / `Bytes` parameters or return types:
+///|   and `String` / `Bytes` / `FixedArray[T]` parameters or return types (`String` / `Bytes` only):
 ///|   - `String` param (must be in `#borrow`) -> C prototype `(const char *ptr, int32_t len)` via `s.as_cstr(), s.to_bytes().length()`
 ///|   - `Bytes` param (must be in `#borrow`) -> C prototype `(const uint8_t *ptr, int32_t len)` via `mbt_compat::mbt_ffi_ptr_alloc` + `mbt_compat::mbt_ffi_bytes_copy_to_ptr` + `mbt_compat::mbt_ffi_ptr_free`
 ///|     - Copy-in only: C shims must treat the temporary buffer as read-only input; mutations
 ///|       made in C are NOT written back to the caller's `Bytes` value, and passing the same
 ///|       `Bytes` value to two parameters allocates independent temporary buffers (no pointer aliasing guarantee).
+///|   - `FixedArray[T]` param (must be in `#borrow`; `len` is Pion `Int` = C `int32_t`, matching `String`/`Bytes`):
+///|     - `FixedArray[Double]` -> C prototype `(double *ptr, int32_t len)` (8 bytes/elem, IEEE-754 binary64)
+///|     - `FixedArray[Int]` -> C prototype `(int32_t *ptr, int32_t len)` (4 bytes/elem, Pion `Int` is signed 32-bit `i32`)
+///|     - `FixedArray[Byte]` -> C prototype `(uint8_t *ptr, int32_t len)` (1 byte/elem, unsigned 8-bit)
+///|     - `FixedArray[Float]` / `FixedArray[Float32]` -> C prototype `(float *ptr, int32_t len)` (4 bytes/elem, IEEE-754 binary32)
+///|     - `FixedArray[Int64]` -> C prototype `(int64_t *ptr, int32_t len)` (8 bytes/elem, signed 64-bit)
+///|     - In-out copy-in / copy-back semantics: for `len == 0`, passes `(NULL, 0)` without allocating or freeing;
+///|       for `len > 0`, allocates an overflow-checked temporary C buffer, copies elements in, invokes the C shim,
+///|       copies all elements back into the caller's `FixedArray[T]`, and frees the temporary buffer (after capturing any return value).
+///|     - Aliasing: passing the same `FixedArray[T]` to two parameters allocates independent temporary buffers
+///|       and copies back in left-to-right parameter order (no C pointer aliasing guarantee).
+///|     - Unsupported `FixedArray[Elem]` element types and `FixedArray[T]` return types fail closed.
 ///|   - `String` return -> C return `const char *` (borrowed/static, not auto-freed), converted via `if mbt_compat::mbt_ffi_ptr_is_null(p) { "" } else { mbt_compat::mbt_ffi_cstr_to_str(p) }`
 ///|     - NUL-terminated C string domain: conversion stops at the first NUL byte (`'\0'`);
 ///|       strings containing embedded NUL bytes cannot be returned through `String` (use `Bytes` return instead).
 ///|   - `Bytes` return -> trailing C parameter `int32_t *out_len` + C return `const uint8_t *` (borrowed/static, not auto-freed), converted via `if mbt_compat::mbt_ffi_ptr_is_null(p) || n <= 0 { "".to_bytes() } else { mbt_compat::mbt_ffi_bytes_from_ptr(p, n) }`
-///| - Fail-closed rejection (`ok: false`) for `#owned(...)`, unannotated `String`/`Bytes` params,
+///| - Fail-closed rejection (`ok: false`) for `#owned(...)`, unannotated `String`/`Bytes`/`FixedArray[T]` params,
 ///|   unknown FFI attributes, malformed return annotations, invalid/duplicate parameter names,
 ///|   invalid `#borrow` parameter references, or unsupported non-C-ABI types.
 
@@ -24,6 +36,11 @@ pub enum FfiParamKind {
   Direct
   Str
   Bytes
+  FixedArrayDouble
+  FixedArrayInt
+  FixedArrayByte
+  FixedArrayFloat
+  FixedArrayInt64
 }
 
 pub enum FfiRetKind {
@@ -61,6 +78,25 @@ pub fn is_pion_c_abi_scalar_type(ty : String) -> Bool {
   t == "Float" || t == "Float32" || t == "Ptr"
 }
 
+fn is_bridged_ffi_param_kind(kind : FfiParamKind) -> Bool {
+  match kind {
+    FfiParamKind::Direct => false
+    _ => true
+  }
+}
+
+fn extract_fixed_array_elem_type(ty : String) -> Option[String] {
+  let t = ty.trim()
+  if !t.starts_with("FixedArray") || !t.ends_with("]") {
+    return None
+  }
+  let rest = t.slice(10, t.length()).trim()
+  if !rest.starts_with("[") || !rest.ends_with("]") {
+    return None
+  }
+  Some(rest.slice(1, rest.length() - 1).trim())
+}
+
 ///| Classify a Pion parameter type for C-ABI FFI lowering.
 pub fn classify_ffi_param_type(ty : String) -> Option[FfiParamKind] {
   let t = ty.trim()
@@ -71,7 +107,14 @@ pub fn classify_ffi_param_type(ty : String) -> Option[FfiParamKind] {
   } else if t == "Bytes" {
     Some(FfiParamKind::Bytes)
   } else {
-    None
+    match extract_fixed_array_elem_type(t) {
+      Some("Double") => Some(FfiParamKind::FixedArrayDouble)
+      Some("Int") => Some(FfiParamKind::FixedArrayInt)
+      Some("Byte") => Some(FfiParamKind::FixedArrayByte)
+      Some("Float") | Some("Float32") => Some(FfiParamKind::FixedArrayFloat)
+      Some("Int64") => Some(FfiParamKind::FixedArrayInt64)
+      _ => None
+    }
   }
 }
 
@@ -342,6 +385,33 @@ pub fn try_lower_extern_c_fn_with_prefix(
   used_idents : Map[String, Bool],
   shim_prefix : String,
 ) -> FfiLowerResult {
+  try_lower_extern_c_fn_with_prefix_raw(
+    vis,
+    fn_name,
+    p_str,
+    ret_str,
+    c_sym_lit,
+    pending_ffi_attrs,
+    used_idents,
+    shim_prefix,
+    [],
+  )
+}
+
+///| Variant of `try_lower_extern_c_fn_with_prefix` accepting the source-level (unrenamed) parameter
+///| names so `#borrow(...)` / `#owned(...)` attributes are validated strictly against original source
+///| parameter names and mapped positionally to emitted Pion parameter names (e.g. `val` -> `val_`).
+pub fn try_lower_extern_c_fn_with_prefix_raw(
+  vis : String,
+  fn_name : String,
+  p_str : String,
+  ret_str : String,
+  c_sym_lit : String,
+  pending_ffi_attrs : Array[String],
+  used_idents : Map[String, Bool],
+  shim_prefix : String,
+  raw_param_names : Array[String],
+) -> FfiLowerResult {
   let sym_trimmed = c_sym_lit.trim()
   if sym_trimmed.length() < 3 || !sym_trimmed.starts_with("\"") || !sym_trimmed.ends_with("\"") {
     return FfiLowerResult::{
@@ -423,28 +493,63 @@ pub fn try_lower_extern_c_fn_with_prefix(
       error_msg: "unsupported FFI return type `" + ret_ty + "` on `" + fn_name + "`",
     }
   }
-  // Validate that every `String`/`Bytes` parameter is explicitly listed in `#borrow(...)`
-  // (unannotated MoonBit FFI params default to owned and must fail closed).
+  // Validate that every bridged parameter (`String`/`Bytes`/`FixedArray[T]`) is explicitly listed in `#borrow(...)`
+  // using its original source-level parameter name (unannotated MoonBit FFI params default to owned and must fail closed).
+  if raw_param_names.length() > 0 && raw_param_names.length() != params.length() {
+    return FfiLowerResult::{
+      ok: false,
+      needs_bridge: false,
+      code: "",
+      c_symbol: c_sym_lit,
+      emitted_pion_fn: "",
+      error_msg: "FFI source parameter count mismatch on `" + fn_name + "`",
+    }
+  }
   let param_kinds : Map[String, FfiParamKind] = Map()
   let mut needs_bridge = false
-  for p in params {
-    param_kinds[p.name] = p.kind
-    match p.kind {
-      FfiParamKind::Direct => ()
-      FfiParamKind::Str | FfiParamKind::Bytes => {
-        needs_bridge = true
-        if !attr_info.borrowed.contains(p.name) {
-          return FfiLowerResult::{
-            ok: false,
-            needs_bridge: false,
-            code: "",
-            c_symbol: c_sym_lit,
-            emitted_pion_fn: "",
-            error_msg: "FFI parameter `" + p.name + "` of type `" + p.ty + "` must be explicitly listed in `#borrow(...)`",
-          }
+  let mut pi = 0
+  while pi < params.length() {
+    let p = params[pi]
+    let rname = if raw_param_names.length() == params.length() {
+      raw_param_names[pi].trim()
+    } else {
+      p.name
+    }
+    if !is_valid_ffi_ident(rname) {
+      return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        emitted_pion_fn: "",
+        error_msg: "invalid FFI source parameter name `" + rname + "`",
+      }
+    }
+    if param_kinds.contains(rname) {
+      return FfiLowerResult::{
+        ok: false,
+        needs_bridge: false,
+        code: "",
+        c_symbol: c_sym_lit,
+        emitted_pion_fn: "",
+        error_msg: "duplicate FFI source parameter name `" + rname + "`",
+      }
+    }
+    param_kinds[rname] = p.kind
+    if is_bridged_ffi_param_kind(p.kind) {
+      needs_bridge = true
+      if !attr_info.borrowed.contains(rname) {
+        return FfiLowerResult::{
+          ok: false,
+          needs_bridge: false,
+          code: "",
+          c_symbol: c_sym_lit,
+          emitted_pion_fn: "",
+          error_msg: "FFI parameter `" + rname + "` of type `" + p.ty + "` must be explicitly listed in `#borrow(...)`",
         }
       }
     }
+    pi = pi + 1
   }
   match ret_kind {
     FfiRetKind::Unit | FfiRetKind::Direct => ()
@@ -452,14 +557,16 @@ pub fn try_lower_extern_c_fn_with_prefix(
   }
   for bname in attr_info.borrowed.keys() {
     match param_kinds.get(bname) {
-      Some(FfiParamKind::Str) | Some(FfiParamKind::Bytes) => ()
-      Some(FfiParamKind::Direct) => return FfiLowerResult::{
-        ok: false,
-        needs_bridge: false,
-        code: "",
-        c_symbol: c_sym_lit,
-        emitted_pion_fn: "",
-        error_msg: "`#borrow(" + bname + ")` is only valid on `String` or `Bytes` parameters",
+      Some(k) =>
+      if !is_bridged_ffi_param_kind(k) {
+        return FfiLowerResult::{
+          ok: false,
+          needs_bridge: false,
+          code: "",
+          c_symbol: c_sym_lit,
+          emitted_pion_fn: "",
+          error_msg: "`#borrow(" + bname + ")` is only valid on `String`, `Bytes`, or supported `FixedArray[T]` parameters",
+        }
       }
       None => return FfiLowerResult::{
         ok: false,
@@ -473,14 +580,16 @@ pub fn try_lower_extern_c_fn_with_prefix(
   }
   for oname in attr_info.owned.keys() {
     match param_kinds.get(oname) {
-      Some(FfiParamKind::Str) | Some(FfiParamKind::Bytes) => ()
-      Some(FfiParamKind::Direct) => return FfiLowerResult::{
-        ok: false,
-        needs_bridge: false,
-        code: "",
-        c_symbol: c_sym_lit,
-        emitted_pion_fn: "",
-        error_msg: "`#owned(" + oname + ")` is only valid on `String` or `Bytes` parameters",
+      Some(k) =>
+      if !is_bridged_ffi_param_kind(k) {
+        return FfiLowerResult::{
+          ok: false,
+          needs_bridge: false,
+          code: "",
+          c_symbol: c_sym_lit,
+          emitted_pion_fn: "",
+          error_msg: "`#owned(" + oname + ")` is only valid on `String`, `Bytes`, or supported `FixedArray[T]` parameters",
+        }
       }
       None => return FfiLowerResult::{
         ok: false,
@@ -538,15 +647,31 @@ pub fn try_lower_extern_c_fn_with_prefix(
   wrap_used[c_fn_name] = true
   for p in params {
     wrap_used[p.name] = true
-    match p.kind {
-      FfiParamKind::Direct => c_used[p.name] = true
-      FfiParamKind::Str | FfiParamKind::Bytes => ()
+    if !is_bridged_ffi_param_kind(p.kind) {
+      c_used[p.name] = true
     }
   }
   let c_params : Array[String] = []
   let call_args : Array[String] = []
   let pre_stmts : Array[String] = []
   let post_frees : Array[String] = []
+
+  let emit_fixed_array_bridge = fn(p : FfiParamSpec, elem_tag : String) -> Unit {
+    let cp = ffi_fresh_ident(c_used, p.name + "_ptr")
+    let cl = ffi_fresh_ident(c_used, p.name + "_len")
+    let len_var = ffi_fresh_ident(wrap_used, "__ffi_" + p.name + "_len")
+    let buf_var = ffi_fresh_ident(wrap_used, "__ffi_" + p.name + "_buf")
+    c_params.push(cp + " : Ptr")
+    c_params.push(cl + " : Int")
+    pre_stmts.push("  let " + len_var + " = " + p.name + ".length()")
+    pre_stmts.push("  let " + buf_var + " = mbt_compat::mbt_ffi_fixed_array_" + elem_tag + "_to_ptr(" + p.name + ")")
+    post_frees.push("  if !mbt_compat::mbt_ffi_ptr_is_null(" + buf_var + ") {")
+    post_frees.push("    mbt_compat::mbt_ffi_fixed_array_" + elem_tag + "_from_ptr(" + p.name + ", " + buf_var + ")")
+    post_frees.push("    mbt_compat::mbt_ffi_ptr_free(" + buf_var + ")")
+    post_frees.push("  }")
+    call_args.push(buf_var)
+    call_args.push(len_var)
+  }
 
   for p in params {
     match p.kind {
@@ -576,6 +701,11 @@ pub fn try_lower_extern_c_fn_with_prefix(
         call_args.push(buf_var)
         call_args.push(len_var)
       }
+      FfiParamKind::FixedArrayDouble => emit_fixed_array_bridge(p, "double")
+      FfiParamKind::FixedArrayInt => emit_fixed_array_bridge(p, "int")
+      FfiParamKind::FixedArrayByte => emit_fixed_array_bridge(p, "byte")
+      FfiParamKind::FixedArrayFloat => emit_fixed_array_bridge(p, "float")
+      FfiParamKind::FixedArrayInt64 => emit_fixed_array_bridge(p, "int64")
     }
   }
 
@@ -634,8 +764,8 @@ pub fn try_lower_extern_c_fn_with_prefix(
       let bytes_var = ffi_fresh_ident(wrap_used, "__ffi_ret_bytes")
       sb.write_string("  let " + ptr_var + " = " + call_expr + "\n")
       sb.write_string("  let " + rlen_var + " = mbt_compat::mbt_ffi_ptr_read_i32(" + out_len_box + ", 0L)\n")
-      sb.write_string("  mbt_compat::mbt_ffi_ptr_free(" + out_len_box + ")\n")
       sb.write_string("  let " + bytes_var + " = if mbt_compat::mbt_ffi_ptr_is_null(" + ptr_var + ") || " + rlen_var + " <= 0 { \"\".to_bytes() } else { mbt_compat::mbt_ffi_bytes_from_ptr(" + ptr_var + ", " + rlen_var + ") }\n")
+      sb.write_string("  mbt_compat::mbt_ffi_ptr_free(" + out_len_box + ")\n")
       for pf in post_frees {
         sb.write_string(pf + "\n")
       }
