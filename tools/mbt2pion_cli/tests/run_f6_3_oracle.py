@@ -881,6 +881,32 @@ pub fn run(xs : Array[Int], ms : Array[Map[Int, Int]]) -> Bool {
 ''',
         "MBT2PION_ARRAY_ITER_MUTATION",
     ),
+    (
+        "neg_f6_4a_multiline_pipe_map_init",
+        r'''
+fn wrap_ext(_m : Map[Int, Int], ext : Map[Int, Int]) -> Map[Int, Int] {
+  ext
+}
+pub fn run(xs : Array[Int], ext : Map[Int, Int]) -> Bool {
+  let v : Map[Int, Int] = { 1: 2 }
+    |> wrap_ext(ext)
+  xs.iter().any(fn(x) { v.contains(x) })
+}
+''',
+        "MBT2PION_ARRAY_ITER_MUTATION",
+    ),
+    (
+        "neg_f6_4a_ordered_set_copy_callback",
+        r'''
+pub fn run(xs : Array[Int], s : Set[Int]) -> Int? {
+  xs.search_by(fn(x) {
+    let _ = s.copy()
+    x == 1
+  })
+}
+''',
+        "Array::search_by",
+    ),
 ]
 
 
