@@ -303,6 +303,25 @@ fn sort_abi_values(xs : Array[AbiValueSchema]) -> Array[AbiValueSchema] {
   out
 }
 
+fn sort_abi_raising_fns(xs : Array[AbiRaisingFn]) -> Array[AbiRaisingFn] {
+  let out : Array[AbiRaisingFn] = []
+  for x in xs {
+    out.push(x)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].name, key.name) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
 ///| True iff `s` is complete, externally constructible & updatable, and has zero `priv` fields.
 pub fn abi_struct_is_externally_expandable(s : AbiStructSchema) -> Bool {
   if !s.complete || !s.can_construct || !s.can_update {
@@ -733,6 +752,107 @@ pub fn collect_exported_abi_values(
   sort_abi_values(out)
 }
 
+///| Extract exported top-level `pub fn ... raise E` raising function signatures from
+///| non-test MoonBit sources (before checked-error lowering rewrites `raise` to `Result`).
+pub fn collect_exported_abi_raising_fns(
+  sources : Array[SourceFile],
+  self_pkg : String,
+  symtab : SymbolTable,
+  target : String,
+) -> Array[AbiRaisingFn] {
+  let local_suberrors : Map[String, Bool] = Map()
+  for sf in sources {
+    if sf.is_test { continue }
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let t = tokens[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && (t.kind == TokenKind::Keyword || t.kind == TokenKind::Ident) && t.raw == "suberror" &&
+      i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        local_suberrors[tokens[i + 1].raw] = true
+      }
+      i = i + 1
+    }
+  }
+  let out : Array[AbiRaisingFn] = []
+  let seen : Map[String, Bool] = Map()
+  for sf in sources {
+    if sf.is_test { continue }
+    let tokens = lex_moonbit(sf.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    let mut next_cfg_excluded = false
+    while i < n {
+      let t = tokens[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && t.kind == TokenKind::Attr {
+        if t.raw.starts_with("#cfg") {
+          match eval_cfg_attr(t.raw, target) {
+            Some(true) => ()
+            _ => next_cfg_excluded = true
+          }
+        }
+        i = i + 1
+        continue
+      }
+      if depth == 0 && next_cfg_excluded {
+        next_cfg_excluded = false
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "fn" && is_decl_pub(tokens, i) {
+        match le_parse_fn_header(sf.content, tokens, i, n) {
+          Some((fname, _, _, _, has_r, ety, has_rp, lb)) => {
+            let rb = find_matching_delim(tokens, lb)
+            if has_r && !has_rp && fname.length() > 0 && !str_has(fname, "::") && ety.length() > 0 && ety != "Error" && ety != "Failure" && !seen.contains(fname) {
+              let q_et = if ety.starts_with("@") {
+                let dot = ety.index_of(".")
+                if dot > 1 {
+                  let rp = ety.slice(1, dot)
+                  let tn = ety.slice(dot + 1, ety.length()).trim()
+                  let cp = match symtab.pkg_aliases.get(rp) {
+                    Some(p) => p
+                    None => match symtab.moon_import_paths.get(rp) {
+                      Some(fp) => {
+                        let d = moon_import_default_alias(fp)
+                        if d.length() > 0 { d } else { rp }
+                      }
+                      None => rp
+                    }
+                  }
+                  cp + "::" + tn
+                } else {
+                  ety
+                }
+              } else if self_pkg.length() > 0 && local_suberrors.contains(ety) {
+                self_pkg + "::" + ety
+              } else {
+                match symtab.using_types.get(ety) {
+                  Some(resolved) => resolved
+                  None => ety
+                }
+              }
+              seen[fname] = true
+              out.push(AbiRaisingFn::{ name: fname, err_ty: q_et })
+            }
+            i = rb + 1
+            continue
+          }
+          None => ()
+        }
+      }
+      i = i + 1
+    }
+  }
+  sort_abi_raising_fns(out)
+}
+
 ///| Exact compiler-aligned library source check (`compiler/src/cli/main.pion:188`):
 ///| ONLY literal suffix `_test.pion` is excluded from library compilation; `*_wbtest.pion` IS included!
 pub fn is_abi_library_pion(rel_path : String) -> Bool {
@@ -993,6 +1113,7 @@ fn abi_payload_to_json_opts(
   include_publishable : Bool,
   include_reexports : Bool,
   include_values : Bool,
+  include_raising_fns : Bool,
 ) -> json::JsonValue {
   let sorted_enums = sort_abi_enums(abi.enums)
   let enum_arr : Array[json::JsonValue] = []
@@ -1106,6 +1227,16 @@ fn abi_payload_to_json_opts(
     }
     fields.push(json_field("values", json_arr(val_arr)))
   }
+  if schema_ver >= 2 && (include_raising_fns || abi.raising_fns.length() > 0) {
+    let rf_arr : Array[json::JsonValue] = []
+    for rf in sort_abi_raising_fns(abi.raising_fns) {
+      rf_arr.push(json_obj([
+        json_field("name", json_str(rf.name)),
+        json_field("err_ty", json_str(rf.err_ty)),
+      ]))
+    }
+    fields.push(json_field("raising_fns", json_arr(rf_arr)))
+  }
   if schema_ver >= 2 && abi.ffi_shim_prefix.length() > 0 {
     fields.push(json_field("ffi_shim_prefix", json_str(abi.ffi_shim_prefix)))
   }
@@ -1116,7 +1247,7 @@ fn abi_payload_to_json_opts(
 }
 
 fn abi_payload_to_json_versioned(abi : PackageAbi, schema_ver : Int) -> json::JsonValue {
-  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0, abi.values.length() > 0)
+  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0, abi.values.length() > 0, abi.raising_fns.length() > 0)
 }
 
 fn abi_payload_to_json(abi : PackageAbi) -> json::JsonValue {
@@ -1874,6 +2005,35 @@ pub fn verify_and_parse_dep_abi(
     }
   }
 
+  let raising_fns : Array[AbiRaisingFn] = []
+  let seen_raising_fns : Map[String, Bool] = Map()
+  let mut has_raising_fns_field = false
+  if sv >= 2 {
+    match json::obj_get(payload_v, "raising_fns") {
+      Some(rfv) => {
+        has_raising_fns_field = true
+        let rfitems = match json::as_arr(rfv) {
+          Some(a) => a
+          None => {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `raising_fns` field in dep `" + dep_name + "`"))
+            return None
+          }
+        }
+        for rfit in rfitems {
+          let rfn = j_str(rfit, "name", "")
+          let rfe = j_str(rfit, "err_ty", "")
+          if rfn.length() == 0 || rfe.length() == 0 || seen_raising_fns.contains(rfn) {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `raising_fns` entry `" + rfn + "` in dep `" + dep_name + "`"))
+            return None
+          }
+          seen_raising_fns[rfn] = true
+          raising_fns.push(AbiRaisingFn::{ name: rfn, err_ty: rfe })
+        }
+      }
+      None => ()
+    }
+  }
+
   let mut parsed_ffi_shim_prefix = ""
   if sv >= 2 {
     match json::obj_get(payload_v, "ffi_shim_prefix") {
@@ -1910,11 +2070,12 @@ pub fn verify_and_parse_dep_abi(
     op_impls: op_impls,
     reexports: reexports,
     values: values,
+    raising_fns: raising_fns,
     ffi_shim_prefix: parsed_ffi_shim_prefix,
     publishable: is_publishable,
   }
   // Direction 1: canonical payload SHA-256 MUST equal `abi_sha256`!
-  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field, has_values_field)))
+  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field, has_values_field, has_raising_fns_field)))
   if actual_abi_sha != decl_abi_sha {
     diags.push(diag_error(
       "MBT2PION_DEP_ABI_ERROR",

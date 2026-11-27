@@ -937,6 +937,42 @@ pub fn transpile_package_with_query_types(
   check_fn : (Array[(String, String)]) -> String,
   query_types_cb : (Array[(String, String)]) -> String,
 ) -> TranspileResult {
+  transpile_package_with_query_types_and_dep_dirs(
+    sources,
+    api_map,
+    recipes,
+    overlays,
+    mbti_files,
+    dep_doc_jsons,
+    dep_abis,
+    Map(),
+    companion_files,
+    asset_bypass_rules,
+    opts,
+    pre_diags,
+    run_probes,
+    check_fn,
+    query_types_cb,
+  )
+}
+
+pub fn transpile_package_with_query_types_and_dep_dirs(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+  dep_canon_dirs : Map[String, String],
+  companion_files : Array[(String, String, String)],
+  asset_bypass_rules : Array[AssetBypassRule],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+  query_types_cb : (Array[(String, String)]) -> String,
+) -> TranspileResult {
   let sorted_sources = sort_source_files(sources)
   let symtab = empty_symbol_table()
   symtab_load_api_map(symtab, api_map)
@@ -954,6 +990,63 @@ pub fn transpile_package_with_query_types(
   }
 
   let ctx = stage_a_context_new(symtab, recipes, opts)
+  // Fail closed on ambiguous non-core imports:
+  // (a) multiple imports share a trailing segment without distinct `--dep` aliases, or
+  // (b) a renamed import `path/def_al @imp_al` has both `--dep def_al` and `--dep imp_al`
+  //     and neither uniquely matches `def_al` by canonical package name.
+  for imp_al in symtab.moon_import_paths.keys() {
+    match symtab.moon_import_paths.get(imp_al) {
+      Some(fp) =>
+      if !fp.starts_with("moonbitlang/core/") && !symtab.pkg_aliases.contains(imp_al) {
+        let def_al = moon_import_default_alias(fp)
+        if def_al.length() > 0 {
+          let mut holders = 0
+          let mut raw_retargeted = false
+          for k2 in symtab.moon_import_paths.keys() {
+            match symtab.moon_import_paths.get(k2) {
+              Some(fp2) =>
+              if !fp2.starts_with("moonbitlang/core/") {
+                let d2 = moon_import_default_alias(fp2)
+                if d2 == def_al { holders = holders + 1 }
+                if k2 != imp_al && d2 == imp_al { raw_retargeted = true }
+              }
+              None => ()
+            }
+          }
+          if holders > 1 && !symtab.dep_alias_names.contains(imp_al) {
+            ctx.diags.push(diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              "moon.pkg",
+              1,
+              1,
+              "ambiguous dependency import `@" + imp_al + "` (`" + fp + "`): multiple imports share default segment `" + def_al + "` without a matching `--dep " + imp_al + "=<dir>`",
+            ))
+          } else if holders == 1 && def_al != imp_al && !raw_retargeted &&
+          symtab.dep_alias_names.contains(def_al) && symtab.dep_alias_names.contains(imp_al) {
+            let def_canon = match symtab.dep_alias_to_canon_pkg.get(def_al) { Some(c) => c, None => "" }
+            let raw_canon = match symtab.dep_alias_to_canon_pkg.get(imp_al) { Some(c) => c, None => "" }
+            let def_sig = match symtab.dep_alias_to_abi_sig.get(def_al) { Some(s) => s, None => "" }
+            let raw_sig = match symtab.dep_alias_to_abi_sig.get(imp_al) { Some(s) => s, None => "" }
+            let def_dir = match dep_canon_dirs.get(def_al) { Some(d) => d, None => "" }
+            let raw_dir = match dep_canon_dirs.get(imp_al) { Some(d) => d, None => "" }
+            let same_verified_pkg = def_sig.length() > 0 && def_sig == raw_sig && def_dir.length() > 0 && def_dir == raw_dir
+            let unique_def = def_canon == def_al && raw_canon != def_al
+            let unique_raw = raw_canon == def_al && def_canon != def_al
+            if !same_verified_pkg && !unique_def && !unique_raw {
+              ctx.diags.push(diag_error(
+                "MBT2PION_DEP_ABI_ERROR",
+                "moon.pkg",
+                1,
+                1,
+                "ambiguous renamed dependency import `@" + imp_al + "` (`" + fp + "`): both `--dep " + def_al + "` and `--dep " + imp_al + "` exist and neither uniquely identifies `" + def_al + "`",
+              ))
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
   // Derive self package name for stripping `@<self_pkg>.` in black-box `*_test.mbt` files
   match api_map.pkg_aliases.get("__mbt_self_pkg__") {
     Some(sp) => ctx.self_pkg_name = sp
@@ -1238,8 +1331,16 @@ pub fn transpile_package_with_query_types(
   // §D1-3 pre-pass: lower `impl (Add|Sub|Mul|Neg|Div) for <Type>` into collision-free top-level functions
   let (op_selected, local_op_impls) = preprocess_op_trait_impls(canon_selected, ctx.self_pkg_name)
   let op_lookup = build_op_impl_lookup(local_op_impls, dep_abis)
-  // §E2-2 pre-pass: controlled `suberror`/`raise`/`try ... catch` lowering (actively writes blockers!)
-  let err_selected = preprocess_controlled_errors(op_selected, ctx.diags)
+  // Collect exported `pub fn ... raise E` ABI signatures BEFORE checked-error lowering rewrites `raise` -> `Result`
+  let exported_abi_raising_fns = collect_exported_abi_raising_fns(op_selected, ctx.self_pkg_name, symtab, opts.target)
+  // Unified checked-error pre-pass (two strictly non-overlapping phases):
+  //   Phase 1: Category A private bare-`raise` test helpers (`preprocess_test_helper_raises_with_env`)
+  //   Phase 2: Universal checked-error lowering (`lower_checked_errors_with_env`)
+  let err_cfg = default_error_lower_config()
+  let base_err_env = build_external_error_env(symtab, dep_abis, Map())
+  let (cat_a_selected, cat_a_rewritten) = preprocess_test_helper_raises_with_env(op_selected, err_cfg, base_err_env, ctx.diags)
+  let err_env = build_external_error_env(symtab, dep_abis, cat_a_rewritten)
+  let err_selected = lower_checked_errors_with_env(cat_a_selected, err_cfg, err_env, ctx.diags)
 
   // Stage A.0: prescan intra-package symbols
   prescan_package_symbols(ctx, err_selected)
@@ -1488,6 +1589,7 @@ pub fn transpile_package_with_query_types(
     op_impls: local_op_impls,
     reexports: local_reexports,
     values: exported_abi_values,
+    raising_fns: exported_abi_raising_fns,
     ffi_shim_prefix: valid_ffi_shim_prefix,
     publishable: is_publishable,
   }
