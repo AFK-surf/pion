@@ -148,6 +148,23 @@ fn shadow_lifted_local_fns(ctx : StageAContext, raw_names : Array[String]) -> Un
   }
 }
 
+fn collect_occupied_pion_names(ctx : StageAContext, tokens : Array[Token]) -> Map[String, Bool] {
+  let occ : Map[String, Bool] = Map()
+  collect_all_idents_with_interp_f3d2(tokens, occ)
+  for cur_sv in ctx.scope_vars {
+    occ[cur_sv.name] = true
+  }
+  for k in ctx.symtab.local_value_names.keys() { occ[k] = true }
+  for k in ctx.symtab.const_defs.keys() { occ[k] = true }
+  for k in ctx.symtab.local_fn_names.keys() { occ[k] = true }
+  for k in ctx.symtab.fn_param_types.keys() { occ[k] = true }
+  for k in ctx.symtab.prod_pub_decls.keys() { occ[k] = true }
+  for k in ctx.symtab.blackbox_decls.keys() { occ[k] = true }
+  for k in ctx.symtab.using_values.keys() { occ[k] = true }
+  for k in ctx.symtab.val_types.keys() { occ[k] = true }
+  occ
+}
+
 ///| Return true iff `pat_s` is an irrefutable simple binder pattern (a single lowercase identifier or `_`).
 fn is_irrefutable_simple_pat(pat_s : String) -> Bool {
   let p = pat_s.trim()
@@ -3347,7 +3364,7 @@ fn push_is_seg_binders(
     cs = cs + 1
     ce = ce - 1
   }
-  if cs >= ce || tokens[cs].kind == TokenKind::Bang {
+  if cs >= ce {
     return
   }
   let mut has_ampamp = false
@@ -3395,6 +3412,9 @@ fn push_is_seg_binders(
     }
     return
   }
+  if tokens[cs].kind == TokenKind::Bang {
+    return
+  }
   if is_idx > cs && is_idx + 1 < ce && !has_cmp {
     let raw_is_b = collect_raw_pattern_binders(tokens, is_idx + 1, ce)
     let is_rn = compute_scoped_binder_renames(ctx, raw_is_b)
@@ -3439,6 +3459,47 @@ fn lower_cond_with_is_binders(
   end : Int,
   file : String,
 ) -> String {
+  // Precedence: `||` / `|>` < `&&`. If any depth-0 `||` or `|>` exists, lower each branch
+  // recursively with isolated scope (so `&&` inside a branch works, while nothing leaks out).
+  let mut has_or_pipe = false
+  let mut ok = start
+  let mut od = 0
+  while ok < end {
+    let k = tokens[ok].kind
+    if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { od = od + 1 }
+    else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { if od > 0 { od = od - 1 } }
+    else if od == 0 && (k == TokenKind::PipePipe || k == TokenKind::PipeGt) { has_or_pipe = true; break }
+    ok = ok + 1
+  }
+  if has_or_pipe {
+    let sb_or = StringBuilder()
+    let mut os = start
+    while os < end {
+      let mut oe = os
+      let mut d = 0
+      while oe < end {
+        let k = tokens[oe].kind
+        if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+        else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && (k == TokenKind::PipePipe || k == TokenKind::PipeGt) { break }
+        oe = oe + 1
+      }
+      let saved_sc = ctx.scope_vars.length()
+      let saved_rn = ctx.ident_renames.length()
+      let saved_lf = save_lifted_local_fns(ctx)
+      sb_or.write_string(lower_cond_with_is_binders(ctx, tokens, os, oe, file))
+      restore_scope_vars(ctx, saved_sc)
+      restore_ident_renames(ctx, saved_rn)
+      restore_lifted_local_fns(ctx, saved_lf)
+      if oe < end && (tokens[oe].kind == TokenKind::PipePipe || tokens[oe].kind == TokenKind::PipeGt) {
+        sb_or.write_string(tokens[oe].leading_trivia + tokens[oe].raw)
+        os = oe + 1
+      } else {
+        break
+      }
+    }
+    return sb_or.to_string()
+  }
   let sb = StringBuilder()
   let mut seg_s = start
   while seg_s < end {
@@ -4913,16 +4974,17 @@ fn lower_stmts_range(
           restore_scope_vars(ctx, saved_sc)
           restore_ident_renames(ctx, saved_rn)
           restore_lifted_local_fns(ctx, saved_lf)
-          let occ_lfn : Map[String, Bool] = Map()
+          let scope_occ_lfn : Map[String, Bool] = Map()
           for cur_sv in ctx.scope_vars {
-            occ_lfn[cur_sv.name] = true
+            scope_occ_lfn[cur_sv.name] = true
           }
-          let local_fn_pion_name = if occ_lfn.contains(g.name) {
+          let local_fn_pion_name = if scope_occ_lfn.contains(g.name) {
+            let all_occ_lfn = collect_occupied_pion_names(ctx, tokens)
             ctx.lift_counter = ctx.lift_counter + 1
             let base_lfn = "__mbt_lfn_" + ctx.lift_counter.to_string() + "_" + g.name
             let mut lfn_cand = base_lfn
             let mut lfn_sfx = 1
-            while occ_lfn.contains(lfn_cand) {
+            while all_occ_lfn.contains(lfn_cand) {
               lfn_cand = base_lfn + "_" + lfn_sfx.to_string()
               lfn_sfx = lfn_sfx + 1
             }
@@ -4976,19 +5038,7 @@ fn lower_stmts_range(
         let body_cap_scope_vars : Array[ScopeVar] = []
         let cap_renames : Map[String, String] = Map()
         let captured_pion : Map[String, String] = Map()
-        let used_idents : Map[String, Bool] = Map()
-        collect_all_idents_with_interp_f3d2(tokens, used_idents)
-        for cur_sv in ctx.scope_vars {
-          used_idents[cur_sv.name] = true
-        }
-        for k in ctx.symtab.local_value_names.keys() { used_idents[k] = true }
-        for k in ctx.symtab.const_defs.keys() { used_idents[k] = true }
-        for k in ctx.symtab.local_fn_names.keys() { used_idents[k] = true }
-        for k in ctx.symtab.fn_param_types.keys() { used_idents[k] = true }
-        for k in ctx.symtab.prod_pub_decls.keys() { used_idents[k] = true }
-        for k in ctx.symtab.blackbox_decls.keys() { used_idents[k] = true }
-        for k in ctx.symtab.using_values.keys() { used_idents[k] = true }
-        for k in ctx.symtab.val_types.keys() { used_idents[k] = true }
+        let used_idents = collect_occupied_pion_names(ctx, tokens)
         for raw_r in sorted_map_keys(free_raw_refs) {
           let outer_pion = resolve_ident_in_scope(ctx, raw_r)
           match lookup_scope_var(ctx, outer_pion) {
@@ -6277,7 +6327,8 @@ pub fn lower_expr_range(
         if tk == TokenKind::AmpAmp {
           has_top_ampamp = true
         } else if tk == TokenKind::Comma || tk == TokenKind::Semi || tk == TokenKind::FatArrow || tk == TokenKind::Eq ||
-        (tk == TokenKind::Keyword && (tokens[sk].raw == "let" || tokens[sk].raw == "fn" || tokens[sk].raw == "if" || tokens[sk].raw == "while" || tokens[sk].raw == "for" || tokens[sk].raw == "match" || tokens[sk].raw == "guard")) {
+        (tk == TokenKind::Keyword && (tokens[sk].raw == "let" || tokens[sk].raw == "fn" || tokens[sk].raw == "while" || tokens[sk].raw == "for" || tokens[sk].raw == "guard" ||
+          (!has_top_ampamp && (tokens[sk].raw == "if" || tokens[sk].raw == "match")))) {
           has_top_sep = true
         }
       }
@@ -7679,7 +7730,14 @@ fn lower_one_token_or_form(
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
+    let raw_is_pat_b = collect_raw_pattern_binders(tokens, i + 1, pat_end)
+    let is_pat_rn = compute_scoped_binder_renames(ctx, raw_is_pat_b)
+    let saved_is_pat_rn = ctx.ident_renames.length()
+    if is_pat_rn.length() > 0 {
+      ctx.ident_renames.push(is_pat_rn)
+    }
     let pat_str = lower_expr_range(ctx, tokens, i + 1, pat_end, file, true)
+    restore_ident_renames(ctx, saved_is_pat_rn)
     if lhs_ty.length() > 0 {
       pop_expected_type(ctx)
     }
