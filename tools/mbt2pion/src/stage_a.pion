@@ -864,6 +864,15 @@ struct LiftedLocalFn {
   env_args : Array[String]
 }
 
+///| Pre-resolved `[struct_defaults.<Type>]` entry keyed by canonical ABI type identity.
+struct ResolvedStructDefaultEntry {
+  abi_id : String
+  emit_name : String
+  is_local : Bool
+  schema : Option[AbiStructSchema]
+  defaults : Array[StructDefaultField]
+}
+
 ///| Stage A context for lowering a package.
 pub struct StageAContext {
   symtab : SymbolTable
@@ -937,6 +946,9 @@ pub struct StageAContext {
   alias_op_get : Map[String, String]
   pub_alias_op_set : Map[String, String]
   pub_alias_op_get : Map[String, String]
+  struct_defaults_by_id : Map[String, ResolvedStructDefaultEntry]
+  struct_defaults_order : Array[String]
+  mut struct_defaults_built : Bool
 }
 
 fn rebuild_symtab_pion_index(ctx : StageAContext) -> Unit {
@@ -1039,6 +1051,9 @@ pub fn stage_a_context_new(
     alias_op_get: Map(),
     pub_alias_op_set: Map(),
     pub_alias_op_get: Map(),
+    struct_defaults_by_id: Map(),
+    struct_defaults_order: [],
+    struct_defaults_built: false,
   }
 }
 
@@ -1204,9 +1219,156 @@ fn rename_struct_field(ctx : StageAContext, struct_name : String, raw_field : St
   rename_keyword_ident(raw_field)
 }
 
-///| Resolve declarative `[struct_defaults.<Type>]` entries for `struct_name`,
-///| matching full qualified names, package-alias / canonical-package mappings,
-///| `using` / type aliases, and local bare struct names.
+///| Pre-resolve all `[struct_defaults.<Type>]` recipe rules once per package,
+///| keyed by canonical ABI type identity (`symtab_resolve_type_abi_identity`).
+fn build_struct_defaults_index(ctx : StageAContext) -> Unit {
+  ctx.struct_defaults_by_id.clear()
+  ctx.struct_defaults_order.clear()
+  ctx.struct_defaults_built = true
+  if ctx.recipes.struct_defaults.length() == 0 {
+    return
+  }
+  let meta_by_id : Map[String, (String, Bool, Option[AbiStructSchema])] = Map()
+  let fields_by_id : Map[String, Array[(String, StructDefaultField)]] = Map()
+  let seen_fields_by_id : Map[String, Map[String, Bool]] = Map()
+  for rule in ctx.recipes.struct_defaults {
+    let abi_id = match symtab_resolve_type_abi_identity(ctx.symtab, rule.target_type, true) {
+      Ok(id) => id
+      Err(_) => continue
+    }
+    let need_meta = match meta_by_id.get(abi_id) {
+      None => true
+      Some((_, prev_local, prev_schema)) => !prev_local && prev_schema is None
+    }
+    if need_meta {
+      let rt = strip_type_args_sym(rule.target_type.trim())
+      let (rt_eff, rt_from_source) = match ctx.symtab.using_types.get(rt) {
+        Some(q) => (strip_type_args_sym(q), false)
+        None =>
+        match ctx.symtab.type_aliases.get(rt) {
+          Some(a) => (strip_type_args_sym(a), false)
+          None => (rt, true)
+        }
+      }
+      let meta : (String, Bool, Option[AbiStructSchema]) = if ctx.struct_field_renames.contains(rt_eff) {
+        (rt_eff, true, None)
+      } else {
+        let cc = rt_eff.index_of("::")
+        if cc > 0 && cc + 2 < rt_eff.length() && !str_has(rt_eff, "[") && !str_has(rt_eff, "->") && !str_has(rt_eff, "(") {
+          let rpkg = rt_eff.slice(0, cc)
+          let rtyp = rt_eff.slice(cc + 2, rt_eff.length())
+          let mapped = if rt_from_source { resolve_pkg_ref_alias(ctx.symtab, rpkg) } else { rpkg }
+          let mut emit_pkg = ""
+          if mapped.length() > 0 && ctx.symtab.dep_pkg_names.contains(mapped) {
+            emit_pkg = mapped
+          } else if ctx.symtab.dep_pkg_names.contains(rpkg) {
+            emit_pkg = rpkg
+          } else if !ctx.symtab.canon_pkg_ambig.contains(rpkg) &&
+          !(mapped.length() > 0 && ctx.symtab.canon_pkg_ambig.contains(mapped)) {
+            for al in sorted_map_keys(ctx.symtab.dep_alias_to_canon_pkg) {
+              if !ctx.symtab.dep_pkg_names.contains(al) {
+                continue
+              }
+              match ctx.symtab.dep_alias_to_canon_pkg.get(al) {
+                Some(cp) =>
+                if cp == rpkg || (mapped.length() > 0 && cp == mapped) {
+                  emit_pkg = al
+                  break
+                }
+                None => ()
+              }
+            }
+          }
+          let emit_name = if emit_pkg.length() > 0 { emit_pkg + "::" + rtyp } else { rt_eff }
+          let schema_opt : Option[AbiStructSchema] = match symtab_query_foreign_struct_update(ctx.symtab, emit_name) {
+            ForeignStructUpdateInfo::Expandable(schema) => Some(schema)
+            _ => None
+          }
+          (emit_name, false, schema_opt)
+        } else {
+          (rt_eff, false, None)
+        }
+      }
+      let is_new = !meta_by_id.contains(abi_id)
+      if is_new {
+        meta_by_id[abi_id] = meta
+        ctx.struct_defaults_order.push(abi_id)
+        fields_by_id[abi_id] = []
+        seen_fields_by_id[abi_id] = Map()
+      } else if meta.1 || meta.2 is Some(_) {
+        meta_by_id[abi_id] = meta
+      }
+    }
+    match meta_by_id.get(abi_id) {
+      Some((emit_name, _, schema_opt)) =>
+      match (fields_by_id.get(abi_id), seen_fields_by_id.get(abi_id)) {
+        (Some(f_list), Some(f_seen)) => {
+          for df in rule.fields {
+            let mut norm_key = ""
+            match schema_opt {
+              Some(schema) => {
+                for sf in schema.fields {
+                  if (sf.src_name == df.field || sf.emit_name == df.field) && sf.emit_name.length() > 0 {
+                    norm_key = sf.emit_name
+                    break
+                  }
+                }
+              }
+              None => ()
+            }
+            if norm_key.length() == 0 {
+              norm_key = rename_struct_field(ctx, emit_name, df.field)
+            }
+            if !f_seen.contains(norm_key) {
+              f_seen[norm_key] = true
+              f_list.push((norm_key, df))
+            }
+          }
+        }
+        _ => ()
+      }
+      None => ()
+    }
+  }
+  for abi_id in ctx.struct_defaults_order {
+    match (meta_by_id.get(abi_id), fields_by_id.get(abi_id)) {
+      (Some((emit_name, is_local, schema_opt)), Some(f_list)) => {
+        let mut si = 1
+        while si < f_list.length() {
+          let key = f_list[si]
+          let mut sj = si - 1
+          while sj >= 0 && str_cmp(f_list[sj].0, key.0) > 0 {
+            f_list[sj + 1] = f_list[sj]
+            sj = sj - 1
+          }
+          f_list[sj + 1] = key
+          si = si + 1
+        }
+        let defaults : Array[StructDefaultField] = []
+        for item in f_list {
+          defaults.push(item.1)
+        }
+        ctx.struct_defaults_by_id[abi_id] = ResolvedStructDefaultEntry::{
+          abi_id: abi_id,
+          emit_name: emit_name,
+          is_local: is_local,
+          schema: schema_opt,
+          defaults: defaults,
+        }
+      }
+      _ => ()
+    }
+  }
+}
+
+fn ensure_struct_defaults_index(ctx : StageAContext) -> Unit {
+  if !ctx.struct_defaults_built {
+    build_struct_defaults_index(ctx)
+  }
+}
+
+///| Resolve declarative `[struct_defaults.<Type>]` entries for `struct_name` from
+///| the pre-resolved `StageAContext` index.
 fn resolve_struct_defaults_for_type(
   ctx : StageAContext,
   struct_name : String,
@@ -1214,78 +1376,15 @@ fn resolve_struct_defaults_for_type(
   if ctx.recipes.struct_defaults.length() == 0 {
     return []
   }
-  let clean = strip_type_args_sym(struct_name.trim())
-  if clean.length() == 0 {
-    return []
-  }
-  let cands : Array[String] = []
-  let seen : Map[String, Bool] = Map()
-  let add_cand = fn(c : String) -> Unit {
-    let t = strip_type_args_sym(c.trim())
-    if t.length() > 0 && !seen.contains(t) {
-      seen[t] = true
-      cands.push(t)
+  ensure_struct_defaults_index(ctx)
+  match symtab_resolve_type_abi_identity(ctx.symtab, struct_name, false) {
+    Ok(target_id) =>
+    match ctx.struct_defaults_by_id.get(target_id) {
+      Some(entry) => entry.defaults
+      None => []
     }
+    Err(_) => []
   }
-  add_cand(clean)
-  match ctx.symtab.using_types.get(clean) {
-    Some(u) => add_cand(u)
-    None => ()
-  }
-  match ctx.symtab.type_aliases.get(clean) {
-    Some(a) => add_cand(a)
-    None => ()
-  }
-  // Expand package-qualified candidates across package aliases and canonical package names.
-  let mut ci = 0
-  while ci < cands.length() {
-    let c = cands[ci]
-    let cc = c.index_of("::")
-    if cc > 0 && cc + 2 < c.length() {
-      let pkg = c.slice(0, cc)
-      let typ = c.slice(cc + 2, c.length())
-      let mapped = resolve_pkg_ref_alias(ctx.symtab, pkg)
-      if mapped.length() > 0 && mapped != pkg {
-        add_cand(mapped + "::" + typ)
-      }
-      match ctx.symtab.dep_alias_to_canon_pkg.get(pkg) {
-        Some(cp) => if cp.length() > 0 { add_cand(cp + "::" + typ) }
-        None => ()
-      }
-      if mapped.length() > 0 && mapped != pkg {
-        match ctx.symtab.dep_alias_to_canon_pkg.get(mapped) {
-          Some(cp) => if cp.length() > 0 { add_cand(cp + "::" + typ) }
-          None => ()
-        }
-      }
-    }
-    ci = ci + 1
-  }
-  for rule in ctx.recipes.struct_defaults {
-    if seen.contains(rule.target_type) {
-      return rule.fields
-    }
-    let rcc = rule.target_type.index_of("::")
-    if rcc > 0 && rcc + 2 < rule.target_type.length() {
-      let rpkg = rule.target_type.slice(0, rcc)
-      let rtyp = rule.target_type.slice(rcc + 2, rule.target_type.length())
-      let rmapped = resolve_pkg_ref_alias(ctx.symtab, rpkg)
-      if rmapped.length() > 0 && seen.contains(rmapped + "::" + rtyp) {
-        return rule.fields
-      }
-      match ctx.symtab.dep_alias_to_canon_pkg.get(rpkg) {
-        Some(rcp) => if rcp.length() > 0 && seen.contains(rcp + "::" + rtyp) { return rule.fields }
-        None => ()
-      }
-      if rmapped.length() > 0 && rmapped != rpkg {
-        match ctx.symtab.dep_alias_to_canon_pkg.get(rmapped) {
-          Some(rcp) => if rcp.length() > 0 && seen.contains(rcp + "::" + rtyp) { return rule.fields }
-          None => ()
-        }
-      }
-    }
-  }
-  []
 }
 
 ///| Append missing `[struct_defaults]` fields to a non-spread struct value literal.
@@ -1302,12 +1401,14 @@ fn append_missing_struct_defaults(
   if defaults.length() == 0 {
     return false
   }
+  let written_fields : Map[String, Bool] = Map()
   let mut emitted_any = emitted_any_field_in
   let mut ends_with_comma = ends_with_comma_in
   let mut appended = false
   for df in defaults {
     let df_renamed = rename_struct_field(ctx, struct_name, df.field)
-    if present_fields.contains(df.field) || present_fields.contains(df_renamed) {
+    if present_fields.contains(df.field) || present_fields.contains(df_renamed) ||
+    written_fields.contains(df_renamed) {
       continue
     }
     if emitted_any {
@@ -1320,6 +1421,7 @@ fn append_missing_struct_defaults(
       sb.write_string(" ")
     }
     sb.write_string(df_renamed + ": " + df.expr)
+    written_fields[df_renamed] = true
     emitted_any = true
     ends_with_comma = false
     appended = true
@@ -2489,6 +2591,102 @@ fn resolve_anon_struct_literal_name(
   }
   if exact_matches.length() == 1 {
     return Some(exact_matches[0])
+  }
+  if exact_matches.length() > 1 {
+    return None
+  }
+  // 3. Unique match via pre-resolved `[struct_defaults]` index across local and `--dep` ABI structs (fail-closed)
+  if fields.length() > 0 && ctx.recipes.struct_defaults.length() > 0 {
+    ensure_struct_defaults_index(ctx)
+    let default_matches : Array[String] = []
+    for abi_id in ctx.struct_defaults_order {
+      match ctx.struct_defaults_by_id.get(abi_id) {
+        Some(entry) =>
+        if entry.is_local {
+          match ctx.struct_field_renames.get(entry.emit_name) {
+            Some(rmap) => {
+              let mut all_present = true
+              for f in fields {
+                if !rmap.contains(f) {
+                  all_present = false
+                  break
+                }
+              }
+              if all_present {
+                let user_set : Map[String, Bool] = Map()
+                for f in fields {
+                  user_set[f] = true
+                  user_set[rename_struct_field(ctx, entry.emit_name, f)] = true
+                }
+                let def_set : Map[String, Bool] = Map()
+                for df in entry.defaults {
+                  def_set[df.field] = true
+                  def_set[rename_struct_field(ctx, entry.emit_name, df.field)] = true
+                }
+                let mut all_covered = true
+                for rf in rmap.keys() {
+                  let rf_ren = match rmap.get(rf) { Some(r) => r, None => rf }
+                  if !user_set.contains(rf) && !user_set.contains(rf_ren) &&
+                  !def_set.contains(rf) && !def_set.contains(rf_ren) {
+                    all_covered = false
+                    break
+                  }
+                }
+                if all_covered {
+                  default_matches.push(entry.emit_name)
+                }
+              }
+            }
+            None => ()
+          }
+        } else {
+          match entry.schema {
+            Some(schema) => {
+              let mut all_present = true
+              for f in fields {
+                let mut found_f = false
+                for sf in schema.fields {
+                  if sf.src_name == f {
+                    found_f = true
+                    break
+                  }
+                }
+                if !found_f {
+                  all_present = false
+                  break
+                }
+              }
+              if all_present {
+                let user_set : Map[String, Bool] = Map()
+                for f in fields {
+                  user_set[f] = true
+                }
+                let def_set : Map[String, Bool] = Map()
+                for df in entry.defaults {
+                  def_set[df.field] = true
+                }
+                let mut all_covered = true
+                for sf in schema.fields {
+                  if !user_set.contains(sf.src_name) &&
+                  !def_set.contains(sf.src_name) && !def_set.contains(sf.emit_name) {
+                    all_covered = false
+                    break
+                  }
+                }
+                if all_covered {
+                  default_matches.push(entry.emit_name)
+                }
+              }
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
+    }
+    if default_matches.length() == 1 {
+      return Some(default_matches[0])
+    }
   }
   None
 }
@@ -3705,7 +3903,7 @@ fn lower_single_param_method_closure(
     return None
   }
   let outer_exp = resolve_method_closure_outer_exp(ctx, tokens, close_p)
-  let body_exp = if method_name == "filter" {
+  let body_exp = if method_name == "filter" || method_name == "any" || method_name == "all" || method_name == "find_first" {
     "Bool"
   } else if method_name == "each" {
     "Unit"
@@ -3771,6 +3969,14 @@ fn lookup_ident_static_type(ctx : StageAContext, raw_ident : String) -> String {
   }
   match ctx.symtab.val_types.get(eff) {
     Some(vt) => return vt
+    None => ()
+  }
+  match ctx.symtab.using_values.get(raw_ident) {
+    Some(q) =>
+    match ctx.symtab.val_types.get(q) {
+      Some(vt) => return vt
+      None => ()
+    }
     None => ()
   }
   ""
@@ -13104,23 +13310,49 @@ fn lower_one_token_or_form(
     }
 
     // Single-parameter closure on general receiver `.map(fn(x) { ... })` / `.filter` / `.each` / `.filter_map`
-    // (e.g. `items(...).map(fn(x) { { ... } })`): propagate receiver element type & outer expected return type.
+    // and `.iter().any/all/find_first/filter/filter_map/map/each(fn(x) { ... })`:
+    // propagate receiver element type & outer expected return type.
     if !in_pattern && prev_dot && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before &&
-    (t.raw == "map" || t.raw == "filter" || t.raw == "each" || t.raw == "filter_map") {
-      let close_p = find_matching_delim(tokens, next_i)
-      let mut ety = ""
-      let recv_s = find_dot_receiver_start_f3d2(tokens, 0, i - 1)
-      if recv_s >= 0 && recv_s < i - 1 {
-        let rty = infer_simple_expr_type(ctx, tokens, recv_s, i - 1).trim()
-        if rty.starts_with("Option[") && rty.ends_with("]") {
-          ety = rty.slice(7, rty.length() - 1).trim()
-        } else if rty.length() > 0 {
-          ety = extract_container_value_type(rty)
+    (t.raw == "map" || t.raw == "filter" || t.raw == "each" || t.raw == "filter_map" ||
+      t.raw == "any" || t.raw == "all" || t.raw == "find_first") {
+      let is_iter_chain = i >= 6 &&
+      tokens[i - 5].kind == TokenKind::Dot &&
+      tokens[i - 4].kind == TokenKind::Ident &&
+      tokens[i - 4].raw == "iter" &&
+      tokens[i - 3].kind == TokenKind::LParen &&
+      tokens[i - 2].kind == TokenKind::RParen
+      let is_pred_only = t.raw == "any" || t.raw == "all" || t.raw == "find_first"
+      if !is_pred_only || is_iter_chain {
+        let close_p = find_matching_delim(tokens, next_i)
+        let mut ety = ""
+        if is_iter_chain {
+          let recv_s = find_dot_receiver_start_f3d2(tokens, 0, i - 5)
+          if recv_s >= 0 && recv_s < i - 5 {
+            let rty = infer_simple_expr_type(ctx, tokens, recv_s, i - 5).trim()
+            let rbase = strip_type_args_sym(rty)
+            if rbase == "Array" || rbase == "FixedArray" || rbase == "ReadOnlyArray" ||
+            rbase == "ArrayView" || rbase == "mbt_compat::ArrayView" {
+              ety = extract_container_value_type(rty)
+            }
+          }
         }
-      }
-      match lower_single_param_method_closure(ctx, tokens, next_i + 1, close_p, end, file, t.raw, ety) {
-        Some(cl_s) => return (trivia + name + "(" + cl_s + ")", close_p + 1)
-        None => ()
+        if ety.length() == 0 {
+          let recv_s = find_dot_receiver_start_f3d2(tokens, 0, i - 1)
+          if recv_s >= 0 && recv_s < i - 1 {
+            let rty = infer_simple_expr_type(ctx, tokens, recv_s, i - 1).trim()
+            if rty.starts_with("Option[") && rty.ends_with("]") {
+              ety = rty.slice(7, rty.length() - 1).trim()
+            } else if rty.length() > 0 {
+              ety = extract_container_value_type(rty)
+            }
+          }
+        }
+        if !is_pred_only || ety.length() > 0 {
+          match lower_single_param_method_closure(ctx, tokens, next_i + 1, close_p, end, file, t.raw, ety) {
+            Some(cl_s) => return (trivia + name + "(" + cl_s + ")", close_p + 1)
+            None => ()
+          }
+        }
       }
     }
 
@@ -19380,6 +19612,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
     let n = tokens.length() - 1
     let mut pi = 0
     let mut p_cfg_excluded = false
+    let mut p_using_idx = 0
     while pi < n {
       let pt = tokens[pi]
       if pt.kind == TokenKind::Attr {
@@ -19395,7 +19628,22 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
       if p_cfg_excluded {
         p_cfg_excluded = false
-        pi = skip_top_level_decl(tokens, pi, n)
+        let skipped_end = skip_top_level_decl(tokens, pi, n)
+        let mut sk = pi
+        let mut sd = 0
+        while sk < skipped_end {
+          if sd == 0 && (tokens[sk].kind == TokenKind::Keyword || tokens[sk].kind == TokenKind::Ident) &&
+          tokens[sk].raw == "using" && sk + 2 < skipped_end &&
+          tokens[sk + 1].kind == TokenKind::PkgRef && tokens[sk + 2].kind == TokenKind::LBrace {
+            p_using_idx = p_using_idx + 1
+            sk = find_matching_delim(tokens, sk + 2) + 1
+            continue
+          }
+          if tokens[sk].kind == TokenKind::LBrace { sd = sd + 1 }
+          else if tokens[sk].kind == TokenKind::RBrace && sd > 0 { sd = sd - 1 }
+          sk = sk + 1
+        }
+        pi = skipped_end
         continue
       }
       if pt.kind == TokenKind::Keyword &&
@@ -19433,7 +19681,12 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if (pt.kind == TokenKind::Keyword || pt.kind == TokenKind::Ident) && pt.raw == "using" &&
       pi + 2 < n && tokens[pi + 1].kind == TokenKind::PkgRef && tokens[pi + 2].kind == TokenKind::LBrace {
         let raw_pkg = tokens[pi + 1].raw.slice(1, tokens[pi + 1].raw.length())
-        let target_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
+        let using_key = sf.rel_path + ":" + p_using_idx.to_string()
+        p_using_idx = p_using_idx + 1
+        let target_pkg = match ctx.symtab.reexport_resolved_using_pkgs.get(using_key) {
+          Some(rpkg) => rpkg
+          None => resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
+        }
         let rb = find_matching_delim(tokens, pi + 2)
         let mut uk = pi + 3
         while uk < rb {
@@ -19600,6 +19853,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
     let mut i = 0
     let mut next_autofill = false
     let mut next_cfg_excluded = false
+    let mut using_idx = 0
     while i < n {
       let t = tokens[i]
       if t.kind == TokenKind::Attr {
@@ -19633,7 +19887,22 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if next_cfg_excluded {
         next_cfg_excluded = false
         next_autofill = false
-        i = skip_top_level_decl(tokens, i, n)
+        let skipped_end = skip_top_level_decl(tokens, i, n)
+        let mut sk = i
+        let mut sd = 0
+        while sk < skipped_end {
+          if sd == 0 && (tokens[sk].kind == TokenKind::Keyword || tokens[sk].kind == TokenKind::Ident) &&
+          tokens[sk].raw == "using" && sk + 2 < skipped_end &&
+          tokens[sk + 1].kind == TokenKind::PkgRef && tokens[sk + 2].kind == TokenKind::LBrace {
+            using_idx = using_idx + 1
+            sk = find_matching_delim(tokens, sk + 2) + 1
+            continue
+          }
+          if tokens[sk].kind == TokenKind::LBrace { sd = sd + 1 }
+          else if tokens[sk].kind == TokenKind::RBrace && sd > 0 { sd = sd - 1 }
+          sk = sk + 1
+        }
+        i = skipped_end
         continue
       }
       // P0-4: Record all locally defined types (`struct`, `enum`, `type`, `suberror`, `trait`) so stdlib rewrites
@@ -20114,7 +20383,12 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       i + 2 < n && tokens[i + 1].kind == TokenKind::PkgRef && tokens[i + 2].kind == TokenKind::LBrace {
         next_autofill = false
         let raw_pkg = tokens[i + 1].raw.slice(1, tokens[i + 1].raw.length())
-        let target_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
+        let using_key = sf.rel_path + ":" + using_idx.to_string()
+        using_idx = using_idx + 1
+        let target_pkg = match ctx.symtab.reexport_resolved_using_pkgs.get(using_key) {
+          Some(rpkg) => rpkg
+          None => resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
+        }
         let rb = find_matching_delim(tokens, i + 2)
         let mut uk = i + 3
         while uk < rb {
@@ -20513,6 +20787,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
     }
   }
   prescan_recursive_derive_eq_types(ctx, files)
+  build_struct_defaults_index(ctx)
 }
 
 ///| Lower a single `.mbt` file through Stage A, emitting declaration anchors,
