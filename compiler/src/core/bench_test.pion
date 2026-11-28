@@ -356,3 +356,70 @@ test "bench: emit_qbe_benches harness order, prof window, and syms_sidecar" {
   assert_true(pkg_off.ssa == pkg_on.ssa, "enabling syms_sidecar does not change SSA")
   assert_true(str_contains(pkg_on.syms_sidecar, "\twork\tfn\tbpkg\tbench_sample.pion\t"), "pkg syms_sidecar has fn work")
 }
+
+///|
+test "bench: multiple owned RC setup locals stay alive across bench_loop" {
+  let src =
+  #|fn pair_len(a : String, b : String) -> Int {
+  #| a.length() + b.length()
+  #|}
+  #|
+  #|bench "multi_rc_setup" {
+  #| let n = 42
+  #| let a = "hello_" + n.to_string()
+  #| let b = "world_" + n.to_string()
+  #| bench_loop {
+  #| black_box(pair_len(a, b))
+  #| }
+  #|}
+  #|
+  let cr = check_source_files_full("bmulti", ["multi_rc.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, "bmulti check: " + check_result_to_json(cr.diagnostics))
+  let res = emit_qbe_benches(cr.pkg, cr.tc, [])
+  let idx_fn = bench_test_index_of(res.ssa, "function w $__pion_bench_run_0(l %iters, w %prof_win)")
+  assert_true(idx_fn >= 0, "found $__pion_bench_run_0")
+  let fn_tail = slice_str(res.ssa, idx_fn, res.ssa.length())
+  let idx_end = bench_test_index_of(fn_tail, "\n}\n")
+  let fn_ssa = if idx_end > 0 { slice_str(fn_tail, 0, idx_end) } else { fn_tail }
+  let idx_loop_hdr = bench_test_index_of(fn_ssa, "@bl_h")
+  assert_true(idx_loop_hdr > 0, "found bench loop header @bl_h")
+  let setup_ssa = slice_str(fn_ssa, 0, idx_loop_hdr)
+  // Neither setup String `a` nor `b` may be early-dropped before `@bl_h`:
+  // only temporary `n.to_string()` results are released during setup, whereas
+  // an early drop of `a` would zero its local slot (`storel 0, %t...`) after storing it.
+  // Specifically, there must be NO `pion_rc_dec` emitted after `a` is bound except for
+  // the temporary `n.to_string()` in `b`'s initializer (2 `pion_rc_dec` total for 2 `to_string()`),
+  // never 3 (which would mean `a` was prematurely early-dropped).
+  let setup_decs = bench_test_count(setup_ssa, "call $pion_rc_dec(")
+  assert_true(
+    setup_decs == 2,
+    "setup must release only the 2 temporary to_string() results before bench_loop, never owned RC local `a` (found " +
+    setup_decs.to_string() +
+    " rc_dec in setup):\n" +
+    setup_ssa,
+  )
+}
+
+///|
+test "lexer: unexpected non-ASCII character reports full Unicode scalar once" {
+  let src = "fn main() -> Int {\n  let a = foo（1）\n  let c = （ undefined_y\n  a + c\n}\n"
+  let (ok, json, _) = check_one(src)
+  assert_true(!ok, "full-width parens must fail check")
+  assert_true(
+    str_contains(json, "unexpected character `（`"),
+    "expected full Unicode scalar `（` in diagnostic, got: " + json,
+  )
+  assert_true(
+    str_contains(json, "unexpected character `）`"),
+    "expected full Unicode scalar `）` in diagnostic, got: " + json,
+  )
+  assert_true(
+    !str_contains(json, "\u{FFFD}"),
+    "non-ASCII unexpected character must not degrade into U+FFFD: " + json,
+  )
+  // `  let c = （ undefined_y` -> `（` is 3 UTF-8 bytes at col 11..13, space at 14, `undefined_y` at col 15
+  assert_true(
+    str_contains(json, "\"line\":3,\"col\":15,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"undefined identifier `undefined_y`\""),
+    "expected byte-offset col 15 after multi-byte unexpected char, got: " + json,
+  )
+}
