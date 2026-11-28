@@ -949,6 +949,12 @@ pub struct StageAContext {
   struct_defaults_by_id : Map[String, ResolvedStructDefaultEntry]
   struct_defaults_order : Array[String]
   mut struct_defaults_built : Bool
+  defer_frames : Array[DeferFrame]
+}
+
+struct DeferFrame {
+  kind : String
+  defers : Array[String]
 }
 
 fn rebuild_symtab_pion_index(ctx : StageAContext) -> Unit {
@@ -1054,6 +1060,7 @@ pub fn stage_a_context_new(
     struct_defaults_by_id: Map(),
     struct_defaults_order: [],
     struct_defaults_built: false,
+    defer_frames: [],
   }
 }
 
@@ -3943,7 +3950,7 @@ fn lower_single_param_method_closure(
   let saved_mc_ret = ctx.cur_fn_ret_ty
   ctx.cur_fn_ret_ty = body_exp
   push_expected_type(ctx, body_exp)
-  let body_s = lower_block_range(ctx, tokens, fn_i + 4, close_p - 1, file, "")
+  let body_s = lower_block_range_frame(ctx, tokens, fn_i + 4, close_p - 1, file, "", "fn")
   pop_expected_type(ctx)
   ctx.cur_fn_ret_ty = saved_mc_ret
   restore_scope_vars(ctx, saved_sc)
@@ -5880,6 +5887,20 @@ fn prescan_boxed_mut_vars(tokens : Array[Token], start : Int, end : Int, boxed :
       }
       None => ()
     }
+    // `defer <expr>` lowers to an in-place local closure `let __mbt_defer_fn_N = fn() -> Unit { ... }`,
+    // so any `let mut` variable referenced inside a `defer` body must be boxed in `MbtCell`.
+    if is_defer_stmt_start(tokens, i, end) &&
+    (i == start || tokens[i].newline_before || tokens[i - 1].kind == TokenKind::Semi || tokens[i - 1].kind == TokenKind::LBrace) {
+      let de = find_defer_stmt_end(tokens, i, end)
+      if de > i + 1 {
+        let refs = collect_body_ident_set(tokens, i + 1, de)
+        for mv in mut_vars.keys() {
+          if refs.contains(mv) {
+            boxed[mv] = true
+          }
+        }
+      }
+    }
     i = i + 1
   }
 }
@@ -6682,19 +6703,194 @@ fn extract_param_info(
   (names, tys, all_typed)
 }
 
-///| Lower a block `{ ... }` handling value-returning `guard` statements by rewriting
-///| non-diverging `guard cond else { fallback }; rest...` into `if`/`match` with the remainder!
-pub fn lower_block_range(
+fn is_defer_stmt_start(tokens : Array[Token], i : Int, end : Int) -> Bool {
+  if i < 0 || i + 1 >= end {
+    return false
+  }
+  let t = tokens[i]
+  if !((t.kind == TokenKind::Ident || t.kind == TokenKind::Keyword) && t.raw == "defer") {
+    return false
+  }
+  if i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon) {
+    return false
+  }
+  let nxt = tokens[i + 1]
+  match nxt.kind {
+    TokenKind::Eq
+    | TokenKind::AssignOp
+    | TokenKind::Colon
+    | TokenKind::ColonColon
+    | TokenKind::Dot
+    | TokenKind::Comma
+    | TokenKind::Semi
+    | TokenKind::RBrace
+    | TokenKind::RParen
+    | TokenKind::RBracket
+    | TokenKind::Eof => false
+    _ => true
+  }
+}
+
+fn find_defer_stmt_end(tokens : Array[Token], i : Int, end : Int) -> Int {
+  find_expr_end(tokens, i + 1, end)
+}
+
+fn defer_body_has_forbidden_jump(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  let mut k = s
+  while k < e {
+    let tk = tokens[k]
+    // Skip nested closures `fn(...) [-> R] { ... }` (their own `return` does not escape `defer`).
+    if tk.kind == TokenKind::Keyword && tk.raw == "fn" {
+      let mut p = k + 1
+      if p < e && tokens[p].kind == TokenKind::Ident {
+        p = p + 1
+      }
+      if p < e && tokens[p].kind == TokenKind::LParen {
+        let cp = find_matching_delim(tokens, p)
+        let mut lb = cp + 1
+        let mut d = 0
+        while lb < e {
+          let lk = tokens[lb].kind
+          if d == 0 && lk == TokenKind::LBrace {
+            break
+          }
+          if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace { d = d + 1 }
+          else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+          lb = lb + 1
+        }
+        if lb < e && tokens[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(tokens, lb)
+          if rb > lb {
+            k = rb + 1
+            continue
+          }
+        }
+      }
+    }
+    if tk.kind == TokenKind::Keyword && (tk.raw == "return" || tk.raw == "break" || tk.raw == "continue") {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+fn block_has_top_level_defer(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let tk = tokens[k].kind
+    if d == 0 && is_defer_stmt_start(tokens, k, end) {
+      if k == start || tokens[k].newline_before || tokens[k - 1].kind == TokenKind::Semi {
+        return true
+      }
+    }
+    if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+      d = d + 1
+    } else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    }
+    k = k + 1
+  }
+  false
+}
+
+fn collect_active_defers_for_return(ctx : StageAContext) -> Array[String] {
+  let out : Array[String] = []
+  let mut fi = ctx.defer_frames.length() - 1
+  while fi >= 0 {
+    let fr = ctx.defer_frames[fi]
+    let mut di = fr.defers.length() - 1
+    while di >= 0 {
+      out.push(fr.defers[di])
+      di = di - 1
+    }
+    if fr.kind == "fn" {
+      break
+    }
+    fi = fi - 1
+  }
+  out
+}
+
+fn collect_active_defers_for_loop_jump(ctx : StageAContext) -> Array[String] {
+  let out : Array[String] = []
+  let mut fi = ctx.defer_frames.length() - 1
+  while fi >= 0 {
+    let fr = ctx.defer_frames[fi]
+    if fr.kind == "fn" {
+      break
+    }
+    let mut di = fr.defers.length() - 1
+    while di >= 0 {
+      out.push(fr.defers[di])
+      di = di - 1
+    }
+    if fr.kind == "loop" {
+      break
+    }
+    fi = fi - 1
+  }
+  out
+}
+
+fn has_active_defers_in_fn(ctx : StageAContext) -> Bool {
+  let mut fi = ctx.defer_frames.length() - 1
+  while fi >= 0 {
+    let fr = ctx.defer_frames[fi]
+    if fr.defers.length() > 0 {
+      return true
+    }
+    if fr.kind == "fn" {
+      break
+    }
+    fi = fi - 1
+  }
+  false
+}
+
+fn render_defer_stmts(defers : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < defers.length() {
+    if i > 0 {
+      sb.write_string("\n")
+    }
+    sb.write_string(defers[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn current_frame_defers_lifo(ctx : StageAContext) -> Array[String] {
+  let out : Array[String] = []
+  let n = ctx.defer_frames.length()
+  if n == 0 {
+    return out
+  }
+  let fr = ctx.defer_frames[n - 1]
+  let mut di = fr.defers.length() - 1
+  while di >= 0 {
+    out.push(fr.defers[di])
+    di = di - 1
+  }
+  out
+}
+
+///| Lower a block `{ ... }` with an explicit `DeferFrame` kind (`"fn"`, `"loop"`, or `"block"`).
+fn lower_block_range_frame(
   ctx : StageAContext,
   tokens : Array[Token],
   open_b : Int,
   close_b : Int,
   file : String,
   prelude : String,
+  frame_kind : String,
 ) -> String {
   let saved_scope = ctx.scope_vars.length()
   let saved_renames = ctx.ident_renames.length()
   let saved_lifted = save_lifted_local_fns(ctx)
+  ctx.defer_frames.push(DeferFrame::{ kind: frame_kind, defers: [] })
   let sb = StringBuilder()
   sb.write_string("{")
   if prelude.length() > 0 {
@@ -6705,15 +6901,264 @@ pub fn lower_block_range(
   sb.write_string(inner)
   sb.write_string(tokens[close_b].leading_trivia)
   sb.write_string("}")
+  let _ = ctx.defer_frames.pop()
   restore_scope_vars(ctx, saved_scope)
   restore_ident_renames(ctx, saved_renames)
   restore_lifted_local_fns(ctx, saved_lifted)
   sb.to_string()
 }
 
+///| Lower a block `{ ... }` handling value-returning `guard` statements by rewriting
+///| non-diverging `guard cond else { fallback }; rest...` into `if`/`match` with the remainder!
+pub fn lower_block_range(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  open_b : Int,
+  close_b : Int,
+  file : String,
+  prelude : String,
+) -> String {
+  lower_block_range_frame(ctx, tokens, open_b, close_b, file, prelude, "block")
+}
+
+///| Lower a statement sequence `[start, end)` that contains one or more top-level `defer` statements.
+///| Preserves LIFO execution order on normal exit (evaluating any non-Unit tail expression into a
+///| fresh temp before running defers), early `return`, and loop `break`/`continue`.
+fn lower_stmts_range_with_defer(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> String {
+  let items : Array[(Int, Int, String)] = []
+  let mut cur = start
+  while cur < end {
+    let tk = tokens[cur]
+    if tk.kind == TokenKind::Semi {
+      cur = cur + 1
+      continue
+    }
+    if is_defer_stmt_start(tokens, cur, end) {
+      let de = find_defer_stmt_end(tokens, cur, end)
+      if de <= cur + 1 {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, tk.line, tk.col, "malformed `defer` statement"))
+        cur = cur + 1
+        continue
+      }
+      items.push((cur, de, "defer"))
+      cur = de
+      continue
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "guard" {
+      let mut j = cur + 1
+      let mut depth = 0
+      let mut else_idx = -1
+      while j < end {
+        let jk = tokens[j].kind
+        if jk == TokenKind::LParen || jk == TokenKind::LBrace || jk == TokenKind::LBracket { depth = depth + 1 }
+        else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if depth > 0 { depth = depth - 1 } }
+        else if depth == 0 && jk == TokenKind::Keyword && tokens[j].raw == "else" { else_idx = j; break }
+        j = j + 1
+      }
+      if else_idx > cur && else_idx + 1 < end && tokens[else_idx + 1].kind == TokenKind::LBrace {
+        let else_close = find_matching_delim(tokens, else_idx + 1)
+        if !block_diverges(tokens, else_idx + 1, else_close) {
+          items.push((cur, end, "val_guard"))
+          cur = end
+          break
+        }
+        items.push((cur, else_close + 1, "div_guard"))
+        cur = else_close + 1
+        continue
+      }
+    }
+    match try_parse_local_fn_decl(tokens, cur, end) {
+      Some(g) => {
+        items.push((cur, g.end_tok, "local_fn"))
+        cur = g.end_tok
+        continue
+      }
+      None => ()
+    }
+    if tk.kind == TokenKind::Keyword && tk.raw == "let" {
+      let mut eq_i = cur + 1
+      let mut d = 0
+      while eq_i < end && !(d == 0 && tokens[eq_i].kind == TokenKind::Eq) {
+        let kk = tokens[eq_i].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        eq_i = eq_i + 1
+      }
+      if eq_i < end && tokens[eq_i].kind == TokenKind::Eq {
+        let re = find_expr_end(tokens, eq_i + 1, end)
+        if re > cur {
+          items.push((cur, re, "let"))
+          cur = re
+          continue
+        }
+      }
+    }
+    if tk.kind == TokenKind::Keyword && (tk.raw == "for" || tk.raw == "while") {
+      let le = find_loop_stmt_end(tokens, cur, end)
+      if le > cur {
+        items.push((cur, le, "loop"))
+        cur = le
+        continue
+      }
+    }
+    if tk.kind == TokenKind::Keyword && (tk.raw == "return" || tk.raw == "break" || tk.raw == "continue") {
+      let re = find_expr_end(tokens, cur, end)
+      if re > cur {
+        items.push((cur, re, "jump"))
+        cur = re
+        continue
+      }
+    }
+    let ee = find_expr_end(tokens, cur, end)
+    let eff_ee = if ee > cur { ee } else { cur + 1 }
+    let mut is_void_stmt = false
+    if tk.kind == TokenKind::Keyword && tk.raw == "if" {
+      let mut has_else = false
+      let mut k = cur + 1
+      let mut d = 0
+      while k < eff_ee {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "else" { has_else = true; break }
+        k = k + 1
+      }
+      if !has_else { is_void_stmt = true }
+    } else {
+      let mut k = cur
+      let mut d = 0
+      while k < eff_ee {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && (kk == TokenKind::Eq || kk == TokenKind::AssignOp) { is_void_stmt = true; break }
+        k = k + 1
+      }
+    }
+    items.push((cur, eff_ee, if is_void_stmt { "void_stmt" } else { "expr" }))
+    cur = eff_ee
+  }
+
+  let sb = StringBuilder()
+  let n_items = items.length()
+  let mut idx = 0
+  let mut emitted_any = false
+  while idx < n_items {
+    let it = items[idx]
+    let s = it.0
+    let e = it.1
+    let kind = it.2
+    let is_last = idx == n_items - 1
+    if emitted_any && !str_has(tokens[s].leading_trivia, "\n") {
+      sb.write_string("\n")
+    }
+    if kind == "defer" {
+      let tk = tokens[s]
+      if ctx.in_try_catch_depth > 0 {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, tk.line, tk.col, "`defer` inside unlowered `try` block is not supported"))
+      }
+      if defer_body_has_forbidden_jump(tokens, s + 1, e) {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, tk.line, tk.col, "`return`/`break`/`continue` inside `defer` body is not supported"))
+      }
+      let fn_tmp = fresh_temp(ctx, "defer_fn")
+      push_expected_type(ctx, "")
+      let lowered_d = lower_expr_range(ctx, tokens, s + 1, e, file, false).trim()
+      pop_expected_type(ctx)
+      if lowered_d.length() > 0 && ctx.defer_frames.length() > 0 {
+        sb.write_string(tk.leading_trivia + "let " + fn_tmp + " = fn() -> Unit {\n" + lowered_d + "\n()\n}\n")
+        ctx.defer_frames[ctx.defer_frames.length() - 1].defers.push(fn_tmp + "()")
+        emitted_any = true
+      }
+      if is_last {
+        let lifo = current_frame_defers_lifo(ctx)
+        if lifo.length() > 0 {
+          sb.write_string("\n" + render_defer_stmts(lifo) + "\n()")
+          emitted_any = true
+        }
+      }
+      idx = idx + 1
+      continue
+    }
+    if kind == "val_guard" {
+      let lifo = current_frame_defers_lifo(ctx)
+      let lowered_vg = lower_stmts_range_body(ctx, tokens, s, e, file)
+      if lifo.length() > 0 {
+        let res_tmp = fresh_temp(ctx, "defer_res")
+        sb.write_string(tokens[s].leading_trivia + "let " + res_tmp + " = " + lowered_vg.trim() + "\n" + render_defer_stmts(lifo) + "\n" + res_tmp)
+      } else {
+        sb.write_string(lowered_vg)
+      }
+      emitted_any = true
+      idx = idx + 1
+      continue
+    }
+    if !is_last {
+      push_expected_type(ctx, "")
+      sb.write_string(lower_stmts_range_body(ctx, tokens, s, e, file))
+      pop_expected_type(ctx)
+      emitted_any = true
+      idx = idx + 1
+      continue
+    }
+    // Last item in the block
+    let lifo = current_frame_defers_lifo(ctx)
+    if kind == "jump" {
+      sb.write_string(lower_stmts_range_body(ctx, tokens, s, e, file))
+    } else if kind == "let" || kind == "loop" || kind == "void_stmt" || kind == "div_guard" || kind == "local_fn" {
+      push_expected_type(ctx, "")
+      sb.write_string(lower_stmts_range_body(ctx, tokens, s, e, file))
+      pop_expected_type(ctx)
+      if lifo.length() > 0 {
+        sb.write_string("\n" + render_defer_stmts(lifo) + "\n()")
+      }
+    } else {
+      let tail_raw = lower_expr_range(ctx, tokens, s, e, file, false)
+      let tail_final = if is_expected_mbt_json(ctx) {
+        let trimmed = tail_raw.trim()
+        let wrapped = maybe_wrap_mbt_json_expr(ctx, tokens, s, e, trimmed)
+        if wrapped != trimmed {
+          tokens[s].leading_trivia + wrapped
+        } else {
+          tail_raw
+        }
+      } else {
+        tail_raw
+      }
+      if lifo.length() > 0 {
+        let res_tmp = fresh_temp(ctx, "defer_res")
+        sb.write_string(tokens[s].leading_trivia + "let " + res_tmp + " = " + tail_final.trim() + "\n" + render_defer_stmts(lifo) + "\n" + res_tmp)
+      } else {
+        sb.write_string(tail_final)
+      }
+    }
+    emitted_any = true
+    idx = idx + 1
+  }
+  sb.to_string()
+}
+
 ///| Lower a sequence of statements inside a block `[start, end)`.
 ///| Rewrites value-returning `guard` with its remainder; preserves diverging `guard` untouched!
 fn lower_stmts_range(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> String {
+  if start < end && block_has_top_level_defer(tokens, start, end) {
+    return lower_stmts_range_with_defer(ctx, tokens, start, end, file)
+  }
+  lower_stmts_range_body(ctx, tokens, start, end, file)
+}
+
+fn lower_stmts_range_body(
   ctx : StageAContext,
   tokens : Array[Token],
   start : Int,
@@ -6935,7 +7380,9 @@ fn lower_stmts_range(
           let saved_g_rn = ctx.ident_renames.length()
           let saved_g_lf = save_lifted_local_fns(ctx)
           let cond_str = lower_cond_with_is_binders(ctx, tokens, i + 1, else_idx, file).trim()
+          ctx.defer_frames.push(DeferFrame::{ kind: "block", defers: [] })
           let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
+          let _ = ctx.defer_frames.pop()
           restore_scope_vars(ctx, saved_g_sc)
           restore_ident_renames(ctx, saved_g_rn)
           restore_lifted_local_fns(ctx, saved_g_lf)
@@ -7020,7 +7467,7 @@ fn lower_stmts_range(
             })
             pi = pi + 1
           }
-          let body = lower_block_range(ctx, tokens, g.lb, g.rb, file, p_pre)
+          let body = lower_block_range_frame(ctx, tokens, g.lb, g.rb, file, p_pre, "fn")
           restore_scope_vars(ctx, saved_sc)
           restore_ident_renames(ctx, saved_rn)
           restore_lifted_local_fns(ctx, saved_lf)
@@ -7271,7 +7718,7 @@ fn lower_stmts_range(
           pi = pi + 1
         }
         let full_body_pre = cap_body_pre.to_string() + self_trampoline + p_pre
-        let body = lower_block_range(ctx, tokens, g.lb, g.rb, file, full_body_pre)
+        let body = lower_block_range_frame(ctx, tokens, g.lb, g.rb, file, full_body_pre, "fn")
         restore_scope_vars(ctx, saved_sc)
         restore_ident_renames(ctx, saved_rn)
         restore_lifted_local_fns(ctx, saved_lf)
@@ -7883,7 +8330,7 @@ fn lower_fn_body_with_views(
   ctx.borrowed_bufs.clear()
   ctx.borrowed_views.clear()
   prescan_borrowed_slices(tokens, lb, rb, ctx.borrowed_bufs, ctx.borrowed_views)
-  let body = lower_block_range(ctx, tokens, lb, rb, file, preamble)
+  let body = lower_block_range_frame(ctx, tokens, lb, rb, file, preamble, "fn")
   ctx.borrowed_bufs.clear()
   ctx.borrowed_views.clear()
   body
@@ -9408,6 +9855,183 @@ fn try_lower_general_postfix_slice(
   Some((trivia + recv_str, final_next))
 }
 
+fn is_builtin_int_ty_for_radix(ty : String) -> Bool {
+  ty == "Int" || ty == "Int64" || ty == "UInt" || ty == "UInt64" ||
+  ty == "Int16" || ty == "UInt16" || ty == "Byte"
+}
+
+fn is_known_string_expr_before_pad(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  dot_i : Int,
+) -> Bool {
+  if start >= dot_i {
+    return false
+  }
+  let rty = infer_simple_expr_type(ctx, tokens, start, dot_i).trim()
+  if rty == "String" || rty == "StringView" || rty == "StrView" {
+    return true
+  }
+  if dot_i == start + 1 {
+    let tk = tokens[start].kind
+    if tk == TokenKind::StringLit || tk == TokenKind::InterpString ||
+    tk == TokenKind::RawMultiline || tk == TokenKind::InterpMultiline {
+      return true
+    }
+  }
+  if dot_i >= start + 4 && tokens[dot_i - 1].kind == TokenKind::RParen {
+    let lp = find_open_before(tokens, dot_i - 1, start)
+    if lp >= start + 2 && tokens[lp - 1].kind == TokenKind::Ident && tokens[lp - 2].kind == TokenKind::Dot {
+      let m = tokens[lp - 1].raw
+      if m == "to_string" || m == "__mbt_int_to_string" {
+        let base_ty = infer_simple_expr_type(ctx, tokens, start, lp - 2).trim()
+        if is_builtin_int_ty_for_radix(base_ty) {
+          let mut ri = lp + 1
+          let mut rd = 0
+          while ri < dot_i - 1 {
+            let rk = tokens[ri].kind
+            if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+            else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+            else if rd == 0 && rk == TokenKind::Ident && tokens[ri].raw == "radix" &&
+            ri + 1 < dot_i - 1 && (tokens[ri + 1].kind == TokenKind::Eq || tokens[ri + 1].kind == TokenKind::Tilde) {
+              return true
+            }
+            ri = ri + 1
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+///| Lower `.pad_start(width, ch)` / `.pad_end(width, ch)` postfix calls on known `String` receivers
+///| (including chained expressions like `((k >> 8) & 0xFFFFFFL).to_string(radix=16).pad_start(6, '0')`).
+///| Unknown receiver types fall through to Stage B (`lookup_missing_method_helper`) so custom types are never hijacked.
+fn try_lower_string_pad_postfix(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  i : Int,
+  end : Int,
+  file : String,
+) -> Option[(String, Int)] {
+  if i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon) {
+    return None
+  }
+  let t = tokens[i]
+  let mut cur = -1
+  if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent ||
+  t.kind == TokenKind::StringLit || t.kind == TokenKind::InterpString ||
+  t.kind == TokenKind::RawMultiline || t.kind == TokenKind::InterpMultiline ||
+  t.kind == TokenKind::IntLit || t.kind == TokenKind::FloatLit || t.kind == TokenKind::CharLit {
+    cur = i + 1
+  } else if t.kind == TokenKind::PkgRef {
+    if i + 2 < end && tokens[i + 1].kind == TokenKind::Dot {
+      cur = i + 3
+    } else {
+      return None
+    }
+  } else if t.kind == TokenKind::LParen {
+    if is_arrow_fn_at(tokens, i, end) >= 0 {
+      return None
+    }
+    cur = find_matching_delim(tokens, i) + 1
+  } else if t.kind == TokenKind::LBracket {
+    cur = find_matching_delim(tokens, i) + 1
+  } else {
+    return None
+  }
+  let mut first_pad_dot = -1
+  while cur < end {
+    let ck = tokens[cur].kind
+    if ck == TokenKind::Dot && cur + 2 < end && tokens[cur + 1].kind == TokenKind::Ident &&
+    (tokens[cur + 1].raw == "pad_start" || tokens[cur + 1].raw == "pad_end") &&
+    tokens[cur + 2].kind == TokenKind::LParen && !tokens[cur + 2].newline_before {
+      first_pad_dot = cur
+      break
+    }
+    if ck == TokenKind::LBracket && !tokens[cur].newline_before {
+      let cbr = find_matching_delim(tokens, cur)
+      if find_slice_colon(tokens, cur, cbr) >= 0 {
+        return None
+      }
+      cur = cbr + 1
+    } else if ck == TokenKind::LParen && !tokens[cur].newline_before {
+      cur = find_matching_delim(tokens, cur) + 1
+    } else if ck == TokenKind::Dot && cur + 1 < end &&
+    (tokens[cur + 1].kind == TokenKind::Ident || tokens[cur + 1].kind == TokenKind::IntLit) {
+      cur = cur + 2
+    } else if ck == TokenKind::ColonColon && cur + 1 < end &&
+    (tokens[cur + 1].kind == TokenKind::Ident || tokens[cur + 1].kind == TokenKind::UpperIdent) {
+      cur = cur + 2
+    } else {
+      break
+    }
+  }
+  if first_pad_dot < 0 {
+    return None
+  }
+  if !is_known_string_expr_before_pad(ctx, tokens, i, first_pad_dot) {
+    return None
+  }
+  let first_lp = first_pad_dot + 2
+  let first_rp = find_matching_delim(tokens, first_lp)
+  if first_rp <= first_lp + 1 {
+    return None
+  }
+  let trivia = t.leading_trivia
+  let mut expr_s = lower_expr_range(ctx, tokens, i, first_pad_dot, file, false).trim()
+  let mut pos = first_pad_dot
+  let mut wrapped_any = false
+  while pos + 2 < end && tokens[pos].kind == TokenKind::Dot && tokens[pos + 1].kind == TokenKind::Ident &&
+  (tokens[pos + 1].raw == "pad_start" || tokens[pos + 1].raw == "pad_end") &&
+  tokens[pos + 2].kind == TokenKind::LParen && !tokens[pos + 2].newline_before {
+    let mname = tokens[pos + 1].raw
+    let lp = pos + 2
+    let rp = find_matching_delim(tokens, lp)
+    if rp <= lp + 1 {
+      break
+    }
+    let arg_spans : Array[(Int, Int)] = []
+    let mut ai = lp + 1
+    while ai < rp {
+      if tokens[ai].kind == TokenKind::Comma {
+        ai = ai + 1
+        continue
+      }
+      let mut ae = ai
+      let mut ad = 0
+      while ae < rp {
+        let ak = tokens[ae].kind
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+        else if ad == 0 && ak == TokenKind::Comma { break }
+        ae = ae + 1
+      }
+      if ae > ai {
+        arg_spans.push((ai, ae))
+      }
+      ai = ae + 1
+    }
+    if arg_spans.length() != 2 {
+      break
+    }
+    push_expected_type(ctx, "")
+    let a0 = lower_expr_range(ctx, tokens, arg_spans[0].0, arg_spans[0].1, file, false).trim()
+    let a1 = lower_expr_range(ctx, tokens, arg_spans[1].0, arg_spans[1].1, file, false).trim()
+    pop_expected_type(ctx)
+    let helper = if mname == "pad_start" { "mbt_compat::str_pad_start" } else { "mbt_compat::str_pad_end" }
+    expr_s = helper + "(" + expr_s + ", " + a0 + ", " + a1 + ")"
+    pos = rp + 1
+    wrapped_any = true
+  }
+  if !wrapped_any {
+    return None
+  }
+  Some((trivia + expr_s, pos))
+}
+
 ///| Lower one token or compound syntactic form starting at `i` within `[i, end)`.
 ///| Returns `(lowered_text, next_token_index)`.
 fn lower_one_token_or_form(
@@ -9433,6 +10057,14 @@ fn lower_one_token_or_form(
   if !in_pattern {
     match try_lower_general_postfix_slice(ctx, tokens, i, end, file) {
       Some((scode, next_i)) => return (scode, next_i)
+      None => ()
+    }
+  }
+
+  // 0c. Postfix `String::pad_start` / `String::pad_end` on known `String` receivers
+  if !in_pattern {
+    match try_lower_string_pad_postfix(ctx, tokens, i, end, file) {
+      Some((pcode, next_i)) => return (pcode, next_i)
       None => ()
     }
   }
@@ -9954,12 +10586,31 @@ fn lower_one_token_or_form(
     }
   }
 
-  // 1b3. `return <expr>`: push enclosing function return type for expected-type enum disambiguation
-  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "return" && ctx.cur_fn_ret_ty.length() > 0 {
+  // 1b3. `return [<expr>]`: unwind active `defer` frames in LIFO order and push enclosing return type
+  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "return" {
+    let active_defers = collect_active_defers_for_return(ctx)
     let next_i = i + 1
-    if next_i < end && !tokens[next_i].newline_before &&
+    let has_ret_expr = next_i < end && !tokens[next_i].newline_before &&
     tokens[next_i].kind != TokenKind::RBrace && tokens[next_i].kind != TokenKind::Semi &&
-    tokens[next_i].kind != TokenKind::RParen && tokens[next_i].kind != TokenKind::Comma {
+    tokens[next_i].kind != TokenKind::RParen && tokens[next_i].kind != TokenKind::Comma
+    if active_defers.length() > 0 {
+      if has_ret_expr {
+        let expr_end = find_expr_end(tokens, next_i, end)
+        if expr_end > next_i {
+          if ctx.cur_fn_ret_ty.length() > 0 {
+            push_expected_type(ctx, ctx.cur_fn_ret_ty)
+          }
+          let expr_s = lower_expr_range(ctx, tokens, next_i, expr_end, file, false)
+          if ctx.cur_fn_ret_ty.length() > 0 {
+            pop_expected_type(ctx)
+          }
+          let ret_tmp = fresh_temp(ctx, "defer_ret")
+          return (trivia + "{ let " + ret_tmp + " = " + expr_s.trim() + "\n" + render_defer_stmts(active_defers) + "\nreturn " + ret_tmp + " }", expr_end)
+        }
+      }
+      return (trivia + "{\n" + render_defer_stmts(active_defers) + "\nreturn }", i + 1)
+    }
+    if ctx.cur_fn_ret_ty.length() > 0 && has_ret_expr {
       let expr_end = find_expr_end(tokens, next_i, end)
       if expr_end > next_i {
         push_expected_type(ctx, ctx.cur_fn_ret_ty)
@@ -9967,6 +10618,48 @@ fn lower_one_token_or_form(
         pop_expected_type(ctx)
         return (trivia + "return" + expr_s, expr_end)
       }
+    }
+  }
+
+  // 1b3b. `break` / `continue`: unwind active loop-body `defer` frames (fail-closed on labeled jumps crossing defer)
+  if !in_pattern && t.kind == TokenKind::Keyword && (t.raw == "break" || t.raw == "continue") {
+    let is_labeled_jump = i + 2 < end && !tokens[i + 1].newline_before &&
+    tokens[i + 1].kind == TokenKind::Ident && tokens[i + 2].kind == TokenKind::Tilde
+    if is_labeled_jump {
+      if has_active_defers_in_fn(ctx) {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "labeled `" + t.raw + "` crossing active `defer` is not supported"))
+      }
+    } else {
+      let loop_defers = collect_active_defers_for_loop_jump(ctx)
+      if loop_defers.length() > 0 {
+        let next_i = i + 1
+        let has_operand = next_i < end && !tokens[next_i].newline_before &&
+        tokens[next_i].kind != TokenKind::RBrace && tokens[next_i].kind != TokenKind::Semi &&
+        tokens[next_i].kind != TokenKind::RParen && tokens[next_i].kind != TokenKind::Comma
+        if t.raw == "continue" && has_operand {
+          ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "value-carrying `continue` crossing active `defer` is not supported"))
+        } else if t.raw == "break" && has_operand {
+          let expr_end = find_expr_end(tokens, next_i, end)
+          if expr_end > next_i {
+            let expr_s = lower_expr_range(ctx, tokens, next_i, expr_end, file, false)
+            let brk_tmp = fresh_temp(ctx, "defer_brk")
+            return (trivia + "{ let " + brk_tmp + " = " + expr_s.trim() + "\n" + render_defer_stmts(loop_defers) + "\nbreak " + brk_tmp + " }", expr_end)
+          }
+        }
+        return (trivia + "{\n" + render_defer_stmts(loop_defers) + "\n" + t.raw + " }", i + 1)
+      }
+    }
+  }
+
+  // 1b3c. Unlowered `raise`, postfix `?`, or `try?`/`try!` crossing active `defer`: fail-closed
+  if !in_pattern && has_active_defers_in_fn(ctx) {
+    if t.kind == TokenKind::Keyword && t.raw == "raise" {
+      ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "`raise` crossing active `defer` is not supported"))
+    } else if t.kind == TokenKind::Question && i > 0 && !t.newline_before {
+      ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "error propagation `?` crossing active `defer` is not supported"))
+    } else if (t.kind == TokenKind::Keyword || t.kind == TokenKind::Ident) && t.raw == "try" &&
+    i + 1 < end && (tokens[i + 1].kind == TokenKind::Question || tokens[i + 1].kind == TokenKind::Bang) {
+      ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "`try?`/`try!` crossing active `defer` is not supported"))
     }
   }
 
@@ -10080,7 +10773,7 @@ fn lower_one_token_or_form(
       let cond_s = lower_cond_with_is_binders(ctx, tokens, i + 1, lb, file)
       pop_expected_type(ctx)
       push_expected_type(ctx, "")
-      let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+      let body_s = lower_block_range_frame(ctx, tokens, lb, close_b, file, "", "loop")
       restore_expected_type_stack(ctx, saved_w_exp)
       restore_scope_vars(ctx, saved_w_sc)
       restore_ident_renames(ctx, saved_w_rn)
@@ -10212,7 +10905,7 @@ fn lower_one_token_or_form(
             }
           }
         }
-        let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+        let body_s = lower_block_range_frame(ctx, tokens, lb, close_b, file, "", "loop")
         // Lower tuple-destructuring `for (a, b) in xs { ... }` and `for i, (a, b) in xs { ... }`
         // BEFORE restoring `ctx.ident_renames` / `ctx.scope_vars` so bindings match the renamed body!
         let mut tuple_out : Option[String] = None
@@ -10346,7 +11039,7 @@ fn lower_one_token_or_form(
         }
         shadow_lifted_local_fns(ctx, raw_loop_vars)
         let rest_hdr = lower_expr_range(ctx, tokens, semi1, lb, file, false)
-        let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+        let body_s = lower_block_range_frame(ctx, tokens, lb, close_b, file, "", "loop")
         restore_expected_type_stack(ctx, saved_cfor_exp)
         restore_scope_vars(ctx, saved_for_sc)
         restore_ident_renames(ctx, saved_for_rn)
@@ -10417,7 +11110,7 @@ fn lower_one_token_or_form(
       ctx.cur_fn_ret_ty = exp_ret_ty
       push_expected_type(ctx, exp_ret_ty)
       ctx.in_closure_depth = ctx.in_closure_depth + 1
-      let mut body = lower_block_range(ctx, tokens, cur, close_b, file, p_pre)
+      let mut body = lower_block_range_frame(ctx, tokens, cur, close_b, file, p_pre, "fn")
       if exp_ret_ty == "Double" {
         let bt = body.trim()
         if bt.starts_with("{") && bt.ends_with("}") && bt.length() >= 3 {
@@ -10578,7 +11271,7 @@ fn lower_one_token_or_form(
       ctx.in_closure_depth = ctx.in_closure_depth + 1
       if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
         let body_close = find_matching_delim(tokens, body_start)
-        let mut body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+        let mut body = lower_block_range_frame(ctx, tokens, body_start, body_close, file, "", "fn")
         if exp_arr_ret == "Double" {
           let bt = body.trim()
           if bt.starts_with("{") && bt.ends_with("}") && bt.length() >= 3 {
@@ -10598,7 +11291,9 @@ fn lower_one_token_or_form(
         return (trivia + "fn(" + p_str + ") " + body, body_close + 1)
       }
       let body_end = find_expr_end(tokens, body_start, end)
+      ctx.defer_frames.push(DeferFrame::{ kind: "fn", defers: [] })
       let raw_body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+      let _ = ctx.defer_frames.pop()
       let body_expr = if exp_arr_ret == "Double" {
         coerce_standalone_int_to_double_f42(raw_body_expr)
       } else {
@@ -10770,7 +11465,7 @@ fn lower_one_token_or_form(
     ctx.in_closure_depth = ctx.in_closure_depth + 1
     if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
       let body_close = find_matching_delim(tokens, body_start)
-      let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+      let body = lower_block_range_frame(ctx, tokens, body_start, body_close, file, "", "fn")
       ctx.in_closure_depth = ctx.in_closure_depth - 1
       ctx.cur_fn_ret_ty = saved_arr1_ret
       restore_expected_type_stack(ctx, saved_arr1_exp)
@@ -10780,7 +11475,9 @@ fn lower_one_token_or_form(
       return (trivia + "fn(" + pname + ") " + body, body_close + 1)
     }
     let body_end = find_expr_end(tokens, body_start, end)
+    ctx.defer_frames.push(DeferFrame::{ kind: "fn", defers: [] })
     let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+    let _ = ctx.defer_frames.pop()
     ctx.in_closure_depth = ctx.in_closure_depth - 1
     ctx.cur_fn_ret_ty = saved_arr1_ret
     restore_expected_type_stack(ctx, saved_arr1_exp)
@@ -10793,6 +11490,9 @@ fn lower_one_token_or_form(
   // 3. Nested `{ ... }` block, Map literal, Ref literal `{ val: e }`, or anonymous struct literal `S::{ ... }`
   if !in_pattern && (t.kind == TokenKind::Keyword || t.kind == TokenKind::Ident) &&
   t.raw == "try" && i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace {
+    if has_active_defers_in_fn(ctx) {
+      ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, t.line, t.col, "`try` crossing active `defer` is not supported"))
+    }
     let close_tb = find_matching_delim(tokens, i + 1)
     ctx.in_try_catch_depth = ctx.in_try_catch_depth + 1
     let tbody = lower_block_range(ctx, tokens, i + 1, close_tb, file, "")
@@ -13264,6 +13964,31 @@ fn lower_one_token_or_form(
       if has_old_or_new {
         let inner = lower_expr_range(ctx, tokens, next_i + 1, close_p, file, false)
         return (trivia + "__mbt_str_replace" + tokens[next_i].leading_trivia + "(" + inner + tokens[close_p].leading_trivia + ")", close_p + 1)
+      }
+    }
+
+    // `.to_string(radix=...)` / `.to_string(radix~)` -> `.__mbt_int_to_string(...)` so Stage B routes
+    // integer radix formatting to `mbt_compat::int*_to_string_radix` (Pion's built-in `to_string` is base-10 only),
+    // while restoring `.to_string(...)` for non-integer receivers.
+    if !in_pattern && prev_dot && t.raw == "to_string" && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before {
+      let close_p = find_matching_delim(tokens, next_i)
+      let mut has_radix = false
+      let mut ri = next_i + 1
+      let mut rd = 0
+      while ri < close_p {
+        let rk = tokens[ri].kind
+        if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+        else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+        else if rd == 0 && rk == TokenKind::Ident && tokens[ri].raw == "radix" &&
+        ri + 1 < close_p && (tokens[ri + 1].kind == TokenKind::Eq || tokens[ri + 1].kind == TokenKind::Tilde) {
+          has_radix = true
+          break
+        }
+        ri = ri + 1
+      }
+      if has_radix {
+        let inner = lower_expr_range(ctx, tokens, next_i + 1, close_p, file, false)
+        return (trivia + "__mbt_int_to_string" + tokens[next_i].leading_trivia + "(" + inner + tokens[close_p].leading_trivia + ")", close_p + 1)
       }
     }
 
@@ -21101,7 +21826,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let init_name = "__mbt_init_" + file_id + "_" + init_seq_in_file.to_string()
         let saved_li = ctx.cur_lowering_init
         ctx.cur_lowering_init = true
-        let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
+        ctx.boxed_mut_vars.clear()
+        prescan_boxed_mut_vars(tokens, lb, rb, ctx.boxed_mut_vars)
+        let body = lower_block_range_frame(ctx, tokens, lb, rb, sf.rel_path, "", "fn")
+        ctx.boxed_mut_vars.clear()
         ctx.cur_lowering_init = saved_li
         let (refs, calls, arg_closures) = collect_init_refs_full(tokens, lb, rb + 1)
         let init_target = if sf.is_test { ctx.test_init_items } else { ctx.init_items }
@@ -22062,7 +22790,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             ctx.scope_vars.push(ScopeVar::{ name: ip.0, ty: ip.1, is_mut: false, is_boxed: false })
           }
         }
-        let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, p_pre)
+        ctx.boxed_mut_vars.clear()
+        prescan_boxed_mut_vars(tokens, lb, rb, ctx.boxed_mut_vars)
+        let body = lower_block_range_frame(ctx, tokens, lb, rb, sf.rel_path, p_pre, "fn")
+        ctx.boxed_mut_vars.clear()
         restore_ident_renames(ctx, saved_impl_rn)
         restore_scope_vars(ctx, saved_impl_sc)
         let ikey = trait_name + "|" + self_ty
@@ -22929,7 +23660,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let rb = find_matching_delim(tokens, lb)
         let saved_tb = ctx.cur_in_test_block
         ctx.cur_in_test_block = true
-        let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
+        ctx.boxed_mut_vars.clear()
+        prescan_boxed_mut_vars(tokens, lb, rb, ctx.boxed_mut_vars)
+        let body = lower_block_range_frame(ctx, tokens, lb, rb, sf.rel_path, "", "fn")
+        ctx.boxed_mut_vars.clear()
         ctx.cur_in_test_block = saved_tb
         let decl_code = "test " + tname + " " + body
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)
