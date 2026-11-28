@@ -235,6 +235,7 @@ pub struct QbeGen {
   /// holds (see `qbe_ret_default_methods`).
   mut ret_default_methods : Option[Map[String, Bool]]
   dyn_vtables : Array[String]
+  clo_env_consts : Array[String]
   extra_fns : Array[String]
   mono_seen : Map[String, Bool]
   mono_queue : Array[QbeMonoReq]
@@ -23379,6 +23380,7 @@ fn qbe_new_for_target_name(
     extern_c_syms: None,
     ret_default_methods: None,
     dyn_vtables: [],
+    clo_env_consts: [],
     extra_fns: [],
     mono_seen: Map([]),
     mono_queue: [],
@@ -32036,7 +32038,9 @@ fn qbe_emit_closure_call(
     qbe_rc_dec(g, arg_vals[j], arg_tys[j])
     j = j + 1
   }
-  qbe_emit(g, "call $pion_rc_dec(l " + clo_val + ")")
+  if !g.immortal_regs.contains(clo_val) {
+    qbe_emit(g, "call $pion_rc_dec(l " + clo_val + ")")
+  }
   res
 }
 
@@ -33062,115 +33066,132 @@ fn qbe_emit_closure_obj(
     tpi = tpi + 1
   }
 
-  let n_slots = 1 + cap_locals.length() + cap_tparams.length()
-  let drop_slots : Array[Int] = []
-  let mut has_tparam_cap = false
-  let mut mi = 0
-  while mi < cap_locals.length() {
-    if cap_locals[mi].is_cell || qbe_is_obj_ty(g, cap_locals[mi].ty) {
-      drop_slots.push(mi + 1)
-    } else {
-      match cap_locals[mi].ty {
-        TParam(tn) =>
-          if str_arr_contains(cap_tparams, tn) {
-            has_tparam_cap = true
-          }
-        _ => ()
-      }
-    }
-    mi = mi + 1
-  }
-  let drop_sym = if has_tparam_cap {
-    let dsym = "$pion_drop_clo_" + clo_id.to_string()
-    qbe_record_sym(g, dsym, "drop(closure#" + clo_id.to_string() + ")", "drop", sp.file, sp.line)
-    let dsb = StringBuilder()
-    dsb.write_string("function " + dsym + "(l %p) {\n@start\n")
-    let mut di = 0
-    while di < cap_locals.length() {
-      let cty = cap_locals[di].ty
-      let off = (di + 1) * 8
-      if cap_locals[di].is_cell || qbe_is_obj_ty(g, cty) {
-        dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
-        dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
-        dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
+  let env_obj = qbe_tmp(g)
+  let mut ki = 0
+  if cap_locals.length() == 0 && cap_tparams.length() == 0 && !is_spawn {
+    let env_sym = "$__pion_clo_env_" +
+      g.pkg_prefix +
+      clo_id.to_string() +
+      "_hdr"
+    g.clo_env_consts.push(
+      "data " +
+      env_sym +
+      " = align 8 { w 0, w 0, w 1, h 6, h 3, l 0, l " +
+      fn_sym +
+      " }\n",
+    )
+    qbe_emit(g, env_obj + " =l add " + env_sym + ", 24")
+    g.immortal_regs.set(env_obj, true)
+  } else {
+    let n_slots = 1 + cap_locals.length() + cap_tparams.length()
+    let drop_slots : Array[Int] = []
+    let mut has_tparam_cap = false
+    let mut mi = 0
+    while mi < cap_locals.length() {
+      if cap_locals[mi].is_cell || qbe_is_obj_ty(g, cap_locals[mi].ty) {
+        drop_slots.push(mi + 1)
       } else {
-        match cty {
-          TParam(tn) => {
-            let mut found_ti = -1
-            let mut tj = 0
-            while tj < cap_tparams.length() {
-              if cap_tparams[tj] == tn {
-                found_ti = tj
-                break
-              }
-              tj = tj + 1
+        match cap_locals[mi].ty {
+          TParam(tn) =>
+            if str_arr_contains(cap_tparams, tn) {
+              has_tparam_cap = true
             }
-            if found_ti >= 0 {
-              let tp_off = (1 + cap_locals.length() + found_ti) * 8
-              dsb.write_string("    %tp_a" + di.to_string() + " =l add %p, " + tp_off.to_string() + "\n")
-              dsb.write_string("    %tp_f" + di.to_string() + " =l loadl %tp_a" + di.to_string() + "\n")
-              dsb.write_string("    %tp_fw" + di.to_string() + " =w cnel %tp_f" + di.to_string() + ", 0\n")
-              dsb.write_string("    jnz %tp_fw" + di.to_string() + ", @do_" + di.to_string() + ", @sk_" + di.to_string() + "\n")
-              dsb.write_string("@do_" + di.to_string() + "\n")
-              dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
-              dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
-              dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
-              dsb.write_string("    jmp @sk_" + di.to_string() + "\n")
-              dsb.write_string("@sk_" + di.to_string() + "\n")
-            }
-          }
           _ => ()
         }
       }
-      di = di + 1
+      mi = mi + 1
     }
-    dsb.write_string("    ret\n}\n\n")
-    g.extra_fns.push(dsb.to_string())
-    dsym
-  } else {
-    qbe_register_slot_drop(g, drop_slots)
-  }
-  let env_obj = qbe_tmp(g)
-  qbe_emit(
-    g,
-    env_obj +
-    " =l call $pion_alloc_uninit(w " +
-    (n_slots * 8).to_string() +
-    ", w 6, l " +
-    drop_sym +
-    ")",
-  )
-  qbe_emit(g, "storel " + fn_sym + ", " + env_obj)
-  let mut ki = 0
-  while ki < cap_locals.length() {
-    let loc = cap_locals[ki]
-    let v = if loc.is_cell {
-      let cell_p = qbe_tmp(g)
-      qbe_emit(g, cell_p + " =l loadl " + loc.slot)
-      qbe_emit(g, "call $pion_rc_inc(l " + cell_p + ")")
-      cell_p
-    } else {
-      let dv = qbe_load_local_slot(g, loc.slot, loc.ty)
-      let lv = qbe_as_l(g, qval(dv, loc.ty))
-      if is_spawn {
-        qbe_emit_deep_freeze(g, lv, loc.ty)
+    let drop_sym = if has_tparam_cap {
+      let dsym = "$pion_drop_clo_" + clo_id.to_string()
+      qbe_record_sym(g, dsym, "drop(closure#" + clo_id.to_string() + ")", "drop", sp.file, sp.line)
+      let dsb = StringBuilder()
+      dsb.write_string("function " + dsym + "(l %p) {\n@start\n")
+      let mut di = 0
+      while di < cap_locals.length() {
+        let cty = cap_locals[di].ty
+        let off = (di + 1) * 8
+        if cap_locals[di].is_cell || qbe_is_obj_ty(g, cty) {
+          dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
+          dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
+          dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
+        } else {
+          match cty {
+            TParam(tn) => {
+              let mut found_ti = -1
+              let mut tj = 0
+              while tj < cap_tparams.length() {
+                if cap_tparams[tj] == tn {
+                  found_ti = tj
+                  break
+                }
+                tj = tj + 1
+              }
+              if found_ti >= 0 {
+                let tp_off = (1 + cap_locals.length() + found_ti) * 8
+                dsb.write_string("    %tp_a" + di.to_string() + " =l add %p, " + tp_off.to_string() + "\n")
+                dsb.write_string("    %tp_f" + di.to_string() + " =l loadl %tp_a" + di.to_string() + "\n")
+                dsb.write_string("    %tp_fw" + di.to_string() + " =w cnel %tp_f" + di.to_string() + ", 0\n")
+                dsb.write_string("    jnz %tp_fw" + di.to_string() + ", @do_" + di.to_string() + ", @sk_" + di.to_string() + "\n")
+                dsb.write_string("@do_" + di.to_string() + "\n")
+                dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
+                dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
+                dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
+                dsb.write_string("    jmp @sk_" + di.to_string() + "\n")
+                dsb.write_string("@sk_" + di.to_string() + "\n")
+              }
+            }
+            _ => ()
+          }
+        }
+        di = di + 1
       }
-      qbe_rc_inc(g, lv, loc.ty)
-      lv
+      dsb.write_string("    ret\n}\n\n")
+      g.extra_fns.push(dsb.to_string())
+      dsym
+    } else {
+      qbe_register_slot_drop(g, drop_slots)
     }
-    let off = (ki + 1) * 8
-    let p = qbe_tmp(g)
-    qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
-    qbe_emit(g, "storel " + v + ", " + p)
-    ki = ki + 1
-  }
-  tpi = 0
-  while tpi < cap_tparams.length() {
-    let off = (1 + cap_locals.length() + tpi) * 8
-    let p = qbe_tmp(g)
-    qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
-    qbe_emit(g, "storel %tp_" + cap_tparams[tpi] + ", " + p)
-    tpi = tpi + 1
+    qbe_emit(
+      g,
+      env_obj +
+      " =l call $pion_alloc_uninit(w " +
+      (n_slots * 8).to_string() +
+      ", w 6, l " +
+      drop_sym +
+      ")",
+    )
+    qbe_emit(g, "storel " + fn_sym + ", " + env_obj)
+    ki = 0
+    while ki < cap_locals.length() {
+      let loc = cap_locals[ki]
+      let v = if loc.is_cell {
+        let cell_p = qbe_tmp(g)
+        qbe_emit(g, cell_p + " =l loadl " + loc.slot)
+        qbe_emit(g, "call $pion_rc_inc(l " + cell_p + ")")
+        cell_p
+      } else {
+        let dv = qbe_load_local_slot(g, loc.slot, loc.ty)
+        let lv = qbe_as_l(g, qval(dv, loc.ty))
+        if is_spawn {
+          qbe_emit_deep_freeze(g, lv, loc.ty)
+        }
+        qbe_rc_inc(g, lv, loc.ty)
+        lv
+      }
+      let off = (ki + 1) * 8
+      let p = qbe_tmp(g)
+      qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
+      qbe_emit(g, "storel " + v + ", " + p)
+      ki = ki + 1
+    }
+    tpi = 0
+    while tpi < cap_tparams.length() {
+      let off = (1 + cap_locals.length() + tpi) * 8
+      let p = qbe_tmp(g)
+      qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
+      qbe_emit(g, "storel %tp_" + cap_tparams[tpi] + ", " + p)
+      tpi = tpi + 1
+    }
   }
 
   let saved_allocs = g.fn_allocs
@@ -45947,8 +45968,11 @@ fn qbe_emit_expr_inner(
                       qbe_emit(g, clo_v + " =l loadl " + cell_p)
                     } else {
                       qbe_emit(g, clo_v + " =l loadl " + loc.slot)
+                      if g.immortal_slots.contains(loc.slot) {
+                        g.immortal_regs.set(clo_v, true)
+                      }
                     }
-                    qbe_emit(g, "call $pion_rc_inc(l " + clo_v + ")")
+                    qbe_rc_inc(g, clo_v, loc.ty)
                     let arg_vals : Array[String] = []
                     let arg_tys : Array[Ty] = []
                     let guards = qbe_arg_guards_in_order(g, args)
@@ -46593,7 +46617,9 @@ fn qbe_emit_expr_inner(
             qbe_emit_lbl(g, l_body)
             let iw = qbe_tmp(g)
             qbe_emit(g, iw + " =w copy " + ci)
-            qbe_emit(g, "call $pion_rc_inc(l " + fn_v.reg + ")")
+            if !g.immortal_regs.contains(fn_v.reg) {
+              qbe_emit(g, "call $pion_rc_inc(l " + fn_v.reg + ")")
+            }
             let res_l = qbe_emit_closure_call(g, fn_v.reg, [iw], [TInt])
             match qbe_flat_pod_struct_info(g, elem) {
               Some(sinfo) => {
@@ -62258,6 +62284,14 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
     dvi = dvi + 1
   }
   if g.dyn_vtables.length() > 0 {
+    out.write_string("\n")
+  }
+  let mut cei = 0
+  while cei < g.clo_env_consts.length() {
+    out.write_string(g.clo_env_consts[cei])
+    cei = cei + 1
+  }
+  if g.clo_env_consts.length() > 0 {
     out.write_string("\n")
   }
   let mut i = 0

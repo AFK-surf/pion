@@ -1071,3 +1071,133 @@ test "qbe_rodata_and_bss_data_sections" {
   let wasm_bytes = emit_wasm_from_ssa(pkg_ssa)
   assert_true(wasm_bytes.length() > 8, "emit_wasm_from_ssa must succeed on .rodata/.bss SSA")
 }
+
+///|
+test "w1a_captureless_closure_static_hoist_native_and_wasm" {
+  // 1. Captureless closure in a loop hoists to a static immortal env data symbol
+  //    with zero heap allocation and zero RC; capturing closure, polymorphic generic
+  //    closure (cap_tparams > 0), and spawn still heap-allocate.
+  let src =
+    #|fn apply(f : (Int) -> Int, x : Int) -> Int {
+    #|  f(x)
+    #|}
+    #|
+    #|fn hoist_loop(n : Int) -> Int {
+    #|  let mut acc = 0
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    let f = fn(x : Int) -> Int { x + 1 }
+    #|    acc = acc + f(i)
+    #|    i = i + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|fn cap_local(k : Int) -> Int {
+    #|  let f = fn(x : Int) -> Int { x + k }
+    #|  apply(f, 10)
+    #|}
+    #|
+    #|fn poly_clo[T](v : T) -> T {
+    #|  let f = fn(x : T) -> T { x }
+    #|  f(v)
+    #|}
+    #|
+    #|pub fn main(w : World) -> Int {
+    #|  let a = hoist_loop(5)
+    #|  let b = cap_local(3)
+    #|  let c = poly_clo(7)
+    #|  let mut d = 0
+    #|  scope(w, fn(s : Scope) {
+    #|    spawn(s, fn() {
+    #|      let _ = 1 + 1
+    #|    })
+    #|  })
+    #|  a + b + c + d
+    #|}
+    #|
+  let pkg = parse_package("clo_pkg", ["clo.pion"], [src])
+  let tc = build_typechecker_for_codegen(pkg)
+  let ssa = emit_qbe_package_with_tc(pkg, tc, true).ssa
+
+  // Static immortal closure env definition uses writable .data (holds function ptr reloc)
+  // and 24-byte immortal PionHeader (type_tag=6 Closure, flags=3 FROZEN|IMMORTAL, drop=0).
+  assert_true(
+    ssa.contains("data $__pion_clo_env_0_hdr = align 8 { w 0, w 0, w 1, h 6, h 3, l 0, l $pion_clo_0 }"),
+    "captureless closure must emit static immortal data symbol:\n" + ssa,
+  )
+
+  // hoist_loop must address the static env (+24) with zero heap alloc and zero RC
+  let hl_fn = qso_extract_fn(ssa, "$pion_fn_hoist_loop")
+  assert_true(
+    hl_fn.contains("=l add $__pion_clo_env_0_hdr, 24"),
+    "hoist_loop must use static closure env address:\n" + hl_fn,
+  )
+  assert_true(
+    !hl_fn.contains("call $pion_alloc_uninit("),
+    "hoist_loop must not heap-allocate captureless closure:\n" + hl_fn,
+  )
+  assert_true(
+    !hl_fn.contains("call $pion_rc_inc(") && !hl_fn.contains("call $pion_rc_dec("),
+    "hoist_loop must emit zero RC for immortal closure:\n" + hl_fn,
+  )
+
+  // Capturing closure must still heap-allocate
+  let cap_fn = qso_extract_fn(ssa, "$pion_fn_cap_local")
+  assert_true(
+    cap_fn.contains("call $pion_alloc_uninit("),
+    "capturing closure must still heap-allocate:\n" + cap_fn,
+  )
+
+  // Polymorphic generic closure (cap_tparams > 0) must NOT be statically hoisted
+  let poly_fn = qso_extract_fn(ssa, "$pion_fn_poly_clo")
+  assert_true(
+    poly_fn.contains("call $pion_alloc_uninit("),
+    "polymorphic generic closure with cap_tparams must still heap-allocate:\n" + poly_fn,
+  )
+  assert_true(
+    !poly_fn.contains("$__pion_clo_env_"),
+    "polymorphic generic closure must not use static env:\n" + poly_fn,
+  )
+
+  // spawn closure must NOT be statically hoisted
+  let main_fn = qso_extract_fn(ssa, "$pion_fn_main")
+  assert_true(
+    main_fn.contains("call $pion_alloc_uninit("),
+    "spawn closure must still heap-allocate:\n" + main_fn,
+  )
+
+  // 2. Multi-package Wasm32: two packages with captureless closures alpha-renamed
+  //    via wasm_namespace_local_ssa must compile cleanly with zero collision.
+  let pkg_a_src =
+    #|pub fn run_a(x : Int) -> Int {
+    #|  let f = fn(v : Int) -> Int { v + 10 }
+    #|  f(x)
+    #|}
+    #|
+  let pkg_b_src =
+    #|pub fn run_b(x : Int) -> Int {
+    #|  let f = fn(v : Int) -> Int { v * 3 }
+    #|  f(x)
+    #|}
+    #|
+  let pa = parse_package("pkg_a", ["a.pion"], [pkg_a_src])
+  let tca = build_typechecker_for_codegen(pa)
+  let pb = parse_package("pkg_b", ["b.pion"], [pkg_b_src])
+  let tcb = build_typechecker_for_codegen(pb)
+  let ssa_a = wasm_namespace_local_ssa(emit_qbe_package_with_tc(pa, tca, true).ssa, "p_a__")
+  let ssa_b = wasm_namespace_local_ssa(emit_qbe_package_with_tc(pb, tcb, true).ssa, "p_b__")
+  assert_true(
+    ssa_a.contains("data $p_a____pion_clo_env_0_hdr = align 8 { w 0, w 0, w 1, h 6, h 3, l 0, l $p_a__pion_clo_0 }"),
+    "pkg A static closure env and fn_sym must both be namespaced:\n" + ssa_a,
+  )
+  assert_true(
+    ssa_b.contains("data $p_b____pion_clo_env_0_hdr = align 8 { w 0, w 0, w 1, h 6, h 3, l 0, l $p_b__pion_clo_0 }"),
+    "pkg B static closure env and fn_sym must both be namespaced:\n" + ssa_b,
+  )
+  let combined_wasm = emit_wasm_from_ssa(ssa_a + "\n" + ssa_b)
+  assert_true(
+    combined_wasm.length() > 8,
+    "multi-package Wasm32 build with static captureless closures must succeed",
+  )
+}

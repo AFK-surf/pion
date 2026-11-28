@@ -180,6 +180,16 @@ pub struct ProfHint {
 }
 
 ///|
+pub struct ProfBackingSite {
+  name : String
+  file : String
+  line : Int
+  bytes : Int64
+  count : Int64
+  share_pct : Double
+}
+
+///|
 pub struct ProfReport {
   schema_version : Int
   target : String
@@ -203,6 +213,7 @@ pub struct ProfReport {
   by_type_tag : Array[ProfTagRow]
   by_type : Array[ProfTypeRow]
   top_functions : Array[ProfFuncEntry]
+  backing_top_sites : Array[ProfBackingSite]
   hints : Array[ProfHint]
 }
 
@@ -1372,6 +1383,94 @@ fn prof_get_or_add_func(
 }
 
 ///|
+struct BackingSiteAcc {
+  name : String
+  file : String
+  line : Int
+  mut bytes : Int64
+  mut count : Int64
+}
+
+///|
+fn prof_backing_site_higher(a : ProfBackingSite, b : ProfBackingSite) -> Bool {
+  if a.bytes != b.bytes {
+    return a.bytes > b.bytes
+  }
+  if a.count != b.count {
+    return a.count > b.count
+  }
+  if a.name != b.name {
+    return a.name < b.name
+  }
+  if a.file != b.file {
+    return a.file < b.file
+  }
+  a.line < b.line
+}
+
+///|
+fn prof_sort_backing_sites(
+  sites : Array[ProfBackingSite],
+  limit : Int,
+) -> Array[ProfBackingSite] {
+  let n = sites.length()
+  let out : Array[ProfBackingSite] = []
+  let mut i = 0
+  while i < n {
+    out.push(sites[i])
+    i = i + 1
+  }
+  i = 1
+  while i < n {
+    let cur = out[i]
+    let mut j = i - 1
+    while j >= 0 && prof_backing_site_higher(cur, out[j]) {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = cur
+    i = i + 1
+  }
+  if limit > 0 && limit < out.length() {
+    let trimmed : Array[ProfBackingSite] = []
+    let mut k = 0
+    while k < limit {
+      trimmed.push(out[k])
+      k = k + 1
+    }
+    trimmed
+  } else {
+    out
+  }
+}
+
+///|
+fn prof_fmt_1dp(v : Double) -> String {
+  let neg = v < 0.0
+  let av = if neg { 0.0 - v } else { v }
+  let scaled = (av * 10.0 + 0.5).to_int64()
+  let whole = scaled / 10L
+  let frac = scaled % 10L
+  (if neg { "-" } else { "" }) + whole.to_string() + "." + frac.to_string()
+}
+
+///|
+fn prof_fmt_kb(bytes : Int64) -> String {
+  prof_fmt_1dp(bytes.to_double() / 1024.0)
+}
+
+///|
+fn prof_format_site_loc(s : ProfBackingSite) -> String {
+  if s.file.length() > 0 && s.line > 0 {
+    s.file + ":" + s.line.to_string() + " " + s.name
+  } else if s.file.length() > 0 {
+    s.file + " " + s.name
+  } else {
+    s.name
+  }
+}
+
+///|
 fn prof_pct_i64(num : Int64, den : Int64) -> Double {
   if den <= 0L {
     0.0
@@ -1624,6 +1723,8 @@ pub fn prof_build_report(
   }
 
   let mut container_grow_bytes = 0L
+  let grow_sites : Array[BackingSiteAcc] = []
+  let grow_site_idx : Map[String, Int] = Map([])
   let mut si = 0
   while si < raw.stacks.length() {
     let stk = raw.stacks[si]
@@ -1648,6 +1749,35 @@ pub fn prof_build_report(
       }
       if is_grow {
         container_grow_bytes = container_grow_bytes + stk.bytes
+        let mut attr_sym = resolved_frames[0]
+        fi = 0
+        while fi < resolved_frames.length() {
+          let cand = resolved_frames[fi]
+          let cdm = demangle_symbol_with_sidecar(cand, sidecar)
+          if cdm.category == "user" {
+            attr_sym = cand
+            break
+          }
+          fi = fi + 1
+        }
+        let adm = demangle_symbol_with_sidecar(attr_sym, sidecar)
+        let site_key = adm.pretty + "|" + adm.file + "|" + adm.line.to_string()
+        match grow_site_idx.get(site_key) {
+          Some(gi) => {
+            grow_sites[gi].bytes = grow_sites[gi].bytes + stk.bytes
+            grow_sites[gi].count = grow_sites[gi].count + stk.count
+          }
+          None => {
+            grow_site_idx.set(site_key, grow_sites.length())
+            grow_sites.push(BackingSiteAcc::{
+              name: adm.pretty,
+              file: adm.file,
+              line: adm.line,
+              bytes: stk.bytes,
+              count: stk.count,
+            })
+          }
+        }
       }
     } else if resolved_frames.length() > 0 {
       // Attribute alloc/inuse/rc self-cost to the first user frame on the stack
@@ -1730,6 +1860,21 @@ pub fn prof_build_report(
   }
 
   let sorted_fns = prof_sort_funcs(top_functions, "cpu")
+  let raw_backing_sites : Array[ProfBackingSite] = []
+  let mut bsi = 0
+  while bsi < grow_sites.length() {
+    let gs = grow_sites[bsi]
+    raw_backing_sites.push(ProfBackingSite::{
+      name: gs.name,
+      file: gs.file,
+      line: gs.line,
+      bytes: gs.bytes,
+      count: gs.count,
+      share_pct: prof_pct_i64(gs.bytes, container_grow_bytes),
+    })
+    bsi = bsi + 1
+  }
+  let backing_top_sites = prof_sort_backing_sites(raw_backing_sites, 5)
 
   // 4. Generate threshold-gated `hints[]` (RFC v2 §1.6)
   let hints : Array[ProfHint] = []
@@ -1814,11 +1959,25 @@ pub fn prof_build_report(
   if container_grow_bytes >= 262144L && backing.alloc_bytes > 0L {
     let grow_share = prof_pct_i64(container_grow_bytes, backing.alloc_bytes)
     if grow_share >= 30.0 {
+      let mut grow_msg = "Container growth (Array/Map/StrBuf) accounts for >= 30% of backing buffer allocations; pre-size or reuse buffers"
+      if backing_top_sites.length() > 0 {
+        let top_site = backing_top_sites[0]
+        grow_msg = grow_msg +
+        " (top site: " +
+        prof_format_site_loc(top_site) +
+        " — " +
+        prof_fmt_kb(top_site.bytes) +
+        " KB, " +
+        prof_fmt_1dp(top_site.share_pct) +
+        "%, " +
+        top_site.count.to_string() +
+        " calls)"
+      }
       hints.push(ProfHint::{
         code: "H_CONTAINER_GROW_CHURN",
         severity: "high",
         target: "backing",
-        message: "Container growth (Array/Map/StrBuf) accounts for >= 30% of backing buffer allocations; pre-size or reuse buffers",
+        message: grow_msg,
         evidence: ProfHintEvidence::{
           metric: "container_grow_backing_pct",
           value: grow_share,
@@ -1902,6 +2061,7 @@ pub fn prof_build_report(
     by_type_tag: raw.tags,
     by_type,
     top_functions: sorted_fns,
+    backing_top_sites,
     hints,
   }
 }
@@ -2104,6 +2264,29 @@ pub fn prof_report_to_json(rep : ProfReport, top_n : Int, sort_by : String) -> S
     i = i + 1
   }
 
+  sb.write_string("],\"backing_top_sites\":[")
+  i = 0
+  while i < rep.backing_top_sites.length() {
+    if i > 0 {
+      sb.write_char(',')
+    }
+    let s = rep.backing_top_sites[i]
+    sb.write_string("{\"name\":")
+    sb.write_string(json_quote(s.name))
+    sb.write_string(",\"file\":")
+    sb.write_string(json_quote(s.file))
+    sb.write_string(",\"line\":")
+    sb.write_string(s.line.to_string())
+    sb.write_string(",\"bytes\":")
+    sb.write_string(s.bytes.to_string())
+    sb.write_string(",\"count\":")
+    sb.write_string(s.count.to_string())
+    sb.write_string(",\"share_pct\":")
+    sb.write_string(s.share_pct.to_string())
+    sb.write_char('}')
+    i = i + 1
+  }
+
   sb.write_string("],\"hints\":[")
   i = 0
   while i < rep.hints.length() {
@@ -2206,6 +2389,23 @@ pub fn prof_report_to_text(rep : ProfReport, top_n : Int, sort_by : String) -> S
       sb.write_string("B rc=")
       sb.write_string(f.rc_ops.to_string())
       sb.write_string("\n")
+      i = i + 1
+    }
+  }
+  if rep.backing_top_sites.length() > 0 {
+    sb.write_string("Top Backing Grow Sites:\n")
+    let mut i = 0
+    while i < rep.backing_top_sites.length() {
+      let s = rep.backing_top_sites[i]
+      sb.write_string("  ")
+      sb.write_string(prof_format_site_loc(s))
+      sb.write_string(" — ")
+      sb.write_string(prof_fmt_kb(s.bytes))
+      sb.write_string(" KB (")
+      sb.write_string(prof_fmt_1dp(s.share_pct))
+      sb.write_string("%, ")
+      sb.write_string(s.count.to_string())
+      sb.write_string(" calls)\n")
       i = i + 1
     }
   }
@@ -2456,6 +2656,95 @@ fn prof_parse_func_json(txt : String, pos : Array[Int], n : Int) -> Option[ProfF
 }
 
 ///|
+fn prof_parse_backing_site_json(
+  txt : String,
+  pos : Array[Int],
+  n : Int,
+) -> Option[ProfBackingSite] {
+  if !prof_json_expect_char(txt, pos, n, 123) {
+    return None
+  }
+  let mut name = ""
+  let mut file = ""
+  let mut line = 0
+  let mut bytes = 0L
+  let mut count = 0L
+  let mut share_pct = 0.0
+  cas_json_skip_ws(txt, pos, n)
+  if pos[0] < n && str_code_at(txt, pos[0]) == 125 {
+    pos[0] = pos[0] + 1
+    return Some(ProfBackingSite::{
+      name: name,
+      file: file,
+      line: line,
+      bytes: bytes,
+      count: count,
+      share_pct: share_pct,
+    })
+  }
+  while true {
+    cas_json_skip_ws(txt, pos, n)
+    let k = match prof_json_parse_string(txt, pos, n) {
+      Some(s) => s
+      None => return None
+    }
+    if !prof_json_expect_char(txt, pos, n, 58) {
+      return None
+    }
+    if k == "name" {
+      match prof_json_parse_string(txt, pos, n) {
+        Some(v) => name = v
+        None => return None
+      }
+    } else if k == "file" {
+      match prof_json_parse_string(txt, pos, n) {
+        Some(v) => file = v
+        None => return None
+      }
+    } else if k == "line" {
+      match prof_json_parse_i64(txt, pos, n) {
+        Some(v) => line = v.to_int()
+        None => return None
+      }
+    } else if k == "bytes" {
+      match prof_json_parse_i64(txt, pos, n) {
+        Some(v) => bytes = v
+        None => return None
+      }
+    } else if k == "count" {
+      match prof_json_parse_i64(txt, pos, n) {
+        Some(v) => count = v
+        None => return None
+      }
+    } else if k == "share_pct" {
+      match prof_json_parse_double(txt, pos, n) {
+        Some(v) => share_pct = v
+        None => return None
+      }
+    } else if !cas_json_skip_value(txt, pos, n, 0) {
+      return None
+    }
+    cas_json_skip_ws(txt, pos, n)
+    if pos[0] < n && str_code_at(txt, pos[0]) == 44 {
+      pos[0] = pos[0] + 1
+    } else if pos[0] < n && str_code_at(txt, pos[0]) == 125 {
+      pos[0] = pos[0] + 1
+      break
+    } else {
+      return None
+    }
+  }
+  Some(ProfBackingSite::{
+    name: name,
+    file: file,
+    line: line,
+    bytes: bytes,
+    count: count,
+    share_pct: share_pct,
+  })
+}
+
+///|
 fn prof_parse_hint_json(txt : String, pos : Array[Int], n : Int) -> Option[ProfHint] {
   if !prof_json_expect_char(txt, pos, n, 123) {
     return None
@@ -2590,6 +2879,7 @@ pub fn prof_parse_report_json(json : String) -> Result[ProfReport, String] {
   let by_type_tag : Array[ProfTagRow] = []
   let by_type : Array[ProfTypeRow] = []
   let top_functions : Array[ProfFuncEntry] = []
+  let backing_top_sites : Array[ProfBackingSite] = []
   let hints : Array[ProfHint] = []
 
   cas_json_skip_ws(json, pos, n)
@@ -2788,6 +3078,23 @@ pub fn prof_parse_report_json(json : String) -> Result[ProfReport, String] {
           else { return Err("invalid top_functions end") }
         }
       }
+    } else if k == "backing_top_sites" {
+      if !prof_json_expect_char(json, pos, n, 91) { return Err("invalid backing_top_sites") }
+      cas_json_skip_ws(json, pos, n)
+      if pos[0] < n && str_code_at(json, pos[0]) == 93 {
+        pos[0] = pos[0] + 1
+      } else {
+        while true {
+          match prof_parse_backing_site_json(json, pos, n) {
+            Some(r) => backing_top_sites.push(r)
+            None => return Err("invalid backing_top_sites entry")
+          }
+          cas_json_skip_ws(json, pos, n)
+          if pos[0] < n && str_code_at(json, pos[0]) == 44 { pos[0] = pos[0] + 1 }
+          else if pos[0] < n && str_code_at(json, pos[0]) == 93 { pos[0] = pos[0] + 1; break }
+          else { return Err("invalid backing_top_sites end") }
+        }
+      }
     } else if k == "hints" {
       if !prof_json_expect_char(json, pos, n, 91) { return Err("invalid hints") }
       cas_json_skip_ws(json, pos, n)
@@ -2866,6 +3173,7 @@ pub fn prof_parse_report_json(json : String) -> Result[ProfReport, String] {
     by_type_tag: by_type_tag,
     by_type: by_type,
     top_functions: top_functions,
+    backing_top_sites: backing_top_sites,
     hints: hints,
   })
 }
