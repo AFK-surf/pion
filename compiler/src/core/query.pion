@@ -787,6 +787,14 @@ struct AnalyzeCallSite {
 }
 
 ///|
+struct AnalyzeCaptureUse {
+  name : String
+  methods : Array[String]
+  field_gets : Array[String]
+  mut escaped : Bool
+}
+
+///|
 struct AnalyzeClosureRec {
   pkg : String
   enclosing_fn : String
@@ -797,6 +805,7 @@ struct AnalyzeClosureRec {
   context_arg : String
   captures : Array[AnalyzeCapture]
   calls : Array[AnalyzeCallSite]
+  capture_uses : Array[AnalyzeCaptureUse]
 }
 
 ///|
@@ -1059,9 +1068,298 @@ fn analyze_ty_struct_has_mut_fields(tc : TypeChecker, t : Ty) -> Bool {
 }
 
 ///|
+fn analyze_push_unique(arr : Array[String], item : String) -> Unit {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == item {
+      return
+    }
+    i = i + 1
+  }
+  arr.push(item)
+}
+
+///|
+fn analyze_walk_cond_capture_uses(
+  cond : Expr,
+  shadowed : Map[String, Bool],
+  use_map : Map[String, AnalyzeCaptureUse],
+  in_nested_closure : Bool,
+) -> Unit {
+  match cond {
+    EIs(scrut, pat, _) => {
+      analyze_walk_expr_capture_uses(scrut, shadowed, use_map, in_nested_closure)
+      collect_pat_bindings(pat, shadowed)
+    }
+    EBinary("&&", lhs, rhs, _) => {
+      analyze_walk_cond_capture_uses(lhs, shadowed, use_map, in_nested_closure)
+      analyze_walk_cond_capture_uses(rhs, shadowed, use_map, in_nested_closure)
+    }
+    _ => analyze_walk_expr_capture_uses(cond, shadowed, use_map, in_nested_closure)
+  }
+}
+
+///|
+fn analyze_walk_stmts_capture_uses(
+  stmts : Array[Stmt],
+  shadowed : Map[String, Bool],
+  use_map : Map[String, AnalyzeCaptureUse],
+  in_nested_closure : Bool,
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(name, _, _, init, _) => {
+        analyze_walk_expr_capture_uses(init, shadowed, use_map, in_nested_closure)
+        if name != "_" {
+          shadowed.set(name, true)
+        }
+      }
+      SLetTuple(names, _, init, _) => {
+        analyze_walk_expr_capture_uses(init, shadowed, use_map, in_nested_closure)
+        let mut ni = 0
+        while ni < names.length() {
+          if names[ni] != "_" {
+            shadowed.set(names[ni], true)
+          }
+          ni = ni + 1
+        }
+      }
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        analyze_walk_expr_capture_uses(lhs, shadowed, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(rhs, shadowed, use_map, in_nested_closure)
+      }
+      SGuard(cond, else_body, _) => {
+        let cond_sh = shadowed.copy()
+        analyze_walk_cond_capture_uses(cond, cond_sh, use_map, in_nested_closure)
+        let else_sh = shadowed.copy()
+        analyze_walk_stmts_capture_uses(else_body, else_sh, use_map, in_nested_closure)
+        collect_cond_is_locals(cond, shadowed)
+      }
+      SWhile(cond, body, _) => {
+        let body_sh = shadowed.copy()
+        analyze_walk_cond_capture_uses(cond, body_sh, use_map, in_nested_closure)
+        analyze_walk_stmts_capture_uses(body, body_sh, use_map, in_nested_closure)
+      }
+      SBenchLoop(body, _) => {
+        let blk_sh = shadowed.copy()
+        analyze_walk_stmts_capture_uses(body, blk_sh, use_map, in_nested_closure)
+      }
+      SFor(init_s, cond, step_s, body, _) => {
+        let for_sh = shadowed.copy()
+        analyze_walk_stmts_capture_uses([init_s], for_sh, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(cond, for_sh, use_map, in_nested_closure)
+        analyze_walk_stmts_capture_uses([step_s], for_sh, use_map, in_nested_closure)
+        let body_sh = for_sh.copy()
+        analyze_walk_stmts_capture_uses(body, body_sh, use_map, in_nested_closure)
+      }
+      SForRange(var_name, start_e, end_e, _, body, _) => {
+        analyze_walk_expr_capture_uses(start_e, shadowed, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(end_e, shadowed, use_map, in_nested_closure)
+        let body_sh = shadowed.copy()
+        if var_name != "_" {
+          body_sh.set(var_name, true)
+        }
+        analyze_walk_stmts_capture_uses(body, body_sh, use_map, in_nested_closure)
+      }
+      SForIn(k_name, v_name, iter_e, body, _) => {
+        analyze_walk_expr_capture_uses(iter_e, shadowed, use_map, in_nested_closure)
+        let body_sh = shadowed.copy()
+        if k_name != "" && k_name != "_" {
+          body_sh.set(k_name, true)
+        }
+        if v_name != "" && v_name != "_" {
+          body_sh.set(v_name, true)
+        }
+        analyze_walk_stmts_capture_uses(body, body_sh, use_map, in_nested_closure)
+      }
+      SReturn(opt, _) =>
+        match opt {
+          Some(e) => analyze_walk_expr_capture_uses(e, shadowed, use_map, in_nested_closure)
+          None => ()
+        }
+      SBreak(_) | SContinue(_) => ()
+      SDebugAssert(c, m, _) => {
+        analyze_walk_expr_capture_uses(c, shadowed, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(m, shadowed, use_map, in_nested_closure)
+      }
+      SExpr(e, _) => analyze_walk_expr_capture_uses(e, shadowed, use_map, in_nested_closure)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn analyze_walk_expr_capture_uses(
+  e : Expr,
+  shadowed : Map[String, Bool],
+  use_map : Map[String, AnalyzeCaptureUse],
+  in_nested_closure : Bool,
+) -> Unit {
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EDouble(_, _) | EFloat(_, _) | EBool(_, _) => ()
+    EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) | EPath(_, _, _) => ()
+    EIdent(name, _) =>
+      if !shadowed.contains(name) {
+        match use_map.get(name) {
+          Some(u) => u.escaped = true
+          None => ()
+        }
+      }
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) | EMutArg(inner, _) =>
+      analyze_walk_expr_capture_uses(inner, shadowed, use_map, in_nested_closure)
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        analyze_walk_expr_capture_uses(parts[i], shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EDotVariant(_, args, _) => {
+      let mut i = 0
+      while i < args.length() {
+        analyze_walk_expr_capture_uses(args[i], shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EBinary(op, l, r, _) =>
+      if op == "&&" && expr_has_is(l) {
+        let and_sh = shadowed.copy()
+        analyze_walk_cond_capture_uses(l, and_sh, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(r, and_sh, use_map, in_nested_closure)
+      } else {
+        analyze_walk_expr_capture_uses(l, shadowed, use_map, in_nested_closure)
+        analyze_walk_expr_capture_uses(r, shadowed, use_map, in_nested_closure)
+      }
+    ECall(callee, args, _) => {
+      analyze_walk_expr_capture_uses(callee, shadowed, use_map, in_nested_closure)
+      let mut i = 0
+      while i < args.length() {
+        analyze_walk_expr_capture_uses(args[i], shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EField(obj, _, _) => analyze_walk_expr_capture_uses(obj, shadowed, use_map, in_nested_closure)
+    EMethodCall(obj, method_name, args, _) => {
+      if !in_nested_closure {
+        if method_name == "get" && args.length() == 0 {
+          match obj {
+            EField(EIdent(cap, _), field_name, _) =>
+              if !shadowed.contains(cap) {
+                match use_map.get(cap) {
+                  Some(u) => {
+                    analyze_push_unique(u.field_gets, field_name)
+                    return
+                  }
+                  None => ()
+                }
+              }
+            _ => ()
+          }
+        }
+        match obj {
+          EIdent(cap, _) =>
+            if !shadowed.contains(cap) {
+              match use_map.get(cap) {
+                Some(u) => {
+                  analyze_push_unique(u.methods, method_name)
+                  let mut i = 0
+                  while i < args.length() {
+                    analyze_walk_expr_capture_uses(args[i], shadowed, use_map, in_nested_closure)
+                    i = i + 1
+                  }
+                  return
+                }
+                None => ()
+              }
+            }
+          _ => ()
+        }
+      }
+      analyze_walk_expr_capture_uses(obj, shadowed, use_map, in_nested_closure)
+      let mut i = 0
+      while i < args.length() {
+        analyze_walk_expr_capture_uses(args[i], shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EIndex(obj, idx, _) => {
+      analyze_walk_expr_capture_uses(obj, shadowed, use_map, in_nested_closure)
+      analyze_walk_expr_capture_uses(idx, shadowed, use_map, in_nested_closure)
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        analyze_walk_expr_capture_uses(elems[i], shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => analyze_walk_expr_capture_uses(base, shadowed, use_map, in_nested_closure)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        analyze_walk_expr_capture_uses(fields[i].value, shadowed, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EBlock(stmts, _) => {
+      let blk_sh = shadowed.copy()
+      analyze_walk_stmts_capture_uses(stmts, blk_sh, use_map, in_nested_closure)
+    }
+    EIf(cond, then_s, else_opt, _) => {
+      let then_sh = shadowed.copy()
+      analyze_walk_cond_capture_uses(cond, then_sh, use_map, in_nested_closure)
+      analyze_walk_stmts_capture_uses(then_s, then_sh, use_map, in_nested_closure)
+      match else_opt {
+        Some(el) => analyze_walk_expr_capture_uses(el, shadowed.copy(), use_map, in_nested_closure)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      analyze_walk_expr_capture_uses(scrut, shadowed, use_map, in_nested_closure)
+      let mut i = 0
+      while i < arms.length() {
+        let arm_sh = shadowed.copy()
+        collect_pat_bindings(arms[i].pat, arm_sh)
+        match arms[i].guard_expr {
+          Some(ge) => analyze_walk_cond_capture_uses(ge, arm_sh, use_map, in_nested_closure)
+          None => ()
+        }
+        analyze_walk_expr_capture_uses(arms[i].body, arm_sh, use_map, in_nested_closure)
+        i = i + 1
+      }
+    }
+    EIs(scrut, _, _) => analyze_walk_expr_capture_uses(scrut, shadowed, use_map, in_nested_closure)
+    EClosure(inner_params, _, inner_body, _) => {
+      let inner_sh = shadowed.copy()
+      let mut i = 0
+      while i < inner_params.length() {
+        if inner_params[i].name != "_" {
+          inner_sh.set(inner_params[i].name, true)
+        }
+        i = i + 1
+      }
+      analyze_walk_stmts_capture_uses(inner_body, inner_sh, use_map, true)
+    }
+    EScope(w, f, _) => {
+      analyze_walk_expr_capture_uses(w, shadowed, use_map, in_nested_closure)
+      analyze_walk_expr_capture_uses(f, shadowed, use_map, in_nested_closure)
+    }
+    ESpawn(s, f, _) => {
+      analyze_walk_expr_capture_uses(s, shadowed, use_map, in_nested_closure)
+      analyze_walk_expr_capture_uses(f, shadowed, use_map, in_nested_closure)
+    }
+  }
+}
+
+///|
 fn analyze_emit_closure(
   tc : TypeChecker,
   enclosing_fn : String,
+  cparams : Array[Param],
   cbody : Array[Stmt],
   csp : Span,
   context_callee : String,
@@ -1071,6 +1369,37 @@ fn analyze_emit_closure(
   let caps = match tc.analyze_closure_captures.get(span_key(csp)) {
     Some(cs) => cs
     None => []
+  }
+  let capture_uses : Array[AnalyzeCaptureUse] = []
+  if caps.length() > 0 {
+    let use_map : Map[String, AnalyzeCaptureUse] = Map([])
+    let mut ci = 0
+    while ci < caps.length() {
+      let rec = AnalyzeCaptureUse::{
+        name: caps[ci].name,
+        methods: [],
+        field_gets: [],
+        escaped: false,
+      }
+      capture_uses.push(rec)
+      use_map.set(caps[ci].name, rec)
+      ci = ci + 1
+    }
+    let shadowed : Map[String, Bool] = Map([])
+    let mut pi = 0
+    while pi < cparams.length() {
+      if cparams[pi].name != "_" {
+        shadowed.set(cparams[pi].name, true)
+      }
+      pi = pi + 1
+    }
+    analyze_walk_stmts_capture_uses(cbody, shadowed, use_map, false)
+    let mut ui = 0
+    while ui < capture_uses.length() {
+      capture_uses[ui].methods.sort()
+      capture_uses[ui].field_gets.sort()
+      ui = ui + 1
+    }
   }
   let clo_calls : Array[AnalyzeCallSite] = []
   closures.push(AnalyzeClosureRec::{
@@ -1083,6 +1412,7 @@ fn analyze_emit_closure(
     context_arg: context_arg,
     captures: caps,
     calls: clo_calls,
+    capture_uses: capture_uses,
   })
   analyze_walk_stmts(tc, enclosing_fn, cbody, clo_calls, closures)
 }
@@ -1117,12 +1447,13 @@ fn analyze_walk_call_args(
     match args[i] {
       ENamedArg(label, _, inner, _) =>
         match inner {
-          EClosure(_, _, cbody, csp) => {
+          EClosure(cparams, _, cbody, csp) => {
             let eff_callee = if into_callee != "" { into_callee } else { callee_target }
             let eff_arg = if into_callee != "" { "0" } else { label }
             analyze_emit_closure(
               tc,
               enclosing_fn,
+              cparams,
               cbody,
               csp,
               eff_callee,
@@ -1132,12 +1463,13 @@ fn analyze_walk_call_args(
           }
           _ => analyze_walk_expr(tc, enclosing_fn, inner, calls, closures)
         }
-      EClosure(_, _, cbody, csp) => {
+      EClosure(cparams, _, cbody, csp) => {
         let eff_callee = if into_callee != "" { into_callee } else { callee_target }
         let eff_arg = if into_callee != "" { "0" } else { i.to_string() }
         analyze_emit_closure(
           tc,
           enclosing_fn,
+          cparams,
           cbody,
           csp,
           eff_callee,
@@ -1318,14 +1650,14 @@ fn analyze_walk_expr(
     }
     EIs(scrut, _, _) =>
       analyze_walk_expr(tc, enclosing_fn, scrut, calls, closures)
-    EClosure(_, _, cbody, csp) =>
-      analyze_emit_closure(tc, enclosing_fn, cbody, csp, "", "", closures)
+    EClosure(cparams, _, cbody, csp) =>
+      analyze_emit_closure(tc, enclosing_fn, cparams, cbody, csp, "", "", closures)
     EScope(w, f, sp) => {
       calls.push(AnalyzeCallSite::{ target: "builtin::scope", line: sp.line, col: sp.col })
       analyze_walk_expr(tc, enclosing_fn, w, calls, closures)
       match f {
-        EClosure(_, _, cbody, csp) =>
-          analyze_emit_closure(tc, enclosing_fn, cbody, csp, "builtin::scope", "1", closures)
+        EClosure(cparams, _, cbody, csp) =>
+          analyze_emit_closure(tc, enclosing_fn, cparams, cbody, csp, "builtin::scope", "1", closures)
         _ => analyze_walk_expr(tc, enclosing_fn, f, calls, closures)
       }
     }
@@ -1333,12 +1665,52 @@ fn analyze_walk_expr(
       calls.push(AnalyzeCallSite::{ target: "builtin::spawn", line: sp.line, col: sp.col })
       analyze_walk_expr(tc, enclosing_fn, s, calls, closures)
       match f {
-        EClosure(_, _, cbody, csp) =>
-          analyze_emit_closure(tc, enclosing_fn, cbody, csp, "builtin::spawn", "1", closures)
+        EClosure(cparams, _, cbody, csp) =>
+          analyze_emit_closure(tc, enclosing_fn, cparams, cbody, csp, "builtin::spawn", "1", closures)
         _ => analyze_walk_expr(tc, enclosing_fn, f, calls, closures)
       }
     }
   }
+}
+
+///|
+fn analyze_write_string_array_json(sb : StringBuilder, items : Array[String]) -> Unit {
+  sb.write_string("[")
+  let mut i = 0
+  while i < items.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(json_quote(items[i]))
+    i = i + 1
+  }
+  sb.write_string("]")
+}
+
+///|
+fn analyze_write_capture_uses_json(
+  sb : StringBuilder,
+  uses : Array[AnalyzeCaptureUse],
+) -> Unit {
+  sb.write_string("[")
+  let mut i = 0
+  while i < uses.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    let u = uses[i]
+    sb.write_string("{\"name\":")
+    sb.write_string(json_quote(u.name))
+    sb.write_string(",\"methods\":")
+    analyze_write_string_array_json(sb, u.methods)
+    sb.write_string(",\"field_gets\":")
+    analyze_write_string_array_json(sb, u.field_gets)
+    sb.write_string(",\"escaped\":")
+    sb.write_string(if u.escaped { "true" } else { "false" })
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]")
 }
 
 ///|
@@ -1613,6 +1985,8 @@ pub fn query_analyze_packages_json(
     }
     sb.write_string("],\"calls\":")
     analyze_write_calls_json(sb, cl.calls)
+    sb.write_string(",\"capture_uses\":")
+    analyze_write_capture_uses_json(sb, cl.capture_uses)
     sb.write_string("}")
     ci = ci + 1
   }
