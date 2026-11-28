@@ -334,6 +334,7 @@ pub struct QbeGen {
   mut loop_conts : Array[String]
   mut loop_depths : Array[Int]
   mut hot_loop_depth : Int
+  mut bench_loop_mode : Int
   /// Set while emitting an unflattened nested `+` operand of a string chain:
   /// its root `+` must not start a new flattened chain (see qbe_string_add_parts).
   mut nested_add_part : Bool
@@ -23476,6 +23477,7 @@ fn qbe_new_for_target_name(
     loop_conts: [],
     loop_depths: [],
     hot_loop_depth: 0,
+    bench_loop_mode: 0,
     nested_add_part: false,
     cur_tparams: [],
     live_tparams: [],
@@ -33159,6 +33161,7 @@ fn qbe_emit_closure_obj(
   let saved_conts = g.loop_conts
   let saved_depths = g.loop_depths
   let saved_hot_loop_depth = g.hot_loop_depth
+  let saved_bench_loop_mode = g.bench_loop_mode
   let saved_ret = g.cur_ret_ty
   let saved_ret_abi = g.cur_ret_abi_ty
   let saved_fn_void = g.cur_fn_void
@@ -33230,6 +33233,7 @@ fn qbe_emit_closure_obj(
   g.loop_conts = []
   g.loop_depths = []
   g.hot_loop_depth = 0
+  g.bench_loop_mode = 0
   g.cur_ret_ty = ret_ty
   g.cur_ret_abi_ty = TInt64
   g.cur_fn_void = is_spawn
@@ -33406,6 +33410,7 @@ fn qbe_emit_closure_obj(
   g.loop_conts = saved_conts
   g.loop_depths = saved_depths
   g.hot_loop_depth = saved_hot_loop_depth
+  g.bench_loop_mode = saved_bench_loop_mode
   g.cur_ret_ty = saved_ret
   g.cur_ret_abi_ty = saved_ret_abi
   g.cur_fn_void = saved_fn_void
@@ -58277,16 +58282,84 @@ fn qbe_emit_stmt(
       qbe_apply_min_lens(g, cond, grd_names, grd_mins)
       qval("0", TUnit)
     }
-    SBenchLoop(body, _) => {
-      qbe_scope_push(g)
-      let bv = qbe_emit_stmts(g, body, None)
-      if !g.block_term {
-        let bb = qbe_emit_black_box_val(g, bv)
-        qbe_rc_dec(g, bb.reg, bb.ty)
+    SBenchLoop(body, _) =>
+      if g.bench_loop_mode > 0 {
+        let prof_enabled = g.bench_loop_mode == 2
+        let saved_bl_mode = g.bench_loop_mode
+        g.bench_loop_mode = 0
+        qbe_invalidate_escaping_unfrozen_arrs(g, None, None, body)
+        let loop_inv_kml = qbe_prepare_loop_min_lens(g, None, None, body)
+        let b_i_slot = qbe_tmp(g)
+        g.fn_allocs.write_string("    " + b_i_slot + " =l alloc8 8\n")
+        let b_t0 = qbe_tmp(g)
+        qbe_emit(g, b_t0 + " =l call $pion_clock_monotonic_us()")
+        if prof_enabled {
+          let l_pon = qbe_lbl(g, "bp_on")
+          let l_pskip = qbe_lbl(g, "bp_ons")
+          qbe_emit_term(g, "jnz %prof_win, " + l_pon + ", " + l_pskip)
+          qbe_emit_lbl(g, l_pon)
+          qbe_emit(g, "call $pion_prof_reset()")
+          qbe_emit(g, "call $pion_prof_resume()")
+          qbe_emit_term(g, "jmp " + l_pskip)
+          qbe_emit_lbl(g, l_pskip)
+        }
+        qbe_emit(g, "storel 0, " + b_i_slot)
+        let l_hdr = qbe_lbl(g, "bl_h")
+        let l_body = qbe_lbl(g, "bl_b")
+        let l_end = qbe_lbl(g, "bl_e")
+        qbe_emit_term(g, "jmp " + l_hdr)
+        qbe_emit_lbl(g, l_hdr)
+        let b_i = qbe_tmp(g)
+        let b_cond = qbe_tmp(g)
+        qbe_emit(g, b_i + " =l loadl " + b_i_slot)
+        qbe_emit(g, b_cond + " =w csltl " + b_i + ", %iters")
+        qbe_emit_term(g, "jnz " + b_cond + ", " + l_body + ", " + l_end)
+        qbe_emit_lbl(g, l_body)
+        g.hot_loop_depth = g.hot_loop_depth + 1
+        qbe_scope_push(g)
+        let lres = qbe_emit_stmts(g, body, None)
+        if !g.block_term {
+          let bb_res = qbe_emit_black_box_val(g, lres)
+          qbe_rc_dec(g, bb_res.reg, bb_res.ty)
+          qbe_scope_pop(g)
+          let b_i_cur = qbe_tmp(g)
+          let b_i_next = qbe_tmp(g)
+          qbe_emit(g, b_i_cur + " =l loadl " + b_i_slot)
+          qbe_emit(g, b_i_next + " =l add " + b_i_cur + ", 1")
+          qbe_emit(g, "storel " + b_i_next + ", " + b_i_slot)
+          qbe_emit_term(g, "jmp " + l_hdr)
+        } else {
+          let _ = g.scopes.pop()
+        }
+        g.hot_loop_depth = g.hot_loop_depth - 1
+        qbe_emit_lbl(g, l_end)
+        if prof_enabled {
+          let l_poff = qbe_lbl(g, "bp_off")
+          let l_poffs = qbe_lbl(g, "bp_offs")
+          qbe_emit_term(g, "jnz %prof_win, " + l_poff + ", " + l_poffs)
+          qbe_emit_lbl(g, l_poff)
+          qbe_emit(g, "call $pion_prof_pause()")
+          qbe_emit_term(g, "jmp " + l_poffs)
+          qbe_emit_lbl(g, l_poffs)
+        }
+        let b_t1 = qbe_tmp(g)
+        let b_dt = qbe_tmp(g)
+        qbe_emit(g, b_t1 + " =l call $pion_clock_monotonic_us()")
+        qbe_emit(g, b_dt + " =l sub " + b_t1 + ", " + b_t0)
+        qbe_emit(g, "storel " + b_dt + ", $__pion_bench_elapsed_us")
+        g.known_min_len_arrs = loop_inv_kml
+        g.bench_loop_mode = saved_bl_mode
+        qval("0", TUnit)
+      } else {
+        qbe_scope_push(g)
+        let bv = qbe_emit_stmts(g, body, None)
+        if !g.block_term {
+          let bb = qbe_emit_black_box_val(g, bv)
+          qbe_rc_dec(g, bb.reg, bb.ty)
+        }
+        qbe_scope_pop(g)
+        qval("0", TUnit)
       }
-      qbe_scope_pop(g)
-      qval("0", TUnit)
-    }
     SWhile(cond, body, _) => {
       if qbe_expr_has_is(cond) {
         qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), None, body)
@@ -64429,108 +64502,30 @@ pub fn emit_qbe_benches_target(
     let body = qbe_fn_body(g, td.body)
     g.boxed_mut_vars = qbe_collect_boxed_mut_vars(body)
 
-    let setup_stmts : Array[Stmt] = []
-    let mut loop_stmts : Array[Stmt] = []
-    let teardown_stmts : Array[Stmt] = []
     let mut found_bl = false
     let mut si = 0
     while si < body.length() {
       match body[si] {
-        SBenchLoop(lb, _) =>
-          if !found_bl {
-            found_bl = true
-            loop_stmts = lb
-          }
-        other =>
-          if !found_bl {
-            setup_stmts.push(other)
-          } else {
-            teardown_stmts.push(other)
-          }
+        SBenchLoop(_, _) => {
+          found_bl = true
+          break
+        }
+        _ => ()
       }
       si = si + 1
     }
-    if !found_bl {
-      loop_stmts = setup_stmts
-    }
+    let effective_body = if found_bl { body } else { [SBenchLoop(body, td.span)] }
 
+    // Emit the entire bench body in a single `qbe_emit_stmts` pass so Perceus-lite
+    // last-use early-drop, data-pointer pinning, and borrowed-view lifetimes see
+    // uses of setup bindings inside `SBenchLoop` and any following teardown statements.
+    g.bench_loop_mode = if prof_enabled { 2 } else { 1 }
     qbe_scope_push(g)
-    if found_bl && setup_stmts.length() > 0 {
-      let sres = qbe_emit_stmts(g, setup_stmts, None)
-      if !g.block_term {
-        qbe_rc_dec(g, sres.reg, sres.ty)
-      }
-    }
+    let bres = qbe_emit_stmts(g, effective_body, None)
+    g.bench_loop_mode = 0
 
     if !g.block_term {
-      let b_i_slot = qbe_tmp(g)
-      g.fn_allocs.write_string("    " + b_i_slot + " =l alloc8 8\n")
-      let b_t0 = qbe_tmp(g)
-      qbe_emit(g, b_t0 + " =l call $pion_clock_monotonic_us()")
-      if prof_enabled {
-        let l_pon = qbe_lbl(g, "bp_on")
-        let l_pskip = qbe_lbl(g, "bp_ons")
-        qbe_emit_term(g, "jnz %prof_win, " + l_pon + ", " + l_pskip)
-        qbe_emit_lbl(g, l_pon)
-        qbe_emit(g, "call $pion_prof_reset()")
-        qbe_emit(g, "call $pion_prof_resume()")
-        qbe_emit_term(g, "jmp " + l_pskip)
-        qbe_emit_lbl(g, l_pskip)
-      }
-      qbe_emit(g, "storel 0, " + b_i_slot)
-      let l_hdr = qbe_lbl(g, "bl_h")
-      let l_body = qbe_lbl(g, "bl_b")
-      let l_end = qbe_lbl(g, "bl_e")
-      qbe_emit_term(g, "jmp " + l_hdr)
-      qbe_emit_lbl(g, l_hdr)
-      let b_i = qbe_tmp(g)
-      let b_cond = qbe_tmp(g)
-      qbe_emit(g, b_i + " =l loadl " + b_i_slot)
-      qbe_emit(g, b_cond + " =w csltl " + b_i + ", %iters")
-      qbe_emit_term(g, "jnz " + b_cond + ", " + l_body + ", " + l_end)
-      qbe_emit_lbl(g, l_body)
-      g.hot_loop_depth = g.hot_loop_depth + 1
-      qbe_scope_push(g)
-      let lres = qbe_emit_stmts(g, loop_stmts, None)
-      if !g.block_term {
-        let bb_res = qbe_emit_black_box_val(g, lres)
-        qbe_rc_dec(g, bb_res.reg, bb_res.ty)
-        qbe_scope_pop(g)
-        let b_i_cur = qbe_tmp(g)
-        let b_i_next = qbe_tmp(g)
-        qbe_emit(g, b_i_cur + " =l loadl " + b_i_slot)
-        qbe_emit(g, b_i_next + " =l add " + b_i_cur + ", 1")
-        qbe_emit(g, "storel " + b_i_next + ", " + b_i_slot)
-        qbe_emit_term(g, "jmp " + l_hdr)
-      } else {
-        let _ = g.scopes.pop()
-      }
-      g.hot_loop_depth = g.hot_loop_depth - 1
-      qbe_emit_lbl(g, l_end)
-      if prof_enabled {
-        let l_poff = qbe_lbl(g, "bp_off")
-        let l_poffs = qbe_lbl(g, "bp_offs")
-        qbe_emit_term(g, "jnz %prof_win, " + l_poff + ", " + l_poffs)
-        qbe_emit_lbl(g, l_poff)
-        qbe_emit(g, "call $pion_prof_pause()")
-        qbe_emit_term(g, "jmp " + l_poffs)
-        qbe_emit_lbl(g, l_poffs)
-      }
-      let b_t1 = qbe_tmp(g)
-      let b_dt = qbe_tmp(g)
-      qbe_emit(g, b_t1 + " =l call $pion_clock_monotonic_us()")
-      qbe_emit(g, b_dt + " =l sub " + b_t1 + ", " + b_t0)
-      qbe_emit(g, "storel " + b_dt + ", $__pion_bench_elapsed_us")
-    }
-
-    if !g.block_term && found_bl && teardown_stmts.length() > 0 {
-      let tres = qbe_emit_stmts(g, teardown_stmts, None)
-      if !g.block_term {
-        qbe_rc_dec(g, tres.reg, tres.ty)
-      }
-    }
-
-    if !g.block_term {
+      qbe_rc_dec(g, bres.reg, bres.ty)
       qbe_scope_pop(g)
       qbe_emit_term(g, "ret 0")
     } else {

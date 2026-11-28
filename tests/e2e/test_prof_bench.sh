@@ -359,6 +359,41 @@ assert d["rc_partial"] is True, f"expected rc_partial==True when running RC mode
 print("OK native build_modes=3 rc_partial=True")
 PY
 
+# Multi-RC setup locals must stay alive across bench_loop and teardown (Native + Wasm32)
+cat > "$TMP/multi_rc_bench.pion" <<'EOF'
+fn pair_len(a : String, b : String) -> Int {
+  a.length() + b.length()
+}
+
+bench "multi_rc_setup" {
+  let n = 42
+  let a = "hello_world_" + n.to_string()
+  let b = "foobar_baz_" + n.to_string()
+  let mut acc = 0
+  bench_loop {
+    acc = acc + pair_len(a, b)
+    black_box(acc)
+  }
+  if a.length() + b.length() == 0 { abort("bad_setup") }
+}
+EOF
+MULTI_RC_JSON="$("$PIONC" bench --iters 5 --samples 1 --json "$TMP/multi_rc_bench.pion")"
+python3 - "$MULTI_RC_JSON" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["benchmarks"]) == 1 and d["benchmarks"][0]["name"] == "multi_rc_setup", d
+print("OK native multi-RC bench setup:", d["benchmarks"][0]["name"])
+PY
+if command -v node >/dev/null 2>&1; then
+  WASM_MULTI_RC_JSON="$("$PIONC" bench --target wasm32 --iters 5 --samples 1 --json "$TMP/multi_rc_bench.pion")"
+  python3 - "$WASM_MULTI_RC_JSON" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["benchmarks"]) == 1 and d["benchmarks"][0]["name"] == "multi_rc_setup", d
+print("OK wasm32 multi-RC bench setup:", d["benchmarks"][0]["name"])
+PY
+fi
+
 T1_MS="$(python3 -c 'import time; print(int(time.time()*1000))')"
 ELAPSED_MS=$((T1_MS - T0_MS))
 echo "ALL PROF & BENCH E2E TESTS PASSED in ${ELAPSED_MS}ms!"
