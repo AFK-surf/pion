@@ -3988,7 +3988,24 @@ PION_IO_FN static char *pion_win_build_cmdline(PionArray *arr) {
 }
 #endif
 
-#if !defined(_WIN32) && !PION_NO_SPAWN
+/* A child spawned by one thread must never inherit another thread's capture
+ * pipe write end, or that capture's read() waits for the unrelated child to
+ * exit. Linux creates the pipe close-on-exec atomically (pipe2); elsewhere
+ * pipe()+FD_CLOEXEC and every spawn are serialized by one lock, held only
+ * across pipe/spawn setup, never across read()/wait. */
+#ifdef _WIN32
+static SRWLOCK g_pion_spawn_lock = SRWLOCK_INIT;
+#elif !PION_NO_SPAWN
+#ifdef __linux__
+int pipe2(int fds[2], int flags); /* glibc declares it only under _GNU_SOURCE */
+#define PION_SPAWN_LOCK() ((void)0)
+#define PION_SPAWN_UNLOCK() ((void)0)
+#else
+static pthread_mutex_t g_pion_spawn_mu = PTHREAD_MUTEX_INITIALIZER;
+#define PION_SPAWN_LOCK() ((void)pthread_mutex_lock(&g_pion_spawn_mu))
+#define PION_SPAWN_UNLOCK() ((void)pthread_mutex_unlock(&g_pion_spawn_mu))
+#endif
+
 static PION_NOINLINE PION_IO_FN char **pion_posix_build_argv(PionArray *arr) {
     if (!arr || arr->len <= 0) return NULL;
     char **argv = (char **)malloc(((size_t)arr->len + 1) * sizeof(char *));
@@ -4024,7 +4041,9 @@ PION_IO_FN int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
     memset(&si, 0, sizeof(si));
     memset(&pi, 0, sizeof(pi));
     si.cb = (DWORD)sizeof(si);
+    AcquireSRWLockExclusive(&g_pion_spawn_lock);
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    ReleaseSRWLockExclusive(&g_pion_spawn_lock);
     free(cmdline);
     if (!ok) return 127;
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -4041,7 +4060,9 @@ PION_IO_FN int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
     char **argv = pion_posix_build_argv((PionArray *)argv_arr);
     if (!argv) return -1;
     pid_t pid = 0;
+    PION_SPAWN_LOCK();
     int rc = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+    PION_SPAWN_UNLOCK();
     free(argv);
     if (rc != 0) return 127;
     return pion_posix_wait_pid(pid);
@@ -4062,7 +4083,10 @@ static PION_IO_FN char *pion_exec_capture_raw(void *argv_arr, int silence_stderr
     sa.lpSecurityDescriptor = NULL;
     sa.bInheritHandle = TRUE;
     HANDLE rd = NULL, wr = NULL;
+    /* wr and nul_h are inheritable until closed below: no other spawn may run meanwhile. */
+    AcquireSRWLockExclusive(&g_pion_spawn_lock);
     if (!CreatePipe(&rd, &wr, &sa, 0)) {
+        ReleaseSRWLockExclusive(&g_pion_spawn_lock);
         free(cmdline);
         return NULL;
     }
@@ -4082,9 +4106,10 @@ static PION_IO_FN char *pion_exec_capture_raw(void *argv_arr, int silence_stderr
     si.hStdOutput = wr;
     si.hStdError = (silence_stderr && nul_h != INVALID_HANDLE_VALUE) ? nul_h : GetStdHandle(STD_ERROR_HANDLE);
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
-    free(cmdline);
     CloseHandle(wr);
     if (nul_h != INVALID_HANDLE_VALUE) CloseHandle(nul_h);
+    ReleaseSRWLockExclusive(&g_pion_spawn_lock);
+    free(cmdline);
     if (!ok) {
         CloseHandle(rd);
         if (exit_code_out) *exit_code_out = 127;
@@ -4138,30 +4163,36 @@ static PION_IO_FN char *pion_exec_capture_raw(void *argv_arr, int silence_stderr
     char **argv = pion_posix_build_argv((PionArray *)argv_arr);
     if (!argv) return NULL;
 
-    int pfd[2];
-    if (pipe(pfd) != 0) {
-        free(argv);
-        return NULL;
-    }
-    (void)fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
-    (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
-
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
         free(argv);
-        close(pfd[0]);
-        close(pfd[1]);
         return NULL;
     }
-    (void)posix_spawn_file_actions_adddup2(&actions, pfd[1], STDOUT_FILENO);
-    if (silence_stderr) {
-        (void)posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    }
 
+    int pfd[2];
     pid_t pid = 0;
-    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    int rc = -1;
+    PION_SPAWN_LOCK();
+#ifdef __linux__
+    int prc = pipe2(pfd, O_CLOEXEC);
+#else
+    int prc = pipe(pfd);
+    if (prc == 0) {
+        (void)fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+        (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+    }
+#endif
+    if (prc == 0) {
+        (void)posix_spawn_file_actions_adddup2(&actions, pfd[1], STDOUT_FILENO);
+        if (silence_stderr) {
+            (void)posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+        }
+        rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    }
+    PION_SPAWN_UNLOCK();
     posix_spawn_file_actions_destroy(&actions);
     free(argv);
+    if (prc != 0) return NULL;
     close(pfd[1]);
 
     if (rc != 0) {

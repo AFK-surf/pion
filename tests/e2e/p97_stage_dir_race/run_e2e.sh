@@ -27,7 +27,8 @@
 # Case 4 is driven by a small python3 coordinator (FIFOs + `select` against
 # one deadline, the run in its own process group that is always killed and
 # checked gone); it also checks its own failure paths (pionc exiting early,
-# a failed assertion while A is paused). No `sleep` anywhere.
+# a failed assertion while A is paused). No `sleep` is used to order events
+# (only a 10 ms backoff while polling for B's directory removal).
 # Usage: sh tests/e2e/p97_stage_dir_race/run_e2e.sh <pionc>
 set -eu
 
@@ -386,6 +387,7 @@ try:
         while os.path.exists(b_stage):
             if time.monotonic() > deadline:
                 raise Fail("B's staging directory %s was never removed" % b_stage)
+            time.sleep(0.01)  # poll backoff only, not synchronization
         if mode == "bad_sentinel":
             os.remove(sentinel)
         if not os.path.isdir(a_stage):
