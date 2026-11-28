@@ -1,0 +1,170 @@
+///| Unit tests for generic callback partial parameter preservation, bare `Iter`/`Iter2` constructors,
+///| `OrderedMap::keys()`/`values()` lazy iterator lowering, `if <lhs> is Ctor([p0, ...])` array-pattern
+///| binding lowering (plus non-`if` fail-closed), and `ToJson::to_json` lowering.
+
+test "generic callee callback preserves concrete param type while masking unresolved generic slots" {
+  let dep_axis = "{\"packages\":[{\"name\":\"axis\",\"items\":[" +
+  "{\"kind\":\"enum\",\"name\":\"Align\",\"sig\":\"pub enum Align { Start; Center; End }\"}" +
+  "]}]}"
+  let dep_ui = "{\"packages\":[{\"name\":\"ui\",\"items\":[" +
+  "{\"kind\":\"struct\",\"name\":\"View\",\"sig\":\"pub struct View { id : Int }\"}," +
+  "{\"kind\":\"struct\",\"name\":\"Signal\",\"sig\":\"pub struct Signal[T] { val : T }\"}," +
+  "{\"kind\":\"enum\",\"name\":\"Prop\",\"sig\":\"pub enum Prop[T] { Is(T); Bind(() -> T) }\"}," +
+  "{\"kind\":\"method\",\"name\":\"View::over\",\"sig\":\"pub fn View::over(self : View, b : Prop[Bool]) -> View\"}," +
+  "{\"kind\":\"method\",\"name\":\"View::lies_along\",\"sig\":\"pub fn View::lies_along(self : View, a : Prop[axis::Align]) -> View\"}," +
+  "{\"kind\":\"method\",\"name\":\"View::pick\",\"sig\":\"pub fn View::pick[T](self : View, src : () -> T, body : (View, T) -> Unit) -> View\"}," +
+  "{\"kind\":\"method\",\"name\":\"View::each\",\"sig\":\"pub fn View::each[T, K](self : View, src : () -> Array[T], key : (T) -> K, body : (View, Signal[T]) -> Unit) -> View\"}" +
+  "]}]}"
+  let src = SourceFile::{
+    rel_path: "cb_partial.mbt",
+    content: "enum LocalDir {\n  Start\n  End\n}\n\n" +
+    "pub fn layout(v : @ui.View, get_flag : () -> Bool, items : () -> Array[Int]) -> Unit {\n" +
+    "  let _ = v.pick(get_flag, fn(p, small) {\n" +
+    "    let _ = small\n" +
+    "    let _ = p.over(Is(true)).lies_along(Is(End))\n" +
+    "  })\n" +
+    "  let _ = v.each(items, fn(x) { x }, (p, sig) => {\n" +
+    "    let _ = sig\n" +
+    "    let _ = p.lies_along(Is(Start))\n" +
+    "  })\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [dep_axis, dep_ui], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "axis::Align::End"), "pick callback preserves View param type and disambiguates End: " + out)
+  assert_true(str_has(out, "axis::Align::Start"), "each arrow callback preserves View param type and disambiguates Start: " + out)
+  assert_true(!str_has(out, "__mbt_gen_hole__"), "internal hole sentinel must never leak into output: " + out)
+}
+
+test "iter constructors: bare Iter(f), Iter2::new(f), bare Iter2(f), and local shadowing guard" {
+  let src = SourceFile::{
+    rel_path: "iters.mbt",
+    content: "pub fn make_iters() -> (Iter[Int], Iter2[String, Int], Iter2[String, Int]) {\n" +
+    "  let a = Iter(fn() { None })\n" +
+    "  let b = Iter2::new(fn() { None })\n" +
+    "  let c = Iter2(fn() { None })\n" +
+    "  (a, b, c)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::mbt_iter_new("), "bare Iter(f) lowers to mbt_iter_new: " + out)
+  assert_true(str_has(out, "mbt_compat::mbt_iter2_new("), "Iter2::new(f) and Iter2(f) lower to mbt_iter2_new: " + out)
+
+  let shadow_src = SourceFile::{
+    rel_path: "iter_shadow.mbt",
+    content: "struct Iter(Int)\nstruct Iter2(Int)\npub fn keep_local() -> (Iter, Iter2) {\n  (Iter(1), Iter2(2))\n}\n",
+    is_test: false,
+  }
+  let sres = transpile_package([shadow_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(sres.blockers, 0)
+  let sout = sres.files[0].content
+  assert_true(!str_has(sout, "mbt_iter_new"), "local struct Iter must not be rewritten: " + sout)
+  assert_true(!str_has(sout, "mbt_iter2_new"), "local struct Iter2 must not be rewritten: " + sout)
+}
+
+test "ordered_map keys/values: lazy iter on iter-chain and MbtIter expected type, conservative otherwise" {
+  let src = SourceFile::{
+    rel_path: "map_iter.mbt",
+    content: "struct LiveMap[K, V] {\n  inner : Map[K, V]\n}\n\n" +
+    "fn[K, V] LiveMap::read(self : LiveMap[K, V]) -> Map[K, V] {\n  self.inner\n}\n\n" +
+    "pub fn[K, V] LiveMap::keys(self : LiveMap[K, V]) -> Iter[K] {\n  self.read().keys()\n}\n\n" +
+    "pub fn[K, V] LiveMap::values(self : LiveMap[K, V]) -> Iter[V] {\n  self.read().values()\n}\n\n" +
+    "pub fn first_val(lm : LiveMap[String, Int]) -> Int? {\n  lm.read().values().next()\n}\n\n" +
+    "pub fn field_vals(lm : LiveMap[String, Int]) -> Array[Int] {\n  lm.inner.values().collect()\n}\n\n" +
+    "pub fn keep_array_for(m : Map[String, Int]) -> Int {\n" +
+    "  let mut n = 0\n" +
+    "  for k in m.keys() {\n" +
+    "    let _ = k\n" +
+    "    n = n + 1\n" +
+    "  }\n" +
+    "  n + m.values().length()\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::ordered_map_keys_iter(self.read())"), "expected Iter[K] lowers self.read().keys(): " + out)
+  assert_true(str_has(out, "mbt_compat::ordered_map_values_iter(self.read())"), "expected Iter[V] lowers self.read().values(): " + out)
+  assert_true(str_has(out, "mbt_compat::ordered_map_values_iter(lm.read()).head()"), ".values().next() lowers to .head(): " + out)
+  assert_true(str_has(out, "mbt_compat::ordered_map_values_iter(lm.inner).collect()"), "field.values().collect() lowers: " + out)
+  assert_true(str_has(out, "for k in m.keys()"), "for-in m.keys() stays Array[K]: " + out)
+  assert_true(str_has(out, "m.values().length()"), "m.values().length() stays Array[V]: " + out)
+}
+
+test "if-is ctor array pattern: lowers binders in if-stmt/if-expr and fails closed outside single if" {
+  let src = SourceFile::{
+    rel_path: "arr_pat.mbt",
+    content: "pub fn extract_pair(x : Json) -> Double {\n" +
+    "  let mut out = 0.0\n" +
+    "  if x is Array([Number(at, ..), Number(_, ..)]) {\n" +
+    "    out = at\n" +
+    "  }\n" +
+    "  out\n" +
+    "}\n\n" +
+    "pub fn extract_single(x : Json) -> Double {\n" +
+    "  if x is Array([Number(v, ..)]) {\n" +
+    "    v\n" +
+    "  } else {\n" +
+    "    -1.0\n" +
+    "  }\n" +
+    "}\n\n" +
+    "pub fn wildcard_only(x : Json) -> Bool {\n" +
+    "  x is Array([Number(_, ..)])\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, ".length() == 2"), "two-element array pattern checks length == 2: " + out)
+  assert_true(str_has(out, "mbt_compat::MbtJson::Number(at, _)"), "rest pattern Number(at, ..) expands with binder in scope: " + out)
+  assert_true(str_has(out, ".length() == 1"), "single-element array pattern checks length == 1: " + out)
+  assert_true(!str_has(out, "(mbt_compat::MbtJson::Number(v, _))"), "N==1 must not wrap in single-element tuple: " + out)
+
+  let neg_let = SourceFile::{
+    rel_path: "arr_pat_neg_let.mbt",
+    content: "pub fn bad(x : Json) -> Bool {\n  let b = x is Array([Number(at, ..)])\n  b\n}\n",
+    is_test: false,
+  }
+  let nres1 = transpile_package([neg_let], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(nres1.blockers > 0, "array pattern with binder in `let` expr must fail closed")
+
+  let neg_and = SourceFile::{
+    rel_path: "arr_pat_neg_and.mbt",
+    content: "pub fn bad2(flag : Bool, x : Json) -> Double {\n  if flag && x is Array([Number(at, ..)]) {\n    at\n  } else {\n    0.0\n  }\n}\n",
+    is_test: false,
+  }
+  let nres2 = transpile_package([neg_and], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(nres2.blockers > 0, "array pattern with binder in compound `&&` condition must fail closed")
+}
+
+test "ToJson::to_json lowers to mbt_compat::mbt_to_json unless locally shadowed" {
+  let src = SourceFile::{
+    rel_path: "to_json.mbt",
+    content: "pub fn encode(n : Int, s : String) -> Array[Json] {\n" +
+    "  [ToJson::to_json(n), ToJson::to_json(s)]\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::mbt_to_json(n)"), "ToJson::to_json(n) lowers: " + out)
+  assert_true(str_has(out, "mbt_compat::mbt_to_json(s)"), "ToJson::to_json(s) lowers: " + out)
+
+  let shadow_src = SourceFile::{
+    rel_path: "to_json_shadow.mbt",
+    content: "struct ToJson { v : Int }\nfn ToJson::to_json(x : Int) -> Int { x }\npub fn keep(n : Int) -> Int { ToJson::to_json(n) }\n",
+    is_test: false,
+  }
+  let sres = transpile_package([shadow_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(sres.blockers, 0)
+  let sout = sres.files[0].content
+  assert_true(!str_has(sout, "mbt_to_json"), "local struct ToJson must not be rewritten: " + sout)
+}
