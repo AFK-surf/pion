@@ -385,3 +385,152 @@ test "infer_closure_param_type_from_body supports cross-pkg calls, trailing name
   assert_true(str_has(out, "fn(ps : Array[(String, String)])"), "container+tuple param type Array[(String, String)] is inferred: " + out)
   assert_true(str_has(out, "fn(x) {"), "named arg preceding pname fails closed and leaves x unannotated: " + out)
 }
+
+test "cross-package #alias index_set/index_get and op_set/op_get round-trip through ABI v2 into Stage B" {
+  let dep_src = SourceFile::{
+    rel_path: "store.mbt",
+    content: "pub struct Store[K, V] { dummy : Int }\n" +
+    "#alias(\"_[_]=_\")\n" +
+    "pub fn[K, V] Store::put(self : Store[K, V], k : K, v : V) -> Unit { let _ = (self, k, v) }\n" +
+    "#alias(\"_[_]\")\n" +
+    "pub fn[K, V] Store::at(self : Store[K, V], k : K) -> V { abort(\"x\") }\n" +
+    "pub struct Legacy[V] { dummy : Int }\n" +
+    "pub fn[V] Legacy::op_set(self : Legacy[V], i : Int, v : V) -> Unit { let _ = (self, i, v) }\n" +
+    "pub fn[V] Legacy::op_get(self : Legacy[V], i : Int) -> V { abort(\"x\") }\n" +
+    "struct Secret { dummy : Int }\n" +
+    "#alias(\"_[_]=_\")\n" +
+    "fn Secret::hide(self : Secret, i : Int, v : Int) -> Unit { let _ = (self, i, v) }\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(dep_res.blockers, 0)
+
+  let mut saw_store_set = false
+  let mut saw_store_get = false
+  let mut saw_legacy_set = false
+  let mut saw_legacy_get = false
+  let mut saw_secret = false
+  for op in dep_res.abi.op_impls {
+    if op.type_name == "Store" && op.op == "index_set" && op.fn_name == "put" { saw_store_set = true }
+    if op.type_name == "Store" && op.op == "index_get" && op.fn_name == "at" { saw_store_get = true }
+    if op.type_name == "Legacy" && op.op == "index_set" && op.fn_name == "op_set" { saw_legacy_set = true }
+    if op.type_name == "Legacy" && op.op == "index_get" && op.fn_name == "op_get" { saw_legacy_get = true }
+    if op.type_name == "Secret" { saw_secret = true }
+  }
+  assert_true(saw_store_set && saw_store_get, "pub #alias index ops must be exported in ABI op_impls")
+  assert_true(saw_legacy_set && saw_legacy_get, "pub op_set/op_get must be exported in ABI op_impls")
+  assert_true(!saw_secret, "private #alias index op must never leak into ABI op_impls")
+
+  let dep_files : Array[(String, String)] = []
+  for f in dep_res.files {
+    dep_files.push((f.rel_path, f.content))
+  }
+  let abi_json = render_abi_json(dep_res.abi, dep_files)
+  let v_diags : Array[Diag] = []
+  let parsed_opt = verify_and_parse_dep_abi("store", "/store", dep_files, Some(abi_json), v_diags)
+  assert_true(parsed_opt is Some(_) && v_diags.length() == 0, "ABI v2 with index_set/index_get verifies cleanly")
+  let parsed_abi = match parsed_opt {
+    Some(a) => a
+    None => empty_package_abi("store")
+  }
+  let op_lookup = build_op_impl_lookup([], [("store", parsed_abi)])
+  assert_true((match op_lookup.get("store::Store|#alias_op_set") { Some(v) => v, None => "" }) == "put", "store::Store index_set -> put")
+  assert_true((match op_lookup.get("store::Store|#alias_op_get") { Some(v) => v, None => "" }) == "at", "store::Store index_get -> at")
+  assert_true((match op_lookup.get("store::Legacy|#alias_op_set") { Some(v) => v, None => "" }) == "op_set", "store::Legacy index_set -> op_set")
+  assert_true((match op_lookup.get("store::Legacy|#alias_op_get") { Some(v) => v, None => "" }) == "op_get", "store::Legacy index_get -> op_get")
+
+  let consumer_file = GeneratedFile::{
+    rel_path: "use_store.pion",
+    content: "pub fn run(m : store::Store[String, Int], a : store::Legacy[Int]) -> Int {\n" +
+    "  m[\"k\"] = 7\n" +
+    "  a[0]\n" +
+    "}\n",
+    source_file: "use_store.mbt",
+    anchors: [],
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let content = files[0].1
+    let diags_arr : Array[String] = []
+    if str_has(content, "m[\"k\"] = 7") {
+      diags_arr.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"use_store.pion\",\"line\":2,\"col\":3,\"message\":\"cannot assign to indexed type `store::Store[String, Int]`\"}")
+    }
+    if str_has(content, "a[0]") {
+      diags_arr.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"use_store.pion\",\"line\":3,\"col\":3,\"message\":\"cannot index into type `store::Legacy[Int]`\"}")
+    }
+    let sb = StringBuilder()
+    sb.write_string("{\"diagnostics\":[")
+    let mut i = 0
+    while i < diags_arr.length() {
+      if i > 0 { sb.write_string(",") }
+      sb.write_string(diags_arr[i])
+      i = i + 1
+    }
+    sb.write_string("]}")
+    sb.to_string()
+  }
+  let diags : Array[Diag] = []
+  let drift : Array[DriftEntry] = []
+  let (out_files, _, _) = run_stage_b_with_ops_and_deps([consumer_file], empty_api_map(), op_lookup, Map(), mock_check, diags, drift)
+  let out = out_files[0].content
+  assert_true(str_has(out, "m.put(\"k\", 7)"), "cross-pkg #alias index_set rewrites to unqualified method call: " + out)
+  assert_true(str_has(out, "a.op_get(0)"), "cross-pkg op_get rewrites to unqualified method call: " + out)
+}
+
+test "stage B multiline Array + Array rewrites multiline LHS and leading-plus safely" {
+  let src_file = GeneratedFile::{
+    rel_path: "multi_concat.pion",
+    content: "pub fn build(ok : Bool) -> Array[Int] {\n" +
+    "  let a = [\n" +
+    "    1,\n" +
+    "    2\n" +
+    "  ] +\n" +
+    "    (if ok {\n" +
+    "      [3]\n" +
+    "    } else {\n" +
+    "      []\n" +
+    "    })\n" +
+    "  let b = [\n" +
+    "    4\n" +
+    "  ]\n" +
+    "  // comment\n" +
+    "  + [5]\n" +
+    "  a\n" +
+    "}\n",
+    source_file: "multi_concat.mbt",
+    anchors: [],
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let lines = files[0].1.split("\n")
+    let ds : Array[String] = []
+    let mut li = 0
+    while li < lines.length() {
+      let ln = lines[li]
+      if str_has(ln, "] +") {
+        let c = ln.index_of("+") + 1
+        ds.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"multi_concat.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + c.to_string() + ",\"message\":\"operator `+` is not supported on `Array[Int]`\"}")
+      } else if ln.trim().starts_with("+ [5]") {
+        let c = ln.index_of("+") + 1
+        ds.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"multi_concat.pion\",\"line\":" + (li + 1).to_string() + ",\"col\":" + c.to_string() + ",\"message\":\"operator `+` is not supported on `Array[Int]`\"}")
+      }
+      li = li + 1
+    }
+    let sb = StringBuilder()
+    sb.write_string("{\"diagnostics\":[")
+    let mut i = 0
+    while i < ds.length() {
+      if i > 0 { sb.write_string(",") }
+      sb.write_string(ds[i])
+      i = i + 1
+    }
+    sb.write_string("]}")
+    sb.to_string()
+  }
+  let diags : Array[Diag] = []
+  let drift : Array[DriftEntry] = []
+  let (out_files, _, _) = run_stage_b_with_ops_and_deps([src_file], empty_api_map(), Map(), Map(), mock_check, diags, drift)
+  let out = out_files[0].content
+  assert_true(str_has(out, "let a = mbt_compat::arr_concat(["), "multiline LHS Array + Array rewrites cleanly: " + out)
+  assert_true(str_has(out, "let b = mbt_compat::arr_concat(["), "leading-plus multiline Array + Array rewrites cleanly: " + out)
+  assert_true(!str_has(out, "] +"), "no leftover ] + after rewrite: " + out)
+  assert_true(!str_has(out, "+ [5]"), "no leftover + [5] after rewrite: " + out)
+}
