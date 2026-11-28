@@ -89,9 +89,69 @@ fn pattern_has_top_pipe(tokens : Array[Token], start : Int, end : Int) -> Bool {
   false
 }
 
+///| Rewrite all `Double` float literal occurrences (including unary `-<FloatLit>`) in pattern
+///| token range `[start, end)` into fresh hygienic binding temps (`__mbt_fpat_N`, recorded in
+///| `ctx.synth_sp_temps`), returning `(rewritten_tokens_with_eof, guard_conditions)`.
+fn rewrite_float_lits_in_is_pat(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> (Array[Token], Array[String]) {
+  let rw_toks : Array[Token] = []
+  let flt_conds : Array[String] = []
+  let mut k = start
+  while k < end {
+    if k + 1 < end && tokens[k].kind == TokenKind::Minus && tokens[k + 1].kind == TokenKind::FloatLit &&
+    !tokens[k + 1].raw.ends_with("F") && !tokens[k + 1].raw.ends_with("f") {
+      let flt_v = fresh_temp(ctx, "fpat")
+      ctx.synth_sp_temps[flt_v] = true
+      push_expected_type(ctx, "Double")
+      let lit_s = lower_expr_range(ctx, tokens, k, k + 2, file, false).trim()
+      pop_expected_type(ctx)
+      flt_conds.push(flt_v + " == " + lit_s)
+      rw_toks.push(Token::{
+        kind: TokenKind::Ident,
+        raw: flt_v,
+        leading_trivia: tokens[k].leading_trivia,
+        newline_before: tokens[k].newline_before,
+        line: tokens[k].line,
+        col: tokens[k].col,
+        start_byte: tokens[k].start_byte,
+        end_byte: tokens[k + 1].end_byte,
+      })
+      k = k + 2
+    } else if tokens[k].kind == TokenKind::FloatLit &&
+    !tokens[k].raw.ends_with("F") && !tokens[k].raw.ends_with("f") {
+      let flt_v = fresh_temp(ctx, "fpat")
+      ctx.synth_sp_temps[flt_v] = true
+      push_expected_type(ctx, "Double")
+      let lit_s = lower_expr_range(ctx, tokens, k, k + 1, file, false).trim()
+      pop_expected_type(ctx)
+      flt_conds.push(flt_v + " == " + lit_s)
+      rw_toks.push(Token::{
+        kind: TokenKind::Ident,
+        raw: flt_v,
+        leading_trivia: tokens[k].leading_trivia,
+        newline_before: tokens[k].newline_before,
+        line: tokens[k].line,
+        col: tokens[k].col,
+        start_byte: tokens[k].start_byte,
+        end_byte: tokens[k].end_byte,
+      })
+      k = k + 1
+    } else {
+      rw_toks.push(tokens[k])
+      k = k + 1
+    }
+  }
+  (finish_peeled_tokens(rw_toks), flt_conds)
+}
+
 ///| Check whether a condition `[start, end)` in `if` or `guard` contains an `is` segment
-///| whose pattern uses struct destructuring `{ ... }` (without top-level `|` or-pattern)
-///| or `as` aliasing and therefore requires nested `match` lowering instead of Pion's built-in `is`.
+///| whose pattern uses struct destructuring `{ ... }` (without top-level `|` or-pattern),
+///| `as` aliasing, or float literal patterns and therefore requires nested `match` lowering.
 fn cond_needs_is_chain_lowering(tokens : Array[Token], start : Int, end : Int) -> Bool {
   let segs = split_cond_ampamp_segs(tokens, start, end)
   if segs.length() == 0 {
@@ -106,6 +166,9 @@ fn cond_needs_is_chain_lowering(tokens : Array[Token], start : Int, end : Int) -
           return true
         }
         if pattern_contains_struct_pat(tokens, is_i + 1, se) {
+          return true
+        }
+        if pattern_has_float_lit(tokens, is_i + 1, se) {
           return true
         }
       }
@@ -520,7 +583,29 @@ fn expand_is_chain_as_obls(
       "match " + eff_scrut + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
-    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    let has_flt = pattern_has_float_lit(p_toks, p_s, p_e)
+    let mut flt_guard = ""
+    let pat_str = if has_flt {
+      if pattern_has_b2d_disallowed_tok(p_toks, p_s, p_e) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          p_toks[p_s].line,
+          p_toks[p_s].col,
+          "float literal pattern combined with unsupported pattern construct in `is`-chain (fail-closed)",
+        ))
+        lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+      } else {
+        let (rw_toks, flt_conds) = rewrite_float_lits_in_is_pat(ctx, p_toks, p_s, p_e, file)
+        flt_guard = flt_conds.join(" && ")
+        if scrut_ty.length() > 0 { push_expected_type(ctx, scrut_ty) }
+        let ps_s = lower_expr_range(ctx, rw_toks, 0, rw_toks.length() - 1, file, true).trim()
+        if scrut_ty.length() > 0 { pop_expected_type(ctx) }
+        ps_s
+      }
+    } else {
+      lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    }
     let raw_bs = collect_pattern_binders(p_toks, p_s, p_e)
     for rb in raw_bs {
       let bname = resolve_ident_in_scope(ctx, rb)
@@ -541,7 +626,9 @@ fn expand_is_chain_as_obls(
       bound_out,
       bound_seen,
     )
-    if is_irrefutable_simple_pat(pat_str) {
+    if flt_guard.length() > 0 {
+      "match " + eff_scrut + " { " + pat_str + " if " + flt_guard + " => " + next_s + ", _ => " + fail_expr + " }"
+    } else if is_irrefutable_simple_pat(pat_str) {
       if pat_str == "_" {
         next_s
       } else if pat_str == eff_scrut {
@@ -1425,10 +1512,29 @@ fn lower_is_chain_segs(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
+    let has_flt = pattern_has_float_lit(p_toks, p_s, p_e)
+    let mut flt_guard = ""
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    let pat_str = if has_flt {
+      if pattern_has_b2d_disallowed_tok(p_toks, p_s, p_e) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          p_toks[p_s].line,
+          p_toks[p_s].col,
+          "float literal pattern combined with unsupported pattern construct in `is`-chain (fail-closed)",
+        ))
+        lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+      } else {
+        let (rw_toks, flt_conds) = rewrite_float_lits_in_is_pat(ctx, p_toks, p_s, p_e, file)
+        flt_guard = flt_conds.join(" && ")
+        lower_expr_range(ctx, rw_toks, 0, rw_toks.length() - 1, file, true).trim()
+      }
+    } else {
+      lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    }
     if lhs_ty.length() > 0 {
       pop_expected_type(ctx)
     }
@@ -1456,7 +1562,9 @@ fn lower_is_chain_segs(
       bound_out,
       bound_seen,
     )
-    if is_irrefutable_simple_pat(pat_str) {
+    if flt_guard.length() > 0 {
+      "match " + scrut_expr + " { " + pat_str + " if " + flt_guard + " => " + next_s + ", _ => " + fail_expr + " }"
+    } else if is_irrefutable_simple_pat(pat_str) {
       if pat_str == "_" {
         "{ let _ = " + scrut_expr + "; " + next_s + " }"
       } else if pat_str == scrut_expr {
@@ -1840,10 +1948,29 @@ fn lower_is_chain_segs_with_block(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
+    let has_flt = pattern_has_float_lit(p_toks, p_s, p_e)
+    let mut flt_guard = ""
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
-    let pat_str = lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    let pat_str = if has_flt {
+      if pattern_has_b2d_disallowed_tok(p_toks, p_s, p_e) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          p_toks[p_s].line,
+          p_toks[p_s].col,
+          "float literal pattern combined with unsupported pattern construct in `is`-chain (fail-closed)",
+        ))
+        lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+      } else {
+        let (rw_toks, flt_conds) = rewrite_float_lits_in_is_pat(ctx, p_toks, p_s, p_e, file)
+        flt_guard = flt_conds.join(" && ")
+        lower_expr_range(ctx, rw_toks, 0, rw_toks.length() - 1, file, true).trim()
+      }
+    } else {
+      lower_expr_range(ctx, p_toks, p_s, p_e, file, true).trim()
+    }
     if lhs_ty.length() > 0 {
       pop_expected_type(ctx)
     }
@@ -1871,7 +1998,9 @@ fn lower_is_chain_segs_with_block(
       bound_out,
       bound_seen,
     )
-    if is_irrefutable_simple_pat(pat_str) {
+    if flt_guard.length() > 0 {
+      "match " + scrut_expr + " { " + pat_str + " if " + flt_guard + " => " + next_s + ", _ => " + fail_expr + " }"
+    } else if is_irrefutable_simple_pat(pat_str) {
       if pat_str == "_" {
         "{ let _ = " + scrut_expr + "; " + next_s + " }"
       } else if pat_str == scrut_expr {
