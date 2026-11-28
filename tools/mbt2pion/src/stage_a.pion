@@ -3538,7 +3538,7 @@ fn extract_container_value_type(ty : String) -> String {
   if base == "Array" || base == "FixedArray" || base == "ReadOnlyArray" || base == "ArrayView" || base == "mbt_compat::ArrayView" || base == "mbt_compat::ArrayBuf" {
     return inner
   }
-  if base == "Map" || base == "mbt_compat::OrderedMap" {
+  if base == "Map" || base == "OrderedMap" || base == "mbt_compat::OrderedMap" {
     let mut i = 0
     let mut d = 0
     while i < inner.length() {
@@ -4981,7 +4981,17 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
           return rty
         }
       }
-      None => ()
+      None =>
+      if !ctx.symtab.local_fn_names.contains(t.raw) && !ctx.symtab.local_value_names.contains(t.raw) {
+        match ctx.symtab.using_values.get(t.raw) {
+          Some(uqual) =>
+          match ctx.symtab.fn_ret_types.get(uqual) {
+            Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.fn_type_params, uqual) { return r }
+            None => ()
+          }
+          None => ()
+        }
+      }
     }
   }
   // `recv.m(...).unwrap_or(...)` where `Type::m` of the statically typed receiver returns `Option[T]` -> `T`
@@ -5018,7 +5028,17 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     }
     if d == 0 && lp >= start + 2 && tokens[lp - 2].kind == TokenKind::Dot && tokens[lp - 1].kind == TokenKind::Ident {
       let mn = tokens[lp - 1].raw
-      if mn == "get" || mn == "rev_find" || mn == "search" || mn == "pop" || mn == "last" {
+      if mn == "get" || mn == "pop" || mn == "last" {
+        let recv_ty = infer_simple_expr_type(ctx, tokens, start, lp - 2).trim()
+        if recv_ty.length() > 0 {
+          let vty = extract_container_value_type(recv_ty).trim()
+          if vty.length() > 0 {
+            return "Option[" + vty + "]"
+          }
+        }
+        return "Option"
+      }
+      if mn == "rev_find" || mn == "search" {
         return "Option"
       }
     }
@@ -9569,8 +9589,9 @@ fn lower_one_token_or_form(
             let k_s = lower_expr_range(ctx, tokens, cur, col_i, file, false).trim()
             pop_expected_type(ctx)
             push_expected_type(ctx, "mbt_compat::MbtJson")
-            let v_s = lower_expr_range(ctx, tokens, col_i + 1, v_end, file, false).trim()
+            let v_s_raw = lower_expr_range(ctx, tokens, col_i + 1, v_end, file, false).trim()
             pop_expected_type(ctx)
+            let v_s = maybe_wrap_mbt_json_expr(ctx, tokens, col_i + 1, v_end, v_s_raw)
             if !first { sb.write_string(", ") }
             first = false
             sb.write_string("(" + k_s + ", " + v_s + ")")
@@ -9828,8 +9849,9 @@ fn lower_one_token_or_form(
         }
         if ae > ai {
           push_expected_type(ctx, "mbt_compat::MbtJson")
-          let item_e = lower_expr_range(ctx, tokens, ai, ae, file, false).trim()
+          let item_e_raw = lower_expr_range(ctx, tokens, ai, ae, file, false).trim()
           pop_expected_type(ctx)
+          let item_e = maybe_wrap_mbt_json_expr(ctx, tokens, ai, ae, item_e_raw)
           if !first { sb.write_string(", ") }
           first = false
           sb.write_string(item_e)
@@ -11434,7 +11456,34 @@ fn lower_one_token_or_form(
         pi = pe + 1
       }
       if has_rest {
-        let arity = lookup_ctor_arity_resolved(ctx.symtab, t.raw, head_name, raw_pats.length())
+        let arity_qual_head = if str_has(head_name, "::") {
+          head_name
+        } else if prev_colon2 && i >= 2 && tokens[i - 2].kind == TokenKind::UpperIdent {
+          let en_raw = tokens[i - 2].raw
+          if i >= 4 && tokens[i - 3].kind == TokenKind::ColonColon &&
+          (tokens[i - 4].kind == TokenKind::Ident || tokens[i - 4].kind == TokenKind::UpperIdent) {
+            tokens[i - 4].raw + "::" + en_raw + "::" + t.raw
+          } else if i >= 4 && tokens[i - 3].kind == TokenKind::Dot && tokens[i - 4].kind == TokenKind::PkgRef {
+            let raw_p = tokens[i - 4].raw
+            let clean_p = if raw_p.starts_with("@") { raw_p.slice(1, raw_p.length()) } else { raw_p }
+            let pkg_r = match ctx.symtab.pkg_aliases.get(clean_p) {
+              Some(mapped) => mapped
+              None => clean_p
+            }
+            pkg_r + "::" + en_raw + "::" + t.raw
+          } else {
+            match ctx.symtab.using_types.get(en_raw) {
+              Some(ut) => ut + "::" + t.raw
+              None => en_raw + "::" + t.raw
+            }
+          }
+        } else if head_name.starts_with(".") || prev_dot {
+          let eb = strip_type_args_sym(current_expected_type(ctx))
+          if eb.length() > 0 { eb + "::" + t.raw } else { head_name }
+        } else {
+          head_name
+        }
+        let arity = lookup_ctor_arity_resolved(ctx.symtab, t.raw, arity_qual_head, raw_pats.length())
         if arity < 0 || arity < raw_pats.length() {
           ctx.diags.push(diag_error(
             "MBT2PION_MANUAL",
@@ -11784,6 +11833,40 @@ fn lower_one_token_or_form(
           return (trivia + name + ".v", next_i)
         }
         None => ()
+      }
+    }
+
+    // First-class `physical_equal` value (not shadowed and not a direct call `physical_equal(...)`):
+    // wrap in a 2-arg closure so Pion accepts it as a function value (e.g. `same=physical_equal`).
+    if !in_pattern && !prev_dot && !prev_cc && t.raw == "physical_equal" &&
+    !(lookup_scope_var(ctx, "physical_equal") is Some(_)) &&
+    !ctx.symtab.local_fn_names.contains("physical_equal") &&
+    !ctx.symtab.local_value_names.contains("physical_equal") &&
+    !ctx.lifted_local_fns.contains("physical_equal") {
+      let is_direct_call = next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before
+      let is_label_or_field = next_i < end &&
+      (tokens[next_i].kind == TokenKind::Eq || tokens[next_i].kind == TokenKind::Colon || tokens[next_i].kind == TokenKind::Tilde)
+      if !is_direct_call && !is_label_or_field {
+        return (trivia + "fn(__mbt_pe_a, __mbt_pe_b) { physical_equal(__mbt_pe_a, __mbt_pe_b) }", next_i)
+      }
+    }
+
+    // `.unwrap_or(default_expr)`: propagate unwrapped `Option[T]` inner type `T` into `default_expr`!
+    if !in_pattern && prev_dot && t.raw == "unwrap_or" && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before {
+      let recv_start = find_dot_receiver_start(tokens, i - 1)
+      if recv_start >= 0 && recv_start < i - 1 {
+        let recv_ty = infer_simple_expr_type(ctx, tokens, recv_start, i - 1).trim()
+        let inner_ty = unwrap_option_type_str(recv_ty)
+        if inner_ty.length() > 0 {
+          let close_p = find_matching_delim(tokens, next_i)
+          if close_p > next_i + 1 {
+            let saved_uo = ctx.expected_type_stack.length()
+            push_expected_type(ctx, inner_ty)
+            let inner_s = lower_expr_range(ctx, tokens, next_i + 1, close_p, file, false)
+            restore_expected_type_stack(ctx, saved_uo)
+            return (trivia + "unwrap_or" + tokens[next_i].leading_trivia + "(" + inner_s + tokens[close_p].leading_trivia + ")", close_p + 1)
+          }
+        }
       }
     }
 
@@ -12165,13 +12248,7 @@ fn lower_one_token_or_form(
           None => ()
         }
       }
-      let elem_ty = if arr_ty.starts_with("Array[") && arr_ty.ends_with("]") {
-        arr_ty.slice(6, arr_ty.length() - 1).trim()
-      } else if arr_ty.starts_with("FixedArray[") && arr_ty.ends_with("]") {
-        arr_ty.slice(11, arr_ty.length() - 1).trim()
-      } else {
-        ""
-      }
+      let elem_ty = extract_container_value_type(arr_ty)
       if elem_ty.length() > 0 {
         let mname = tokens[next_i + 1].raw
         let close_p = find_matching_delim(tokens, next_i + 2)
@@ -12294,17 +12371,36 @@ fn lower_one_token_or_form(
             return (trivia + name + "." + f_out + op_tok.leading_trivia + op_tok.raw + rhs_s, rhs_end)
           }
         }
-        // `x.arr_field.unsafe_set(i, v)` / `.set(i, v)` / `.push(v)` when `field_ty` is `Array[T]` / `FixedArray[T]`
+        // `x.container_field[k] = rhs`: propagate container value type as expected type for `rhs`!
+        if after_f < end && tokens[after_f].kind == TokenKind::LBracket && !tokens[after_f].newline_before {
+          let close_br = find_matching_delim(tokens, after_f)
+          if close_br + 1 < end && tokens[close_br + 1].kind == TokenKind::Eq {
+            let vty = extract_container_value_type(field_ty)
+            if vty.length() > 0 {
+              let f_out = if field_raw == "val" {
+                match try_resolve_static_val_field(ctx, tokens, next_i) {
+                  Some(rf) => rf
+                  None => alloc_fresh_val_placeholder(ctx, tokens[next_i + 1].line, tokens[next_i + 1].col)
+                }
+              } else {
+                rename_keyword_ident(field_raw)
+              }
+              push_expected_type(ctx, "")
+              let idx_s = lower_expr_range(ctx, tokens, after_f + 1, close_br, file, false)
+              pop_expected_type(ctx)
+              let rhs_end = find_expr_end(tokens, close_br + 2, end)
+              push_expected_type(ctx, vty)
+              let rhs_s = lower_expr_range(ctx, tokens, close_br + 2, rhs_end, file, false)
+              pop_expected_type(ctx)
+              return (trivia + name + "." + f_out + tokens[after_f].leading_trivia + "[" + idx_s + tokens[close_br].leading_trivia + "]" + tokens[close_br + 1].leading_trivia + "=" + rhs_s, rhs_end)
+            }
+          }
+        }
+        // `x.arr_field.unsafe_set(i, v)` / `.set(i, v)` / `.push(v)` when `field_ty` is `Array[T]` / `FixedArray[T]` / `Map[K, V]` / `OrderedMap[K, V]`
         if after_f + 2 < end && tokens[after_f].kind == TokenKind::Dot &&
         tokens[after_f + 1].kind == TokenKind::Ident && tokens[after_f + 2].kind == TokenKind::LParen &&
         (tokens[after_f + 1].raw == "unsafe_set" || tokens[after_f + 1].raw == "set" || tokens[after_f + 1].raw == "push") {
-          let elem_ty = if field_ty.starts_with("Array[") && field_ty.ends_with("]") {
-            field_ty.slice(6, field_ty.length() - 1).trim()
-          } else if field_ty.starts_with("FixedArray[") && field_ty.ends_with("]") {
-            field_ty.slice(11, field_ty.length() - 1).trim()
-          } else {
-            ""
-          }
+          let elem_ty = extract_container_value_type(field_ty)
           if elem_ty.length() > 0 {
             let mname = tokens[after_f + 1].raw
             let close_p = find_matching_delim(tokens, after_f + 2)
@@ -14435,6 +14531,160 @@ fn is_diverging_match_arm(ctx : StageAContext, tokens : Array[Token], bs : Int, 
   false
 }
 
+///| When lowering a value inside a `Json` (`mbt_compat::MbtJson`) object or array literal,
+///| implicitly wrap typed non-literal expressions (`String`, `Double`, `Int`, `Bool`,
+///| `Array[MbtJson]`, `OrderedMap[String, MbtJson]`) into `MbtJson` constructors.
+fn maybe_wrap_mbt_json_expr(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  es : Int,
+  ee : Int,
+  lowered : String,
+) -> String {
+  let ls = lowered.trim()
+  if ls.length() == 0 || es >= ee {
+    return lowered
+  }
+  if ls.starts_with("mbt_compat::MbtJson::") || ls.starts_with("MbtJson::") {
+    return lowered
+  }
+  if tokens[es].kind == TokenKind::Keyword && (tokens[es].raw == "if" || tokens[es].raw == "match") {
+    return lowered
+  }
+  let ety = infer_simple_expr_type(ctx, tokens, es, ee).trim()
+  if ety == "String" {
+    return "mbt_compat::MbtJson::String(" + ls + ")"
+  }
+  if ety == "Double" {
+    return "mbt_compat::MbtJson::number(" + ls + ")"
+  }
+  if ety == "Int" {
+    return "mbt_compat::MbtJson::number((" + ls + ").to_double())"
+  }
+  if ety == "Bool" {
+    return "mbt_compat::MbtJson::boolean(" + ls + ")"
+  }
+  if ety == "Array[mbt_compat::MbtJson]" || ety == "Array[MbtJson]" || ety == "Array[Json]" {
+    return "mbt_compat::MbtJson::array(" + ls + ")"
+  }
+  if ety == "mbt_compat::OrderedMap[String, mbt_compat::MbtJson]" ||
+  ety == "OrderedMap[String, mbt_compat::MbtJson]" ||
+  ety == "Map[String, mbt_compat::MbtJson]" ||
+  ety == "Map[String, Json]" {
+    return "mbt_compat::MbtJson::object(" + ls + ")"
+  }
+  lowered
+}
+
+///| Walk backwards from a `.` token at `dot_idx` to locate the start of its receiver expression.
+fn find_dot_receiver_start(tokens : Array[Token], dot_idx : Int) -> Int {
+  let mut cur = dot_idx - 1
+  if cur < 0 {
+    return -1
+  }
+  while cur >= 0 {
+    let k = tokens[cur].kind
+    if k == TokenKind::RParen || k == TokenKind::RBracket {
+      let close_k = k
+      let open_k = if k == TokenKind::RParen { TokenKind::LParen } else { TokenKind::LBracket }
+      let mut d = 0
+      let mut j = cur
+      while j >= 0 {
+        if tokens[j].kind == close_k { d = d + 1 }
+        else if tokens[j].kind == open_k {
+          d = d - 1
+          if d == 0 { break }
+        }
+        j = j - 1
+      }
+      if d != 0 {
+        return -1
+      }
+      cur = j
+      if cur > 0 && !tokens[cur].newline_before {
+        let pk = tokens[cur - 1].kind
+        if pk == TokenKind::Ident || pk == TokenKind::UpperIdent || pk == TokenKind::RParen || pk == TokenKind::RBracket {
+          cur = cur - 1
+          continue
+        }
+      }
+      return cur
+    }
+    if k == TokenKind::Ident || k == TokenKind::UpperIdent || k == TokenKind::PkgRef ||
+    (k == TokenKind::Keyword && tokens[cur].raw == "self") {
+      if cur >= 2 && (tokens[cur - 1].kind == TokenKind::Dot || tokens[cur - 1].kind == TokenKind::ColonColon) {
+        cur = cur - 2
+        continue
+      }
+      return cur
+    }
+    return -1
+  }
+  -1
+}
+
+///| Return true iff `[start, end)` in a match body contains an unguarded wildcard/ident catchall arm.
+fn match_arms_have_unguarded_catchall(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut i = start
+  while i < end {
+    if tokens[i].kind == TokenKind::Comma || tokens[i].kind == TokenKind::Semi {
+      i = i + 1
+      continue
+    }
+    let mut fa = i
+    let mut depth = 0
+    let mut if_idx = -1
+    while fa < end {
+      let k = tokens[fa].kind
+      if k == TokenKind::LParen || k == TokenKind::LBrace || k == TokenKind::LBracket { depth = depth + 1 }
+      else if k == TokenKind::RParen || k == TokenKind::RBrace || k == TokenKind::RBracket { if depth > 0 { depth = depth - 1 } }
+      else if depth == 0 {
+        if k == TokenKind::FatArrow { break }
+        else if k == TokenKind::Keyword && tokens[fa].raw == "if" && if_idx < 0 { if_idx = fa }
+      }
+      fa = fa + 1
+    }
+    if fa >= end {
+      break
+    }
+    if if_idx < 0 && fa == i + 1 && (tokens[i].kind == TokenKind::Underscore || tokens[i].kind == TokenKind::Ident) {
+      return true
+    }
+    let body_start = fa + 1
+    let mut next_i = if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
+      let body_end = find_match_arm_body_end(tokens, body_start, end)
+      let blk_end = find_matching_delim(tokens, body_start) + 1
+      if body_end > blk_end { body_end } else { blk_end }
+    } else if body_start < end && tokens[body_start].kind == TokenKind::Keyword &&
+    (tokens[body_start].raw == "for" || tokens[body_start].raw == "while") {
+      find_loop_stmt_end(tokens, body_start, end)
+    } else {
+      find_match_arm_body_end(tokens, body_start, end)
+    }
+    if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
+      next_i = next_i + 1
+    }
+    if next_i <= i {
+      break
+    }
+    i = next_i
+  }
+  false
+}
+
+///| Return true iff pattern tokens `[start, end)` contain any `Double` `FloatLit` (excludes Float32 `F`/`f`).
+fn pattern_has_float_lit(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    if tokens[k].kind == TokenKind::FloatLit &&
+    !tokens[k].raw.ends_with("F") && !tokens[k].raw.ends_with("f") {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
 fn is_json_type_str(ty : String) -> Bool {
   let t = ty.trim()
   t == "mbt_compat::MbtJson" || t == "MbtJson" || t == "Json"
@@ -14863,8 +15113,13 @@ fn lower_match_arms_with_ty(
         } else {
           ""
         }
+        let rest_has_catchall = next_i < end && match_arms_have_unguarded_catchall(tokens, next_i, end)
         let none_uncached = if rest_uncached.length() > 0 {
-          "match " + mc_var + " { " + rest_uncached + " }"
+          if !rest_has_catchall && !str_has(rest_uncached, "_ => panic(\"unreachable\")") {
+            "match " + mc_var + " { " + rest_uncached + "\n    _ => panic(\"unreachable\") }"
+          } else {
+            "match " + mc_var + " { " + rest_uncached + " }"
+          }
         } else {
           "panic(\"unreachable\")"
         }
@@ -14885,7 +15140,15 @@ fn lower_match_arms_with_ty(
           let _ = ctx.match_arr_cache_elems.pop()
           let _ = ctx.match_arr_cache_suffix.pop()
           let _ = ctx.match_arr_cache_len.pop()
-          if rc.length() > 0 { "match " + mc_var + " { " + rc + " }" } else { "panic(\"unreachable\")" }
+          if rc.length() > 0 {
+            if !rest_has_catchall && !str_has(rc, "_ => panic(\"unreachable\")") {
+              "match " + mc_var + " { " + rc + "\n    _ => panic(\"unreachable\") }"
+            } else {
+              "match " + mc_var + " { " + rc + " }"
+            }
+          } else {
+            "panic(\"unreachable\")"
+          }
         } else {
           none_uncached
         }
@@ -15278,6 +15541,204 @@ fn lower_match_arms_with_ty(
         sb.write_string(lead_triv + fp_v + " if " + full_guard + fa_triv + "=>" + body_raw + trail_sep)
         had_guarded_struct_arm = true
         handled_special = true
+      }
+    }
+
+    // Special case B2d: nested float literal pattern (`Some((-2.0, _)) => ...`, `Some(Number(3.0, _)) => ...`,
+    // including or-patterns like `Some(-2.0) | Some(2.0) => ...`). Replaces each float literal (with optional
+    // unary `-`) by a fresh `__mbt_flt_N` binding and conjoins `__mbt_flt_N == <lit>` into the arm guard.
+    if !handled_special && pat_end > i && pattern_has_float_lit(tokens, i, pat_end) {
+      let flt_alts : Array[(Int, Int)] = []
+      let mut as_i = i
+      let mut adep = 0
+      let mut ak = i
+      while ak <= pat_end {
+        if ak == pat_end || (adep == 0 && tokens[ak].kind == TokenKind::Pipe) {
+          if ak > as_i {
+            flt_alts.push((as_i, ak))
+          }
+          as_i = ak + 1
+        } else {
+          let kk = tokens[ak].kind
+          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { adep = adep + 1 }
+          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if adep > 0 { adep = adep - 1 } }
+        }
+        ak = ak + 1
+      }
+      if flt_alts.length() > 0 {
+        let mut alt_idx = 0
+        while alt_idx < flt_alts.length() {
+          let (a0, a1) = flt_alts[alt_idx]
+          let arm_lead = if alt_idx == 0 { lead_triv } else { "\n    " }
+          let arm_sep = if alt_idx + 1 < flt_alts.length() { "," } else { trail_sep }
+          if !pattern_has_float_lit(tokens, a0, a1) {
+            let exp_a = expand_nested_or_pat(ctx, tokens, a0, a1, file)
+            if guard_str.length() == 0 && exp_a.length() == 1 && is_irrefutable_simple_pat(exp_a[0]) {
+              has_unguarded_catchall = true
+            }
+            let pat_s = exp_a.join(" | ")
+            let g_part = if guard_str.length() > 0 { " if " + guard_str } else { "" }
+            let fa_triv = if guard_str.length() > 0 { guard_arrow_trivia(tokens[fa].leading_trivia) } else { tokens[fa].leading_trivia }
+            sb.write_string(arm_lead + pat_s + g_part + fa_triv + "=>" + body_raw + arm_sep)
+          } else {
+            let rw_toks : Array[Token] = []
+            let flt_conds : Array[String] = []
+            let mut k = a0
+            while k < a1 {
+              if k + 1 < a1 && tokens[k].kind == TokenKind::Minus && tokens[k + 1].kind == TokenKind::FloatLit &&
+              !tokens[k + 1].raw.ends_with("F") && !tokens[k + 1].raw.ends_with("f") {
+                let flt_v = fresh_temp(ctx, "flt")
+                let lit_s = lower_expr_range(ctx, tokens, k, k + 2, file, false).trim()
+                flt_conds.push(flt_v + " == " + lit_s)
+                rw_toks.push(Token::{
+                  kind: TokenKind::Ident,
+                  raw: flt_v,
+                  leading_trivia: tokens[k].leading_trivia,
+                  newline_before: tokens[k].newline_before,
+                  line: tokens[k].line,
+                  col: tokens[k].col,
+                  start_byte: tokens[k].start_byte,
+                  end_byte: tokens[k + 1].end_byte,
+                })
+                k = k + 2
+              } else if tokens[k].kind == TokenKind::FloatLit &&
+              !tokens[k].raw.ends_with("F") && !tokens[k].raw.ends_with("f") {
+                let flt_v = fresh_temp(ctx, "flt")
+                let lit_s = lower_expr_range(ctx, tokens, k, k + 1, file, false).trim()
+                flt_conds.push(flt_v + " == " + lit_s)
+                rw_toks.push(Token::{
+                  kind: TokenKind::Ident,
+                  raw: flt_v,
+                  leading_trivia: tokens[k].leading_trivia,
+                  newline_before: tokens[k].newline_before,
+                  line: tokens[k].line,
+                  col: tokens[k].col,
+                  start_byte: tokens[k].start_byte,
+                  end_byte: tokens[k].end_byte,
+                })
+                k = k + 1
+              } else {
+                rw_toks.push(tokens[k])
+                k = k + 1
+              }
+            }
+            rw_toks.push(Token::{
+              kind: TokenKind::Eof,
+              raw: "",
+              leading_trivia: "",
+              newline_before: false,
+              line: tokens[a1 - 1].line,
+              col: tokens[a1 - 1].col,
+              start_byte: tokens[a1 - 1].end_byte,
+              end_byte: tokens[a1 - 1].end_byte,
+            })
+            let exp_a = expand_nested_or_pat(ctx, rw_toks, 0, rw_toks.length() - 1, file)
+            let pat_s = exp_a.join(" | ")
+            let flt_guard = flt_conds.join(" && ")
+            let full_guard = if guard_str.length() > 0 {
+              "(" + flt_guard + ") && (" + guard_str + ")"
+            } else {
+              flt_guard
+            }
+            let fa_triv = guard_arrow_trivia(tokens[fa].leading_trivia)
+            sb.write_string(arm_lead + pat_s + " if " + full_guard + fa_triv + "=>" + body_raw + arm_sep)
+            had_guarded_struct_arm = true
+          }
+          alt_idx = alt_idx + 1
+        }
+        handled_special = true
+      }
+    }
+
+    // Special case B2e: top-level `|` or-pattern containing empty array pattern (`Some(Array([])) | Some(Null) | None => ...`,
+    // `Null | Array([]) => ...`, `[] | ... => ...`). Splits empty-array alternatives into guarded arms and emits
+    // remaining plain alternatives together so illegal `[]` pattern syntax never leaks.
+    if !handled_special && pat_end > i {
+      let or_alts : Array[(Int, Int)] = []
+      let mut as_i = i
+      let mut adep = 0
+      let mut ak = i
+      while ak <= pat_end {
+        if ak == pat_end || (adep == 0 && tokens[ak].kind == TokenKind::Pipe) {
+          if ak > as_i {
+            or_alts.push((as_i, ak))
+          }
+          as_i = ak + 1
+        } else {
+          let kk = tokens[ak].kind
+          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { adep = adep + 1 }
+          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if adep > 0 { adep = adep - 1 } }
+        }
+        ak = ak + 1
+      }
+      if or_alts.length() >= 2 {
+        let empty_arr_arms : Array[(String, String)] = []
+        let plain_alts : Array[(Int, Int)] = []
+        for alt in or_alts {
+          let (a0, a1) = alt
+          if a0 + 2 == a1 && tokens[a0].kind == TokenKind::LBracket && tokens[a0 + 1].kind == TokenKind::RBracket {
+            let scrut_clean = strip_type_args_sym(scrut_ty)
+            let is_prov = scrut_clean == "Array" || scrut_clean == "FixedArray" ||
+            scrut_clean == "ArrayView" || scrut_clean == "mbt_compat::ArrayView" ||
+            scrut_clean == "ArrayBuf" || scrut_clean == "mbt_compat::ArrayBuf"
+            let arr_v = fresh_temp(ctx, "arr")
+            let len_c = if is_prov { arr_v + ".length() == 0" } else { "mbt_compat::__mbt_arrpat_len(" + arr_v + ") == 0" }
+            empty_arr_arms.push((arr_v, len_c))
+          } else {
+            match find_nested_ctor_array_pat(ctx, tokens, a0, a1, file) {
+              Some((lbr, rbr, as_idx, outer_prefix, outer_suffix, is_json_arr)) =>
+              if rbr == lbr + 1 && as_idx < 0 {
+                let scrut_t = scrut_ty.trim()
+                let unwrapped_inner = if (outer_prefix == "Some(" || outer_prefix == "Option::Some(") &&
+                scrut_t.starts_with("Option[") && scrut_t.ends_with("]") {
+                  scrut_t.slice(7, scrut_t.length() - 1).trim()
+                } else {
+                  ""
+                }
+                let inner_clean = strip_type_args_sym(unwrapped_inner)
+                let is_prov = is_json_arr || inner_clean == "Array" || inner_clean == "FixedArray" ||
+                inner_clean == "ArrayView" || inner_clean == "mbt_compat::ArrayView" ||
+                inner_clean == "ArrayBuf" || inner_clean == "mbt_compat::ArrayBuf"
+                let arr_v = fresh_temp(ctx, "arr")
+                let len_c = if is_prov { arr_v + ".length() == 0" } else { "mbt_compat::__mbt_arrpat_len(" + arr_v + ") == 0" }
+                empty_arr_arms.push((outer_prefix + arr_v + outer_suffix, len_c))
+              } else {
+                plain_alts.push((a0, a1))
+              }
+              None => plain_alts.push((a0, a1))
+            }
+          }
+        }
+        if empty_arr_arms.length() > 0 {
+          let total_emitted = empty_arr_arms.length() + (if plain_alts.length() > 0 { 1 } else { 0 })
+          let mut emit_idx = 0
+          for ea in empty_arr_arms {
+            let arm_lead = if emit_idx == 0 { lead_triv } else { "\n    " }
+            let arm_sep = if emit_idx + 1 < total_emitted { "," } else { trail_sep }
+            let full_g = if guard_str.length() > 0 { "(" + ea.1 + ") && (" + guard_str + ")" } else { ea.1 }
+            let fa_triv = guard_arrow_trivia(tokens[fa].leading_trivia)
+            sb.write_string(arm_lead + ea.0 + " if " + full_g + fa_triv + "=>" + body_raw + arm_sep)
+            had_guarded_struct_arm = true
+            emit_idx = emit_idx + 1
+          }
+          if plain_alts.length() > 0 {
+            let arm_lead = if emit_idx == 0 { lead_triv } else { "\n    " }
+            let plain_pats : Array[String] = []
+            for pa in plain_alts {
+              let exp_p = expand_nested_or_pat(ctx, tokens, pa.0, pa.1, file)
+              for ep in exp_p {
+                plain_pats.push(ep)
+              }
+            }
+            if guard_str.length() == 0 && plain_pats.length() == 1 && is_irrefutable_simple_pat(plain_pats[0]) {
+              has_unguarded_catchall = true
+            }
+            let g_part = if guard_str.length() > 0 { " if " + guard_str } else { "" }
+            let fa_triv = if guard_str.length() > 0 { guard_arrow_trivia(tokens[fa].leading_trivia) } else { tokens[fa].leading_trivia }
+            sb.write_string(arm_lead + plain_pats.join(" | ") + g_part + fa_triv + "=>" + body_raw + trail_sep)
+          }
+          handled_special = true
+        }
       }
     }
 
