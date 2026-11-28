@@ -96,23 +96,152 @@ pub fn summary_may_mutate_array(sum : FnMutationSummary, target_elem_ty : String
   sum.mutated_elem_types.contains(t)
 }
 
-///| Context-aware `summary_may_mutate_array`: fails closed when `target_elem_ty` is empty,
-///| contains an active generic type parameter (e.g. `Array[T]` aliasing `Array[Int]`),
-///| or is not a ground canonical type in `pkg`.
+///| Recursively canonicalize a type string in `pkg` by expanding unambiguous local `type` aliases,
+///| `using` type imports, and package import aliases (`<alias>::<T>` -> `<canon>::<T>`) across
+///| nested generic arguments `[...]` and tuples `(...)`. Returns `""` (fail-closed) on any
+///| unexpandable/ambiguous alias, cyclic alias, or function type.
+pub fn ms_canonicalize_type(pkg : PkgMutationSummary, ty : String) -> String {
+  ms_canonicalize_type_rec(pkg, ty, 0)
+}
+
+fn ms_canonicalize_type_rec(pkg : PkgMutationSummary, ty : String, depth : Int) -> String {
+  if depth > 16 {
+    return ""
+  }
+  let t0 = qt_strip_pkg_hash(ms_strip_trailing_comma(ty.trim()))
+  if t0.length() == 0 || t0 == "__AMBIG__" {
+    return ""
+  }
+  if ms_ty_is_fn_type(t0) || ms_ty_is_dyn(t0) {
+    return ""
+  }
+  // Tuple `(A, B, ...)`
+  if t0.starts_with("(") && t0.ends_with(")") {
+    let inner = ms_strip_trailing_comma(t0.slice(1, t0.length() - 1))
+    if inner.length() == 0 {
+      return "()"
+    }
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() == 0 {
+      return ""
+    }
+    let canon_parts : Array[String] = []
+    for p in parts {
+      let cp = ms_canonicalize_type_rec(pkg, p, depth + 1)
+      if cp.length() == 0 {
+        return ""
+      }
+      canon_parts.push(cp)
+    }
+    return "(" + join_comma(canon_parts) + ")"
+  }
+  // Parameterized type `Head[A, B, ...]`
+  let lb = t0.index_of("[")
+  if lb > 0 {
+    if !t0.ends_with("]") {
+      return ""
+    }
+    let head = t0.slice(0, lb).trim()
+    let chead = ms_canonicalize_type_rec(pkg, head, depth + 1)
+    if chead.length() == 0 {
+      return ""
+    }
+    let inner = ms_strip_trailing_comma(t0.slice(lb + 1, t0.length() - 1))
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() == 0 {
+      return ""
+    }
+    let canon_parts : Array[String] = []
+    for p in parts {
+      let cp = ms_canonicalize_type_rec(pkg, p, depth + 1)
+      if cp.length() == 0 {
+        return ""
+      }
+      canon_parts.push(cp)
+    }
+    return chead + "[" + join_comma(canon_parts) + "]"
+  }
+  // Qualified type `pkg::Type` / `@pkg.Type` / `pkg.Type`
+  let qnorm = ms_qualified_type_head(t0)
+  let cc = qnorm.index_of("::")
+  if cc > 0 {
+    let p = qnorm.slice(0, cc).trim()
+    let nm = qnorm.slice(cc + 2, qnorm.length()).trim()
+    if p.length() == 0 || nm.length() == 0 {
+      return ""
+    }
+    match pkg.pkg_aliases.get(p) {
+      Some(canon) =>
+      if canon == "__AMBIG__" {
+        return ""
+      } else if canon.length() > 0 && canon != p {
+        return ms_canonicalize_type_rec(pkg, canon + "::" + nm, depth + 1)
+      }
+      None => ()
+    }
+    return p + "::" + nm
+  }
+  // Bare local `type` alias: expand if unambiguous, otherwise fail-closed (`""`).
+  if pkg.type_alias_names.contains(t0) {
+    match pkg.type_aliases.get(t0) {
+      Some(rhs) =>
+      if rhs.length() > 0 && rhs != "__AMBIG__" {
+        return ms_canonicalize_type_rec(pkg, rhs, depth + 1)
+      } else {
+        return ""
+      }
+      None => return ""
+    }
+  }
+  // Bare `using`-imported type: expand to qualified target and canonicalize, else fail-closed.
+  if pkg.using_types.contains(t0) {
+    match pkg.using_type_targets.get(t0) {
+      Some(target) =>
+      if target.length() > 0 && target != "__AMBIG__" {
+        return ms_canonicalize_type_rec(pkg, target, depth + 1)
+      } else {
+        return ""
+      }
+      None => return ""
+    }
+  }
+  t0
+}
+
+///| Context-aware `summary_may_mutate_array`: recursively canonicalizes both `target_elem_ty`
+///| and `sum.mutated_elem_types` across package aliases, `using` type imports, and local `type`
+///| aliases, failing closed on empty/unknown/generic/ambiguous/unexpandable types.
 pub fn summary_may_mutate_array_in_ctx(
   pkg : PkgMutationSummary,
   sum : FnMutationSummary,
   target_elem_ty : String,
   active_generics : Map[String, Bool],
 ) -> Bool {
-  let t = target_elem_ty.trim()
-  let elem_check = if t.length() == 0 || ms_ty_contains_generic(t, active_generics) ||
-  !qt_is_ground_canon_type(t, pkg.declared_types, active_generics) {
+  if sum.unknown || sum.mutates_any_array {
+    return true
+  }
+  let canon_t = ms_canonicalize_type(pkg, target_elem_ty)
+  let elem_check = if canon_t.length() == 0 ||
+  ms_ty_contains_generic(canon_t, active_generics) ||
+  !qt_is_ground_canon_type(canon_t, pkg.declared_types, active_generics) ||
+  pkg.type_alias_names.contains(canon_t) {
     ""
   } else {
-    t
+    canon_t
   }
-  summary_may_mutate_array(sum, elem_check)
+  if elem_check.length() == 0 {
+    return sum.mutated_elem_types.length() > 0
+  }
+  if sum.mutated_elem_types.contains(elem_check) {
+    return true
+  }
+  for raw_m in sum.mutated_elem_types.keys() {
+    let cm = ms_canonicalize_type(pkg, raw_m)
+    if cm.length() == 0 || cm == elem_check {
+      return true
+    }
+  }
+  false
 }
 
 pub struct PkgMutationSummary {
@@ -151,6 +280,8 @@ pub struct PkgMutationSummary {
   using_value_targets : Map[String, String]
   using_type_targets : Map[String, String]
   pkg_aliases : Map[String, String]
+  type_alias_names : Map[String, Bool]
+  type_aliases : Map[String, String]
 }
 
 pub fn PkgMutationSummary::empty() -> PkgMutationSummary {
@@ -190,6 +321,8 @@ pub fn PkgMutationSummary::empty() -> PkgMutationSummary {
     using_value_targets: Map(),
     using_type_targets: Map(),
     pkg_aliases: Map(),
+    type_alias_names: Map(),
+    type_aliases: Map(),
   }
 }
 
@@ -3740,6 +3873,18 @@ pub fn collect_pkg_mutation_summary_with_cross_pkg(
       None => ()
     }
   }
+  // Pre-seed dep_name -> canonical package_name aliases before canonicalizing summaries.
+  for dabi in cross_pkg.dep_abis {
+    let dep_name = dabi.0
+    let abi = dabi.1
+    let canon_pkg = if abi.package_name.length() > 0 { abi.package_name } else { dep_name }
+    if dep_name.length() > 0 && canon_pkg.length() > 0 && dep_name != canon_pkg {
+      match pkg.pkg_aliases.get(dep_name) {
+        Some(prev) => if prev != canon_pkg { pkg.pkg_aliases[dep_name] = "__AMBIG__" }
+        None => pkg.pkg_aliases[dep_name] = canon_pkg
+      }
+    }
+  }
   for dabi in cross_pkg.dep_abis {
     let dep_name = dabi.0
     let abi = dabi.1
@@ -3759,10 +3904,16 @@ pub fn collect_pkg_mutation_summary_with_cross_pkg(
       }
       for et in fms.mutated_elem_types {
         if et.length() > 0 {
-          s_canon.mutated_elem_types[et] = true
-          s_dep.mutated_elem_types[et] = true
+          let cet = ms_canonicalize_type(pkg, et)
+          let store_et = if cet.length() > 0 { cet } else { et }
+          s_canon.mutated_elem_types[store_et] = true
+          s_dep.mutated_elem_types[store_et] = true
+          if cet.length() == 0 {
+            s_canon.mutates_any_array = true
+            s_dep.mutates_any_array = true
+          }
           if canon_pkg.length() > 0 && dep_name.length() > 0 && canon_pkg != dep_name {
-            let remapped = remap_abi_pkg_prefix(et, canon_pkg, dep_name)
+            let remapped = remap_abi_pkg_prefix(store_et, canon_pkg, dep_name)
             if remapped.length() > 0 {
               s_dep.mutated_elem_types[remapped] = true
             }
@@ -3897,6 +4048,40 @@ pub fn collect_pkg_mutation_summary_with_cross_pkg(
         if is_generic_ty {
           derive_eq_invalid[tname] = true
           derive_hash_invalid[tname] = true
+        }
+        if tk.raw == "type" {
+          pkg.type_alias_names[tname] = true
+          if is_generic_ty {
+            pkg.type_aliases[tname] = "__AMBIG__"
+          } else {
+            let mut eq_i = i + 2
+            while eq_i < n && ts[eq_i].kind != TokenKind::Eq && ts[eq_i].kind != TokenKind::Semi && !ts[eq_i].newline_before {
+              eq_i = eq_i + 1
+            }
+            if eq_i < n && ts[eq_i].kind == TokenKind::Eq {
+              let rhs_s = eq_i + 1
+              let mut rhs_e = rhs_s
+              let mut rd = 0
+              while rhs_e < n {
+                let rk = ts[rhs_e].kind
+                if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+                else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } else { break } }
+                else if rd == 0 && (rk == TokenKind::Semi || (rhs_e > rhs_s && ts[rhs_e].newline_before)) { break }
+                rhs_e = rhs_e + 1
+              }
+              let rhs_ty = ms_join_token_slice(ts, rhs_s, rhs_e)
+              if rhs_ty.length() > 0 {
+                match pkg.type_aliases.get(tname) {
+                  Some(prev) => if prev != rhs_ty { pkg.type_aliases[tname] = "__AMBIG__" }
+                  None => pkg.type_aliases[tname] = rhs_ty
+                }
+              } else {
+                pkg.type_aliases[tname] = "__AMBIG__"
+              }
+            } else {
+              pkg.type_aliases[tname] = "__AMBIG__"
+            }
+          }
         }
         if tk.raw == "struct" {
           let mut struct_is_pub_all = false

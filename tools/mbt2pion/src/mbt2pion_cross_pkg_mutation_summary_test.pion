@@ -540,3 +540,178 @@ test "cross_pkg_pipeline_abi_export_and_transitive_propagation" {
   assert_true(res_b.abi.fn_mutation_summaries[1].name == "b_push" && !res_b.abi.fn_mutation_summaries[1].unknown && res_b.abi.fn_mutation_summaries[1].mutated_elem_types.length() == 1 && res_b.abi.fn_mutation_summaries[1].mutated_elem_types[0] == "pkg_a::Entry", "b_push must propagate mutated_elem_types=[pkg_a::Entry]")
   assert_true(res_b.abi.fn_mutation_summaries[2].name == "b_read" && !res_b.abi.fn_mutation_summaries[2].unknown && !res_b.abi.fn_mutation_summaries[2].mutates_any_array && res_b.abi.fn_mutation_summaries[2].mutated_elem_types.length() == 0, "b_read must propagate pure summary")
 }
+
+test "cross_pkg_r2_1_three_pkg_alias_chain_fail_closed" {
+  // dep exports `Item` + `push_it(Array[Item])`
+  let dep_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub struct Item { id : Int }\npub fn push_it(xs : Array[Item], v : Item) -> Bool { xs.push(v); true }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let st_dep = empty_symbol_table()
+  st_dep.local_types["Item"] = true
+  let fms_dep = collect_exported_abi_fn_mutation_summaries(
+    dep_gen,
+    "dep",
+    st_dep,
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  let abi_dep = mk_test_dep_abi("dep", None, fms_dep)
+
+  // mid depends on dep and exports `relay(Array[dep::Item])` -> mutated_elem_types = ["dep::Item"]
+  let ctx_mid = CrossPkgMutationContext::{
+    dep_abis: [("dep", abi_dep)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let mid_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub fn relay(xs : Array[dep::Item], v : dep::Item) -> Bool { dep::push_it(xs, v) }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let fms_mid = collect_exported_abi_fn_mutation_summaries(
+    mid_gen,
+    "mid",
+    empty_symbol_table(),
+    Map(),
+    ctx_mid,
+    empty_pkg_query_types(),
+  )
+  let abi_mid = mk_test_dep_abi("mid", None, fms_mid)
+
+  // app imports dep as alias `d` (`d -> dep`) and iterates `Array[d::Item]` calling `mid::relay`.
+  let aliases : Map[String, String] = Map()
+  aliases["d"] = "dep"
+  let ctx_app = CrossPkgMutationContext::{
+    dep_abis: [("d", abi_dep), ("mid", abi_mid)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: aliases,
+  }
+  let app_src = "fn f(xs : Array[d::Item], other : Array[d::Item]) -> Option[d::Item] {\n  xs.iter().find_first(fn(x) { mid::relay(other, x) })\n}\n"
+  let toks = lex_moonbit(app_src)
+  let ms = collect_pkg_mutation_summary_with_cross_pkg([toks], ["app.pion"], [app_src], empty_pkg_query_types(), Map(), Map(), ctx_app)
+  assert_true(ms_canonicalize_type(ms, "d::Item") == "dep::Item", "d::Item must canonicalize to dep::Item")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks, find_iter_dot(toks), ms, app_src, None, "d::Item") == None, "R2-1: 3-pkg alias chain Array[d::Item] calling mid::relay MUST fail closed")
+
+  // Disjoint type Array[String] remains safe.
+  let app_ok_src = "fn g(xs : Array[String], other : Array[d::Item], it : d::Item) -> Option[String] {\n  xs.iter().find_first(fn(_s) { mid::relay(other, it) })\n}\n"
+  let toks_ok = lex_moonbit(app_ok_src)
+  let ms_ok = collect_pkg_mutation_summary_with_cross_pkg([toks_ok], ["app_ok.pion"], [app_ok_src], empty_pkg_query_types(), Map(), Map(), ctx_app)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_ok, find_iter_dot(toks_ok), ms_ok, app_ok_src, None, "String") != None, "R2-1: disjoint Array[String] remains allowed")
+}
+
+test "cross_pkg_r2_2_using_type_and_local_type_alias_slice_loop_fail_closed" {
+  let dep_abi = mk_test_dep_abi(
+    "dep",
+    None,
+    [
+      AbiFnMutationSummary::{
+        name: "mutate_item",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: ["dep::Item"],
+      },
+    ],
+  )
+  let ut : Map[String, String] = Map()
+  ut["Item"] = "dep::Item"
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: ut,
+    pkg_aliases: Map(),
+  }
+
+  // 1. `using @dep { type Item }` + `.iter().any(...)` MUST fail closed.
+  let src_using = "using @dep { type Item }\nfn f_u(xs : Array[Item], other : Array[Item]) -> Bool {\n  xs.iter().any(fn(x) { dep::mutate_item(other, x) })\n}\n"
+  let toks_u = lex_moonbit(src_using)
+  let ms_u = collect_pkg_mutation_summary_with_cross_pkg([toks_u], ["u.pion"], [src_using], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(ms_canonicalize_type(ms_u, "Item") == "dep::Item", "using Item must canonicalize to dep::Item")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_u, find_iter_dot(toks_u), ms_u, src_using, None, "Item") == None, "R2-2: using Item in .iter().any MUST fail closed")
+
+  // 2. Local `type MyItem = dep::Item` in `.iter().any(...)` and `for x in xs[..]` slice loop MUST fail closed.
+  let src_alias = "type MyItem = dep::Item\nfn f_a(xs : Array[MyItem], other : Array[MyItem]) -> Bool {\n  xs.iter().any(fn(x) { dep::mutate_item(other, x) })\n}\n"
+  let toks_a = lex_moonbit(src_alias)
+  let ms_a = collect_pkg_mutation_summary_with_cross_pkg([toks_a], ["a.pion"], [src_alias], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(ms_canonicalize_type(ms_a, "MyItem") == "dep::Item", "type MyItem = dep::Item must canonicalize to dep::Item")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_a, find_iter_dot(toks_a), ms_a, src_alias, None, "MyItem") == None, "R2-2: local type MyItem in .iter().any MUST fail closed")
+
+  // 3. Slice loop `for x in xs[..]` via Stage B Gate D must NOT rewrite when body mutates `dep::Item` via alias `MyItem`.
+  let slice_src = "type MyItem = dep::Item\nfn f_sl(xs : Array[MyItem], other : Array[MyItem]) -> Unit {\n  for x in __mbt_slice_borrow(xs, 0, xs.length()) {\n    let _ = dep::mutate_item(other, x)\n  }\n}\n"
+  let sl_files = [GeneratedFile::{ rel_path: "sl.pion", content: slice_src, source_file: "sl.mbt", anchors: [] }]
+  let sl_diags : Array[Diag] = []
+  let sl_drift : Array[DriftEntry] = []
+  let (sl_out, _, _, _) = run_stage_b_with_ops_deps_qt_and_cross_pkg(
+    sl_files,
+    empty_api_map(),
+    Map(),
+    Map(),
+    fn(_fs) { "{\"ok\":true,\"diagnostics\":[]}" },
+    None,
+    empty_pkg_query_types(),
+    ctx,
+    sl_diags,
+    sl_drift,
+  )
+  assert_true(str_has(sl_out[0].content, "__mbt_slice_borrow"), "R2-2: Stage B Gate D must NOT rewrite slice loop over Array[MyItem] when dep::mutate_item mutates Array[dep::Item]")
+
+  // 4. Unexpandable/opaque local `type Opaque` MUST fail closed whenever any array is mutated.
+  let src_opaque = "type Opaque\nfn f_op(xs : Array[Opaque], other : Array[dep::Item], it : dep::Item) -> Bool {\n  xs.iter().any(fn(_x) { dep::mutate_item(other, it) })\n}\n"
+  let toks_op = lex_moonbit(src_opaque)
+  let ms_op = collect_pkg_mutation_summary_with_cross_pkg([toks_op], ["op.pion"], [src_opaque], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(ms_canonicalize_type(ms_op, "Opaque") == "", "opaque local type alias must canonicalize to empty (fail-closed)")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_op, find_iter_dot(toks_op), ms_op, src_opaque, None, "Opaque") == None, "R2-2: opaque local type alias MUST fail closed")
+}
+
+test "cross_pkg_r2_3_nested_container_and_tuple_alias_fail_closed" {
+  let dep_abi = mk_test_dep_abi(
+    "dep",
+    None,
+    [
+      AbiFnMutationSummary::{
+        name: "mutate_opt_item",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: ["Option[dep::Item]"],
+      },
+      AbiFnMutationSummary::{
+        name: "mutate_pair_item",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: ["(dep::Item, Int)"],
+      },
+    ],
+  )
+  let aliases : Map[String, String] = Map()
+  aliases["d"] = "dep"
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("d", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: aliases,
+  }
+  let src_opt = "fn f_opt(xs : Array[Option[d::Item]], other : Array[Option[d::Item]]) -> Option[Option[d::Item]] {\n  xs.iter().find_first(fn(x) { d::mutate_opt_item(other, x) })\n}\n"
+  let toks_opt = lex_moonbit(src_opt)
+  let ms_opt = collect_pkg_mutation_summary_with_cross_pkg([toks_opt], ["opt.pion"], [src_opt], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(ms_canonicalize_type(ms_opt, "Option[d::Item]") == "Option[dep::Item]", "Option[d::Item] must canonicalize to Option[dep::Item]")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_opt, find_iter_dot(toks_opt), ms_opt, src_opt, None, "Option[d::Item]") == None, "R2-3: Array[Option[d::Item]] calling mutate_opt_item MUST fail closed")
+
+  let src_tup = "fn f_tup(xs : Array[(d::Item, Int)], other : Array[(d::Item, Int)]) -> Option[(d::Item, Int)] {\n  xs.iter().find_first(fn(x) { d::mutate_pair_item(other, x) })\n}\n"
+  let toks_tup = lex_moonbit(src_tup)
+  let ms_tup = collect_pkg_mutation_summary_with_cross_pkg([toks_tup], ["tup.pion"], [src_tup], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(ms_canonicalize_type(ms_tup, "(d::Item, Int)") == "(dep::Item, Int)", "(d::Item, Int) must canonicalize to (dep::Item, Int)")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_tup, find_iter_dot(toks_tup), ms_tup, src_tup, None, "(d::Item, Int)") == None, "R2-3: Array[(d::Item, Int)] calling mutate_pair_item MUST fail closed")
+}
