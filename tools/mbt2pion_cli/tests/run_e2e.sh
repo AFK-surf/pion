@@ -2913,7 +2913,37 @@ assert r_blk_pub.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in (r_blk_pub.stdo
     f"Downstream publish MUST reject publishable=false dep with MBT2PION_DEP_ABI_ERROR, got rc={r_blk_pub.returncode}\n{r_blk_pub.stdout}\n{r_blk_pub.stderr}"
 )
 
-print("[e2e] PASS: Wave M2-D1 E2E suite (ABI v1 compat, ABI v2 test/wbtest isolation, 4 companion atomic cases + removal cleanup, chained & renamed audit ABI, publishable=false gate, compound assign fail-closed, get().push fail-closed)")
+# 9. Nested MoonBit subpackage boundary: skip subdirs with `moon.pkg` / `moon.pkg.json`, still detect plain subdirs!
+sub_src = os.path.join(d1_root, "subpkg_parent_src")
+sub_out = os.path.join(d1_root, "subpkg_parent_out")
+os.makedirs(os.path.join(sub_src, "child_a"), exist_ok=True)
+os.makedirs(os.path.join(sub_src, "child_b"), exist_ok=True)
+open(os.path.join(sub_src, "root.mbt"), "w").write("pub fn answer() -> Int { 42 }\n")
+open(os.path.join(sub_src, "child_a", "moon.pkg"), "w").write('import {}\n')
+open(os.path.join(sub_src, "child_a", "sub.mbt"), "w").write("pub fn ignored_a() -> Int { 1 }\n")
+open(os.path.join(sub_src, "child_b", "moon.pkg.json"), "w").write('{}\n')
+open(os.path.join(sub_src, "child_b", "sub.mbt"), "w").write("pub fn ignored_b() -> Int { 2 }\n")
+r_sub_ok = subprocess.run(
+    [bin_path, "--src", sub_src, "--out", sub_out, "--mbt-compat", compat_dir,
+     "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_sub_ok.returncode == 0, f"Nested moon.pkg/moon.pkg.json subpackages must be skipped:\n{r_sub_ok.stdout}\n{r_sub_ok.stderr}"
+assert os.path.exists(os.path.join(sub_out, "root.pion"))
+assert not os.path.exists(os.path.join(sub_out, "child_a")) and not os.path.exists(os.path.join(sub_out, "child_b"))
+# Plain subdirectory without `moon.pkg` / `moon.pkg.json` still triggers E_UNDISCOVERED_SOURCE fail-closed
+os.makedirs(os.path.join(sub_src, "plain_sub"), exist_ok=True)
+open(os.path.join(sub_src, "plain_sub", "extra.mbt"), "w").write("pub fn extra() -> Int { 3 }\n")
+r_sub_bad = subprocess.run(
+    [bin_path, "--src", sub_src, "--out", os.path.join(d1_root, "subpkg_plain_out"), "--mbt-compat", compat_dir,
+     "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_sub_bad.returncode != 0 and "E_UNDISCOVERED_SOURCE" in (r_sub_bad.stdout + r_sub_bad.stderr), (
+    f"Plain subdir without moon.pkg* must still fail closed with E_UNDISCOVERED_SOURCE, got rc={r_sub_bad.returncode}\n{r_sub_bad.stdout}\n{r_sub_bad.stderr}"
+)
+
+print("[e2e] PASS: Wave M2-D1 E2E suite (ABI v1 compat, ABI v2 test/wbtest isolation, 4 companion atomic cases + removal cleanup, chained & renamed audit ABI, publishable=false gate, compound assign fail-closed, get().push fail-closed, nested subpkg boundary)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
