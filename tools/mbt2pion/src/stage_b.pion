@@ -3744,6 +3744,34 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> (Array[GeneratedFile], Int, Array[(String, Int)], PkgQueryTypes) {
+  run_stage_b_with_ops_deps_qt_cross_pkg_and_rets(
+    files,
+    api_map,
+    op_lookup,
+    dep_methods,
+    check_fn,
+    query_types_cb,
+    initial_qt,
+    cross_pkg,
+    Map(),
+    diags,
+    drift_ledger,
+  )
+}
+
+pub fn run_stage_b_with_ops_deps_qt_cross_pkg_and_rets(
+  files : Array[GeneratedFile],
+  api_map : ApiMap,
+  op_lookup : Map[String, String],
+  dep_methods : Map[String, Bool],
+  check_fn : (Array[(String, String)]) -> String,
+  query_types_cb : Option[(Array[(String, String)]) -> String],
+  initial_qt : PkgQueryTypes,
+  cross_pkg : CrossPkgMutationContext,
+  dep_fn_ret_types : Map[String, String],
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Array[(String, Int)], PkgQueryTypes) {
   let mut cur_files : Array[GeneratedFile] = []
   let file_vers : Map[String, Int] = Map()
   let token_cache : Map[String, (Int, Array[Token])] = Map()
@@ -3930,7 +3958,7 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
             contents.push(cf.content)
           }
           let qt_use = get_round_qt()
-          let ms = collect_pkg_mutation_summary_with_cross_pkg(toks, rels, contents, qt_use, dep_methods, op_lookup, cross_pkg)
+          let ms = collect_pkg_mutation_summary_with_cross_pkg_and_rets(toks, rels, contents, qt_use, dep_methods, op_lookup, cross_pkg, dep_fn_ret_types)
           round_mut_summary = Some(ms)
           ms
         }
@@ -6603,13 +6631,136 @@ fn stage_b_is_ident_shadowed_in_fn(tokens : Array[Token], body_open : Int, ident
   pats.contains(ident)
 }
 
-fn stage_b_pkg_contains_new_by(all_tokens : Array[Array[Token]]) -> Bool {
+fn stage_b_is_proven_concrete_dep_type(
+  pkg_ms : PkgMutationSummary,
+  dep_concrete_types : Map[String, Bool],
+  pkg_name : String,
+  type_name : String,
+) -> Bool {
+  if pkg_name.length() == 0 || type_name.length() == 0 ||
+  pkg_name == "mbt_compat" || type_name == "OrderedMap" || type_name == "OrderedSet" {
+    return false
+  }
+  if dep_concrete_types.contains(pkg_name + "::" + type_name) {
+    return true
+  }
+  match pkg_ms.pkg_aliases.get(pkg_name) {
+    Some(canon) =>
+    if canon.length() > 0 && canon != "__AMBIG__" && canon != "mbt_compat" {
+      return dep_concrete_types.contains(canon + "::" + type_name)
+    }
+    None => ()
+  }
+  false
+}
+
+fn stage_b_pkg_contains_new_by(
+  all_tokens : Array[Array[Token]],
+  pkg_ms : PkgMutationSummary,
+  cross_pkg : CrossPkgMutationContext,
+) -> Bool {
+  let dep_concrete_types : Map[String, Bool] = Map()
+  for dabi in cross_pkg.dep_abis {
+    let dep_name = dabi.0
+    let abi = dabi.1
+    let canon_pkg = if abi.package_name.length() > 0 { abi.package_name } else { dep_name }
+    if dep_name == "mbt_compat" || canon_pkg == "mbt_compat" {
+      continue
+    }
+    match abi.structs {
+      Some(sts) => {
+        for s in sts {
+          if s.name.length() > 0 && s.name != "OrderedMap" && s.name != "OrderedSet" {
+            if dep_name.length() > 0 {
+              dep_concrete_types[dep_name + "::" + s.name] = true
+            }
+            if canon_pkg.length() > 0 {
+              dep_concrete_types[canon_pkg + "::" + s.name] = true
+            }
+          }
+        }
+      }
+      None => ()
+    }
+    for en in abi.enums {
+      if en.name.length() > 0 && en.name != "OrderedMap" && en.name != "OrderedSet" {
+        if dep_name.length() > 0 {
+          dep_concrete_types[dep_name + "::" + en.name] = true
+        }
+        if canon_pkg.length() > 0 {
+          dep_concrete_types[canon_pkg + "::" + en.name] = true
+        }
+      }
+    }
+  }
   for toks in all_tokens {
     let n = toks.length() - 1
     let mut i = 0
     while i < n {
-      if toks[i].raw == "new_by" {
+      let raw = toks[i].raw
+      if raw == "ordered_map_new_by" || raw == "ordered_set_new_by" {
         return true
+      }
+      if raw == "new_by" {
+        // Fail-closed on bare `new_by(...)`, `.new_by(...)`, or anything without `Type::new_by`.
+        if !(i >= 2 && toks[i - 1].kind == TokenKind::ColonColon &&
+          (toks[i - 2].kind == TokenKind::UpperIdent || toks[i - 2].kind == TokenKind::Ident)) {
+          return true
+        }
+        let t_name = toks[i - 2].raw
+        if t_name == "OrderedMap" || t_name == "OrderedSet" {
+          return true
+        }
+        let has_prev_sep = i >= 3 && (toks[i - 3].kind == TokenKind::ColonColon || toks[i - 3].kind == TokenKind::Dot)
+        if has_prev_sep {
+          // Qualified `pkg::T::new_by`: allow ONLY when `pkg::T` is a proven concrete dep struct/enum.
+          if i >= 4 && toks[i - 3].kind == TokenKind::ColonColon &&
+          (toks[i - 4].kind == TokenKind::Ident || toks[i - 4].kind == TokenKind::UpperIdent) &&
+          !(i >= 5 && (toks[i - 5].kind == TokenKind::ColonColon || toks[i - 5].kind == TokenKind::Dot)) {
+            let p_name = toks[i - 4].raw
+            if !stage_b_is_proven_concrete_dep_type(pkg_ms, dep_concrete_types, p_name, t_name) {
+              return true
+            }
+          } else {
+            return true
+          }
+        } else {
+          // Unqualified `T::new_by`: allow ONLY when `T` is NOT shadowed by an enclosing generic
+          // parameter and is a proven concrete non-alias local struct/enum or a proven concrete
+          // `using`-imported dep struct/enum.
+          let body_open = outermost_body_open(toks, i)
+          let is_gen_shadow = if body_open >= 0 {
+            enclosing_fn_generic_params_at(toks, body_open, i).contains(t_name)
+          } else {
+            false
+          }
+          if is_gen_shadow {
+            return true
+          }
+          let mut safe_unqual = false
+          if pkg_ms.declared_types.contains(t_name) &&
+          !pkg_ms.type_alias_names.contains(t_name) &&
+          !pkg_ms.declared_traits.contains(t_name) {
+            safe_unqual = true
+          } else if !pkg_ms.type_alias_names.contains(t_name) && pkg_ms.using_type_targets.contains(t_name) {
+            match pkg_ms.using_type_targets.get(t_name) {
+              Some(target_ty) =>
+              if target_ty != "__AMBIG__" && target_ty.length() > 0 {
+                match ms_extract_pkg_and_type(target_ty) {
+                  Some((epkg, etype)) =>
+                  if stage_b_is_proven_concrete_dep_type(pkg_ms, dep_concrete_types, epkg, etype) {
+                    safe_unqual = true
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+          }
+          if !safe_unqual {
+            return true
+          }
+        }
       }
       i = i + 1
     }
@@ -6704,6 +6855,24 @@ pub fn stage_b_lower_pure_mapkey_lookups(
   op_lookup : Map[String, String],
   cross_pkg : CrossPkgMutationContext,
 ) -> (Array[GeneratedFile], Bool) {
+  stage_b_lower_pure_mapkey_lookups_with_rets(
+    cur_files,
+    pkg_qt,
+    dep_methods,
+    op_lookup,
+    cross_pkg,
+    Map(),
+  )
+}
+
+pub fn stage_b_lower_pure_mapkey_lookups_with_rets(
+  cur_files : Array[GeneratedFile],
+  pkg_qt : PkgQueryTypes,
+  dep_methods : Map[String, Bool],
+  op_lookup : Map[String, String],
+  cross_pkg : CrossPkgMutationContext,
+  dep_fn_ret_types : Map[String, String],
+) -> (Array[GeneratedFile], Bool) {
   if !pkg_qt.ok {
     return (cur_files, false)
   }
@@ -6725,7 +6894,7 @@ pub fn stage_b_lower_pure_mapkey_lookups(
     rels.push(f.rel_path)
     contents.push(f.content)
   }
-  let pkg_ms = collect_pkg_mutation_summary_with_cross_pkg(
+  let pkg_ms = collect_pkg_mutation_summary_with_cross_pkg_and_rets(
     all_tokens,
     rels,
     contents,
@@ -6733,13 +6902,14 @@ pub fn stage_b_lower_pure_mapkey_lookups(
     dep_methods,
     op_lookup,
     cross_pkg,
+    dep_fn_ret_types,
   )
   let pkg_mbt_compat_shadowed = pkg_ms.declared_types.contains("mbt_compat") ||
   pkg_ms.top_level_value_bindings.contains("mbt_compat")
   if pkg_mbt_compat_shadowed {
     return (cur_files, false)
   }
-  if stage_b_pkg_contains_new_by(all_tokens) {
+  if stage_b_pkg_contains_new_by(all_tokens, pkg_ms, cross_pkg) {
     return (cur_files, false)
   }
 
