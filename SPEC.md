@@ -209,7 +209,7 @@ bench "bench name" {
 - Optional trailing commas and optional semicolons (newline-terminated statements, matching MoonBit).
 - Attributes `#verify` / `#[verify]` and `#verify_opaque` / `#[verify_opaque]` apply to `fn`s, methods, `impl` methods and (`#verify` only) whole `impl` blocks; they combine with `#no_io` and `#derive(Eq)` (§3.4).
 - `pub` marks items exported in `.pionsig` and accessible from downstream packages via `alias::symbol`. Referencing a non-`pub` symbol from an imported package is a compile-time error (`E_PRIVATE_SYMBOL`).
-- `val struct` asserts at compile time that the struct has zero `mut` fields and every field is `Send`.
+- `val struct` asserts at compile time that the struct has zero `mut` fields and every field is `Send`. (`val struct` is a compile-time immutability/`Send` guarantee, not a separate ABI; flat inline `Array[Struct]` storage applies automatically to any eligible struct—see §4.1 `Array`.)
 - `test "name" { ... }` blocks are type-checked by `pionc check`, omitted (0 bytes) by `pionc build`, and compiled with active `debug_assert` by `pionc test [--json] [--filter <substr>] <path>`.
 - **`bench "name" { ... }` blocks** (AST: `TestDecl` with `is_bench : true`; `bench_loop` is `Stmt::SBenchLoop(Array[Stmt], Span)`) are type-checked by `pionc check`, formatted by `pionc fmt`, stripped to **0 bytes** by `pionc build`, `pionc run` and `pionc test`, and compiled only by `pionc bench` (§5.8, `--release` by default).
   - **Simple form** `bench "name" { <body> }`: the whole body is the timed iteration.
@@ -485,8 +485,16 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void* pion_strbuf_to_str(void *sb);`
 - `StringBuilder::length() -> Int` (reads `PionStrBuf.len` at offset 0)
 
-**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int32_t elem_stride; int64_t *data; }` — `elem_stride` at `+20`: `0`/`8` = 8-byte slots, `1` = compact 1-byte `Bool`/`Byte`/`Int8` slots with `elem_is_obj = 0`, `4` = compact 4-byte `Float`/`Float32` slots with `elem_is_obj = 0`, `16`/`24`/`32`/`40`/`48` = flat inline 2..6-field immutable structs with `elem_is_obj` storing the RC object field bitmask where bit `k` is 1 iff slot `k` is an RC object pointer):**
-- `void*   pion_arr_new(int64_t cap, int32_t elem_flags);` (`0` = 8B scalar, `1` = 8B RC object, `2` = 1B compact `Bool`/`Byte`/`Int8`, `4` = 4B compact `Float`/`Float32`, `> 2` = flat inline struct with `elem_stride = elem_flags & 0xFF` in `{4, 16, 24, 32, 40, 48}` and `elem_is_obj = elem_flags >> 8` RC field bitmask)
+**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int32_t elem_stride; int64_t *data; }` — `elem_stride` at `+20`: `0`/`8` = 8-byte slots, `1` = compact 1-byte `Bool`/`Byte`/`Int8` slots with `elem_is_obj = 0`, `4` = compact 4-byte `Float`/`Float32` slots with `elem_is_obj = 0`, `16..=128` = flat inline 2..=16-field immutable structs with `elem_is_obj` storing the RC object field bitmask where bit `k` is 1 iff slot `k` is an RC object pointer):**
+- **Flat inline `Array[Struct]` / `FixedArray[Struct]` / `ImmArray[Struct]` eligibility**: any struct (with or without `val`) whose substituted type satisfies all of:
+  1. **Field count & RC-field cap**: `2 <= N <= 16` (`elem_stride = N * 8` bytes in `16..=128`; single-field structs are pointer-stored as 8-byte slots), with RC-field limits preventing per-field RC bloat on large AST/IR records:
+     - `2..=6` fields: any mix of supported scalar, unit-enum, and concrete RC object fields (`elem_stride` in `16..=48`).
+     - `7..=8` fields: at most 3 RC object fields (`elem_stride` in `{56, 64}`).
+     - `9..=16` fields: pure primitive scalar / unboxed unit-enum fields only (`0` RC object fields, `elem_stride` in `72..=128`).
+  2. **Immutability**: zero `mut` fields (a single `mut` field disqualifies flat storage because `arr[i].f = v` requires pointer-identity sharing semantics).
+  3. **Supported field types**: every field must be a primitive scalar (`Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`, `Bool`, `Byte`, `Int8`, `Char`), an unboxed unit enum (or `Option[UnitEnum]`), or (within the RC-field cap above) a concrete RC object (such as `String`, `Array[T]`, `Bytes`, another `struct`, or payload `enum`); `dyn Trait`, unconstrained `TParam`, and `Error` fields disqualify flat storage. Nested sub-structs are stored as concrete 8-byte RC object pointers in their slot (bit `k` set in `elem_is_obj`).
+  4. **Zero-boxing vs boxing accesses**: `arr[i].field`, `arr.push(S::{ ... })`, `arr[i] = S::{ ... }`, and a field-only local `let x = arr[i]` (borrowed inline when unaliased/unmutated, or stack-copied for pure-scalar 1..=16-field POD structs) operate with zero heap struct allocation; materializing the element as an escaping value (e.g. `let s = arr[i]` passed to a function or returned) allocates a boxed copy of `S` on the heap.
+- `void*   pion_arr_new(int64_t cap, int32_t elem_flags);` (`0` = 8B scalar, `1` = 8B RC object, `2` = 1B compact `Bool`/`Byte`/`Int8`, `4` = 4B compact `Float`/`Float32`, `> 4` = flat inline struct with `elem_stride = elem_flags & 0xFF` in `16..=128` and `elem_is_obj = elem_flags >> 8` RC field bitmask)
 - `int64_t pion_arr_len(void *a);`
 - `void    pion_arr_push(void *a, int64_t val);` (retains if `elem_is_obj`)
 - `void*   pion_arr_push_flat_grow(void *a);` (slow-path grow for flat-stride arrays, returning `&data[len * stride]`)
@@ -497,7 +505,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void    pion_arr_clear(void *a);` (`arr.clear() -> Unit`; delegates to `pion_arr_truncate(a, 0)`)
 - `void    pion_arr_truncate(void *a, int64_t new_len);` (`arr.truncate(new_len : Int) -> Unit`; no-op if `new_len >= len`, clamps `< 0` to `0`, releases RC elements in `[new_len..old_len)` for both 8B object arrays and flat inline RC struct arrays before setting `len = new_len`)
 - `Array::is_empty() -> Bool` (inline `arr.length() == 0`, 0-byte runtime)
-- `void    pion_arr_reverse(void *a);` (`arr.reverse() -> Unit`; in-place)
+- `void    pion_arr_reverse(void *a);` (`arr.reverse() -> Unit`; in-place reverse for arrays with `elem_stride <= 64`, i.e. 8B/1B/4B elements and 2..=8-field flat structs; flat inline struct arrays with `elem_stride > 64` (`9..=16` fields) are lowered inline by the compiler via word-wise swaps and must not call `pion_arr_reverse`)
 - `void*   pion_arr_join(void *a, void *sep);` (`arr.join(sep) -> String` for `Array[String]`)
 - `void    pion_arr_sort_int(void *a);` (`arr.sort() -> Unit` for `Array[Int]` / `Array[Int64]`)
 - `void    pion_arr_sort_str(void *a);` (`arr.sort() -> Unit` for `Array[String]`)
