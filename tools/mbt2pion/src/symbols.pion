@@ -717,6 +717,7 @@ pub struct SymbolTable {
   hashable_types : Map[String, Bool]
   method_unique_param_types : Map[String, Array[(String, String)]]
   local_types : Map[String, Bool]
+  priv_type_renames : Map[String, String]
   active_generics : Map[String, Bool]
   moon_import_paths : Map[String, String]
   dep_pkg_names : Map[String, Bool]
@@ -793,6 +794,7 @@ pub fn empty_symbol_table() -> SymbolTable {
     hashable_types: Map(),
     method_unique_param_types: Map(),
     local_types: Map(),
+    priv_type_renames: Map(),
     active_generics: Map(),
     moon_import_paths: Map(),
     dep_pkg_names: Map(),
@@ -850,14 +852,18 @@ pub fn symtab_register_enum_schema(st : SymbolTable, schema : AbiEnumSchema) -> 
         xs
       }
     }
-    let mut dup = false
-    for existing in list {
+    let mut replaced = false
+    let mut li = 0
+    while li < list.length() {
+      let existing = list[li]
       if existing.0.pkg == schema.pkg && existing.0.name == schema.name && existing.1.name == v.name {
-        dup = true
+        list[li] = (schema, v)
+        replaced = true
         break
       }
+      li = li + 1
     }
-    if !dup {
+    if !replaced {
       list.push((schema, v))
     }
     symtab_add_ctor(st, v.name, CtorTarget::{
@@ -2053,11 +2059,12 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
             Some(iv) =>
             match json::as_arr(iv) {
               Some(items) => {
-                // Enum names this dependency declares: a bare `MaskType` in its signatures means `pkg::MaskType`
-                // to the package being transpiled (which may declare a private enum of the same name).
+                // Type names (enums, structs, type aliases) this dependency declares: bare names in its
+                // signatures mean `pkg::Name` to the package being transpiled.
                 let dep_enums : Map[String, Bool] = Map()
                 for it0 in items {
-                  if j_str(it0, "kind", "") == "enum" {
+                  let k0 = j_str(it0, "kind", "")
+                  if k0 == "enum" || k0 == "struct" || k0 == "type" {
                     let en = j_str(it0, "name", "")
                     if en.length() > 0 { dep_enums[en] = true }
                   }
@@ -2069,7 +2076,7 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                   if (kind == "struct" || kind == "enum" || kind == "type") && name.length() > 0 {
                     st.dep_method_names[" type:" + name] = true
                   }
-                  if kind == "fn" && str_has(name, "::") {
+                  if (kind == "fn" || kind == "method") && str_has(name, "::") {
                     let mut ci = name.length() - 2
                     while ci > 0 && !(name.code_unit_at(ci) == 58 && name.code_unit_at(ci + 1) == 58) {
                       ci = ci - 1
@@ -2125,6 +2132,17 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                       }
                     }
                     if lb >= 0 && rb > lb {
+                      let enum_gen_set : Map[String, Bool] = Map()
+                      let ekey_s = if pkg_name.length() > 0 { pkg_name + "::" + name } else { name }
+                      match st.enum_type_params.get(ekey_s) {
+                        Some(etps) => {
+                          for etp in etps {
+                            enum_gen_set[etp] = true
+                          }
+                        }
+                        None => ()
+                      }
+                      let doc_variants : Array[AbiEnumVariant] = []
                       let body = sig.slice(lb + 1, rb)
                       let parts = body.split(";")
                       for p in parts {
@@ -2136,11 +2154,51 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                           }
                           let cname = t.slice(0, ci)
                           st.dep_method_names[" ctor:" + cname] = true
+                          let vfields : Array[AbiEnumField] = []
                           let arity = if ci < t.length() && t.code_unit_at(ci) == 40 {
+                            let lp_v = ci
+                            let mut rp_v = -1
+                            let mut vd = 0
+                            let mut vi = lp_v
+                            while vi < t.length() {
+                              let vc = t.code_unit_at(vi)
+                              if vc == 40 { vd = vd + 1 }
+                              else if vc == 41 {
+                                vd = vd - 1
+                                if vd == 0 { rp_v = vi; break }
+                              }
+                              vi = vi + 1
+                            }
+                            if rp_v > lp_v + 1 {
+                              let fbody = t.slice(lp_v + 1, rp_v)
+                              let mut fs = 0
+                              let mut fd = 0
+                              let mut fi = 0
+                              while fi <= fbody.length() {
+                                let at_fe = fi == fbody.length()
+                                let fc = if at_fe { 44 } else { fbody.code_unit_at(fi) }
+                                if !at_fe && (fc == 40 || fc == 91 || fc == 123) { fd = fd + 1 }
+                                else if !at_fe && (fc == 41 || fc == 93 || fc == 125) { if fd > 0 { fd = fd - 1 } }
+                                else if fd == 0 && fc == 44 {
+                                  let ft0 = fbody.slice(fs, fi).trim()
+                                  if ft0.length() > 0 {
+                                    let qft = if pkg_name.length() > 0 && pkg_name != "mbt_compat" {
+                                      qualify_dep_enum_names(ft0, pkg_name, dep_enums, enum_gen_set)
+                                    } else {
+                                      ft0
+                                    }
+                                    vfields.push(AbiEnumField::{ label: "", ty: qft })
+                                  }
+                                  fs = fi + 1
+                                }
+                                fi = fi + 1
+                              }
+                            }
                             count_paren_arity(t, ci)
                           } else {
                             0
                           }
+                          doc_variants.push(AbiEnumVariant::{ name: cname, fields: vfields })
                           symtab_add_ctor(st, cname, CtorTarget::{
                             pkg: pkg_name,
                             enum_name: name,
@@ -2148,6 +2206,27 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                             is_local: false,
                             arity: arity,
                           })
+                        }
+                      }
+                      if doc_variants.length() > 0 && !st.enum_schemas.contains(ekey_s) {
+                        let sch = AbiEnumSchema::{
+                          pkg: pkg_name,
+                          name: name,
+                          can_match: true,
+                          can_construct: true,
+                          variants: doc_variants,
+                        }
+                        st.enum_schemas[ekey_s] = sch
+                        for dv in doc_variants {
+                          let lst = match st.enum_schemas_by_ctor.get(dv.name) {
+                            Some(arr) => arr
+                            None => {
+                              let arr : Array[(AbiEnumSchema, AbiEnumVariant)] = []
+                              st.enum_schemas_by_ctor[dv.name] = arr
+                              arr
+                            }
+                          }
+                          lst.push((sch, dv))
                         }
                       }
                     }
@@ -2158,6 +2237,9 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                       let eqi = vty.index_of("=")
                       if eqi >= 0 { vty = vty.slice(0, eqi).trim() }
                       if vty.length() > 0 {
+                        if pkg_name.length() > 0 && pkg_name != "mbt_compat" {
+                          vty = qualify_dep_enum_names(vty, pkg_name, dep_enums, Map())
+                        }
                         let vkey = if pkg_name.length() > 0 { pkg_name + "::" + name } else { name }
                         st.val_types[vkey] = vty
                       }
@@ -2176,8 +2258,11 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                           let mut fname = pt.slice(0, ci).trim()
                           if fname.starts_with("pub ") { fname = fname.slice(4, fname.length()).trim() }
                           if fname.starts_with("mut ") { fname = fname.slice(4, fname.length()).trim() }
-                          let fty = pt.slice(ci + 1, pt.length()).trim()
+                          let mut fty = pt.slice(ci + 1, pt.length()).trim()
                           if fname.length() > 0 && fty.length() > 0 {
+                            if pkg_name.length() > 0 && pkg_name != "mbt_compat" {
+                              fty = qualify_dep_enum_names(fty, pkg_name, dep_enums, Map())
+                            }
                             fmap[fname] = fty
                           }
                         }
@@ -2187,8 +2272,8 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                         st.struct_field_types[skey] = fmap
                       }
                     }
-                  } else if kind == "fn" {
-                    if str_has(sig, "~ :") && str_has(sig, "=") {
+                  } else if kind == "fn" || kind == "method" {
+                    if (str_has(sig, "~ :") || str_has(sig, "~:")) && str_has(sig, "=") {
                       st.external_tilde_fns[name] = true
                       if pkg_name.length() > 0 {
                         st.external_tilde_fns[pkg_name + "::" + name] = true
@@ -2467,7 +2552,14 @@ pub fn resolve_ctor_at_site(
           if t.is_local && (targets.length() > 1 || name == "Some" || name == "None" || name == "Ok" || name == "Err") {
             return Some(t.enum_name + "::" + t.ctor_name)
           }
-          if in_pattern && targets.length() > 1 && !t.is_local && t.pkg.length() > 0 && t.enum_name.length() > 0 {
+          let mut any_local_ctor = false
+          for t0 in targets {
+            if t0.is_local {
+              any_local_ctor = true
+              break
+            }
+          }
+          if (in_pattern || any_local_ctor) && targets.length() > 1 && !t.is_local && t.pkg.length() > 0 && t.enum_name.length() > 0 {
             return Some(t.pkg + "::" + t.enum_name + "::" + t.ctor_name)
           }
           return Some("." + t.ctor_name)
@@ -2552,6 +2644,60 @@ pub fn resolve_ctor_at_site(
       }
       None
     }
+  }
+}
+
+///| Pion built-in type names that cannot be shadowed by user `enum`/`struct`/`type` declarations.
+pub fn is_pion_reserved_type_name(name : String) -> Bool {
+  name == "Scope" || name == "World" || name == "AtomicInt" || name == "Ptr" ||
+  name == "StrView" || name == "BytesView" || name == "ImmArray" ||
+  name == "Channel" || name == "Mutex" || name == "Never" || name == "Float32" || name == "Int8"
+}
+
+///| Map a local private type name that collides with a Pion built-in type (e.g. `Scope` -> `__mbt_priv_Scope`).
+pub fn rename_priv_type(st : SymbolTable, name : String) -> String {
+  match st.priv_type_renames.get(name) {
+    Some(rn) => rn
+    None => name
+  }
+}
+
+///| True iff `name` is a Pion primitive or built-in non-enum type that must NEVER be used as an enum constructor prefix.
+pub fn is_pion_primitive_or_non_enum_type(name : String) -> Bool {
+  name == "Double" || name == "Float" || name == "Float32" || name == "Bool" ||
+  name == "Int" || name == "Int64" || name == "UInt" || name == "UInt64" ||
+  name == "Byte" || name == "Int8" || name == "Char" || name == "String" ||
+  name == "Unit" || name == "Never" || name == "Ptr" || name == "StringBuilder" ||
+  name == "Bytes" || name == "StrView" || name == "BytesView" || name == "World" ||
+  name == "Scope" || name == "AtomicInt" || name == "Array" || name == "FixedArray" ||
+  name == "ImmArray" || name == "Map" || name == "Channel" || name == "Mutex"
+}
+
+///| True iff `exp_base` is a known enum in `st` (or builtin `Option`/`Result`) that owns constructor `ctor_name`.
+pub fn is_enum_owning_ctor(st : SymbolTable, exp_base : String, ctor_name : String) -> Bool {
+  if exp_base.length() == 0 || is_pion_primitive_or_non_enum_type(exp_base) {
+    return false
+  }
+  if exp_base == "Option" {
+    return ctor_name == "Some" || ctor_name == "None"
+  }
+  if exp_base == "Result" {
+    return ctor_name == "Ok" || ctor_name == "Err"
+  }
+  match st.ctors.get(ctor_name) {
+    Some(targets) => {
+      let exp_has_pkg = str_has(exp_base, "::")
+      for t in targets {
+        let full_e = if t.pkg.length() > 0 { t.pkg + "::" + t.enum_name } else { t.enum_name }
+        if exp_has_pkg {
+          if full_e == exp_base { return true }
+        } else if t.enum_name == exp_base {
+          return true
+        }
+      }
+      false
+    }
+    None => false
   }
 }
 
