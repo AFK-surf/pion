@@ -1,0 +1,542 @@
+///| Cross-package `mutation_summary` ABI propagation, struct field type injection,
+///| and soundness invariant tests (S1-S7).
+
+fn mk_test_dep_abi(
+  pkg_name : String,
+  structs : Option[Array[AbiStructSchema]],
+  fms : Array[AbiFnMutationSummary],
+) -> PackageAbi {
+  PackageAbi::{
+    package_name: pkg_name,
+    enums: [],
+    struct_val_fields: [],
+    structs: structs,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    raising_fns: [],
+    fn_mutation_summaries: fms,
+    ffi_shim_prefix: "",
+    publishable: true,
+    empty_target_pkg: false,
+    empty_target: "",
+  }
+}
+
+fn find_iter_dot(tokens : Array[Token]) -> Int {
+  let mut i = 1
+  while i + 2 < tokens.length() {
+    if tokens[i].kind == TokenKind::Dot && tokens[i + 1].raw == "iter" && tokens[i + 2].kind == TokenKind::LParen {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn find_search_by_cb(tokens : Array[Token]) -> (Int, Int, Int) {
+  let mut i = 1
+  while i + 2 < tokens.length() {
+    if tokens[i].kind == TokenKind::Dot && tokens[i + 1].raw == "search_by" && tokens[i + 2].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, i + 2)
+      let bo = outermost_body_open(tokens, i)
+      return (i + 3, rp, bo)
+    }
+    i = i + 1
+  }
+  (-1, -1, -1)
+}
+
+test "cross_pkg_abi_fn_mutation_summary_roundtrip_and_compat" {
+  let abi = mk_test_dep_abi(
+    "dep",
+    None,
+    [
+      AbiFnMutationSummary::{
+        name: "zeta",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: ["dep::Row", "Int", "Int"],
+      },
+      AbiFnMutationSummary::{
+        name: "alpha",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: [],
+      },
+    ],
+  )
+  let sha = compute_abi_payload_sha256(abi)
+  let pion_src = "// abi-sha256: " + sha + "\npub fn alpha() -> Int { 1 }\n"
+  let abi_json = render_abi_json(abi, [("lib.pion", pion_src)])
+  // Deterministic ordering: `alpha` before `zeta`, `Int` before `dep::Row`, deduplicated.
+  let idx_alpha = abi_json.index_of("\"name\":\"alpha\"")
+  let idx_zeta = abi_json.index_of("\"name\":\"zeta\"")
+  assert_true(idx_alpha > 0 && idx_zeta > idx_alpha, "line 78")
+  assert_true(str_has(abi_json, "\"mutated_elem_types\":[\"Int\",\"dep::Row\"]"), "line 79")
+
+  // Bidirectional verification succeeds.
+  let diags : Array[Diag] = []
+  let parsed_opt = verify_and_parse_dep_abi("dep", "/tmp/dep", [("lib.pion", pion_src)], Some(abi_json), diags)
+  assert_true(diags.length() == 0, "line 84")
+  match parsed_opt {
+    Some(p) => {
+      assert_true(p.fn_mutation_summaries.length() == 2, "line 87")
+      assert_true(p.fn_mutation_summaries[0].name == "alpha", "line 88")
+      assert_true(p.fn_mutation_summaries[0].unknown == false, "line 89")
+      assert_true(p.fn_mutation_summaries[1].name == "zeta", "line 90")
+      assert_true(p.fn_mutation_summaries[1].mutated_elem_types.length() == 2, "line 91")
+    }
+    None => assert_true(false, "expected parsed PackageAbi")
+  }
+
+  // Tampering with `fn_mutation_summaries` fails bidirectional SHA-256 check.
+  let tampered = str_replace_all(abi_json, "\"unknown\":false", "\"unknown\":true")
+  let t_diags : Array[Diag] = []
+  let t_opt = verify_and_parse_dep_abi("dep", "/tmp/dep", [("lib.pion", pion_src)], Some(tampered), t_diags)
+  let t_is_none = match t_opt {
+    None => true
+    Some(_) => false
+  }
+  assert_true(t_is_none, "tampered fn_mutation_summaries must fail")
+  assert_true(t_diags.length() > 0 && t_diags[0].code == "MBT2PION_DEP_ABI_ERROR", "line 101")
+
+  // Backward compatibility: legacy ABI JSON without `fn_mutation_summaries` parses cleanly.
+  let legacy_abi = empty_package_abi("legacy")
+  let legacy_sha = compute_abi_payload_sha256(legacy_abi)
+  let legacy_pion = "// abi-sha256: " + legacy_sha + "\npub fn f() -> Int { 0 }\n"
+  let legacy_json = render_abi_json(legacy_abi, [("lib.pion", legacy_pion)])
+  assert_true(!str_has(legacy_json, "fn_mutation_summaries"), "line 108")
+  let l_diags : Array[Diag] = []
+  let l_opt = verify_and_parse_dep_abi("legacy", "/tmp/legacy", [("lib.pion", legacy_pion)], Some(legacy_json), l_diags)
+  assert_true(l_diags.length() == 0, "line 111")
+  match l_opt {
+    Some(lp) => assert_true(lp.fn_mutation_summaries.length() == 0, "legacy ABI must default fn_mutation_summaries to empty")
+    None => assert_true(false, "expected parsed legacy PackageAbi")
+  }
+
+  // Exporting qualifies local struct names in `mutated_elem_types`.
+  let dep_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub struct Item { id : Int }\npub fn touch_item(xs : Array[Item], v : Item) -> Unit { xs.push(v) }\npub fn pure_read(x : Int) -> Int { x + 1 }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let st = empty_symbol_table()
+  st.local_types["Item"] = true
+  let exported = collect_exported_abi_fn_mutation_summaries(
+    dep_gen,
+    "dep",
+    st,
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  assert_true(exported.length() == 2, "line 136")
+  assert_true(exported[0].name == "pure_read", "line 137")
+  assert_true(!exported[0].unknown && !exported[0].mutates_any_array && exported[0].mutated_elem_types.length() == 0, "line 138")
+  assert_true(exported[1].name == "touch_item", "line 139")
+  assert_true(!exported[1].unknown && !exported[1].mutates_any_array, "line 140")
+  assert_true(exported[1].mutated_elem_types.length() == 1 && exported[1].mutated_elem_types[0] == "dep::Item", "line 141")
+}
+
+test "cross_pkg_s1_missing_summary_fail_closed" {
+  let dep_abi = mk_test_dep_abi("dep", None, [])
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let src = "fn find_it(rows : Array[Int], target : Int) -> Option[Int] {\n  rows.iter().find_first(fn(r) { dep::text(r) == target })\n}\nfn search_it(rows : Array[Int], target : Int) -> Option[Int] {\n  rows.search_by(fn(r) { @dep.text(r) == target })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_with_cross_pkg([toks], ["a.pion"], [src], empty_pkg_query_types(), Map(), Map(), ctx)
+  let dot_i = find_iter_dot(toks)
+  assert_true(dot_i > 0, "line 156")
+  assert_true(immediate_iter_consumer_allow_with_summary(toks, dot_i, ms, src, None, "Int") == None, "line 157")
+  let (sb_s, sb_e, sb_bo) = find_search_by_cb(toks)
+  let sb_sum = summarize_callback_arg(ms, toks, sb_s, sb_e, sb_bo, src, None, "Int", Map())
+  assert_true(sb_sum.unknown, "line 160")
+}
+
+test "cross_pkg_s2_dep_unknown_propagates_fail_closed" {
+  let dep_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub fn run_cb(x : Int, f : (Int) -> Bool) -> Bool { f(x) }\npub struct Box { v : Int }\npub fn Box::check(self : Box, f : (Int) -> Bool) -> Bool { f(self.v) }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let st = empty_symbol_table()
+  st.local_types["Box"] = true
+  let exported = collect_exported_abi_fn_mutation_summaries(
+    dep_gen,
+    "dep",
+    st,
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  let dep_abi = mk_test_dep_abi("dep", None, exported)
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let src = "fn p(x : Int) -> Bool { x > 0 }\nfn use_iter(rows : Array[Int]) -> Option[Int] {\n  rows.iter().find_first(fn(r) { dep::run_cb(r, p) })\n}\nfn use_search(rows : Array[dep::Box]) -> Option[Int] {\n  rows.search_by(fn(b) { b.check(p) })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_with_cross_pkg([toks], ["a.pion"], [src], empty_pkg_query_types(), Map(), Map(), ctx)
+  let dot_i = find_iter_dot(toks)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks, dot_i, ms, src, None, "Int") == None, "line 193")
+  let (sb_s, sb_e, sb_bo) = find_search_by_cb(toks)
+  let sb_sum = summarize_callback_arg(ms, toks, sb_s, sb_e, sb_bo, src, None, "dep::Box", Map())
+  assert_true(sb_sum.unknown, "line 196")
+}
+
+test "cross_pkg_s3_dep_mutates_elem_type_fail_closed" {
+  let dep_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub struct Item { id : Int }\npub fn push_int(xs : Array[Int], v : Int) -> Bool { xs.push(v); true }\npub fn push_item(xs : Array[Item], v : Item) -> Bool { xs.push(v); true }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let st = empty_symbol_table()
+  st.local_types["Item"] = true
+  let exported = collect_exported_abi_fn_mutation_summaries(
+    dep_gen,
+    "dep",
+    st,
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  let dep_abi = mk_test_dep_abi("dep", None, exported)
+  // Load under both canonical `dep` and alias `d`.
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("d", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let src_int = "fn f(rows : Array[Int], other : Array[Int]) -> Option[Int] {\n  rows.iter().find_first(fn(r) { d::push_int(other, r) })\n}\n"
+  let toks_int = lex_moonbit(src_int)
+  let ms_int = collect_pkg_mutation_summary_with_cross_pkg([toks_int], ["a.pion"], [src_int], empty_pkg_query_types(), Map(), Map(), ctx)
+  // Same element type `Int` MUST fail closed.
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_int, find_iter_dot(toks_int), ms_int, src_int, None, "Int") == None, "line 230")
+  // Disjoint element type `String` is allowed.
+  let src_str = "fn g(rows : Array[String], other : Array[Int]) -> Option[String] {\n  rows.iter().find_first(fn(r) { d::push_int(other, r.length()) })\n}\n"
+  let toks_str = lex_moonbit(src_str)
+  let ms_str = collect_pkg_mutation_summary_with_cross_pkg([toks_str], ["a.pion"], [src_str], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_str, find_iter_dot(toks_str), ms_str, src_str, None, "String") != None, "line 235")
+
+  // Aliased cross-package struct `d::Item` MUST fail closed when dep mutates `dep::Item`.
+  let src_item = "fn h(rows : Array[d::Item], other : Array[d::Item]) -> Option[d::Item] {\n  rows.iter().find_first(fn(r) { d::push_item(other, r) })\n}\n"
+  let toks_item = lex_moonbit(src_item)
+  let ms_item = collect_pkg_mutation_summary_with_cross_pkg([toks_item], ["a.pion"], [src_item], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_item, find_iter_dot(toks_item), ms_item, src_item, None, "d::Item") == None, "line 241")
+}
+
+test "cross_pkg_s4_dep_mutates_any_array_fail_closed" {
+  let dep_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub fn[T] push_any(xs : Array[T], v : T) -> Bool { xs.push(v); true }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let exported = collect_exported_abi_fn_mutation_summaries(
+    dep_gen,
+    "dep",
+    empty_symbol_table(),
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  assert_true(exported.length() == 1 && exported[0].mutates_any_array, "line 261")
+  let dep_abi = mk_test_dep_abi("dep", None, exported)
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let src = "fn f(rows : Array[String], other : Array[String]) -> Option[String] {\n  rows.iter().find_first(fn(r) { dep::push_any(other, r) })\n}\n"
+  let toks = lex_moonbit(src)
+  let ms = collect_pkg_mutation_summary_with_cross_pkg([toks], ["a.pion"], [src], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks, find_iter_dot(toks), ms, src, None, "String") == None, "line 272")
+}
+
+test "cross_pkg_s5_three_pkg_transitive_chain" {
+  // Package A: pure helper, mutating helper, unknown helper, and pure struct method.
+  let pkg_a_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub struct Choice { key : String }\npub fn Choice::get_key(self : Choice) -> String { self.key }\npub fn pure_match(x : Int, target : Int) -> Bool { x == target }\npub fn mutate_ints(xs : Array[Int], v : Int) -> Bool { xs.push(v); true }\npub fn call_unknown(x : Int, cb : (Int) -> Bool) -> Bool { cb(x) }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let st_a = empty_symbol_table()
+  st_a.local_types["Choice"] = true
+  let fms_a = collect_exported_abi_fn_mutation_summaries(
+    pkg_a_gen,
+    "pkg_a",
+    st_a,
+    Map(),
+    CrossPkgMutationContext::empty(),
+    empty_pkg_query_types(),
+  )
+  let abi_a = mk_test_dep_abi("pkg_a", None, fms_a)
+
+  // Package B depends on A and re-wraps all three.
+  let ctx_b = CrossPkgMutationContext::{
+    dep_abis: [("pkg_a", abi_a)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let pkg_b_gen = [
+    GeneratedFile::{
+      rel_path: "lib.pion",
+      content: "pub fn b_pure(x : Int, target : Int) -> Bool { pkg_a::pure_match(x, target) }\npub fn b_mutate(xs : Array[Int], v : Int) -> Bool { pkg_a::mutate_ints(xs, v) }\npub fn b_unknown(x : Int, cb : (Int) -> Bool) -> Bool { pkg_a::call_unknown(x, cb) }\n",
+      source_file: "lib.mbt",
+      anchors: [],
+    },
+  ]
+  let fms_b = collect_exported_abi_fn_mutation_summaries(
+    pkg_b_gen,
+    "pkg_b",
+    empty_symbol_table(),
+    Map(),
+    ctx_b,
+    empty_pkg_query_types(),
+  )
+  let abi_b = mk_test_dep_abi("pkg_b", None, fms_b)
+
+  // Package C depends on A and B.
+  let uv_c : Map[String, String] = Map()
+  uv_c["b_pure"] = "pkg_b::b_pure"
+  let ctx_c = CrossPkgMutationContext::{
+    dep_abis: [("pkg_a", abi_a), ("pkg_b", abi_b)],
+    using_values: uv_c,
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+
+  // Pure transitive call via `pkg_b::b_pure`, `using` `b_pure`, `.search_by`, and cross-pkg method `c.get_key()`.
+  let src_ok = "fn c1(rows : Array[Int], target : Int) -> Option[Int] {\n  rows.iter().find_first(fn(r) { pkg_b::b_pure(r, target) })\n}\nfn c2(rows : Array[Int], target : Int) -> Option[Int] {\n  rows.search_by(fn(r) { b_pure(r, target) })\n}\n"
+  let toks_ok = lex_moonbit(src_ok)
+  let ms_ok = collect_pkg_mutation_summary_with_cross_pkg([toks_ok], ["c.pion"], [src_ok], empty_pkg_query_types(), Map(), Map(), ctx_c)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_ok, find_iter_dot(toks_ok), ms_ok, src_ok, None, "Int") != None, "line 336")
+  let (sb_s, sb_e, sb_bo) = find_search_by_cb(toks_ok)
+  let sb_sum = summarize_callback_arg(ms_ok, toks_ok, sb_s, sb_e, sb_bo, src_ok, None, "Int", Map())
+  assert_true(!summary_may_mutate_array_in_ctx(ms_ok, sb_sum, "Int", Map()), "line 339")
+
+  let src_meth = "fn c3(cs : Array[pkg_a::Choice], target : String) -> Option[pkg_a::Choice] {\n  cs.iter().find_first(fn(c) { c.get_key() == target })\n}\n"
+  let toks_meth = lex_moonbit(src_meth)
+  let ms_meth = collect_pkg_mutation_summary_with_cross_pkg([toks_meth], ["cm.pion"], [src_meth], empty_pkg_query_types(), Map(), Map(), ctx_c)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_meth, find_iter_dot(toks_meth), ms_meth, src_meth, None, "pkg_a::Choice") != None, "line 344")
+
+  // Mutating transitive call MUST fail closed on `Array[Int]`.
+  let src_mut = "fn c_bad_mut(rows : Array[Int], other : Array[Int]) -> Option[Int] {\n  rows.iter().find_first(fn(r) { pkg_b::b_mutate(other, r) })\n}\n"
+  let toks_mut = lex_moonbit(src_mut)
+  let ms_mut = collect_pkg_mutation_summary_with_cross_pkg([toks_mut], ["cmut.pion"], [src_mut], empty_pkg_query_types(), Map(), Map(), ctx_c)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_mut, find_iter_dot(toks_mut), ms_mut, src_mut, None, "Int") == None, "line 350")
+
+  // Unknown transitive call MUST fail closed.
+  let src_unk = "fn pred(x : Int) -> Bool { x > 0 }\nfn c_bad_unk(rows : Array[Int]) -> Option[Int] {\n  rows.iter().find_first(fn(r) { pkg_b::b_unknown(r, pred) })\n}\n"
+  let toks_unk = lex_moonbit(src_unk)
+  let ms_unk = collect_pkg_mutation_summary_with_cross_pkg([toks_unk], ["cunk.pion"], [src_unk], empty_pkg_query_types(), Map(), Map(), ctx_c)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_unk, find_iter_dot(toks_unk), ms_unk, src_unk, None, "Int") == None, "line 356")
+}
+
+test "cross_pkg_s6_struct_field_types_and_fn_fields_and_custom_eq" {
+  let choice_schema = AbiStructSchema::{
+    pkg: "dep",
+    name: "Choice",
+    type_params: [],
+    fields: [
+      AbiStructField::{ src_name: "key", emit_name: "key", is_mut: false, visibility: "pub", ty: "String" },
+      AbiStructField::{ src_name: "rank", emit_name: "rank", is_mut: false, visibility: "pub", ty: "Int" },
+      AbiStructField::{ src_name: "cb", emit_name: "cb", is_mut: false, visibility: "pub", ty: "() -> Bool" },
+      AbiStructField::{ src_name: "tag", emit_name: "tag", is_mut: false, visibility: "pub", ty: "dep::CustomKey" },
+    ],
+    can_construct: true,
+    can_update: true,
+    complete: true,
+  }
+  let dep_abi = mk_test_dep_abi("dep", Some([choice_schema]), [])
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  // Simulate a dependency having custom `impl Eq` (`dep_methods` contains `"eq"`).
+  let dep_methods : Map[String, Bool] = Map()
+  dep_methods["eq"] = true
+
+  // 1. Pure String field `c.key == k` MUST pass.
+  let src_str = "fn f_str(models : Array[dep::Choice], k : String) -> Option[dep::Choice] {\n  models.iter().find_first(fn(c) { c.key == k })\n}\n"
+  let toks_str = lex_moonbit(src_str)
+  let ms_str = collect_pkg_mutation_summary_with_cross_pkg([toks_str], ["s.pion"], [src_str], empty_pkg_query_types(), dep_methods, Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_str, find_iter_dot(toks_str), ms_str, src_str, None, "dep::Choice") != None, "line 389")
+
+  // 2. Pure Int field `c.rank == 1` MUST pass.
+  let src_int = "fn f_int(models : Array[dep::Choice]) -> Option[dep::Choice] {\n  models.iter().find_first(fn(c) { c.rank == 1 })\n}\n"
+  let toks_int = lex_moonbit(src_int)
+  let ms_int = collect_pkg_mutation_summary_with_cross_pkg([toks_int], ["i.pion"], [src_int], empty_pkg_query_types(), dep_methods, Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_int, find_iter_dot(toks_int), ms_int, src_int, None, "dep::Choice") != None, "line 395")
+
+  // 3. Function-typed field `(c.cb)()` MUST fail closed.
+  let src_cb1 = "fn f_cb1(models : Array[dep::Choice]) -> Option[dep::Choice] {\n  models.iter().find_first(fn(c) { (c.cb)() })\n}\n"
+  let toks_cb1 = lex_moonbit(src_cb1)
+  let ms_cb1 = collect_pkg_mutation_summary_with_cross_pkg([toks_cb1], ["cb1.pion"], [src_cb1], empty_pkg_query_types(), dep_methods, Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_cb1, find_iter_dot(toks_cb1), ms_cb1, src_cb1, None, "dep::Choice") == None, "line 401")
+
+  // 4. Function-typed field `c.cb()` MUST fail closed.
+  let src_cb2 = "fn f_cb2(models : Array[dep::Choice]) -> Option[dep::Choice] {\n  models.iter().find_first(fn(c) { c.cb() })\n}\n"
+  let toks_cb2 = lex_moonbit(src_cb2)
+  let ms_cb2 = collect_pkg_mutation_summary_with_cross_pkg([toks_cb2], ["cb2.pion"], [src_cb2], empty_pkg_query_types(), dep_methods, Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_cb2, find_iter_dot(toks_cb2), ms_cb2, src_cb2, None, "dep::Choice") == None, "line 407")
+
+  // 5. Custom-Eq field `c.tag == want` MUST fail closed.
+  let src_eq = "fn f_eq(models : Array[dep::Choice], want : dep::CustomKey) -> Option[dep::Choice] {\n  models.iter().find_first(fn(c) { c.tag == want })\n}\n"
+  let toks_eq = lex_moonbit(src_eq)
+  let ms_eq = collect_pkg_mutation_summary_with_cross_pkg([toks_eq], ["eq.pion"], [src_eq], empty_pkg_query_types(), dep_methods, Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_eq, find_iter_dot(toks_eq), ms_eq, src_eq, None, "dep::Choice") == None, "line 413")
+}
+
+test "cross_pkg_s7_using_local_shadowing_fail_closed" {
+  let dep_abi = mk_test_dep_abi(
+    "dep",
+    None,
+    [
+      AbiFnMutationSummary::{
+        name: "helper",
+        mutates_any_array: false,
+        reaches_shrink: false,
+        unknown: false,
+        mutated_elem_types: [],
+      },
+    ],
+  )
+  let uv : Map[String, String] = Map()
+  uv["helper"] = "dep::helper"
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: uv,
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+
+  // 1. Unshadowed `using @dep { helper }` passes.
+  let src_ok = "using @dep { helper }\nfn f_ok(xs : Array[Int]) -> Option[Int] {\n  xs.iter().find_first(fn(x) { helper(x) })\n}\n"
+  let toks_ok = lex_moonbit(src_ok)
+  let ms_ok = collect_pkg_mutation_summary_with_cross_pkg([toks_ok], ["ok.pion"], [src_ok], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_ok, find_iter_dot(toks_ok), ms_ok, src_ok, None, "Int") != None, "line 443")
+
+  // 2. Shadowed by function parameter MUST fail closed.
+  let src_param = "using @dep { helper }\nfn f_param(xs : Array[Int], helper : (Int) -> Bool) -> Option[Int] {\n  xs.iter().find_first(fn(x) { helper(x) })\n}\n"
+  let toks_param = lex_moonbit(src_param)
+  let ms_param = collect_pkg_mutation_summary_with_cross_pkg([toks_param], ["p.pion"], [src_param], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_param, find_iter_dot(toks_param), ms_param, src_param, None, "Int") == None, "line 449")
+
+  // 3. Shadowed by local `let helper = ...` MUST fail closed.
+  let src_let = "using @dep { helper }\nfn f_let(xs : Array[Int], cb : (Int) -> Bool) -> Option[Int] {\n  let helper = cb\n  xs.iter().find_first(fn(x) { helper(x) })\n}\n"
+  let toks_let = lex_moonbit(src_let)
+  let ms_let = collect_pkg_mutation_summary_with_cross_pkg([toks_let], ["l.pion"], [src_let], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_let, find_iter_dot(toks_let), ms_let, src_let, None, "Int") == None, "line 455")
+
+  // 4. Shadowed by top-level `let helper = ...` MUST fail closed.
+  let src_top = "using @dep { helper }\nlet helper : (Int) -> Bool = fn(x : Int) -> Bool { x > 0 }\nfn f_top(xs : Array[Int]) -> Option[Int] {\n  xs.iter().find_first(fn(x) { helper(x) })\n}\n"
+  let toks_top = lex_moonbit(src_top)
+  let ms_top = collect_pkg_mutation_summary_with_cross_pkg([toks_top], ["t.pion"], [src_top], empty_pkg_query_types(), Map(), Map(), ctx)
+  assert_true(immediate_iter_consumer_allow_with_summary(toks_top, find_iter_dot(toks_top), ms_top, src_top, None, "Int") == None, "line 461")
+}
+
+test "cross_pkg_pipeline_abi_export_and_transitive_propagation" {
+  let a_src = "pub struct Entry { id : String }\npub fn read_id(e : Entry) -> String { e.id }\npub fn push_entry(xs : Array[Entry], e : Entry) -> Unit { xs.push(e) }\npub fn call_fn(x : Int, f : (Int) -> Bool) -> Bool { f(x) }\n"
+  let opts_a = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "pkg_a",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let res_a = transpile_package_with_abis(
+    [SourceFile::{ rel_path: "a.mbt", content: a_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [],
+    [],
+    opts_a,
+    [],
+    false,
+    fn(_files) { "" },
+  )
+  assert_true(res_a.blockers == 0, "pkg_a transpile must succeed")
+  assert_true(res_a.abi.package_name == "pkg_a", "pkg_a ABI package_name must be pkg_a")
+  assert_true(res_a.abi.fn_mutation_summaries.length() == 3, "pkg_a must export 3 fn_mutation_summaries")
+  let a_files : Array[(String, String)] = []
+  for f in res_a.files {
+    a_files.push((f.rel_path, f.content))
+  }
+  let a_abi_json = render_abi_json(res_a.abi, a_files)
+  let v_diags : Array[Diag] = []
+  let parsed_a = verify_and_parse_dep_abi("pkg_a", "/tmp/pkg_a", a_files, Some(a_abi_json), v_diags)
+  assert_true(v_diags.length() == 0, "pkg_a ABI round-trip verification must succeed")
+  let abi_a = match parsed_a {
+    Some(p) => p
+    None => {
+      assert_true(false, "expected verified pkg_a ABI")
+      empty_package_abi("pkg_a")
+    }
+  }
+
+  let b_src = "pub fn b_read(e : @pkg_a.Entry) -> String { @pkg_a.read_id(e) }\npub fn b_push(xs : Array[@pkg_a.Entry], e : @pkg_a.Entry) -> Unit { @pkg_a.push_entry(xs, e) }\npub fn b_call(x : Int, f : (Int) -> Bool) -> Bool { @pkg_a.call_fn(x, f) }\n"
+  let opts_b = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "pkg_b",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let res_b = transpile_package_with_abis(
+    [SourceFile::{ rel_path: "b.mbt", content: b_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [("pkg_a", abi_a)],
+    [],
+    opts_b,
+    [],
+    false,
+    fn(_files) { "" },
+  )
+  assert_true(res_b.blockers == 0, "pkg_b transpile must succeed")
+  assert_true(res_b.abi.fn_mutation_summaries.length() == 3, "pkg_b must export 3 fn_mutation_summaries")
+  // Sorted order: b_call, b_push, b_read
+  assert_true(res_b.abi.fn_mutation_summaries[0].name == "b_call" && res_b.abi.fn_mutation_summaries[0].unknown, "b_call must propagate unknown=true")
+  assert_true(res_b.abi.fn_mutation_summaries[1].name == "b_push" && !res_b.abi.fn_mutation_summaries[1].unknown && res_b.abi.fn_mutation_summaries[1].mutated_elem_types.length() == 1 && res_b.abi.fn_mutation_summaries[1].mutated_elem_types[0] == "pkg_a::Entry", "b_push must propagate mutated_elem_types=[pkg_a::Entry]")
+  assert_true(res_b.abi.fn_mutation_summaries[2].name == "b_read" && !res_b.abi.fn_mutation_summaries[2].unknown && !res_b.abi.fn_mutation_summaries[2].mutates_any_array && res_b.abi.fn_mutation_summaries[2].mutated_elem_types.length() == 0, "b_read must propagate pure summary")
+}
