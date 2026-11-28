@@ -1849,6 +1849,18 @@ fn static_ret_mentions_generic(ty : String, gparams : Array[String]) -> Bool {
   type_mentions_any_generic(ty, gset)
 }
 
+///| True iff `ty` mentions any formal type parameter registered for `fn_key` in `tparams_map`.
+fn fn_ret_mentions_formal_generic(
+  ty : String,
+  tparams_map : Map[String, Array[String]],
+  fn_key : String,
+) -> Bool {
+  match tparams_map.get(fn_key) {
+    Some(tps) => static_ret_mentions_generic(ty, tps)
+    None => false
+  }
+}
+
 ///| Look up the concrete (non-generic-param-leaking) return type of a static method `Type::method`
 ///| or cross-package `pkg::Type::method`, honoring blackbox shadowing and `--dep` alias -> canon pkg mapping.
 ///| Returns `""` (fail-closed) when unknown or when the declared return type mentions a formal type parameter.
@@ -3793,7 +3805,11 @@ fn try_lower_ref_literal(
       }
       i = i + 1
     }
+    let ref_inner_exp = unwrap_ref_type_str(current_expected_type(ctx), ref_ty)
+    let saved_ref_exp = ctx.expected_type_stack.length()
+    push_expected_type(ctx, ref_inner_exp)
     let val_expr = lower_expr_range(ctx, tokens, open_b + 3, close_b, file, false).trim()
+    restore_expected_type_stack(ctx, saved_ref_exp)
     let clean_val = if val_expr.ends_with(",") { val_expr.slice(0, val_expr.length() - 1).trim() } else { val_expr }
     return Some(ref_ctor + "(" + clean_val + ")")
   }
@@ -4503,17 +4519,17 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       None => ()
     }
   }
-  // Cross-package static method call `@pkg.Type::fn(...)` -> look up `symtab.fn_ret_types`
+  // Cross-package static method call `@pkg.Type::fn(...)` -> concrete return type (guarding generic params)
   if t.kind == TokenKind::PkgRef && start + 6 <= end &&
   tokens[start + 1].kind == TokenKind::Dot && tokens[start + 2].kind == TokenKind::UpperIdent &&
   tokens[start + 3].kind == TokenKind::ColonColon && tokens[start + 4].kind == TokenKind::Ident &&
   tokens[start + 5].kind == TokenKind::LParen && find_matching_delim(tokens, start + 5) == end - 1 {
     let raw_pkg = t.raw.slice(1, t.raw.length())
     let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
-    let fk = mapped_pkg + "::" + tokens[start + 2].raw + "::" + tokens[start + 4].raw
-    match ctx.symtab.fn_ret_types.get(fk) {
-      Some(rt) => if rt.length() > 0 { return rt }
-      None => ()
+    let pkg_cands = if mapped_pkg == raw_pkg { [mapped_pkg] } else { [mapped_pkg, raw_pkg] }
+    let rt = lookup_static_method_concrete_ret_type(ctx, pkg_cands, tokens[start + 2].raw, tokens[start + 4].raw)
+    if rt.length() > 0 {
+      return rt
     }
   }
   // Sound Ref literal `{ val: expr }` or `Ref::new(expr)` -> `mbt_compat::Ref` (when unshadowed)
@@ -4775,7 +4791,8 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     }
     match ctx.symtab.fn_ret_types.get(t.raw) {
       Some(rty) =>
-      if rty.length() > 0 && (rty.starts_with("Option[") || rty.starts_with("Array[") || rty.starts_with("(") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
+      if rty.length() > 0 && !fn_ret_mentions_formal_generic(rty, ctx.symtab.fn_type_params, t.raw) &&
+      (rty.starts_with("Option[") || rty.starts_with("Array[") || rty.starts_with("(") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
         return rty
       }
       None => ()
@@ -4806,9 +4823,11 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       find_matching_delim(tokens, start + 9) + 1 == find_matching_delim(tokens, start + 8) {
         return rbase
       }
-      match ctx.symtab.fn_ret_types.get(strip_type_args_sym(rbase) + "::" + tokens[start + 2].raw) {
+      let mkey = strip_type_args_sym(rbase) + "::" + tokens[start + 2].raw
+      match ctx.symtab.fn_ret_types.get(mkey) {
         Some(rty) =>
-        if rty.length() > 0 && (rty.starts_with("(") || rty.starts_with("Array[") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
+        if rty.length() > 0 && !fn_ret_mentions_formal_generic(rty, ctx.symtab.fn_type_params, mkey) &&
+        (rty.starts_with("(") || rty.starts_with("Array[") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
           return rty
         }
         None => ()
@@ -4822,22 +4841,37 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     let raw_pkg = t.raw.slice(1, t.raw.length())
     let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
     let fname = tokens[start + 2].raw
-    let rty = match ctx.symtab.fn_ret_types.get(mapped_pkg + "::" + fname) {
+    let mapped_key = mapped_pkg + "::" + fname
+    let raw_key = raw_pkg + "::" + fname
+    let rty = match ctx.symtab.fn_ret_types.get(mapped_key) {
       Some(r) => r
-      None => ""
+      None =>
+      if raw_pkg != mapped_pkg {
+        match ctx.symtab.fn_ret_types.get(raw_key) {
+          Some(r) => r
+          None => ""
+        }
+      } else {
+        ""
+      }
     }
     if rty.length() > 0 {
+      let mut resolved = rty
       // Substitute single type param `[T]` from first argument when possible (e.g. `Signal[T]` -> `Signal[Double]`)
-      if str_has(rty, "[T]") {
+      if str_has(resolved, "[T]") {
         let cp = find_matching_delim(tokens, start + 3)
         if cp > start + 4 {
           let arg_ty = infer_simple_expr_type(ctx, tokens, start + 4, cp)
           if arg_ty.length() > 0 {
-            return str_replace_all(rty, "[T]", "[" + arg_ty + "]")
+            resolved = str_replace_all(resolved, "[T]", "[" + arg_ty + "]")
           }
         }
       }
-      return rty
+      let leaks_gen = fn_ret_mentions_formal_generic(resolved, ctx.symtab.fn_type_params, mapped_key) ||
+      (raw_pkg != mapped_pkg && fn_ret_mentions_formal_generic(resolved, ctx.symtab.fn_type_params, raw_key))
+      if !leaks_gen {
+        return resolved
+      }
     }
   }
   // Local function call `f(...)` -> look up `symtab.fn_ret_types` (ONLY when no trailing `.method(...)` chain!)
@@ -4846,26 +4880,26 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     let fname = rename_keyword_ident(t.raw)
     if ctx.cur_is_blackbox {
       match ctx.symtab.blackbox_fn_ret_types.get(fname) {
-        Some(r) => if r.length() > 0 { return r }
+        Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.blackbox_fn_type_params, fname) { return r }
         None => ()
       }
       if !ctx.symtab.blackbox_decls.contains(t.raw) {
         match ctx.symtab.fn_ret_types.get(fname) {
-          Some(r) => if r.length() > 0 { return r }
+          Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.fn_type_params, fname) { return r }
           None => ()
         }
       }
     } else {
       match ctx.symtab.fn_ret_types.get(fname) {
-        Some(r) => if r.length() > 0 { return r }
+        Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.fn_type_params, fname) { return r }
         None => ()
       }
     }
     match lookup_scope_var(ctx, fname) {
       Some(sv) => {
-        let arrow_i = sv.ty.index_of("->")
-        if arrow_i >= 0 {
-          return sv.ty.slice(arrow_i + 2, sv.ty.length()).trim()
+        let rty = extract_fn_ret_type_str(sv.ty).trim()
+        if rty.length() > 0 {
+          return rty
         }
       }
       None => ()
@@ -4921,9 +4955,9 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
         Some(fmap) =>
         match fmap.get(tokens[start + 3].raw) {
           Some(fty) => {
-            let arrow_i = fty.index_of("->")
-            if arrow_i >= 0 {
-              return fty.slice(arrow_i + 2, fty.length()).trim()
+            let rty = extract_fn_ret_type_str(fty).trim()
+            if rty.length() > 0 {
+              return rty
             }
           }
           None => ()
@@ -4931,30 +4965,6 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
         None => ()
       }
       None => ()
-    }
-  }
-  // Zero-arg anonymous closure `fn() { ... }` -> infer `() -> <ret>` from explicit ret or last expr
-  if t.kind == TokenKind::Keyword && t.raw == "fn" && start + 2 < end &&
-  tokens[start + 1].kind == TokenKind::LParen && tokens[start + 2].kind == TokenKind::RParen {
-    if start + 3 < end && tokens[start + 3].kind == TokenKind::Arrow {
-      let mut lb = start + 4
-      while lb < end && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
-      let rty = lower_type_tokens(tokens, start + 4, lb, ctx.symtab, ctx.recipes).trim()
-      if rty.length() > 0 { return "() -> " + rty }
-    } else if start + 3 < end && tokens[start + 3].kind == TokenKind::LBrace {
-      let cb = find_matching_delim(tokens, start + 3)
-      // Scan for `None => <lit>` or tail literal inside body
-      let mut k = cb - 1
-      while k > start + 3 {
-        if tokens[k].kind == TokenKind::FloatLit {
-          if tokens[k].raw.ends_with("F") { return "() -> Float" }
-          return "() -> Double"
-        }
-        if tokens[k].kind == TokenKind::IntLit { return "() -> Int" }
-        if tokens[k].kind == TokenKind::StringLit { return "() -> String" }
-        if tokens[k].kind == TokenKind::Keyword && (tokens[k].raw == "true" || tokens[k].raw == "false") { return "() -> Bool" }
-        k = k - 1
-      }
     }
   }
   infer_expr_type_f3d2(ctx, tokens, start, end)
@@ -6488,8 +6498,28 @@ fn lower_call_args(
   }
   // When called as `recv.method(...)` via `Type::method` lookup, strip leading `self` parameter!
   // When called as `x |> f(a, b)`, strip the first positional parameter (supplied by the pipe LHS).
-  let callee_pts : Array[(String, String)] = if is_dot_method &&
-  raw_callee_pts.length() > 0 && raw_callee_pts[0].0 == "self" {
+  let dot_strips_recv = is_dot_method && raw_callee_pts.length() > 0 && {
+    if raw_callee_pts[0].0 == "self" {
+      true
+    } else {
+      let mut cc = -1
+      let mut ci = 0
+      while ci + 1 < lookup_callee.length() {
+        if lookup_callee.code_unit_at(ci) == 58 && lookup_callee.code_unit_at(ci + 1) == 58 {
+          cc = ci
+        }
+        ci = ci + 1
+      }
+      if cc > 0 {
+        let owner_ty = lookup_callee.slice(0, cc)
+        let p0_ty = strip_type_args_sym(raw_callee_pts[0].1)
+        p0_ty == owner_ty || (owner_ty.ends_with("::" + p0_ty) && p0_ty.length() > 0)
+      } else {
+        false
+      }
+    }
+  }
+  let callee_pts : Array[(String, String)] = if dot_strips_recv {
     let trimmed : Array[(String, String)] = []
     let mut k = 1
     while k < raw_callee_pts.length() {
@@ -7196,9 +7226,32 @@ fn expand_or_is_pattern_alts(
     head_end = s + 5
   }
   if head_end > s {
-    let head = lower_expr_range(ctx, tokens, s, head_end, file, true).trim()
     let open_p = head_end
     let close_p = e - 1
+    let mut has_nested_pipe = false
+    let mut has_top_rest = false
+    let mut sc_i = open_p + 1
+    let mut sc_d = 0
+    while sc_i < close_p {
+      let sc_k = tokens[sc_i].kind
+      if sc_k == TokenKind::Pipe {
+        has_nested_pipe = true
+      } else if sc_k == TokenKind::LParen || sc_k == TokenKind::LBracket || sc_k == TokenKind::LBrace {
+        sc_d = sc_d + 1
+      } else if sc_k == TokenKind::RParen || sc_k == TokenKind::RBracket || sc_k == TokenKind::RBrace {
+        if sc_d > 0 { sc_d = sc_d - 1 }
+      } else if sc_d == 0 && sc_k == TokenKind::DotDot {
+        has_top_rest = true
+      }
+      sc_i = sc_i + 1
+    }
+    // When there is no nested `|` inside the constructor arguments, delegate directly to
+    // `lower_expr_range(..., in_pattern=true)` so enum constructor rest patterns (`..`) and
+    // labeled enum patterns expand through the canonical schema resolver (or fail closed).
+    if !has_nested_pipe {
+      return Some([lower_expr_range(ctx, tokens, s, e, file, true).trim()])
+    }
+    let head = lower_expr_range(ctx, tokens, s, head_end, file, true).trim()
     let saved_exp_or = ctx.expected_type_stack.length()
     let cur_e = current_expected_type(ctx).trim()
     if head == "Some" || head == "Option::Some" || head == "Ok" || head == "Result::Ok" || head == "Err" || head == "Result::Err" {
@@ -7231,10 +7284,53 @@ fn expand_or_is_pattern_alts(
       }
       ai = ae + 1
     }
+    let mut non_rest_cnt = 0
+    for arg in args {
+      if !(arg.0 + 1 == arg.1 && tokens[arg.0].kind == TokenKind::DotDot) {
+        non_rest_cnt = non_rest_cnt + 1
+      }
+    }
+    let mut rest_wildcards = ""
+    if has_top_rest {
+      let raw_ctor_name = tokens[head_end - 1].raw
+      let arity = lookup_ctor_arity_resolved(ctx.symtab, raw_ctor_name, head, non_rest_cnt)
+      if arity < 0 || arity < non_rest_cnt {
+        ctx.diags.push(diag_error(
+          "MBT2PION_MANUAL",
+          file,
+          tokens[s].line,
+          tokens[s].col,
+          "cannot expand constructor rest pattern `" + raw_ctor_name + "(.., ..)` because variant arity is unknown",
+        ))
+        rest_wildcards = "_"
+      } else {
+        let missing = arity - non_rest_cnt
+        let rsb = StringBuilder()
+        let mut mi = 0
+        while mi < missing {
+          if mi > 0 { rsb.write_string(", ") }
+          rsb.write_string("_")
+          mi = mi + 1
+        }
+        rest_wildcards = rsb.to_string()
+      }
+    }
     let mut combos : Array[String] = [""]
     let mut idx = 0
     while idx < args.length() {
       let (as_i, ae_i) = args[idx]
+      if as_i + 1 == ae_i && tokens[as_i].kind == TokenKind::DotDot {
+        if rest_wildcards.length() > 0 {
+          let next_combos : Array[String] = []
+          for c in combos {
+            let joined = if c.length() == 0 { rest_wildcards } else { c + ", " + rest_wildcards }
+            next_combos.push(joined)
+          }
+          combos = next_combos
+        }
+        idx = idx + 1
+        continue
+      }
       match expand_or_is_pattern_alts(ctx, tokens, as_i, ae_i, file, false) {
         None => {
           restore_expected_type_stack(ctx, saved_exp_or)
@@ -7244,7 +7340,7 @@ fn expand_or_is_pattern_alts(
           let next_combos : Array[String] = []
           for c in combos {
             for item in sub {
-              let joined = if idx == 0 { item } else { c + ", " + item }
+              let joined = if c.length() == 0 { item } else { c + ", " + item }
               next_combos.push(joined)
               if next_combos.length() > 32 {
                 restore_expected_type_stack(ctx, saved_exp_or)
@@ -8044,6 +8140,11 @@ fn lower_one_token_or_form(
       return (trivia + "mbt_compat::MbtJson::String(" + fixed_s + ")", i + 1)
     }
     return (trivia + fixed_s, i + 1)
+  }
+  // Char literal `'...'`: convert MoonBit `\uXXXX` escapes to Pion `\u{XXXX}` and reject lone surrogates
+  if t.kind == TokenKind::CharLit {
+    let fixed_c = lower_mbt_string_surrogates(t.raw, file, t.line, t.col, ctx.diags)
+    return (trivia + fixed_c, i + 1)
   }
   // `..<=` inclusive range: strictly inside `for` loop headers -> `..=`, fail-closed elsewhere!
   if t.kind == TokenKind::DotDotLtEq {
@@ -9630,7 +9731,12 @@ fn lower_one_token_or_form(
         sk = sk + 1
       }
       if has_spread {
-        let exp_sp = current_expected_type(ctx).trim()
+        let sp_suffix_changes_ty = close_br + 1 < end && {
+          let nk = tokens[close_br + 1].kind
+          nk == TokenKind::Dot || nk == TokenKind::PipeGt ||
+          (!tokens[close_br + 1].newline_before && nk == TokenKind::LBracket)
+        }
+        let exp_sp = if sp_suffix_changes_ty { "" } else { current_expected_type(ctx).trim() }
         let sp_elem_ty = if exp_sp.starts_with("Array[") && exp_sp.ends_with("]") {
           exp_sp.slice(6, exp_sp.length() - 1).trim()
         } else {
@@ -10092,7 +10198,11 @@ fn lower_one_token_or_form(
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Ref" &&
     i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 1)
+      let ref_inner_exp = unwrap_ref_type_str(current_expected_type(ctx), effective_ref_type(ctx.recipes))
+      let saved_ref_exp = ctx.expected_type_stack.length()
+      push_expected_type(ctx, ref_inner_exp)
       let inner = lower_expr_range(ctx, tokens, i + 2, close_p, file, false).trim()
+      restore_expected_type_stack(ctx, saved_ref_exp)
       return (trivia + effective_ref_ctor(ctx.recipes) + "(" + inner + ")", close_p + 1)
     }
     // Tuple struct construction `TupleStruct(a, b)` -> `TupleStruct::{ _0: a, _1: b }`
@@ -10958,7 +11068,11 @@ fn lower_one_token_or_form(
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
     tokens[i + 2].raw == "new" && tokens[i + 3].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 3)
+      let ref_inner_exp = unwrap_ref_type_str(current_expected_type(ctx), effective_ref_type(ctx.recipes))
+      let saved_ref_exp = ctx.expected_type_stack.length()
+      push_expected_type(ctx, ref_inner_exp)
       let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+      restore_expected_type_stack(ctx, saved_ref_exp)
       return (trivia + effective_ref_ctor(ctx.recipes) + "(" + inner + ")", close_p + 1)
     }
     // `Set::new()` / `Set::from_array(...)` / `Set::from_iter(...)` (guarded against local/generic `Set`)
@@ -17804,7 +17918,8 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
               method_seen_count[mname] = prev_cnt + 1
               if prev_cnt == 0 {
                 let no_self : Array[(String, String)] = []
-                let mut sk = if pts.length() > 0 && pts[0].0 == "self" { 1 } else { 0 }
+                let owner_nm = rename_priv_type(ctx.symtab, fn_tok.raw)
+                let mut sk = if pts.length() > 0 && (pts[0].0 == "self" || strip_type_args_sym(pts[0].1) == owner_nm) { 1 } else { 0 }
                 while sk < pts.length() {
                   no_self.push(pts[sk])
                   sk = sk + 1

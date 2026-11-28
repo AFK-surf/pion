@@ -28,8 +28,57 @@ fn is_liftable_static_type(ty : String) -> Bool {
   t == "mbt_compat::OrderedSet" || t == "mbt_compat::ArrayBuf" || t == "mbt_compat::ArrayView" {
     return false
   }
+  // Reject malformed types with unbalanced delimiters (e.g. stray `)` in closure types),
+  // and locate any top-level `->` or matching outer `(...)` pair.
+  let mut p_d = 0
+  let mut b_d = 0
+  let mut c_d = 0
+  let mut arrow_pos = -1
+  let mut first_paren_close = -1
+  let mut bi = 0
+  while bi < t.length() {
+    let ch = t.code_unit_at(bi)
+    if ch == 40 { p_d = p_d + 1 }
+    else if ch == 41 {
+      p_d = p_d - 1
+      if p_d < 0 { return false }
+      if p_d == 0 && b_d == 0 && c_d == 0 && first_paren_close < 0 && t.code_unit_at(0) == 40 {
+        first_paren_close = bi
+      }
+    }
+    else if ch == 91 { b_d = b_d + 1 }
+    else if ch == 93 { b_d = b_d - 1; if b_d < 0 { return false } }
+    else if ch == 123 { c_d = c_d + 1 }
+    else if ch == 125 { c_d = c_d - 1; if c_d < 0 { return false } }
+    else if p_d == 0 && b_d == 0 && c_d == 0 && arrow_pos < 0 && ch == 45 && bi + 1 < t.length() && t.code_unit_at(bi + 1) == 62 {
+      arrow_pos = bi
+    }
+    bi = bi + 1
+  }
+  if p_d != 0 || b_d != 0 || c_d != 0 {
+    return false
+  }
+  // Function type `(P1, P2) -> R` (including tuple-returning `(Int, Int) -> (Double, Double)` and `() -> R`):
+  if arrow_pos >= 0 {
+    let lhs = t.slice(0, arrow_pos).trim()
+    let rhs = t.slice(arrow_pos + 2, t.length()).trim()
+    if !lhs.starts_with("(") || !lhs.ends_with(")") {
+      return false
+    }
+    let inner_params = lhs.slice(1, lhs.length() - 1).trim()
+    if inner_params.length() > 0 {
+      let params = split_top_level_type_list(inner_params)
+      for p in params {
+        if !is_liftable_static_type(p) {
+          return false
+        }
+      }
+    }
+    return is_liftable_static_type(rhs)
+  }
   // Reject malformed tuple types with empty slots like `(Double, )` or `(, Int)`
-  if t.starts_with("(") && t.ends_with(")") {
+  // ONLY when index 0 `(` matches the final `)` (never slice across `(A) -> (B)`!).
+  if t.starts_with("(") && t.ends_with(")") && first_paren_close == t.length() - 1 {
     let parts = split_top_level_type_list(t.slice(1, t.length() - 1))
     for p in parts {
       if !is_liftable_static_type(p) {
@@ -124,6 +173,21 @@ fn unwrap_result_type_str(ty : String) -> (String, String) {
   ("", "")
 }
 
+///| Unwrap `Ref[T]` / `mbt_compat::Ref[T]` / `<ref_ty>[T]` -> `T`, or `""`.
+fn unwrap_ref_type_str(ty : String, ref_ty : String) -> String {
+  let mut t = ty.trim()
+  if t.starts_with("__qual__::") {
+    t = t.slice(10, t.length()).trim()
+  }
+  if t.ends_with("]") && (t.starts_with("Ref[") || t.starts_with("mbt_compat::Ref[") || (ref_ty.length() > 0 && t.starts_with(ref_ty + "["))) {
+    let args = extract_type_args_list(t)
+    if args.length() == 1 {
+      return args[0]
+    }
+  }
+  ""
+}
+
 ///| Extract parameter types from a function type `(T1, T2) -> R` -> `["T1", "T2"]`.
 fn extract_expected_fn_param_types(ty : String) -> Array[String] {
   let mut t = ty.trim()
@@ -191,7 +255,29 @@ fn extract_expected_fn_param_types(ty : String) -> Array[String] {
 
 ///| Extract return type from a function type `(T1, T2) -> R` -> `R`.
 fn extract_fn_ret_type_str(ty : String) -> String {
-  let t = ty.trim()
+  let mut t = ty.trim()
+  while t.starts_with("(") && t.ends_with(")") {
+    let mut pd = 0
+    let mut pi = 0
+    let mut matches_end = false
+    while pi < t.length() {
+      let ch = t.code_unit_at(pi)
+      if ch == 40 { pd = pd + 1 }
+      else if ch == 41 {
+        pd = pd - 1
+        if pd == 0 {
+          matches_end = pi == t.length() - 1
+          break
+        }
+      }
+      pi = pi + 1
+    }
+    if matches_end {
+      t = t.slice(1, t.length() - 1).trim()
+    } else {
+      break
+    }
+  }
   let mut d = 0
   let mut i = 0
   while i + 1 < t.length() {
@@ -638,6 +724,65 @@ fn qualify_dep_field_type_f3d2(ctx : StageAContext, owner_clean : String, ft : S
   ft
 }
 
+///| Instantiate a method's declared return type `rty` against `recv_ty`'s type arguments using the
+///| method's declared `self` parameter type; return `""` (fail-closed) if any uninstantiated formal
+///| type parameter still remains in the result.
+fn instantiate_method_ret_ty_f3d2(
+  ctx : StageAContext,
+  recv_ty : String,
+  rty : String,
+  tparams_map : Map[String, Array[String]],
+  param_types_map : Map[String, Array[(String, String)]],
+  fn_key : String,
+) -> String {
+  if rty.length() == 0 {
+    return ""
+  }
+  match tparams_map.get(fn_key) {
+    None => rty
+    Some(tps) => {
+      if tps.length() == 0 {
+        return rty
+      }
+      let tp_set : Map[String, Bool] = Map()
+      for tp in tps { tp_set[tp] = true }
+      let subst : Map[String, String] = Map()
+      let recv_targs = extract_type_args_list(recv_ty)
+      if recv_targs.length() > 0 {
+        match param_types_map.get(fn_key) {
+          Some(pts) =>
+          if pts.length() > 0 {
+            let self_targs = extract_type_args_list(pts[0].1)
+            if self_targs.length() == recv_targs.length() {
+              let mut si = 0
+              while si < self_targs.length() {
+                let stp = self_targs[si].trim()
+                let rta = recv_targs[si].trim()
+                if tp_set.contains(stp) && rta.length() > 0 {
+                  subst[stp] = rta
+                }
+                si = si + 1
+              }
+            }
+          }
+          None => ()
+        }
+      }
+      let unbound : Array[String] = []
+      for tp in tps {
+        if !subst.contains(tp) {
+          unbound.push(tp)
+        }
+      }
+      let resolved = if subst.length() > 0 { subst_type_params_str(rty, subst) } else { rty }
+      if unbound.length() > 0 && static_ret_mentions_generic(resolved, unbound) {
+        return ""
+      }
+      resolved
+    }
+  }
+}
+
 ///| Resolve a method return type `recv_ty.method(...)`.
 fn lookup_method_ret_ty_f3d2(ctx : StageAContext, recv_ty : String, method : String) -> String {
   let base = strip_type_args_sym(recv_ty)
@@ -645,12 +790,18 @@ fn lookup_method_ret_ty_f3d2(ctx : StageAContext, recv_ty : String, method : Str
     let qk = base + "::" + method
     if ctx.cur_is_blackbox {
       match ctx.symtab.blackbox_fn_ret_types.get(qk) {
-        Some(r) => if r.length() > 0 { return r }
+        Some(r) => {
+          let inst = instantiate_method_ret_ty_f3d2(ctx, recv_ty, r, ctx.symtab.blackbox_fn_type_params, ctx.symtab.blackbox_fn_param_types, qk)
+          if inst.length() > 0 { return inst }
+        }
         None => ()
       }
     }
     match ctx.symtab.fn_ret_types.get(qk) {
-      Some(r) => if r.length() > 0 { return r }
+      Some(r) => {
+        let inst = instantiate_method_ret_ty_f3d2(ctx, recv_ty, r, ctx.symtab.fn_type_params, ctx.symtab.fn_param_types, qk)
+        if inst.length() > 0 { return inst }
+      }
       None => ()
     }
     // Check type alias
@@ -658,8 +809,12 @@ fn lookup_method_ret_ty_f3d2(ctx : StageAContext, recv_ty : String, method : Str
       Some(aliased) => {
         let abase = strip_type_args_sym(aliased)
         if abase != base && abase.length() > 0 {
-          match ctx.symtab.fn_ret_types.get(abase + "::" + method) {
-            Some(r) => if r.length() > 0 { return r }
+          let aqk = abase + "::" + method
+          match ctx.symtab.fn_ret_types.get(aqk) {
+            Some(r) => {
+              let inst = instantiate_method_ret_ty_f3d2(ctx, recv_ty, r, ctx.symtab.fn_type_params, ctx.symtab.fn_param_types, aqk)
+              if inst.length() > 0 { return inst }
+            }
             None => ()
           }
         }
@@ -2012,8 +2167,7 @@ fn compute_call_arg_expected_types_f3d2(
     None => callee_pts
   }
   let eff_pts : Array[(String, String)] = if is_dot_method &&
-  raw_pts_all.length() > 0 && raw_pts_all[0].0 == "self" &&
-  raw_pts_all.length() == callee_pts.length() + 1 {
+  raw_pts_all.length() > 0 && raw_pts_all.length() == callee_pts.length() + 1 {
     let trimmed : Array[(String, String)] = []
     let mut ti = 1
     while ti < raw_pts_all.length() {

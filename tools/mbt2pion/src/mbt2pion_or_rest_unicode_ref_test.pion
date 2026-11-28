@@ -1,0 +1,499 @@
+///| Unit tests for:
+///| 1. `expand_or_is_pattern_alts` with enum rest patterns `..`, labeled enum rest patterns, and fail-closed unknown ctors.
+///| 2. MoonBit 4-digit `\uXXXX` escapes in char/string/interp literals -> Pion `\u{XXXX}`, surrogate pairs & lone surrogate rejection.
+///| 3. `Int64::reinterpret_as_double()` Stage B lowering & read-only mutation summary classification.
+///| 4. Stage B `rewrite_index_op_with_index` stopping before leading-dot enum match arms while preserving multiline method chains.
+///| 5. Lifted recursive local `fn` captured closure type inference (including tuple-returning closures) and `is_liftable_static_type`.
+///| 6. Spread array `[..xs, ..ys]` expected-type suppression before type-changing suffixes and preservation across `+` concat.
+///| 7. `Ref::new` / `{ val: e }` expected-type unwrapping and Stage A/B empty `{}` Map lowering (`_pair`, `_array`, expr-position guard).
+
+fn or_rest_noop_check(_ : Array[(String, String)]) -> String {
+  "{\"ok\":true,\"diagnostics\":[]}"
+}
+
+fn or_rest_default_opts() -> TranspileOptions {
+  TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "app",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+}
+
+fn or_rest_find_file(res : TranspileResult, rel : String) -> String {
+  for f in res.files {
+    if f.rel_path == rel {
+      return f.content
+    }
+  }
+  ""
+}
+
+test "or-is pattern: preserves enum ctor rest patterns, labeled rest patterns, and fails closed on unknown" {
+  let src = SourceFile::{
+    rel_path: "or_rest.mbt",
+    content: "pub enum Tag {\n  A\n  B\n}\n" +
+    "pub enum Item {\n  First(Int, String, Bool)\n  Second(Int, Double, String)\n  Third(Int)\n  Tagged(Tag, Int, String)\n  Lab(n~ : Int, tag~ : String, flag~ : Bool)\n  Solo(Tag)\n}\n" +
+    "pub fn check_or_rest(x : Item) -> Bool {\n" +
+    "  x is (First(_, ..) | Second(_, ..) | Third(_))\n" +
+    "}\n" +
+    "pub fn check_nested_tuple(opt : Option[(Tag, Int)]) -> Bool {\n" +
+    "  opt is Some((A | B, _))\n" +
+    "}\n" +
+    "pub fn check_nested_pipe_with_rest(x : Item) -> Bool {\n" +
+    "  x is Tagged(A | B, ..)\n" +
+    "}\n" +
+    "pub fn check_labeled_rest(e : Item) -> Bool {\n" +
+    "  e is (Lab(n=5, ..) | Solo(A | B))\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(res.blockers == 0, "or-is rest positive cases must transpile with 0 blockers")
+  let out = or_rest_find_file(res, "or_rest.pion")
+  assert_true(str_has(out, "First(_, _, _)"), "First(_, ..) must expand to 3 wildcards")
+  assert_true(str_has(out, "Second(_, _, _)"), "Second(_, ..) must expand to 3 wildcards")
+  assert_true(str_has(out, "Third(_)"), "Third(_) preserved")
+  assert_true(
+    str_has(out, "Option::Some((.A, _)) | Option::Some((.B, _))") ||
+    str_has(out, "Some((Tag::A, _)) | Some((Tag::B, _))") ||
+    str_has(out, "Some((.A, _)) | Some((.B, _))"),
+    "nested Some((A | B, _)) must still expand: " + out,
+  )
+  assert_true(str_has(out, "Tagged(Tag::A, _, _)") || str_has(out, "Tagged(.A, _, _)") || str_has(out, "Tagged(A, _, _)"), "Tagged(A | B, ..) must expand first alt with rest")
+  assert_true(str_has(out, "Tagged(Tag::B, _, _)") || str_has(out, "Tagged(.B, _, _)") || str_has(out, "Tagged(B, _, _)"), "Tagged(A | B, ..) must expand second alt with rest")
+  assert_true(str_has(out, "Lab(5, _, _)"), "labeled enum rest Lab(n=5, ..) must expand to positional Lab(5, _, _)")
+  assert_true(str_has(out, "Solo(Tag::A)") || str_has(out, "Solo(.A)") || str_has(out, "Solo(A)"), "Solo(A | B) first alt must expand")
+  assert_true(str_has(out, "Solo(Tag::B)") || str_has(out, "Solo(.B)") || str_has(out, "Solo(B)"), "Solo(A | B) second alt must expand")
+
+  // Negative: unknown constructor with rest pattern `..` MUST still fail closed
+  let bad_src = SourceFile::{
+    rel_path: "or_rest_bad.mbt",
+    content: "pub fn check_bad(x : Int) -> Bool {\n  x is (Unknown(_, ..) | Other(_))\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  let mut saw_manual = false
+  for d in bad_res.diagnostics {
+    if d.code == "MBT2PION_MANUAL" {
+      saw_manual = true
+    }
+  }
+  assert_true(saw_manual && bad_res.blockers >= 1, "unknown ctor with rest pattern must fail closed with MBT2PION_MANUAL")
+}
+
+test "unicode escapes: MoonBit 4-digit \\uXXXX in char/string/interp literals" {
+  let src = SourceFile::{
+    rel_path: "unicode_esc.mbt",
+    content: "pub fn escapes(x : Int) -> (Char, String, String, String, Bool) {\n" +
+    "  let ch = '\\u2007'\n" +
+    "  let s1 = \"\\u2007a\\\\u2007\\u{1F600}\"\n" +
+    "  let s2 = \"\\uD83D\\uDE00\"\n" +
+    "  let s3 = \"\\u2007\\{x}\"\n" +
+    "  let m = match ch {\n    '\\u2007' => true\n    _ => false\n  }\n" +
+    "  (ch, s1, s2, s3, m)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(res.blockers == 0, "valid \\uXXXX escapes must transpile with 0 blockers")
+  let out = or_rest_find_file(res, "unicode_esc.pion")
+  assert_true(str_has(out, "'\\u{2007}'"), "char literal \\u2007 must become \\u{2007}")
+  assert_true(str_has(out, "\"\\u{2007}a\\\\u2007\\u{1F600}\""), "string literal converts \\u2007 while preserving \\\\u2007 and \\u{1F600}")
+  assert_true(str_has(out, "\"\\u{1F600}\""), "surrogate pair \\uD83D\\uDE00 merges to \\u{1F600}")
+  assert_true(str_has(out, "\"\\u{2007}\\{x}\""), "interp string converts \\u2007 to \\u{2007}")
+
+  // Negative: lone surrogates in char and string literals must fail closed
+  let bad_src = SourceFile::{
+    rel_path: "unicode_esc_bad.mbt",
+    content: "pub fn bad() -> (Char, String) {\n  ('\\uD800', \"\\uDC00\")\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  let mut surr_errs = 0
+  for d in bad_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "surrogate") {
+      surr_errs = surr_errs + 1
+    }
+  }
+  assert_true(surr_errs >= 2, "lone high/low surrogates in char and string literals must fail closed")
+}
+
+test "int64_reinterpret_as_double: Stage B rewrite and pure mutation summary" {
+  let src = "fn decode(bits : Int64) -> Double {\n  bits.reinterpret_as_double()\n}\n"
+  let rel = "i64_bits.pion"
+  let round_cnt : Array[Int] = [0]
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let r = round_cnt[0]
+    round_cnt[0] = r + 1
+    if r == 0 {
+      let mut col = 1
+      for f in files {
+        if f.0 == rel {
+          let lns = f.1.split("\n")
+          if lns.length() > 1 {
+            let idx = lns[1].index_of("reinterpret_as_double")
+            if idx >= 0 { col = idx + 1 }
+          }
+        }
+      }
+      "{\"ok\":false,\"diagnostics\":[{\"file\":\"src/" + rel + "\",\"line\":2,\"col\":" + col.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `reinterpret_as_double` on type `Int64`\",\"expected\":\"defined method\",\"found\":\"reinterpret_as_double\"}]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let out_files = [GeneratedFile::{ rel_path: rel, content: src, source_file: rel, anchors: [] }]
+  let diags : Array[Diag] = []
+  let drift : Array[DriftEntry] = []
+  let (final_files, _, _) = run_stage_b(out_files, empty_api_map(), mock_check, diags, drift)
+  let mut final_src = ""
+  for f in final_files {
+    if f.rel_path == rel { final_src = f.content }
+  }
+  assert_true(str_has(final_src, "mbt_compat::int64_reinterpret_as_double(bits)"), "Int64::reinterpret_as_double must rewrite to mbt_compat::int64_reinterpret_as_double(bits)")
+  let pkg = collect_pkg_mutation_summary_tokens([lex_moonbit(final_src)])
+  assert_true(
+    match lookup_fn_mutation_summary(pkg, "decode") { Some(s) => !s.unknown && !s.mutates_any_array, None => false },
+    "mbt_compat::int64_reinterpret_as_double must be classified pure/read-only",
+  )
+}
+
+test "stage_b index assign: stops before leading-dot enum arm and keeps multiline method chain" {
+  let src = "fn run(q : Query, m : mbt_compat::OrderedMap[String, String], xs : Array[Int], f : (Int) -> String) -> Unit {\n" +
+  "  match q {\n" +
+  "    .Unclassified => m[\"a\"] = \"x\"\n" +
+  "    .Named(n) => m[\"b\"] = n\n" +
+  "  }\n" +
+  "  m[\"c\"] = xs\n" +
+  "    .map(f)\n" +
+  "}\n"
+  let rel = "idx_dot_arm.pion"
+  let round_cnt : Array[Int] = [0]
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let r = round_cnt[0]
+    round_cnt[0] = r + 1
+    if r == 0 {
+      let mut c3 = 1
+      let mut c4 = 1
+      let mut c6 = 1
+      for f in files {
+        if f.0 == rel {
+          let lns = f.1.split("\n")
+          c3 = lns[2].index_of("[\"a\"]") + 1
+          c4 = lns[3].index_of("[\"b\"]") + 1
+          c6 = lns[5].index_of("[\"c\"]") + 1
+        }
+      }
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"src/" + rel + "\",\"line\":3,\"col\":" + c3.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot assign to indexed type `OrderedMap[String, String]`\",\"expected\":\"\",\"found\":\"\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":4,\"col\":" + c4.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot assign to indexed type `OrderedMap[String, String]`\",\"expected\":\"\",\"found\":\"\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":6,\"col\":" + c6.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"cannot assign to indexed type `OrderedMap[String, String]`\",\"expected\":\"\",\"found\":\"\"}" +
+      "]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let out_files = [GeneratedFile::{ rel_path: rel, content: src, source_file: rel, anchors: [] }]
+  let diags : Array[Diag] = []
+  let drift : Array[DriftEntry] = []
+  let (final_files, _, _) = run_stage_b(out_files, empty_api_map(), mock_check, diags, drift)
+  let mut final_src = ""
+  for f in final_files {
+    if f.rel_path == rel { final_src = f.content }
+  }
+  assert_true(str_has(final_src, ".Unclassified => m.set(\"a\", \"x\")"), "first arm must close m.set before .Named(n)")
+  assert_true(str_has(final_src, ".Named(n) => m.set(\"b\", n)"), "second arm must independently rewrite to m.set")
+  assert_true(str_has(final_src, "m.set(\"c\", xs\n    .map(f))"), "multiline .map(f) continuation must remain inside m.set")
+}
+
+test "lifted local fn capture: balanced closure types, tuple-returning closures, and accurate return types" {
+  // Direct unit checks on `is_liftable_static_type` for tuple-returning function types vs malformed types
+  assert_true(is_liftable_static_type("(Int, Int) -> (Double, Double)"), "tuple-returning fn type must be liftable")
+  assert_true(is_liftable_static_type("() -> (Int, String)"), "zero-arg tuple-returning fn type must be liftable")
+  assert_true(is_liftable_static_type("((String) -> Unit)"), "parenthesized fn type must be liftable")
+  assert_true(!is_liftable_static_type("(String) -> Unit) -> Unit"), "unbalanced duplicate ) -> Unit must be rejected")
+  assert_true(!is_liftable_static_type("(Double, )"), "malformed tuple with empty slot must be rejected")
+  assert_true(!is_liftable_static_type("() -> "), "fn type with empty return type must be rejected")
+
+  let src = SourceFile::{
+    rel_path: "lift_capture.mbt",
+    content: "pub fn outer(cb : (String) -> Unit, ho : (Int, (String) -> Unit) -> Unit, measure : (Int, Int) -> (Double, Double)) -> Unit {\n" +
+    "  let done = fn(at : String) { cb(at) }\n" +
+    "  let done2 = fn(at : String) { ho(1, cb) }\n" +
+    "  let failed = fn() { done(\"\") }\n" +
+    "  fn next(x : Double) {\n" +
+    "    let (w, _h) = measure(1, 2)\n" +
+    "    if x + w > 0.0 {\n" +
+    "      done(\"ok\")\n" +
+    "      done2(\"ok\")\n" +
+    "    } else {\n" +
+    "      failed()\n" +
+    "      next(x + 1.0)\n" +
+    "    }\n" +
+    "  }\n" +
+    "  next(0.0)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(res.blockers == 0, "lifted local fn capturing typed & tuple-returning closures must have 0 blockers")
+  let out = or_rest_find_file(res, "lift_capture.pion")
+  let mut lifted_sig = ""
+  for ln in out.split("\n") {
+    if str_has(ln, "fn __mbt_local_outer_next_") {
+      lifted_sig = ln
+      break
+    }
+  }
+  assert_true(lifted_sig.length() > 0, "lifted local fn next must be emitted")
+  assert_true(str_has(lifted_sig, "_done : (String) -> Unit"), "captured done must have type (String) -> Unit")
+  assert_true(str_has(lifted_sig, "_done2 : (String) -> Unit"), "captured done2 calling higher-order ho must have type (String) -> Unit")
+  assert_true(str_has(lifted_sig, "_failed : () -> Unit"), "captured failed must have type () -> Unit (not () -> String)")
+  assert_true(str_has(lifted_sig, "_measure : (Int, Int) -> (Double, Double)"), "captured tuple-returning closure must keep exact type")
+  assert_true(!str_has(lifted_sig, ") -> Unit) -> Unit"), "lifted signature must never emit unbalanced duplicate ) -> Unit")
+  assert_true(!str_has(lifted_sig, "_failed : () -> String"), "must never mis-infer String from call arg")
+}
+
+test "spread array: suppresses expected type before type-changing chain, preserves across + concat" {
+  let src = SourceFile::{
+    rel_path: "spread_chain.mbt",
+    content: "pub fn pick_names(xs : Array[(Int, String)], ys : Array[(Int, String)]) -> Array[String] {\n" +
+    "  [..xs, ..ys].filter_map(fn(d) { Some(d.1) })\n" +
+    "}\n" +
+    "pub fn concat_json(a : Array[Json], b : Array[Json]) -> Array[Json] {\n" +
+    "  let out : Array[Json] = [..a, ..b]\n" +
+    "  out\n" +
+    "}\n" +
+    "pub fn concat_json_plus(xs : Array[Json], extra : Array[Json]) -> Array[Json] {\n" +
+    "  [..xs, \"a\"] + extra\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(res.blockers == 0, "spread array cases must transpile with 0 blockers")
+  let out = or_rest_find_file(res, "spread_chain.pion")
+  assert_true(!str_has(out, " : Array[String] = []"), "spread array before .filter_map must not get : Array[String]")
+  assert_true(str_has(out, " : Array[mbt_compat::MbtJson] = []"), "plain spread array without suffix must keep expected Array[MbtJson]")
+  assert_true(str_has(out, "mbt_compat::MbtJson::String(\"a\")"), "spread array before + extra must preserve Array[MbtJson] element expected type")
+}
+
+test "ref unwrap and empty map: Ref::new / { val: e } expected-type unwrapping and Stage A/B empty {} Map lowering" {
+  let src = SourceFile::{
+    rel_path: "ref_empty_map.mbt",
+    content: "pub struct Source {\n  id : Int\n}\n" +
+    "pub fn Source::topic(s : Source, name : String, params : Map[String, Json]) -> Int {\n" +
+    "  let _ = (s, name, params)\n" +
+    "  0\n" +
+    "}\n" +
+    "pub let h1 : Ref[(Int, (Result[Json, Json]) -> Unit) -> Int] = Ref::new(fn(_, done) {\n" +
+    "  done(Err({ \"code\": \"x\" }))\n" +
+    "  0\n" +
+    "})\n" +
+    "pub let h2 : Ref[(Int, (Result[Json, Json]) -> Unit) -> Int] = { val: fn(_, done) {\n" +
+    "  done(Err({ \"code\": \"y\" }))\n" +
+    "  0\n" +
+    "} }\n" +
+    "pub fn call_topic(src : Source) -> Int {\n" +
+    "  src.topic(\"k\", {})\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(res.blockers == 0, "Ref::new and empty map Stage A cases must transpile with 0 blockers")
+  let out = or_rest_find_file(res, "ref_empty_map.pion")
+  let init_out = or_rest_find_file(res, "00_init_order.pion")
+  assert_true(str_has(init_out, "mbt_compat::MbtJson::Object(") && str_has(init_out, "mbt_compat::MbtJson::String(\"x\")"), "Ref::new unwraps Ref[T] into closure param done and Err({...})")
+  assert_true(str_has(init_out, "mbt_compat::MbtJson::String(\"y\")"), "{ val: e } unwraps Ref[T] into closure param done and Err({...})")
+  assert_true(str_has(out, "src.topic(\"k\", mbt_compat::ordered_map_new())"), "src.topic(\"k\", {}) lowers {} to ordered_map_new()")
+
+  // Stage B fallback: empty `{}` when expected OrderedMap[...], tuple-key _pair, Array-key _array,
+  // while non-empty blocks and empty function bodies are NOT touched (fail-closed)
+  let sb_src = "fn pick(opt : Option[mbt_compat::OrderedMap[String, Int]]) -> mbt_compat::OrderedMap[String, Int] {\n" +
+  "  match opt {\n" +
+  "    Some(m) => m\n" +
+  "    None => {}\n" +
+  "  }\n" +
+  "}\n" +
+  "fn pick_pair(opt : Option[mbt_compat::OrderedMap[(Int, String), Int]]) -> mbt_compat::OrderedMap[(Int, String), Int] {\n" +
+  "  match opt {\n" +
+  "    Some(m) => m\n" +
+  "    None => {}\n" +
+  "  }\n" +
+  "}\n" +
+  "fn pick_arr(opt : Option[mbt_compat::OrderedMap[Array[Int], Int]]) -> mbt_compat::OrderedMap[Array[Int], Int] {\n" +
+  "  match opt {\n" +
+  "    Some(m) => m\n" +
+  "    None => {}\n" +
+  "  }\n" +
+  "}\n" +
+  "fn non_empty() -> mbt_compat::OrderedMap[String, Int] {\n" +
+  "  { let _x = 1 }\n" +
+  "}\n" +
+  "fn empty_fn_body() -> mbt_compat::OrderedMap[String, Int] {}\n"
+  let rel = "empty_map_sb.pion"
+  let round_cnt : Array[Int] = [0]
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let r = round_cnt[0]
+    round_cnt[0] = r + 1
+    if r == 0 {
+      let mut c4 = 1
+      let mut c10 = 1
+      let mut c16 = 1
+      let mut c20 = 1
+      let mut c22 = 1
+      for f in files {
+        if f.0 == rel {
+          let lns = f.1.split("\n")
+          c4 = lns[3].index_of("{}") + 1
+          c10 = lns[9].index_of("{}") + 1
+          c16 = lns[15].index_of("{}") + 1
+          c20 = lns[19].index_of("{") + 1
+          c22 = lns[21].index_of("{}") + 1
+        }
+      }
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"src/" + rel + "\",\"line\":4,\"col\":" + c4.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"type mismatch\",\"expected\":\"mbt_compat::OrderedMap[String, Int]\",\"found\":\"Unit\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":10,\"col\":" + c10.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"type mismatch\",\"expected\":\"mbt_compat::OrderedMap[(Int, String), Int]\",\"found\":\"Unit\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":16,\"col\":" + c16.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"type mismatch\",\"expected\":\"mbt_compat::OrderedMap[Array[Int], Int]\",\"found\":\"Unit\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":20,\"col\":" + c20.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"type mismatch\",\"expected\":\"mbt_compat::OrderedMap[String, Int]\",\"found\":\"Unit\"}," +
+      "{\"file\":\"src/" + rel + "\",\"line\":22,\"col\":" + c22.to_string() + ",\"code\":\"E_TYPE_MISMATCH\",\"message\":\"type mismatch\",\"expected\":\"mbt_compat::OrderedMap[String, Int]\",\"found\":\"Unit\"}" +
+      "]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let out_files = [GeneratedFile::{ rel_path: rel, content: sb_src, source_file: rel, anchors: [] }]
+  let diags : Array[Diag] = []
+  let drift : Array[DriftEntry] = []
+  let (final_files, _, _) = run_stage_b(out_files, empty_api_map(), mock_check, diags, drift)
+  let mut final_src = ""
+  for f in final_files {
+    if f.rel_path == rel { final_src = f.content }
+  }
+  assert_true(str_has(final_src, "None => mbt_compat::ordered_map_new()"), "Stage B must rewrite empty {} to ordered_map_new()")
+  assert_true(str_has(final_src, "None => mbt_compat::ordered_map_new_pair()"), "Stage B must rewrite tuple-key empty {} to ordered_map_new_pair()")
+  assert_true(str_has(final_src, "None => mbt_compat::ordered_map_new_array()"), "Stage B must rewrite Array-key empty {} to ordered_map_new_array()")
+  assert_true(str_has(final_src, "{ let _x = 1 }"), "Stage B must NOT touch non-empty block { let _x = 1 }")
+  assert_true(str_has(final_src, "fn empty_fn_body() -> mbt_compat::OrderedMap[String, Int] {}"), "Stage B must NOT rewrite empty function body {}")
+}
+
+test "generic ret guard: uninstantiated generic calls never leak T into closure or method type inference" {
+  // 1. Cross-package generic `pub fn[T] wrap(f : () -> T) -> T` in match arm alongside `None => 0.0`
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "dep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let dep_src = SourceFile::{
+    rel_path: "dep.mbt",
+    content: "pub fn[T] wrap(f : () -> T) -> T {\n  f()\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, or_rest_noop_check)
+  assert_true(dep_res.blockers == 0, "dep package with generic wrap transpiles cleanly")
+  let dep_doc = "{\"packages\":[{\"name\":\"dep\",\"items\":[{\"kind\":\"fn\",\"name\":\"wrap\",\"sig\":\"pub fn[T] wrap(f : () -> T) -> T\"}]}]}"
+
+  let cross_src = SourceFile::{
+    rel_path: "cross_gen.mbt",
+    content: "pub struct Cell {\n  val : Double\n}\n" +
+    "pub fn run(opt : Option[Cell]) -> Double {\n" +
+    "  let get_val = fn() {\n" +
+    "    match opt {\n" +
+    "      Some(v) => @dep.wrap(fn() { v.val })\n" +
+    "      None => 0.0\n" +
+    "    }\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Double {\n" +
+    "    if n <= 0 { get_val() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(2)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let cross_res = transpile_package_with_abis([cross_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("dep", dep_res.abi)], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(cross_res.blockers == 0, "cross-package generic wrap alongside concrete sibling arm must infer () -> Double")
+  let cross_out = or_rest_find_file(cross_res, "cross_gen.pion")
+  assert_true(str_has(cross_out, "_get_val : () -> Double"), "lifted capture get_val must be typed () -> Double")
+  assert_true(!str_has(cross_out, "_get_val : () -> T"), "must never leak formal type param T")
+
+  // 2. Local generic `fn[T] id(x : T) -> T` alongside `None => 42` -> infers () -> Int
+  let local_src = SourceFile::{
+    rel_path: "local_gen.mbt",
+    content: "fn[T] id(x : T) -> T {\n  x\n}\n" +
+    "pub fn run_local(opt : Option[Int]) -> Int {\n" +
+    "  let pick = fn() {\n" +
+    "    match opt {\n" +
+    "      Some(v) => id(v)\n" +
+    "      None => 42\n" +
+    "    }\n" +
+    "  }\n" +
+    "  fn loop_fn(n : Int) -> Int {\n" +
+    "    if n <= 0 { pick() } else { loop_fn(n - 1) }\n" +
+    "  }\n" +
+    "  loop_fn(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let local_res = transpile_package([local_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(local_res.blockers == 0, "local generic id alongside concrete Int arm must infer () -> Int")
+  let local_out = or_rest_find_file(local_res, "local_gen.pion")
+  assert_true(str_has(local_out, "_pick : () -> Int"), "lifted capture pick must be typed () -> Int")
+  assert_true(!str_has(local_out, "_pick : () -> T"), "must never leak formal type param T for local fn")
+
+  // 3. Negative: uninstantiated generic call with no concrete sibling arm MUST fail closed (never emit () -> T)
+  let neg_src = SourceFile::{
+    rel_path: "neg_gen.mbt",
+    content: "fn[T] make_any() -> T {\n  abort(\"unreachable\")\n}\n" +
+    "pub fn run_neg() -> Int {\n" +
+    "  let get_any = fn() {\n" +
+    "    make_any()\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Int {\n" +
+    "    if n <= 0 { get_any() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let neg_res = transpile_package([neg_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  let mut saw_unsup = false
+  for d in neg_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "lacks a statically known type") {
+      saw_unsup = true
+    }
+  }
+  let neg_out = or_rest_find_file(neg_res, "neg_gen.pion")
+  assert_true(saw_unsup && neg_res.blockers >= 1, "uninstantiated generic-only closure must fail closed with MBT2PION_UNSUPPORTED_SYNTAX")
+  assert_true(!str_has(neg_out, ": () -> T"), "must never emit illegal : () -> T")
+
+  // 4. Generic method `Box[T]::untracked(self : Box[T]) -> T` must not leak T and must resolve concrete Double
+  let meth_src = SourceFile::{
+    rel_path: "meth_gen.mbt",
+    content: "pub struct Box[T] {\n  val : T\n}\n" +
+    "pub fn[T] Box::untracked(self : Box[T]) -> T {\n" +
+    "  self.val\n" +
+    "}\n" +
+    "pub fn read_box(b : Box[Double]) -> Double {\n" +
+    "  let read = fn() {\n" +
+    "    b.untracked()\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Double {\n" +
+    "    if n <= 0 { read() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let meth_res = transpile_package([meth_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(meth_res.blockers == 0, "Box[Double].untracked() inside lifted closure must resolve Double cleanly")
+  let meth_out = or_rest_find_file(meth_res, "meth_gen.pion")
+  assert_true(str_has(meth_out, "_read : () -> Double"), "Box[Double].untracked() must resolve to () -> Double")
+  assert_true(!str_has(meth_out, "_read : () -> T"), "Box::untracked must never leak formal type param T")
+}
