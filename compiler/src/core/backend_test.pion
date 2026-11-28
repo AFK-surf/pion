@@ -3044,12 +3044,23 @@ test "p30c_bug18_cross_pkg_option_mono_and_niche_none_struct_lit" {
   assert_true(app_ssa.contains("Boxed__untracked__mono_0L13_vapp__Payload("), app_ssa)
   assert_true(app_ssa.contains("Boxed__get__mono_0L13_vapp__Payload("), app_ssa)
   assert_true(app_ssa.contains("make_boxed__mono_0L13_vapp__Payload("), app_ssa)
-  // Bug #18b: `make_boxed__mono_0L13_vapp__Payload` must normalize untyped None for niche Option[Payload]
+  // Bug #18b: `make_boxed__mono_0L13_vapp__Payload` must store null-niche 0 into the allocated struct field (or normalize via @opt_zn_) and never store boxed $pion_none_hdr
   let mk_s = p18_find_from(app_ssa, "function l $pion_pkg_siglib_fn_make_boxed__mono_0L13_vapp__Payload(", 0)
   let mk_e = p18_find_from(app_ssa, "\n}", mk_s)
   assert_true(mk_s >= 0 && mk_e > mk_s, app_ssa)
   let has_zn = p18_find_from(app_ssa, "@opt_zn_", mk_s)
-  assert_true(has_zn > mk_s && has_zn < mk_e, app_ssa)
+  let alloc_pos = p18_find_from(app_ssa, "$pion_alloc", mk_s)
+  let has_field_zero = if alloc_pos > mk_s && alloc_pos < mk_e {
+    p18_find_from(app_ssa, "storel 0,", alloc_pos)
+  } else {
+    -1
+  }
+  let has_boxed_none = p18_find_from(app_ssa, "$pion_none_hdr", mk_s)
+  assert_true(
+    (has_zn > mk_s && has_zn < mk_e) ||
+    (has_field_zero > alloc_pos && has_field_zero < mk_e && !(has_boxed_none > mk_s && has_boxed_none < mk_e)),
+    app_ssa,
+  )
 }
 
 ///|
@@ -19971,5 +19982,244 @@ test "deferred_infer_eblock_and_generic_call_qbe_and_wasm32" {
       wasm_bin[2].to_int() == 0x73 &&
       wasm_bin[3].to_int() == 0x6D,
     "valid wasm32 module emitted",
+  )
+}
+
+///|
+struct RegWrittenCell[T] {
+  mut item : Option[(Int64, T)]
+}
+
+///|
+struct RegDerivedSignal[T] {
+  upstream : Int
+  value : T
+  written : RegWrittenCell[T]
+}
+
+///|
+fn reg_computed_by[T](f : () -> T) -> Int {
+  let _ = f()
+  7
+}
+
+///|
+fn reg_derived_signal_by[T](init : T) -> RegDerivedSignal[T] {
+  let written = RegWrittenCell::{ item: None }
+  let upstream = reg_computed_by(fn() {
+    written.item = None
+    init
+  })
+  RegDerivedSignal::{ upstream: upstream, value: init, written: written }
+}
+
+///|
+struct RegUnits {
+  ri_run : Array[Int]
+}
+
+///|
+fn reg_make_units(cls : Array[Int]) -> RegUnits {
+  let ri_run = { let _ = cls.length(); [] }
+  let mut m = 0
+  while m < cls.length() {
+    let c_cls = cls[m]
+    ri_run.push(
+      if c_cls != 1 {
+        0
+      } else if m > 0 {
+        ri_run[m - 1] + 1
+      } else {
+        1
+      },
+    )
+    m = m + 1
+  }
+  RegUnits::{ ri_run: ri_run }
+}
+
+///|
+struct RegRef[T] {
+  mut value : T
+}
+
+///|
+fn RegRef::new[T](v : T) -> RegRef[T] {
+  RegRef::{ value: v }
+}
+
+///|
+fn reg_run_cb(f : () -> Unit) -> Unit {
+  f()
+}
+
+///|
+test "deferred_let_struct_hint_branch_prop_field_opt_contains_native_and_wasm32" {
+  // 1. Repro 1: derived_signal_by[T] for both Int (scalar tuple) and String (heap tuple)
+  let di = reg_derived_signal_by(42)
+  assert_eq(di.upstream, 7)
+  assert_eq(di.value, 42)
+  assert_eq(di.written.item is None, true)
+  di.written.item = Some((10L, 99))
+  match di.written.item {
+    Some(p) => {
+      assert_eq(p.0, 10L)
+      assert_eq(p.1, 99)
+    }
+    None => assert_true(false, "expected Some((10L, 99))")
+  }
+
+  let ds = reg_derived_signal_by("hello")
+  assert_eq(ds.upstream, 7)
+  assert_eq(ds.value, "hello")
+  assert_eq(ds.written.item is None, true)
+  ds.written.item = Some((20L, "world"))
+  match ds.written.item {
+    Some(p) => {
+      assert_eq(p.0, 20L)
+      assert_eq(p.1, "world")
+    }
+    None => assert_true(false, "expected Some((20L, world))")
+  }
+
+  // 2a. Repro 2a: Units::make
+  let u = reg_make_units([0, 1, 1, 1, 0, 1])
+  assert_eq(u.ri_run.length(), 6)
+  assert_eq(u.ri_run[0], 0)
+  assert_eq(u.ri_run[1], 1)
+  assert_eq(u.ri_run[2], 2)
+  assert_eq(u.ri_run[3], 3)
+  assert_eq(u.ri_run[4], 0)
+  assert_eq(u.ri_run[5], 1)
+
+  // 2b. Repro 2b: no tail struct (if/else-if/binary + match)
+  let r1 = { let _ = 1; [] }
+  r1.push(if true { 0 } else if 1 > 0 { r1[0] + 1 } else { 1 })
+  r1.push(if false { 0 } else if 1 > 0 { r1[0] + 1 } else { 1 })
+  assert_eq(r1[0], 0)
+  assert_eq(r1[1], 1)
+
+  let r2 = { let _ = 1; [] }
+  r2.push(match 0 { 0 => 5, _ => r2[0] + 1 })
+  r2.push(match 1 { 0 => 5, _ => r2[0] + 1 })
+  assert_eq(r2[0], 5)
+  assert_eq(r2[1], 6)
+
+  // 3. Addendum 1: pending generic struct field assignment
+  let made = RegRef::new(None)
+  reg_run_cb(fn() { made.value = Some("ok_ref") })
+  match made.value {
+    Some(s) => assert_eq(s, "ok_ref")
+    None => assert_true(false, "expected Some(ok_ref)")
+  }
+
+  // 4. Addendum 2: pending Option tag-only match and `is None`
+  let mut before1 = None
+  let mut p1 = 3
+  while p1 >= 0 && match before1 { None => true, _ => false } {
+    if p1 == 1 {
+      before1 = Some(p1 * 10)
+    }
+    p1 = p1 - 1
+  }
+  match before1 {
+    Some(v) => assert_eq(v, 10)
+    None => assert_true(false, "expected Some(10)")
+  }
+
+  let mut before2 = None
+  let mut p2 = 2
+  while p2 >= 0 && before2 is None {
+    if p2 == 0 {
+      before2 = Some("found")
+    }
+    p2 = p2 - 1
+  }
+  match before2 {
+    Some(s) => assert_eq(s, "found")
+    None => assert_true(false, "expected Some(found)")
+  }
+
+  // 5. Addendum 3: Array::contains refinement
+  let under_way = []
+  let on_way = fn(k : Int) {
+    if !under_way.contains(k) {
+      under_way.push(k)
+    }
+  }
+  on_way(3)
+  on_way(3)
+  on_way(7)
+  assert_eq(under_way.length(), 2)
+  assert_eq(under_way[0], 3)
+  assert_eq(under_way[1], 7)
+
+  // 5b. P0 shadowing runtime checks: s8 (guard does not coerce outer Box[Int] to Box[UInt]) and pe1 (guard does not coerce outer Array[Int] to Array[UInt])
+  let s8_res = fn(o : Option[RegRef[UInt]]) -> Int {
+    let b = RegRef::{ value: Some(-1) }
+    let outer = match b.value { Some(x) => x, None => 0 }
+    guard o is Some(b) else { return outer }
+    let _ = b
+    outer
+  }(Some(RegRef::{ value: 7U }))
+  assert_eq(s8_res, -1)
+
+  let pe1_res = fn(o : Option[Array[UInt]]) -> Int {
+    let xs = []
+    xs.push(-1)
+    let outer = xs[0]
+    guard o is Some(xs) else { return outer }
+    let _ = xs
+    outer
+  }(Some([7U]))
+  assert_eq(pe1_res, -1)
+
+  // 6. Emit QBE SSA (native) + Wasm32 binary for full combined program
+  let comb_src =
+    #|struct WrittenCell[T] { mut item : Option[(Int64, T)] }
+    #|struct DerivedSignal[T] { upstream : Int, value : T, written : WrittenCell[T] }
+    #|fn computed_by[T](f : () -> T) -> Int { let _ = f(); 1 }
+    #|pub fn derived_signal_by[T](init : T) -> DerivedSignal[T] {
+    #|  let written = WrittenCell::{ item: None }
+    #|  let upstream = computed_by(fn() {
+    #|    written.item = None
+    #|    init
+    #|  })
+    #|  DerivedSignal::{ upstream: upstream, value: init, written: written }
+    #|}
+    #|struct Ref[T] { mut value : T }
+    #|fn Ref::new[T](v : T) -> Ref[T] { Ref::{ value: v } }
+    #|pub fn run_all() -> Int {
+    #|  let a = derived_signal_by(42)
+    #|  let b = derived_signal_by("hi")
+    #|  let made = Ref::new(None)
+    #|  made.value = Some(a.value + b.value.length())
+    #|  let mut before = None
+    #|  let mut p = 2
+    #|  while p >= 0 && before is None {
+    #|    before = Some(p)
+    #|    p = p - 1
+    #|  }
+    #|  let under_way = []
+    #|  let on_way = fn(k : Int) { if !under_way.contains(k) { under_way.push(k) } }
+    #|  on_way(1)
+    #|  let x = match made.value { Some(v) => v, None => 0 }
+    #|  let y = match before { Some(v) => v, None => 0 }
+    #|  x + y + under_way.length()
+    #|}
+  let cr = check_source_files_full("comb_reg", ["comb_reg.pion"], [comb_src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let nat_ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "amd64_sysv").ssa
+  assert_true(nat_ssa.length() > 0 && !str_contains(nat_ssa, "<error>"), "native SSA valid")
+  let wasm_ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "wasm32").ssa
+  assert_true(wasm_ssa.length() > 0 && !str_contains(wasm_ssa, "<error>"), "wasm32 SSA valid")
+  let wasm_bin = emit_wasm_from_ssa(wasm_ssa)
+  assert_true(
+    wasm_bin.length() >= 8 &&
+      wasm_bin[0].to_int() == 0x00 &&
+      wasm_bin[1].to_int() == 0x61 &&
+      wasm_bin[2].to_int() == 0x73 &&
+      wasm_bin[3].to_int() == 0x6D,
+    "valid wasm32 module emitted for combined regression program",
   )
 }
