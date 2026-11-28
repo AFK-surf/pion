@@ -145,7 +145,7 @@ static inline PionHeader *pion_hdr(void *obj) {
 PION_MINSIZE void pion_panic(const char *msg, const char *file, int32_t line) {
     fprintf(stderr, "pion panic at %s:%d: %s\n",
             file ? file : "<unknown>", (int)line, msg ? msg : "");
-    fflush(stderr);
+    fflush(stderr); PION_PROF_PANIC_FLUSH();
     abort();
 }
 
@@ -206,7 +206,7 @@ static inline const char *pion_error_message(unsigned offset) {
 
 PION_MINSIZE void pion_panic_oob(int64_t idx, int64_t len) {
     fprintf(stderr, "pion panic: index %" PRId64 " out of bounds (len %" PRId64 ")\n", idx, len);
-    fflush(stderr);
+    fflush(stderr); PION_PROF_PANIC_FLUSH();
     abort();
 }
 
@@ -394,6 +394,9 @@ PION_MINSIZE static void pion_slab_thread_cleanup(void *arg) {
         void *mcur = s->med_free[mcls];
         while (mcur) {
             void *mnxt = pion_slab_get_next(mcur);
+#ifdef PION_PROF
+            pion_prof_on_reserved_sub((size_t)2048u << mcls);
+#endif
             free(mcur);
             mcur = mnxt;
         }
@@ -453,6 +456,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE PionHeader *pion_slab_alloc_slow(Pio
         if (__builtin_expect(!chunk, 0)) {
             pion_oom();
         }
+#ifdef PION_PROF
+        pion_prof_on_reserved_add(PION_SLAB_CHUNK_BYTES);
+#endif
         s->chunk_cur = chunk;
         s->chunk_end = chunk + PION_SLAB_CHUNK_BYTES;
     }
@@ -494,6 +500,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_med_alloc(uint32_t mcls) 
     if (__builtin_expect(!mp, 0)) {
         pion_oom();
     }
+#ifdef PION_PROF
+    pion_prof_on_reserved_add((size_t)2048u << mcls);
+#endif
     return mp;
 }
 
@@ -509,6 +518,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_med_free(void *ptr, uint32
             return;
         }
     }
+#ifdef PION_PROF
+    pion_prof_on_reserved_sub((size_t)2048u << mcls);
+#endif
     free(ptr);
 }
 
@@ -538,6 +550,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
     if (__builtin_expect(!p, 0)) {
         pion_oom();
     }
+#ifdef PION_PROF
+    pion_prof_on_reserved_add(bytes);
+#endif
     return p;
 }
 
@@ -550,17 +565,29 @@ static PION_NOINLINE PION_HOT void *pion_slab_raw_alloc(size_t bytes) {
         void *node = g_main_slab.local_free[cls];
         if (__builtin_expect(node != NULL, 1)) {
             g_main_slab.local_free[cls] = pion_slab_get_next(node);
+#ifdef PION_PROF
+            pion_prof_on_backing_alloc(node, bytes);
+#endif
             return node;
         }
         uint32_t slot_sz = pion_slab_sizes[cls];
         char *cur = g_main_slab.chunk_cur;
         if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= slot_sz, 1)) {
             g_main_slab.chunk_cur = cur + slot_sz;
+#ifdef PION_PROF
+            pion_prof_on_backing_alloc((void *)cur, bytes);
+#endif
             return (void *)cur;
         }
     }
 #endif
+#ifdef PION_PROF
+    void *res = pion_slab_raw_alloc_slow(bytes);
+    pion_prof_on_backing_alloc(res, bytes);
+    return res;
+#else
     return pion_slab_raw_alloc_slow(bytes);
+#endif
 }
 
 static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *ptr, size_t bytes, int is_frozen) {
@@ -585,11 +612,17 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *p
     (void)bytes;
     (void)is_frozen;
 #endif
+#ifdef PION_PROF
+    pion_prof_on_reserved_sub(bytes);
+#endif
     free(ptr);
 }
 
 static PION_NOINLINE PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
     if (!ptr) return;
+#ifdef PION_PROF
+    pion_prof_on_backing_free(ptr, bytes);
+#endif
 #if PION_USE_SLAB
     if (__builtin_expect(
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
@@ -609,8 +642,17 @@ static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
     uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn, PionHeader *pre) {
     PionHeader *hdr = pre;
     uint16_t flags = 0;
+#ifdef PION_PROF
+    size_t prof_alloc_bytes = 0;
+    int prof_is_large = 0;
+#endif
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
     if (pre) {
+#ifdef PION_PROF
+        prof_alloc_bytes = sizeof(PionHeader) + (size_t)payload_size;
+        prof_is_large = 1;
+        pion_prof_on_reserved_add(prof_alloc_bytes);
+#endif
     } else
 #if PION_USE_SLAB
     if (__builtin_expect(payload_size <= PION_SLAB_MAX_PAYLOAD, 1)) {
@@ -624,11 +666,17 @@ static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
             hdr = pion_slab_alloc_slow(s, cls);
         }
         flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
+#ifdef PION_PROF
+        prof_alloc_bytes = (size_t)pion_slab_sizes[cls];
+#endif
     } else if (payload_size <= PION_MED_MAX_PAYLOAD) {
         uint32_t total = (uint32_t)sizeof(PionHeader) + payload_size;
         uint32_t mcls = pion_med_cls_for(total);
         hdr = (PionHeader *)pion_med_alloc(mcls);
         flags = (uint16_t)(PION_FLAG_MED_CACHE | (mcls << PION_FLAG_MED_CLS_SHIFT));
+#ifdef PION_PROF
+        prof_alloc_bytes = (size_t)2048u << mcls;
+#endif
     } else
 #endif
     {
@@ -637,6 +685,11 @@ static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
         if (__builtin_expect(!hdr, 0)) {
             pion_oom();
         }
+#ifdef PION_PROF
+        prof_alloc_bytes = total;
+        prof_is_large = 1;
+        pion_prof_on_reserved_add(total);
+#endif
     }
     hdr->owner_tid = mt ? pion_cur_tid_mt() : 1u;
     hdr->local_rc = 1;
@@ -644,6 +697,10 @@ static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
     hdr->type_tag = type_tag;
     hdr->flags = flags;
     hdr->drop_fn = drop_fn;
+#ifdef PION_PROF
+    pion_prof_on_alloc((void *)(hdr + 1), payload_size, prof_alloc_bytes,
+                       type_tag, (void *)drop_fn, prof_is_large);
+#endif
     return (void *)(hdr + 1);
 }
 
@@ -671,6 +728,10 @@ static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag
         hdr->type_tag = type_tag;
         hdr->flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
         hdr->drop_fn = drop_fn;
+#ifdef PION_PROF
+        pion_prof_on_alloc((void *)(hdr + 1), payload_size, (size_t)pion_slab_sizes[cls],
+                           type_tag, (void *)drop_fn, 0);
+#endif
         return (void *)(hdr + 1);
     }
 #endif
@@ -779,6 +840,27 @@ static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
         drop(obj);
         td->depth = d;
     }
+#ifdef PION_PROF
+    {
+        uint16_t prof_tag = hdr->type_tag;
+        size_t prof_bytes = 0;
+        int prof_large = 1;
+#if PION_USE_SLAB
+        uint16_t prof_flags = hdr->flags;
+        if ((prof_flags & PION_FLAG_SLAB) != 0) {
+            uint32_t pcls = (uint32_t)((prof_flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
+            prof_bytes = (size_t)pion_slab_sizes[pcls];
+            prof_large = 0;
+        } else if ((prof_flags & PION_FLAG_MED_CACHE) != 0) {
+            uint32_t pmcls = (uint32_t)((prof_flags >> PION_FLAG_MED_CLS_SHIFT) & PION_FLAG_MED_CLS_MASK);
+            prof_bytes = (size_t)2048u << pmcls;
+            prof_large = 0;
+        }
+#endif
+        pion_prof_on_rc_destroy(prof_tag);
+        pion_prof_on_retire(obj, prof_bytes, prof_tag, (void *)drop, prof_large);
+    }
+#endif
 #if PION_USE_SLAB
     uint16_t flags = hdr->flags;
     if (__builtin_expect(!mt && (flags & PION_FLAG_SLAB) != 0, 1)) {
@@ -802,28 +884,53 @@ PION_MINSIZE void pion_destroy_obj(void *obj) {
 PION_NOINLINE PION_HOT void pion_rc_inc(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
-    if (hdr->flags & PION_FLAG_IMMORTAL) return;
+    if (hdr->flags & PION_FLAG_IMMORTAL) {
+#ifdef PION_PROF
+        pion_prof_on_rc_inc(hdr->type_tag, 0, 1);
+#endif
+        return;
+    }
     if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
         if (__builtin_expect(hdr->owner_tid != 0, 1)) {
             hdr->local_rc++;
+#ifdef PION_PROF
+            pion_prof_on_rc_inc(hdr->type_tag, 0, 0);
+#endif
             return;
         }
         uint32_t rc = atomic_load_explicit(&hdr->shared_rc, memory_order_relaxed);
         atomic_store_explicit(&hdr->shared_rc, rc + 1u, memory_order_relaxed);
+#ifdef PION_PROF
+        pion_prof_on_rc_inc(hdr->type_tag, 1, 0);
+#endif
         return;
     } else if (__builtin_expect(hdr->owner_tid == pion_cur_tid_mt(), 1)) {
         hdr->local_rc++;
+#ifdef PION_PROF
+        pion_prof_on_rc_inc(hdr->type_tag, 0, 0);
+#endif
         return;
     }
     atomic_fetch_add_explicit(&hdr->shared_rc, 1, memory_order_relaxed);
+#ifdef PION_PROF
+    pion_prof_on_rc_inc(hdr->type_tag, 1, 0);
+#endif
 }
 
 PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
-    if (hdr->flags & PION_FLAG_IMMORTAL) return;
+    if (hdr->flags & PION_FLAG_IMMORTAL) {
+#ifdef PION_PROF
+        pion_prof_on_rc_dec(hdr->type_tag, 0, 1);
+#endif
+        return;
+    }
     if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
         if (__builtin_expect(hdr->owner_tid != 0, 1)) {
+#ifdef PION_PROF
+            pion_prof_on_rc_dec(hdr->type_tag, 0, 0);
+#endif
             if (--hdr->local_rc == 0) {
                 pion_destroy(hdr, obj);
             }
@@ -831,11 +938,17 @@ PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
         }
         uint32_t rc = atomic_load_explicit(&hdr->shared_rc, memory_order_relaxed);
         atomic_store_explicit(&hdr->shared_rc, rc - 1u, memory_order_relaxed);
+#ifdef PION_PROF
+        pion_prof_on_rc_dec(hdr->type_tag, 1, 0);
+#endif
         if (rc == 1u) {
             pion_destroy(hdr, obj);
         }
         return;
     } else if (__builtin_expect(hdr->owner_tid == pion_cur_tid_mt(), 1)) {
+#ifdef PION_PROF
+        pion_prof_on_rc_dec(hdr->type_tag, 0, 0);
+#endif
         if (--hdr->local_rc == 0) {
             if (atomic_load_explicit(&hdr->shared_rc, memory_order_acquire) == 0) {
                 pion_destroy(hdr, obj);
@@ -843,8 +956,18 @@ PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
         }
         return;
     }
+#ifdef PION_PROF
+    uint16_t prof_tag = hdr->type_tag;
+#endif
     if (atomic_fetch_sub_explicit(&hdr->shared_rc, 1, memory_order_acq_rel) == 1) {
+#ifdef PION_PROF
+        pion_prof_on_rc_dec(prof_tag, 1, 0);
+#endif
         pion_destroy(hdr, obj);
+    } else {
+#ifdef PION_PROF
+        pion_prof_on_rc_dec(prof_tag, 1, 0);
+#endif
     }
 }
 
@@ -909,7 +1032,14 @@ static PION_NOINLINE PION_MINSIZE void pion_map_foreach_obj(PionMap *m, void (*f
 PION_COLD PION_MINSIZE void pion_rc_freeze(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
-    if ((hdr->flags & PION_FLAG_IMMORTAL) || hdr->owner_tid == 0) return;
+    if ((hdr->flags & PION_FLAG_IMMORTAL) || hdr->owner_tid == 0) {
+#ifdef PION_PROF
+        if (hdr->flags & PION_FLAG_IMMORTAL) {
+            pion_prof_on_rc_freeze(hdr->type_tag, 1);
+        }
+#endif
+        return;
+    }
     if (hdr->owner_tid != pion_cur_tid_fast()) {
         PION_FAIL(freeze_owner);
     }
@@ -1391,7 +1521,7 @@ void *pion_str_split(void *s, void *sep) {
     PionArray *arr = (PionArray *)pion_arr_new(init_cap, 1);
     int64_t pos = 0;
     const char *lim = base + sl;
-#if PION_USE_SLAB
+#if PION_USE_SLAB && !defined(PION_PROF)
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
 #endif
     while (pos <= sl) {
@@ -1414,7 +1544,7 @@ void *pion_str_split(void *s, void *sep) {
         int64_t end = hit ? (int64_t)(hit - base) : sl;
         int64_t tok_len = end - pos;
         void *part;
-#if PION_USE_SLAB
+#if PION_USE_SLAB && !defined(PION_PROF)
         if (__builtin_expect(!mt && tok_len <= 7, 1)) {
             PionHeader *hdr = (PionHeader *)g_main_slab.local_free[1];
             if (__builtin_expect(hdr != NULL, 0)) {
@@ -1458,7 +1588,7 @@ void *pion_str_split(void *s, void *sep) {
         }
 #endif
         part = pion_str_from_cstr(base + pos, tok_len);
-#if PION_USE_SLAB
+#if PION_USE_SLAB && !defined(PION_PROF)
     push_part:
 #endif
         if (__builtin_expect(arr->len == arr->cap, 0)) pion_arr_grow(arr);
@@ -1662,8 +1792,15 @@ static __attribute__((noinline)) PION_MINSIZE void pion_strbuf_grow(PionStrBuf *
     char *nd;
 #if PION_USE_SLAB
     if ((size_t)sb->cap > PION_MED_MAX_BYTES && (size_t)ncap > PION_MED_MAX_BYTES) {
+#ifdef PION_PROF
+        int had_old = (sb->data != NULL);
+        size_t old_bytes = (size_t)sb->cap;
+#endif
         nd = (char *)realloc(sb->data, (size_t)ncap);
         if (!nd) pion_oom();
+#ifdef PION_PROF
+        pion_prof_on_backing_realloc(had_old, old_bytes, nd, (size_t)ncap);
+#endif
     } else {
         nd = (char *)pion_slab_raw_alloc((size_t)ncap);
         if (sb->data) {
@@ -1673,8 +1810,15 @@ static __attribute__((noinline)) PION_MINSIZE void pion_strbuf_grow(PionStrBuf *
         }
     }
 #else
+#ifdef PION_PROF
+    int had_old = (sb->data != NULL);
+    size_t old_bytes = (size_t)sb->cap;
+#endif
     nd = (char *)realloc(sb->data, (size_t)ncap);
     if (!nd) pion_oom();
+#ifdef PION_PROF
+    pion_prof_on_backing_realloc(had_old, old_bytes, nd, (size_t)ncap);
+#endif
 #endif
     sb->data = nd;
     sb->cap = ncap;
@@ -1812,6 +1956,7 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj_from(PionArray *a, i
 
 static void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
+#if !defined(PION_PROF)
     if (a->elem_is_obj == 1 && a->elem_stride <= 8 && a->len > 0 &&
         __builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
         g_map_hint.map = NULL;
@@ -1843,7 +1988,9 @@ static void pion_arr_drop(void *payload) {
                 pion_rc_dec(e);
             }
         }
-    } else {
+    } else
+#endif
+    {
         pion_arr_foreach_obj(a, pion_rc_dec);
     }
     if (a->data) {
@@ -1868,8 +2015,14 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a) {
 #if PION_USE_SLAB
     size_t old_bytes = (size_t)ocap * stride;
     if (old_bytes > PION_MED_MAX_BYTES && new_bytes > PION_MED_MAX_BYTES) {
+#ifdef PION_PROF
+        int had_old = (a->data != NULL);
+#endif
         nd = (int64_t *)realloc(a->data, new_bytes);
         if (!nd) pion_oom();
+#ifdef PION_PROF
+        pion_prof_on_backing_realloc(had_old, old_bytes, nd, new_bytes);
+#endif
     } else {
         nd = (int64_t *)pion_slab_raw_alloc(new_bytes);
         if (a->len > 0) {
@@ -1881,8 +2034,15 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a) {
         }
     }
 #else
+#ifdef PION_PROF
+    int had_old = (a->data != NULL);
+    size_t old_bytes = (size_t)ocap * stride;
+#endif
     nd = (int64_t *)realloc(a->data, new_bytes);
     if (!nd) pion_oom();
+#ifdef PION_PROF
+    pion_prof_on_backing_realloc(had_old, old_bytes, nd, new_bytes);
+#endif
 #endif
     a->data = nd;
     a->cap = ncap;
@@ -2531,6 +2691,9 @@ static unsigned __stdcall pion_spawn_trampoline(void *arg) {
 }
 #else
 static PION_COLD PION_MINSIZE void *pion_spawn_trampoline(void *arg) {
+#ifdef PION_PROF
+    pion_prof_thread_init();
+#endif
     PionSpawnTask *task = (PionSpawnTask *)arg;
     void (*fn)(void *) = task->fn;
     void *env = task->env;
@@ -2848,6 +3011,9 @@ typedef struct PionWorld {
 } PionWorld;
 
 PION_MINSIZE void *pion_world_init(int argc, char **argv) {
+#ifdef PION_PROF
+    pion_prof_init();
+#endif
     PionWorld *w = (PionWorld *)pion_alloc((uint32_t)sizeof(PionWorld), PION_TAG_WORLD, NULL);
     w->argc = argc;
     w->argv = argv;
@@ -3052,7 +3218,12 @@ static PION_NOINLINE PION_IO_FN void *pion_read_file_obj(void *path_str, int as_
                     /* Same length limit as pion_str_from_cstr on the staged copy. */
                     if ((uint64_t)sz > (uint64_t)PION_MAX_CONTAINER_LEN) pion_die_len();
                     PionString *str = (PionString *)pion_alloc_uninit_slow(
-                        0, PION_TAG_STRING, NULL, (PionHeader *)allocation);
+#ifdef PION_PROF
+                        (uint32_t)(sizeof(PionString) + (size_t)sz + 1),
+#else
+                        0,
+#endif
+                        PION_TAG_STRING, NULL, (PionHeader *)allocation);
                     str->len = sz;
                     str->data[sz] = 0;
                     out = str;

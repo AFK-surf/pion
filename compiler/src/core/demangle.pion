@@ -1,0 +1,921 @@
+///| Pure-Pion symbol demangler, classifier, and compile-time sidecar merger.
+///  Reverses `qbe.pion` & `wasm.pion` symbol mangling and classifies symbols into:
+///  "user" | "runtime_mem" | "runtime_rc" | "runtime_std" | "external".
+
+///|
+pub struct ProfSidecarSym {
+  raw_sym : String
+  pretty : String
+  kind : String
+  pkg : String
+  file : String
+  line : Int
+}
+
+///|
+pub struct DemangledSym {
+  raw : String
+  pretty : String
+  category : String
+  kind : String
+  pkg : String
+  file : String
+  line : Int
+}
+
+///|
+fn dm_is_digit(c : Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+///|
+fn dm_hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else {
+    -1
+  }
+}
+
+///|
+fn dm_find_sub(s : String, needle : String, start : Int) -> Int {
+  let hl = s.length()
+  let nl = needle.length()
+  if nl == 0 {
+    return start
+  }
+  if start < 0 || nl > hl - start {
+    return -1
+  }
+  let mut i = start
+  while i + nl <= hl {
+    let mut j = 0
+    let mut ok = true
+    while j < nl {
+      if str_code_at(s, i + j) != str_code_at(needle, j) {
+        ok = false
+        break
+      }
+      j = j + 1
+    }
+    if ok {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn dm_parse_uint_at(s : String, pos : Int) -> (Int, Int) {
+  let n = s.length()
+  let mut i = pos
+  let mut acc = 0
+  while i < n && dm_is_digit(str_code_at(s, i)) {
+    acc = acc * 10 + (str_code_at(s, i) - 48)
+    i = i + 1
+  }
+  (acc, i)
+}
+
+///|
+fn dm_all_digits(s : String, start : Int, end : Int) -> Bool {
+  if start >= end {
+    return false
+  }
+  let mut i = start
+  while i < end {
+    if !dm_is_digit(str_code_at(s, i)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn dm_decode_ident_rev(s : String) -> String {
+  let n = s.length()
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c == 95 && i + 1 < n {
+      let nx = str_code_at(s, i + 1)
+      if nx == 117 {
+        // _u -> '_'
+        sb.write_char('_')
+        i = i + 2
+        continue
+      } else if nx == 100 {
+        // _d -> '-'
+        sb.write_char('-')
+        i = i + 2
+        continue
+      } else if nx == 120 && i + 3 < n {
+        // _xHH -> byte
+        let hi = dm_hex_val(str_code_at(s, i + 2))
+        let lo = dm_hex_val(str_code_at(s, i + 3))
+        if hi >= 0 && lo >= 0 {
+          sb.write_byte(((hi << 4) | lo).to_byte())
+          i = i + 4
+          continue
+        }
+      }
+    }
+    sb.write_byte(c.to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn dm_strip_leading(raw : String) -> String {
+  let mut s = raw
+  if s.length() > 0 && str_code_at(s, 0) == 36 {
+    // Strip leading '$' if SSA symbol passed
+    s = slice_str(s, 1, s.length())
+  }
+  // Strip Mach-O leading '_' (preserve '__pion_ol_' / '__pion_bb_' double-underscore internals)
+  if s.starts_with("_pion_") ||
+  (s.length() > 1 && str_code_at(s, 0) == 95 && str_code_at(s, 1) != 95) {
+    s = slice_str(s, 1, s.length())
+  }
+  s
+}
+
+///|
+fn dm_strip_wasm_conflict_suffix(s : String) -> String {
+  // Strip trailing `__u<ui>_<k>` emitted by wasm_disambiguate_unit_locals
+  let n = s.length()
+  let mut i = n - 1
+  while i >= 0 && dm_is_digit(str_code_at(s, i)) {
+    i = i - 1
+  }
+  if i == n - 1 || i < 4 || str_code_at(s, i) != 95 {
+    return s
+  }
+  let mut j = i - 1
+  while j >= 0 && dm_is_digit(str_code_at(s, j)) {
+    j = j - 1
+  }
+  if j == i - 1 || j < 2 {
+    return s
+  }
+  if str_code_at(s, j) == 117 &&
+  str_code_at(s, j - 1) == 95 &&
+  str_code_at(s, j - 2) == 95 {
+    return slice_str(s, 0, j - 2)
+  }
+  s
+}
+
+///|
+fn dm_strip_wasm_pkg_prefix(s : String) -> (String, String) {
+  // `p_<pkg>__<rest>` -> (pkg, rest)
+  if s.starts_with("p_") {
+    let sep = dm_find_sub(s, "__", 2)
+    if sep > 2 {
+      let pkg = slice_str(s, 2, sep)
+      let rest = slice_str(s, sep + 2, s.length())
+      return (pkg, rest)
+    }
+  }
+  ("", s)
+}
+
+///|
+fn dm_decode_pkg_prefix(s : String) -> (String, String) {
+  // `pkg_0L<len>_<enc>_<rest>` or `pkg_<alnum>_<rest>`
+  if !s.starts_with("pkg_") {
+    return ("", s)
+  }
+  let after = slice_str(s, 4, s.length())
+  if after.starts_with("0L") {
+    let (elen, p1) = dm_parse_uint_at(after, 2)
+    if p1 > 2 && p1 < after.length() && str_code_at(after, p1) == 95 {
+      let enc_start = p1 + 1
+      let enc_end = enc_start + elen
+      if enc_end < after.length() && str_code_at(after, enc_end) == 95 {
+        let pkg = dm_decode_ident_rev(slice_str(after, enc_start, enc_end))
+        let rest = slice_str(after, enc_end + 1, after.length())
+        return (pkg, rest)
+      }
+    }
+  }
+  let us = dm_find_sub(after, "_", 0)
+  if us > 0 {
+    let pkg = slice_str(after, 0, us)
+    let rest = slice_str(after, us + 1, after.length())
+    return (pkg, rest)
+  }
+  ("", s)
+}
+
+///|
+fn dm_decode_pair_prefix(s : String) -> Option[(String, String, String)] {
+  // Returns Some((a, b, tail)) for `0P<la>_<ea>_N<lb>_<eb><tail>`
+  if !s.starts_with("0P") {
+    return None
+  }
+  let (la, p1) = dm_parse_uint_at(s, 2)
+  if p1 == 2 || p1 >= s.length() || str_code_at(s, p1) != 95 {
+    return None
+  }
+  let a_start = p1 + 1
+  let a_end = a_start + la
+  if a_end + 2 > s.length() ||
+  str_code_at(s, a_end) != 95 ||
+  str_code_at(s, a_end + 1) != 78 {
+    return None
+  }
+  let (lb, p2) = dm_parse_uint_at(s, a_end + 2)
+  if p2 == a_end + 2 || p2 >= s.length() || str_code_at(s, p2) != 95 {
+    return None
+  }
+  let b_start = p2 + 1
+  let b_end = b_start + lb
+  if b_end > s.length() {
+    return None
+  }
+  let a = dm_decode_ident_rev(slice_str(s, a_start, a_end))
+  let b = dm_decode_ident_rev(slice_str(s, b_start, b_end))
+  let tail = slice_str(s, b_end, s.length())
+  Some((a, b, tail))
+}
+
+///|
+fn dm_decode_member_suffix(s : String) -> Option[String] {
+  // `_M<len>_<enc>` -> Some(decoded)
+  if !s.starts_with("_M") {
+    return None
+  }
+  let (mlen, p1) = dm_parse_uint_at(s, 2)
+  if p1 == 2 || p1 >= s.length() || str_code_at(s, p1) != 95 {
+    return None
+  }
+  let start = p1 + 1
+  if start + mlen > s.length() {
+    return None
+  }
+  Some(dm_decode_ident_rev(slice_str(s, start, start + mlen)))
+}
+
+///|
+fn dm_decode_pair_whole(s : String) -> (String, String) {
+  match dm_decode_pair_prefix(s) {
+    Some((a, b, _)) => (a, b)
+    None => {
+      let sep = dm_find_sub(s, "__", 0)
+      if sep > 0 {
+        (slice_str(s, 0, sep), slice_str(s, sep + 2, s.length()))
+      } else {
+        ("", s)
+      }
+    }
+  }
+}
+
+///|
+fn dm_decode_qual_sym(s : String) -> String {
+  if s.starts_with("0P") {
+    match dm_decode_pair_prefix(s) {
+      Some((a, b, _)) => return a + "::" + b
+      None => ()
+    }
+  }
+  if s.starts_with("0U_") {
+    return dm_decode_ident_rev(slice_str(s, 3, s.length()))
+  }
+  let sep = dm_find_sub(s, "__", 0)
+  if sep > 0 {
+    return slice_str(s, 0, sep) + "::" + slice_str(s, sep + 2, s.length())
+  }
+  s
+}
+
+///|
+fn dm_decode_mono_args(raw_args : String) -> String {
+  // Convert QBE mangled type list after `__mono_` into readable `[T1, T2]`
+  let sb = StringBuilder()
+  sb.write_char('[')
+  let n = raw_args.length()
+  let mut i = 0
+  while i < n {
+    if i + 3 <= n && str_code_at(raw_args, i) == 95 && str_code_at(raw_args, i + 1) == 90 {
+      let code = str_code_at(raw_args, i + 2)
+      if code == 65 {
+        // _ZA -> '['
+        sb.write_char('[')
+        i = i + 3
+        continue
+      } else if code == 83 {
+        // _ZS -> ", "
+        sb.write_string(", ")
+        i = i + 3
+        continue
+      } else if code == 69 {
+        // _ZE -> ']'
+        sb.write_char(']')
+        i = i + 3
+        continue
+      } else if code == 84 {
+        // _ZT -> '('
+        sb.write_char('(')
+        i = i + 3
+        continue
+      } else if code == 70 {
+        // _ZF -> "fn("
+        sb.write_string("fn(")
+        i = i + 3
+        continue
+      } else if code == 82 {
+        // _ZR -> ")->"
+        sb.write_string(")->")
+        i = i + 3
+        continue
+      } else if code == 80 {
+        // _ZP -> type param
+        i = i + 3
+        continue
+      }
+    }
+    sb.write_byte(str_code_at(raw_args, i).to_byte())
+    i = i + 1
+  }
+  sb.write_char(']')
+  sb.to_string()
+}
+
+///|
+fn dm_split_mono(s : String) -> (String, String) {
+  let idx = dm_find_sub(s, "__mono_", 0)
+  if idx > 0 {
+    let base = slice_str(s, 0, idx)
+    let args = dm_decode_mono_args(slice_str(s, idx + 7, s.length()))
+    (base, args)
+  } else {
+    (s, "")
+  }
+}
+
+///|
+fn dm_decode_freeze_ty_key(s : String) -> String {
+  if s == "strview" {
+    return "StrView"
+  }
+  if s == "bytesview" {
+    return "BytesView"
+  }
+  if s == "dyn" {
+    return "dyn"
+  }
+  if s.starts_with("st_0P") || s.starts_with("en_0P") {
+    let body = slice_str(s, 3, s.length())
+    match dm_decode_pair_prefix(body) {
+      Some((a, b, _)) => return a + "::" + b
+      None => ()
+    }
+  }
+  if s.starts_with("st_0N") || s.starts_with("en_0N") {
+    let body = slice_str(s, 5, s.length())
+    let (ln, p1) = dm_parse_uint_at(body, 0)
+    if p1 > 0 && p1 < body.length() && str_code_at(body, p1) == 95 {
+      let start = p1 + 1
+      if start + ln <= body.length() {
+        return dm_decode_ident_rev(slice_str(body, start, start + ln))
+      }
+    }
+  }
+  if s.starts_with("st_") {
+    return slice_str(s, 3, s.length())
+  }
+  if s.starts_with("en_") {
+    return slice_str(s, 3, s.length())
+  }
+  if s.starts_with("arr_") {
+    return "Array[" + dm_decode_freeze_ty_key(slice_str(s, 4, s.length())) + "]"
+  }
+  if s.starts_with("map_") {
+    return "Map[" + slice_str(s, 4, s.length()) + "]"
+  }
+  if s.starts_with("opt_") {
+    return "Option[" + dm_decode_freeze_ty_key(slice_str(s, 4, s.length())) + "]"
+  }
+  if s.starts_with("res_") {
+    return "Result[" + slice_str(s, 4, s.length()) + "]"
+  }
+  s
+}
+
+///|
+fn dm_is_runtime_mem(s : String) -> Bool {
+  s.starts_with("pion_alloc") ||
+  s.starts_with("pion_slab_") ||
+  s.starts_with("pion_med_") ||
+  s.starts_with("pion_concat_") ||
+  s.starts_with("__pion_raw_free") ||
+  s.starts_with("__pion_slab_")
+}
+
+///|
+fn dm_is_runtime_rc(s : String) -> Bool {
+  s.starts_with("pion_rc_") ||
+  s.starts_with("pion_drop_") ||
+  s.starts_with("pion_freeze_") ||
+  s.starts_with("pion_destroy")
+}
+
+///|
+fn dm_is_runtime_std(s : String) -> Bool {
+  s.starts_with("pion_str_") ||
+  s.starts_with("pion_strbuf_") ||
+  s.starts_with("pion_arr_") ||
+  s.starts_with("pion_map_") ||
+  s.starts_with("pion_bytes_") ||
+  s.starts_with("pion_math_") ||
+  s.starts_with("pion_scope_") ||
+  s.starts_with("pion_chan_") ||
+  s.starts_with("pion_mutex_") ||
+  s.starts_with("pion_atomic_") ||
+  s.starts_with("pion_fs_") ||
+  s.starts_with("pion_io_") ||
+  s.starts_with("pion_net_") ||
+  s.starts_with("pion_http_") ||
+  s.starts_with("pion_clock_") ||
+  s.starts_with("pion_sleep_") ||
+  s.starts_with("pion_world_") ||
+  s.starts_with("pion_panic") ||
+  s.starts_with("pion_int_to_str") ||
+  s.starts_with("pion_double_to_str") ||
+  s.starts_with("pion_enter_mt") ||
+  s.starts_with("pion_once_call") ||
+  s.starts_with("pion_cur_tid") ||
+  s.starts_with("pion_debug_assert") ||
+  s.starts_with("pion_prof_") ||
+  s.starts_with("pion_cli_")
+}
+
+///|
+pub fn classify_symbol(raw : String) -> String {
+  let d = demangle_symbol(raw)
+  d.category
+}
+
+///|
+/// Extracts concrete type name from a `pion_drop_struct_*` / `pion_drop_enum_*` raw symbol.
+/// Returns "" if not a named struct/enum destructor.
+pub fn demangle_drop_type_name(raw : String) -> String {
+  let mut s = dm_strip_wasm_conflict_suffix(dm_strip_leading(raw))
+  let (wpkg, s2) = dm_strip_wasm_pkg_prefix(s)
+  s = s2
+  if s.starts_with("pion_drop_struct_") {
+    let body0 = slice_str(s, 17, s.length())
+    let (inner_pkg, body) = dm_strip_wasm_pkg_prefix(body0)
+    let name = dm_decode_qual_sym(body)
+    let pkg = if inner_pkg.length() > 0 { inner_pkg } else { wpkg }
+    if pkg.length() > 0 && dm_find_sub(name, "::", 0) < 0 {
+      return pkg + "::" + name
+    }
+    return name
+  }
+  if s.starts_with("pion_drop_enum_") {
+    let body0 = slice_str(s, 15, s.length())
+    let (inner_pkg, body) = dm_strip_wasm_pkg_prefix(body0)
+    let name = dm_decode_qual_sym(body)
+    let pkg = if inner_pkg.length() > 0 { inner_pkg } else { wpkg }
+    if pkg.length() > 0 && dm_find_sub(name, "::", 0) < 0 {
+      return pkg + "::" + name
+    }
+    return name
+  }
+  ""
+}
+
+///|
+pub fn demangle_symbol(raw : String) -> DemangledSym {
+  if raw == "[external]" || raw.length() == 0 {
+    return DemangledSym::{
+      raw,
+      pretty: if raw.length() == 0 { "[unknown]" } else { raw },
+      category: "external",
+      kind: "external",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+  let s0 = dm_strip_leading(raw)
+  let s1 = dm_strip_wasm_conflict_suffix(s0)
+  if s1 == "main" || s1 == "pion_main" {
+    return DemangledSym::{
+      raw,
+      pretty: s1,
+      category: "user",
+      kind: "fn",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+  // Check standalone outlined block `__pion_ol_<seq>`
+  if s1.starts_with("__pion_ol_") && dm_all_digits(s1, 10, s1.length()) {
+    let seq = slice_str(s1, 10, s1.length())
+    return DemangledSym::{
+      raw,
+      pretty: "<outlined#" + seq + ">",
+      category: "user",
+      kind: "fn",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+  // Strip optional trailing `__pion_ol_<seq>` suffix
+  let mut outlined_suffix = ""
+  let mut s2 = s1
+  let ol_idx = dm_find_sub(s2, "__pion_ol_", 1)
+  if ol_idx > 0 && dm_all_digits(s2, ol_idx + 10, s2.length()) {
+    outlined_suffix = " (outlined#" + slice_str(s2, ol_idx + 10, s2.length()) + ")"
+    s2 = slice_str(s2, 0, ol_idx)
+  }
+  // Strip Wasm multi-package prefix `p_<pkg>__`
+  let (wasm_pkg, s) = dm_strip_wasm_pkg_prefix(s2)
+
+  // 1. Runtime mem / RC / synthetic drop & freeze
+  if dm_is_runtime_mem(s) {
+    return DemangledSym::{
+      raw,
+      pretty: s + outlined_suffix,
+      category: "runtime_mem",
+      kind: "runtime",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_drop_") {
+    let mut pretty = ""
+    let mut pkg = wasm_pkg
+    if s.starts_with("pion_drop_struct_") {
+      let (ipkg, body) = dm_strip_wasm_pkg_prefix(slice_str(s, 17, s.length()))
+      if ipkg.length() > 0 {
+        pkg = ipkg
+      }
+      let qual = dm_decode_qual_sym(body)
+      pretty = if pkg.length() > 0 && dm_find_sub(qual, "::", 0) < 0 {
+        "drop(" + pkg + "::" + qual + ")"
+      } else {
+        "drop(" + qual + ")"
+      }
+    } else if s.starts_with("pion_drop_enum_") {
+      let (ipkg, body) = dm_strip_wasm_pkg_prefix(slice_str(s, 15, s.length()))
+      if ipkg.length() > 0 {
+        pkg = ipkg
+      }
+      let qual = dm_decode_qual_sym(body)
+      pretty = if pkg.length() > 0 && dm_find_sub(qual, "::", 0) < 0 {
+        "drop(" + pkg + "::" + qual + ")"
+      } else {
+        "drop(" + qual + ")"
+      }
+    } else if s.starts_with("pion_drop_slots_") {
+      let (ipkg, body) = dm_strip_wasm_pkg_prefix(slice_str(s, 16, s.length()))
+      if ipkg.length() > 0 {
+        pkg = ipkg
+      }
+      pretty = "drop(slots:" + body + ")"
+    } else if s.starts_with("pion_drop_clo_") {
+      let (ipkg, body) = dm_strip_wasm_pkg_prefix(slice_str(s, 14, s.length()))
+      if ipkg.length() > 0 {
+        pkg = ipkg
+      }
+      pretty = "drop(closure#" + body + ")"
+    } else if s == "pion_drop_opt_obj" {
+      pretty = "drop(Option)"
+    } else if s == "pion_drop_res_ok" {
+      pretty = "drop(Result::Ok)"
+    } else if s == "pion_drop_res_err" {
+      pretty = "drop(Result::Err)"
+    } else if s == "pion_drop_dyn" {
+      pretty = "drop(dyn)"
+    } else {
+      pretty = "drop(" + slice_str(s, 10, s.length()) + ")"
+    }
+    return DemangledSym::{
+      raw,
+      pretty: pretty + outlined_suffix,
+      category: "runtime_rc",
+      kind: "drop",
+      pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_freeze_") {
+    let key = slice_str(s, 12, s.length())
+    return DemangledSym::{
+      raw,
+      pretty: "freeze(" + dm_decode_freeze_ty_key(key) + ")" + outlined_suffix,
+      category: "runtime_rc",
+      kind: "freeze",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if dm_is_runtime_rc(s) {
+    return DemangledSym::{
+      raw,
+      pretty: s + outlined_suffix,
+      category: "runtime_rc",
+      kind: "runtime",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+  if dm_is_runtime_std(s) {
+    return DemangledSym::{
+      raw,
+      pretty: s + outlined_suffix,
+      category: "runtime_std",
+      kind: "runtime",
+      pkg: "",
+      file: "",
+      line: 0,
+    }
+  }
+
+  // 2. Remaining synthetic symbols: eq, vtable: vtable, dyn_wrap: dyn_wrap, clo: clo, spawn
+  if s.starts_with("pion_eq_") {
+    let key = slice_str(s, 8, s.length())
+    return DemangledSym::{
+      raw,
+      pretty: "eq(" + dm_decode_freeze_ty_key(key) + ")" + outlined_suffix,
+      category: "user",
+      kind: "eq",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_vtable_") {
+    let (tr, ty) = dm_decode_pair_whole(slice_str(s, 12, s.length()))
+    let pretty = if tr.length() > 0 {
+      "vtable(" + tr + " for " + ty + ")"
+    } else {
+      "vtable(" + ty + ")"
+    }
+    return DemangledSym::{
+      raw,
+      pretty: pretty + outlined_suffix,
+      category: "user",
+      kind: "vtable",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_dyn_wrap_") {
+    let body = slice_str(s, 14, s.length())
+    let pretty = match dm_decode_pair_prefix(body) {
+      Some((tr, ty, tail)) =>
+      match dm_decode_member_suffix(tail) {
+        Some(mem) => "dyn_wrap(" + tr + " for " + ty + "::" + mem + ")"
+        None => "dyn_wrap(" + tr + " for " + ty + tail + ")"
+      }
+      None => {
+        let midx = dm_find_sub(body, "_M", 0)
+        if midx > 0 {
+          let (tr, ty) = dm_decode_pair_whole(slice_str(body, 0, midx))
+          match dm_decode_member_suffix(slice_str(body, midx, body.length())) {
+            Some(mem) => "dyn_wrap(" + tr + " for " + ty + "::" + mem + ")"
+            None => "dyn_wrap(" + body + ")"
+          }
+        } else {
+          "dyn_wrap(" + body + ")"
+        }
+      }
+    }
+    return DemangledSym::{
+      raw,
+      pretty: pretty + outlined_suffix,
+      category: "user",
+      kind: "vtable",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_clo_") {
+    let id = slice_str(s, 9, s.length())
+    let pfx = if wasm_pkg.length() > 0 { wasm_pkg + "::" } else { "" }
+    return DemangledSym::{
+      raw,
+      pretty: pfx + "closure#" + id + outlined_suffix,
+      category: "user",
+      kind: "closure",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+  if s.starts_with("pion_spawn_") {
+    let id = slice_str(s, 11, s.length())
+    let pfx = if wasm_pkg.length() > 0 { wasm_pkg + "::" } else { "" }
+    return DemangledSym::{
+      raw,
+      pretty: pfx + "spawn#" + id + outlined_suffix,
+      category: "user",
+      kind: "spawn",
+      pkg: wasm_pkg,
+      file: "",
+      line: 0,
+    }
+  }
+
+  // 3. User Pion symbols: `pion_[pkg_<p>_](fn_|m_|impl_|builtin_eq_|const_)...`
+  if s.starts_with("pion_") {
+    let body0 = slice_str(s, 5, s.length())
+    let (enc_pkg, body) = dm_decode_pkg_prefix(body0)
+    let pkg = if enc_pkg.length() > 0 { enc_pkg } else { wasm_pkg }
+    let pfx = if pkg.length() > 0 { pkg + "::" } else { "" }
+    let (body_nomono, mono_str) = dm_split_mono(body)
+
+    if body_nomono.starts_with("fn_") {
+      let fn_name = slice_str(body_nomono, 3, body_nomono.length())
+      return DemangledSym::{
+        raw,
+        pretty: pfx + fn_name + mono_str + outlined_suffix,
+        category: "user",
+        kind: "fn",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+    if body_nomono.starts_with("m_") {
+      let mbody = slice_str(body_nomono, 2, body_nomono.length())
+      let (recv, meth) = dm_decode_pair_whole(mbody)
+      let pretty = if recv.length() > 0 {
+        pfx + recv + "::" + meth + mono_str + outlined_suffix
+      } else {
+        pfx + meth + mono_str + outlined_suffix
+      }
+      return DemangledSym::{
+        raw,
+        pretty,
+        category: "user",
+        kind: "method",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+    if body_nomono.starts_with("impl_0_") {
+      let ibody = slice_str(body_nomono, 7, body_nomono.length())
+      let pretty = match dm_decode_pair_prefix(ibody) {
+        Some((tr, ty, tail)) =>
+        match dm_decode_member_suffix(tail) {
+          Some(mem) => pfx + tr + " for " + ty + "::" + mem + mono_str + outlined_suffix
+          None => pfx + tr + " for " + ty + tail + mono_str + outlined_suffix
+        }
+        None => {
+          let midx = dm_find_sub(ibody, "_M", 0)
+          if midx > 0 {
+            let (tr, ty) = dm_decode_pair_whole(slice_str(ibody, 0, midx))
+            match dm_decode_member_suffix(slice_str(ibody, midx, ibody.length())) {
+              Some(mem) => pfx + tr + " for " + ty + "::" + mem + mono_str + outlined_suffix
+              None => pfx + ibody + mono_str + outlined_suffix
+            }
+          } else {
+            pfx + ibody + mono_str + outlined_suffix
+          }
+        }
+      }
+      return DemangledSym::{
+        raw,
+        pretty,
+        category: "user",
+        kind: "impl",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+    if body_nomono.starts_with("impl_") {
+      let ibody = slice_str(body_nomono, 5, body_nomono.length())
+      // Plain form: `<tr_alnum>_<ty_alnum>_<method_name>`
+      let u1 = dm_find_sub(ibody, "_", 0)
+      if u1 > 0 {
+        let u2 = dm_find_sub(ibody, "_", u1 + 1)
+        if u2 > u1 + 1 && u2 + 1 < ibody.length() {
+          let tr = slice_str(ibody, 0, u1)
+          let ty = slice_str(ibody, u1 + 1, u2)
+          let mem = slice_str(ibody, u2 + 1, ibody.length())
+          return DemangledSym::{
+            raw,
+            pretty: pfx + tr + " for " + ty + "::" + mem + mono_str + outlined_suffix,
+            category: "user",
+            kind: "impl",
+            pkg,
+            file: "",
+            line: 0,
+          }
+        }
+      }
+      return DemangledSym::{
+        raw,
+        pretty: pfx + "impl " + ibody + mono_str + outlined_suffix,
+        category: "user",
+        kind: "impl",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+    if body_nomono.starts_with("builtin_eq_") {
+      let ty = dm_decode_qual_sym(slice_str(body_nomono, 11, body_nomono.length()))
+      return DemangledSym::{
+        raw,
+        pretty: pfx + "Eq for " + ty + "::eq" + mono_str + outlined_suffix,
+        category: "user",
+        kind: "impl",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+    if body_nomono.starts_with("const_") {
+      let cname = slice_str(body_nomono, 6, body_nomono.length())
+      return DemangledSym::{
+        raw,
+        pretty: pfx + "const::" + cname + outlined_suffix,
+        category: "user",
+        kind: "fn",
+        pkg,
+        file: "",
+        line: 0,
+      }
+    }
+  }
+
+  DemangledSym::{
+    raw,
+    pretty: s + outlined_suffix,
+    category: "external",
+    kind: "external",
+    pkg: wasm_pkg,
+    file: "",
+    line: 0,
+  }
+}
+
+///|
+pub fn demangle_symbol_with_sidecar(
+  raw : String,
+  sidecar : Map[String, ProfSidecarSym],
+) -> DemangledSym {
+  let base = demangle_symbol(raw)
+  let hit = match sidecar.get(raw) {
+    Some(s) => Some(s)
+    None => {
+      let norm = dm_strip_leading(raw)
+      match sidecar.get(norm) {
+        Some(s) => Some(s)
+        None => sidecar.get("$" + norm)
+      }
+    }
+  }
+  match hit {
+    Some(sc) => {
+      let pretty = if sc.pretty.length() > 0 { sc.pretty } else { base.pretty }
+      let kind = if sc.kind.length() > 0 { sc.kind } else { base.kind }
+      let pkg = if sc.pkg.length() > 0 { sc.pkg } else { base.pkg }
+      let category = if base.category != "external" {
+        base.category
+      } else if kind == "drop" || kind == "freeze" {
+        "runtime_rc"
+      } else if kind == "runtime_mem" || kind == "runtime_rc" || kind == "runtime_std" {
+        kind
+      } else {
+        "user"
+      }
+      DemangledSym::{
+        raw,
+        pretty,
+        category,
+        kind,
+        pkg,
+        file: sc.file,
+        line: sc.line,
+      }
+    }
+    None => base
+  }
+}

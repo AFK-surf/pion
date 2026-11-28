@@ -1,0 +1,459 @@
+///| Unit tests for `symtab.pion` (ELF64 & Mach-O 64-bit symbol table parsing,
+///  local + global symbols, ASLR anchor slide, Mach-O `__text` upper bound,
+///  and malformed/truncated binary safety).
+
+///|
+fn st_push_u16_le(buf : Array[Int], v : Int) -> Unit {
+  buf.push(v & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+}
+
+///|
+fn st_push_u32_le(buf : Array[Int], v : Int64) -> Unit {
+  buf.push((v & 0xFFL).to_int())
+  buf.push(((v >> 8) & 0xFFL).to_int())
+  buf.push(((v >> 16) & 0xFFL).to_int())
+  buf.push(((v >> 24) & 0xFFL).to_int())
+}
+
+///|
+fn st_push_u64_le(buf : Array[Int], v : Int64) -> Unit {
+  st_push_u32_le(buf, v & 0xFFFFFFFFL)
+  st_push_u32_le(buf, (v >> 32) & 0xFFFFFFFFL)
+}
+
+///|
+fn st_push_str(buf : Array[Int], s : String) -> Unit {
+  let mut i = 0
+  while i < s.length() {
+    buf.push(str_code_at(s, i))
+    i = i + 1
+  }
+}
+
+///|
+fn st_push_fixed_str(buf : Array[Int], s : String, width : Int) -> Unit {
+  let mut i = 0
+  while i < width {
+    if i < s.length() {
+      buf.push(str_code_at(s, i))
+    } else {
+      buf.push(0)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn st_push_zeros(buf : Array[Int], count : Int) -> Unit {
+  let mut i = 0
+  while i < count {
+    buf.push(0)
+    i = i + 1
+  }
+}
+
+///|
+fn st_arr_to_bytes(buf : Array[Int]) -> Bytes {
+  let b = Bytes::new(buf.length())
+  let mut i = 0
+  while i < buf.length() {
+    b[i] = buf[i].to_byte()
+    i = i + 1
+  }
+  b
+}
+
+///|
+/// Builds a minimal synthetic ELF64 little-endian binary containing:
+///   - global `pion_prof_anchor` @ 0x401000 (size 0x10)
+///   - global `pion_fn_hot`      @ 0x401100 (size 0x80)
+///   - local  `pion_clo_0`       @ 0x401200 (size 0x40)
+///   - undef  `puts`             @ 0x0 (should be filtered out)
+fn st_make_synth_elf64(include_local : Bool) -> Bytes {
+  // Layout:
+  //   0..64: Elf64_Ehdr
+  //   64..256: 3 Elf64_Shdr (0=NULL, 1=.symtab, 2=.strtab)
+  //   256..376: .symtab (5 entries * 24 = 120 bytes)
+  //   376..: .strtab
+  let strtab : Array[Int] = [0]
+  let off_anchor = strtab.length().to_int64()
+  st_push_str(strtab, "pion_prof_anchor")
+  strtab.push(0)
+  let off_hot = strtab.length().to_int64()
+  st_push_str(strtab, "pion_fn_hot")
+  strtab.push(0)
+  let off_clo = strtab.length().to_int64()
+  st_push_str(strtab, "pion_clo_0")
+  strtab.push(0)
+  let off_undef = strtab.length().to_int64()
+  st_push_str(strtab, "puts")
+  strtab.push(0)
+
+  let sym_off = 256L
+  let n_syms = if include_local { 5L } else { 4L }
+  let sym_size = n_syms * 24L
+  let str_off = sym_off + sym_size
+  let str_size = strtab.length().to_int64()
+
+  let b : Array[Int] = []
+  // Elf64_Ehdr (64 bytes)
+  b.push(0x7F)
+  b.push(0x45)
+  b.push(0x4C)
+  b.push(0x46)
+  b.push(2) // ELFCLASS64
+  b.push(1) // ELFDATA2LSB
+  b.push(1) // EV_CURRENT
+  st_push_zeros(b, 9) // padding to 16
+  st_push_u16_le(b, 3) // e_type = ET_DYN
+  st_push_u16_le(b, 62) // e_machine = EM_X86_64
+  st_push_u32_le(b, 1L) // e_version
+  st_push_u64_le(b, 0L) // e_entry
+  st_push_u64_le(b, 0L) // e_phoff
+  st_push_u64_le(b, 64L) // e_shoff
+  st_push_u32_le(b, 0L) // e_flags
+  st_push_u16_le(b, 64) // e_ehsize
+  st_push_u16_le(b, 0) // e_phentsize
+  st_push_u16_le(b, 0) // e_phnum
+  st_push_u16_le(b, 64) // e_shentsize
+  st_push_u16_le(b, 3) // e_shnum
+  st_push_u16_le(b, 0) // e_shstrndx
+
+  // Shdr 0: SHT_NULL
+  st_push_zeros(b, 64)
+
+  // Shdr 1: SHT_SYMTAB (type=2, link=2, entsize=24)
+  st_push_u32_le(b, 0L) // sh_name
+  st_push_u32_le(b, 2L) // sh_type = SHT_SYMTAB
+  st_push_u64_le(b, 0L) // sh_flags
+  st_push_u64_le(b, 0L) // sh_addr
+  st_push_u64_le(b, sym_off) // sh_offset
+  st_push_u64_le(b, sym_size) // sh_size
+  st_push_u32_le(b, 2L) // sh_link = .strtab
+  st_push_u32_le(b, 0L) // sh_info
+  st_push_u64_le(b, 8L) // sh_addralign
+  st_push_u64_le(b, 24L) // sh_entsize
+
+  // Shdr 2: SHT_STRTAB (type=3)
+  st_push_u32_le(b, 0L)
+  st_push_u32_le(b, 3L) // SHT_STRTAB
+  st_push_u64_le(b, 0L)
+  st_push_u64_le(b, 0L)
+  st_push_u64_le(b, str_off)
+  st_push_u64_le(b, str_size)
+  st_push_u32_le(b, 0L)
+  st_push_u32_le(b, 0L)
+  st_push_u64_le(b, 1L)
+  st_push_u64_le(b, 0L)
+
+  // .symtab entries (24 bytes each):
+  // 0: NULL sym
+  st_push_zeros(b, 24)
+  // 1: global pion_prof_anchor (STB_GLOBAL=1, STT_FUNC=2 -> 0x12)
+  st_push_u32_le(b, off_anchor)
+  b.push(0x12)
+  b.push(0)
+  st_push_u16_le(b, 1) // shndx=1
+  st_push_u64_le(b, 0x401000L)
+  st_push_u64_le(b, 0x10L)
+  // 2: global pion_fn_hot
+  st_push_u32_le(b, off_hot)
+  b.push(0x12)
+  b.push(0)
+  st_push_u16_le(b, 1)
+  st_push_u64_le(b, 0x401100L)
+  st_push_u64_le(b, 0x80L)
+  // 3: undef puts (shndx=0 -> ignored)
+  st_push_u32_le(b, off_undef)
+  b.push(0x12)
+  b.push(0)
+  st_push_u16_le(b, 0)
+  st_push_u64_le(b, 0L)
+  st_push_u64_le(b, 0L)
+  // 4: optional local pion_clo_0 (STB_LOCAL=0, STT_FUNC=2 -> 0x02)
+  if include_local {
+    st_push_u32_le(b, off_clo)
+    b.push(0x02)
+    b.push(0)
+    st_push_u16_le(b, 1)
+    st_push_u64_le(b, 0x401200L)
+    st_push_u64_le(b, 0x40L)
+  }
+
+  // .strtab
+  let mut i = 0
+  while i < strtab.length() {
+    b.push(strtab[i])
+    i = i + 1
+  }
+  st_arr_to_bytes(b)
+}
+
+///|
+/// Builds a minimal synthetic Mach-O 64-bit LE binary with:
+///   - `__TEXT` segment containing `__text` section `[0x100004000, 0x100004200)`
+///   - `LC_SYMTAB` with `_pion_prof_anchor` @ 0x100004000 (ext),
+///     `_pion_fn_work` @ 0x100004040 (ext), `_pion_clo_1` @ 0x100004100 (local),
+///     and a debug N_STAB entry (filtered out).
+fn st_make_synth_macho64() -> Bytes {
+  let strtab : Array[Int] = [0]
+  let off_anchor = strtab.length().to_int64()
+  st_push_str(strtab, "_pion_prof_anchor")
+  strtab.push(0)
+  let off_work = strtab.length().to_int64()
+  st_push_str(strtab, "_pion_fn_work")
+  strtab.push(0)
+  let off_clo = strtab.length().to_int64()
+  st_push_str(strtab, "_pion_clo_1")
+  strtab.push(0)
+  let off_stab = strtab.length().to_int64()
+  st_push_str(strtab, "debug_stab")
+  strtab.push(0)
+
+  // mach_header_64 (32) + LC_SEGMENT_64 (72 + 80 = 152) + LC_SYMTAB (24) = 208
+  let sizeofcmds = 152L + 24L
+  let symoff = 32L + sizeofcmds
+  let nsyms = 4L
+  let stroff = symoff + nsyms * 16L
+  let strsize = strtab.length().to_int64()
+
+  let b : Array[Int] = []
+  // mach_header_64
+  st_push_u32_le(b, 0xFEEDFACFL) // MH_MAGIC_64
+  st_push_u32_le(b, 0x0100000CL) // CPU_TYPE_ARM64
+  st_push_u32_le(b, 0L) // cpusubtype
+  st_push_u32_le(b, 2L) // MH_EXECUTE
+  st_push_u32_le(b, 2L) // ncmds
+  st_push_u32_le(b, sizeofcmds) // sizeofcmds
+  st_push_u32_le(b, 0L) // flags
+  st_push_u32_le(b, 0L) // reserved
+
+  // LC_SEGMENT_64 (cmd=0x19, cmdsize=152)
+  st_push_u32_le(b, 0x19L)
+  st_push_u32_le(b, 152L)
+  st_push_fixed_str(b, "__TEXT", 16)
+  st_push_u64_le(b, 0x100000000L) // vmaddr
+  st_push_u64_le(b, 0x8000L) // vmsize
+  st_push_u64_le(b, 0L) // fileoff
+  st_push_u64_le(b, 0x8000L) // filesize
+  st_push_u32_le(b, 5L) // maxprot
+  st_push_u32_le(b, 5L) // initprot
+  st_push_u32_le(b, 1L) // nsects
+  st_push_u32_le(b, 0L) // flags
+
+  // section_64: __text (80 bytes)
+  st_push_fixed_str(b, "__text", 16)
+  st_push_fixed_str(b, "__TEXT", 16)
+  st_push_u64_le(b, 0x100004000L) // addr
+  st_push_u64_le(b, 0x200L) // size -> end = 0x100004200
+  st_push_u32_le(b, 0L) // offset
+  st_push_u32_le(b, 4L) // align
+  st_push_u32_le(b, 0L) // reloff
+  st_push_u32_le(b, 0L) // nreloc
+  st_push_u32_le(b, 0L) // flags
+  st_push_u32_le(b, 0L) // reserved1
+  st_push_u32_le(b, 0L) // reserved2
+  st_push_u32_le(b, 0L) // reserved3
+
+  // LC_SYMTAB (cmd=0x02, cmdsize=24)
+  st_push_u32_le(b, 0x02L)
+  st_push_u32_le(b, 24L)
+  st_push_u32_le(b, symoff)
+  st_push_u32_le(b, nsyms)
+  st_push_u32_le(b, stroff)
+  st_push_u32_le(b, strsize)
+
+  // nlist_64 entries (16 bytes each):
+  // 0: _pion_prof_anchor (N_SECT|N_EXT = 0x0f, sect=1)
+  st_push_u32_le(b, off_anchor)
+  b.push(0x0F)
+  b.push(1)
+  st_push_u16_le(b, 0)
+  st_push_u64_le(b, 0x100004000L)
+  // 1: _pion_fn_work (N_SECT|N_EXT = 0x0f, sect=1)
+  st_push_u32_le(b, off_work)
+  b.push(0x0F)
+  b.push(1)
+  st_push_u16_le(b, 0)
+  st_push_u64_le(b, 0x100004040L)
+  // 2: _pion_clo_1 (N_SECT local = 0x0e, sect=1)
+  st_push_u32_le(b, off_clo)
+  b.push(0x0E)
+  b.push(1)
+  st_push_u16_le(b, 0)
+  st_push_u64_le(b, 0x100004100L)
+  // 3: N_STAB entry (0x20 -> ignored)
+  st_push_u32_le(b, off_stab)
+  b.push(0x2E)
+  b.push(1)
+  st_push_u16_le(b, 0)
+  st_push_u64_le(b, 0x100004080L)
+
+  // strtab
+  let mut i = 0
+  while i < strtab.length() {
+    b.push(strtab[i])
+    i = i + 1
+  }
+  st_arr_to_bytes(b)
+}
+
+///|
+test "symtab: elf64 local+global parse, anchor slide, and bounds" {
+  let elf = st_make_synth_elf64(true)
+  let st = match symtab_parse(elf) {
+    Ok(s) => s
+    Err(e) => {
+      abort("unexpected elf64 parse error: " + e)
+      return ()
+    }
+  }
+  assert_eq(st.format, "elf64")
+  assert_eq(st.has_local_syms, true)
+  assert_eq(st.entries.length(), 3)
+
+  // Simulate ASLR slide of +0x555500000000
+  let slide_expected = 0x555500000000L
+  let slide = match symtab_compute_slide(st, "pion_prof_anchor", 0x401000L + slide_expected) {
+    Ok(v) => v
+    Err(e) => {
+      abort("slide failed: " + e)
+      return ()
+    }
+  }
+  assert_eq(slide, slide_expected)
+
+  // Resolve global function inside st_size
+  match symtab_resolve(st, slide + 0x401124L, slide) {
+    Some(m) => {
+      assert_eq(m.name, "pion_fn_hot")
+      assert_eq(m.offset, 0x24L)
+      assert_eq(m.is_external, false)
+    }
+    None => abort("expected pion_fn_hot match")
+  }
+  // Resolve local closure function
+  match symtab_resolve(st, slide + 0x401210L, slide) {
+    Some(m) => {
+      assert_eq(m.name, "pion_clo_0")
+      assert_eq(m.offset, 0x10L)
+    }
+    None => abort("expected pion_clo_0 match")
+  }
+  // PC past st_size gap returns None
+  match symtab_resolve(st, slide + 0x401190L, slide) {
+    Some(_) => abort("expected None in gap past st_size")
+    None => ()
+  }
+
+  // Missing local symbols sets has_local_syms = false
+  let elf_noloc = st_make_synth_elf64(false)
+  match symtab_parse(elf_noloc) {
+    Ok(s2) => assert_eq(s2.has_local_syms, false)
+    Err(e) => abort("unexpected error: " + e)
+  }
+}
+
+///|
+test "symtab: macho64 parse, leading underscore strip, and __text external clamping" {
+  let mo = st_make_synth_macho64()
+  let st = match symtab_parse(mo) {
+    Ok(s) => s
+    Err(e) => {
+      abort("unexpected macho64 parse error: " + e)
+      return ()
+    }
+  }
+  assert_eq(st.format, "macho64")
+  assert_eq(st.has_local_syms, true)
+  assert_eq(st.has_text_bounds, true)
+  assert_eq(st.entries.length(), 3)
+
+  let aslr = 0x000012340000L
+  let slide = match symtab_compute_slide(st, "pion_prof_anchor", 0x100004000L + aslr) {
+    Ok(v) => v
+    Err(e) => {
+      abort("macho slide failed: " + e)
+      return ()
+    }
+  }
+  assert_eq(slide, aslr)
+
+  // Global symbol (leading '_' stripped)
+  match symtab_resolve(st, aslr + 0x100004050L, slide) {
+    Some(m) => {
+      assert_eq(m.name, "pion_fn_work")
+      assert_eq(m.offset, 0x10L)
+      assert_eq(m.is_external, false)
+    }
+    None => abort("expected pion_fn_work")
+  }
+  // Last symbol capped at text_end (0x100004200)
+  match symtab_resolve(st, aslr + 0x1000041FFL, slide) {
+    Some(m) => {
+      assert_eq(m.name, "pion_clo_1")
+      assert_eq(m.is_external, false)
+    }
+    None => abort("expected pion_clo_1")
+  }
+  // PC at/beyond __text end must resolve to "[external]" (not falsely attributed to last symbol!)
+  match symtab_resolve(st, aslr + 0x100004200L, slide) {
+    Some(m) => {
+      assert_eq(m.name, "[external]")
+      assert_eq(m.is_external, true)
+    }
+    None => abort("expected [external] past __text end")
+  }
+  // PC in shared library (below __text start) resolves to "[external]"
+  match symtab_resolve(st, aslr + 0x100000100L, slide) {
+    Some(m) => {
+      assert_eq(m.name, "[external]")
+      assert_eq(m.is_external, true)
+    }
+    None => abort("expected [external] below __text start")
+  }
+}
+
+///|
+test "symtab: rejects fat macho, truncated, and malformed binaries safely" {
+  // Too small
+  match symtab_parse(Bytes::new(2)) {
+    Ok(_) => abort("expected error on 2-byte input")
+    Err(_) => ()
+  }
+  // Fat Mach-O magic 0xcafebabe
+  let fat = Bytes::new(8)
+  fat[0] = (0xCA).to_byte()
+  fat[1] = (0xFE).to_byte()
+  fat[2] = (0xBA).to_byte()
+  fat[3] = (0xBE).to_byte()
+  match symtab_parse(fat) {
+    Ok(_) => abort("expected fat Mach-O rejection")
+    Err(e) =>
+    match t_str_find(e, "fat Mach-O") {
+      Some(_) => ()
+      None => abort("expected clear fat Mach-O error, got: " + e)
+    }
+  }
+  // Truncated ELF64 header
+  let trunc_elf = Bytes::new(16)
+  trunc_elf[0] = (0x7F).to_byte()
+  trunc_elf[1] = (0x45).to_byte()
+  trunc_elf[2] = (0x4C).to_byte()
+  trunc_elf[3] = (0x46).to_byte()
+  match symtab_parse(trunc_elf) {
+    Ok(_) => abort("expected truncated ELF error")
+    Err(_) => ()
+  }
+  // Truncated Mach-O64
+  let trunc_mo = Bytes::new(16)
+  trunc_mo[0] = (0xCF).to_byte()
+  trunc_mo[1] = (0xFA).to_byte()
+  trunc_mo[2] = (0xED).to_byte()
+  trunc_mo[3] = (0xFE).to_byte()
+  match symtab_parse(trunc_mo) {
+    Ok(_) => abort("expected truncated Mach-O error")
+    Err(_) => ()
+  }
+}

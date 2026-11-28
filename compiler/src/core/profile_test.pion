@@ -1,0 +1,286 @@
+///| Unit tests for `profile.pion`:
+///  1. `PIONPROF 1` raw parsing + symbolization + concrete `by_type[]` (`Struct json::Node`)
+///  2. All 6 threshold-gated `hints[]` positive controls
+///  3. Low-sample suppression (only `H_LOW_SAMPLES`, zero causal hints)
+///  4. Optimized program negative control (0 high-severity hints)
+///  5. Full `summary` JSON round-trip + `diff` (`improved`/`regressed`/`new`/`gone`)
+///  6. V8 `.cpuprofile` JSON parsing with `wasm-function[N]` mapping & merge
+
+///|
+fn prof_test_has_hint(hints : Array[ProfHint], code : String) -> Bool {
+  let mut i = 0
+  while i < hints.length() {
+    if hints[i].code == code {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn prof_test_count_high_hints(hints : Array[ProfHint]) -> Int {
+  let mut cnt = 0
+  let mut i = 0
+  while i < hints.length() {
+    if hints[i].severity == "high" {
+      cnt = cnt + 1
+    }
+    i = i + 1
+  }
+  cnt
+}
+
+///|
+test "profile: PIONPROF 1 parse, by_type struct resolution, and all causal hints" {
+  let raw_txt =
+  #|PIONPROF 1
+  #|META target=amd64_sysv modes=7 build_modes=7 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=1 wall_us=120000 cpu_us=110000 peak_rss_kb=16384 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=6291456 peak_reserved_bytes=8388608 backing_alloc_bytes=524288 backing_alloc_count=500 backing_free_bytes=262144 backing_inuse_bytes=262144
+  #|TAG 1 15000 1500000 14000 1400000 1000 100000 40000 40000 0 0 14000 10
+  #|TAG 4 2000 500000 1000 250000 1000 250000 30000 30000 0 0 1000 0
+  #|TYPE 4 sym:pion_drop_struct_json__Node 2000 500000 1000 250000 1000 250000
+  #|CPU_PC sym:pion_fn_build_doc 70
+  #|CPU_PC sym:pion_alloc_uninit 30
+  #|CPU_PC sym:pion_str_concat 20
+  #|STACK alloc 1 15000 1500000 sym:pion_fn_build_doc,sym:pion_fn_main
+  #|STACK rc 1 60000 0 sym:pion_fn_build_doc
+  #|STACK backing 3 400 300000 sym:pion_arr_grow,sym:pion_fn_build_doc
+  #|
+  let raw = match prof_parse_raw(raw_txt) {
+    Ok(r) => r
+    Err(e) => {
+      abort("prof_parse_raw failed: " + e)
+      return ()
+    }
+  }
+  let sidecar : Map[String, ProfSidecarSym] = Map([])
+  let rep = prof_build_report(raw, None, sidecar, None)
+
+  assert_eq(rep.schema_version, 1)
+  assert_eq(rep.target, "amd64_sysv")
+  assert_eq(rep.rc_partial, false)
+  assert_eq(rep.total_cpu_samples, 120L)
+  assert_eq(rep.managed.alloc_bytes, 2000000L)
+  assert_eq(rep.managed.alloc_count, 17000L)
+  assert_eq(rep.by_type.length(), 1)
+  assert_eq(rep.by_type[0].type_name, "Struct json::Node")
+
+  // All 5 causal hints must trigger (and NOT H_LOW_SAMPLES)
+  assert_eq(prof_test_has_hint(rep.hints, "H_LOW_SAMPLES"), false)
+  assert_eq(prof_test_has_hint(rep.hints, "H_HIGH_RUNTIME_MEM_CALLS"), true)
+  assert_eq(prof_test_has_hint(rep.hints, "H_STRING_ALLOC_STORM"), true)
+  assert_eq(prof_test_has_hint(rep.hints, "H_CONTAINER_GROW_CHURN"), true)
+  assert_eq(prof_test_has_hint(rep.hints, "H_HIGH_RC_TRAFFIC"), true)
+  assert_eq(prof_test_has_hint(rep.hints, "H_HIGH_ALLOCATOR_OVERHEAD"), true)
+
+  // JSON round-trip preserves cum_cpu_pct == null (pc_only), domains, by_type, and hints
+  let js = prof_report_to_json(rep, 20, "cpu")
+  match t_str_find(js, "\"cum_cpu_pct\":null") {
+    Some(_) => ()
+    None => abort("expected cum_cpu_pct:null in pc_only JSON")
+  }
+  let parsed = match prof_parse_report_json(js) {
+    Ok(r) => r
+    Err(e) => {
+      abort("prof_parse_report_json failed: " + e)
+      return ()
+    }
+  }
+  assert_eq(parsed.schema_version, 1)
+  assert_eq(parsed.target, "amd64_sysv")
+  assert_eq(parsed.managed.alloc_bytes, 2000000L)
+  assert_eq(parsed.by_type.length(), 1)
+  assert_eq(parsed.by_type[0].type_name, "Struct json::Node")
+  assert_eq(parsed.hints.length(), rep.hints.length())
+
+  let txt = prof_report_to_text(parsed, 10, "alloc_bytes")
+  match t_str_find(txt, "H_STRING_ALLOC_STORM") {
+    Some(_) => ()
+    None => abort("expected hint in text summary")
+  }
+}
+
+///|
+test "profile: low sample count suppresses causal hints and emits H_LOW_SAMPLES" {
+  let raw_txt =
+  #|PIONPROF 1
+  #|META target=arm64_apple modes=3 build_modes=3 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=0 wall_us=2000 cpu_us=1500 peak_rss_kb=4096 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=65536 peak_reserved_bytes=65536 backing_alloc_bytes=0 backing_alloc_count=0 backing_free_bytes=0 backing_inuse_bytes=0
+  #|TAG 1 50 2000000 50 2000000 0 0 100 100 0 0 50 0
+  #|CPU_PC sym:pion_alloc_uninit 10
+  #|CPU_PC sym:pion_fn_tiny 2
+  #|
+  let raw = match prof_parse_raw(raw_txt) {
+    Ok(r) => r
+    Err(e) => {
+      abort("parse failed: " + e)
+      return ()
+    }
+  }
+  let rep = prof_build_report(raw, None, Map([]), None)
+  assert_eq(prof_test_has_hint(rep.hints, "H_LOW_SAMPLES"), true)
+  assert_eq(prof_test_has_hint(rep.hints, "H_HIGH_RUNTIME_MEM_CALLS"), false)
+  assert_eq(prof_test_has_hint(rep.hints, "H_STRING_ALLOC_STORM"), false)
+  assert_eq(prof_test_count_high_hints(rep.hints), 0)
+}
+
+///|
+test "profile: optimized program negative control produces zero high-severity hints" {
+  // Healthy workload: 500 CPU samples (95% user compute, 2% runtime_mem),
+  // 2000 small allocations (10% String, 90% Struct), low backing grow, low RC, low overhead.
+  let raw_txt =
+  #|PIONPROF 1
+  #|META target=amd64_sysv modes=7 build_modes=7 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=1 wall_us=500000 cpu_us=495000 peak_rss_kb=8192 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=524288 peak_reserved_bytes=524288 backing_alloc_bytes=131072 backing_alloc_count=4 backing_free_bytes=0 backing_inuse_bytes=131072
+  #|TAG 1 200 16000 200 16000 0 0 400 400 0 0 200 0
+  #|TAG 4 1800 144000 1000 80000 800 64000 3600 3600 0 0 1000 0
+  #|CPU_PC sym:pion_fn_compute_kernel 475
+  #|CPU_PC sym:pion_str_slice 15
+  #|CPU_PC sym:pion_alloc_uninit 10
+  #|STACK alloc 4 1800 144000 sym:pion_fn_compute_kernel
+  #|STACK rc 4 3000 0 sym:pion_fn_compute_kernel
+  #|
+  let raw = match prof_parse_raw(raw_txt) {
+    Ok(r) => r
+    Err(e) => {
+      abort("parse failed: " + e)
+      return ()
+    }
+  }
+  let rep = prof_build_report(raw, None, Map([]), None)
+  assert_eq(prof_test_count_high_hints(rep.hints), 0)
+  assert_eq(rep.hints.length(), 0)
+}
+
+///|
+test "profile: diff detects improved, regressed, new, and gone functions" {
+  let base_raw =
+  #|PIONPROF 1
+  #|META target=amd64_sysv modes=3 build_modes=3 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=0 wall_us=100000 cpu_us=90000 peak_rss_kb=8000 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=262144 peak_reserved_bytes=262144 backing_alloc_bytes=0 backing_alloc_count=0 backing_free_bytes=0 backing_inuse_bytes=0
+  #|TAG 1 10000 1000000 10000 1000000 0 0 0 0 0 0 0 0
+  #|CPU_PC sym:pion_fn_hot_old 60
+  #|CPU_PC sym:pion_fn_other 20
+  #|CPU_PC sym:pion_fn_removed 20
+  #|STACK alloc 1 10000 1000000 sym:pion_fn_hot_old
+  #|
+  let patched_raw =
+  #|PIONPROF 1
+  #|META target=amd64_sysv modes=3 build_modes=3 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=0 wall_us=60000 cpu_us=55000 peak_rss_kb=6000 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=262144 peak_reserved_bytes=262144 backing_alloc_bytes=0 backing_alloc_count=0 backing_free_bytes=0 backing_inuse_bytes=0
+  #|TAG 1 2000 200000 2000 200000 0 0 0 0 0 0 0 0
+  #|CPU_PC sym:pion_fn_hot_old 20
+  #|CPU_PC sym:pion_fn_other 50
+  #|CPU_PC sym:pion_fn_added 30
+  #|STACK alloc 1 2000 200000 sym:pion_fn_hot_old
+  #|
+  let r_base = match prof_parse_raw(base_raw) {
+    Ok(r) => prof_build_report(r, None, Map([]), None)
+    Err(e) => { abort(e); return () }
+  }
+  let r_patched = match prof_parse_raw(patched_raw) {
+    Ok(r) => prof_build_report(r, None, Map([]), None)
+    Err(e) => { abort(e); return () }
+  }
+  let d = prof_diff_reports(r_base, r_patched, 10, 5.0)
+  assert_eq(d.improved.length(), 1)
+  assert_eq(d.improved[0].name, "hot_old")
+  assert_eq(d.regressed.length(), 1)
+  assert_eq(d.regressed[0].name, "other")
+  assert_eq(d.new_fns.length(), 1)
+  assert_eq(d.new_fns[0].name, "added")
+  assert_eq(d.gone_fns.length(), 1)
+  assert_eq(d.gone_fns[0].name, "removed")
+
+  let d_json = prof_diff_to_json(d)
+  match t_str_find(d_json, "\"improved\":[") {
+    Some(_) => ()
+    None => abort("missing improved in diff json")
+  }
+  let d_text = prof_diff_to_text(d)
+  match t_str_find(d_text, "Improved:") {
+    Some(_) => ()
+    None => abort("missing Improved section in diff text")
+  }
+}
+
+///|
+test "profile: V8 cpuprofile parsing maps wasm-function[N] and merges with PIONPROF 1" {
+  let v8_json =
+  "{\"nodes\":[" +
+  "{\"id\":1,\"callFrame\":{\"functionName\":\"(root)\",\"scriptId\":\"0\",\"url\":\"\",\"lineNumber\":-1,\"columnNumber\":-1},\"children\":[2]}," +
+  "{\"id\":2,\"callFrame\":{\"functionName\":\"wasm-function[10]\",\"scriptId\":\"1\",\"url\":\"wasm://wasm/0\",\"lineNumber\":0,\"columnNumber\":0},\"children\":[3]}," +
+  "{\"id\":3,\"callFrame\":{\"functionName\":\"wasm-function[11]\",\"scriptId\":\"1\",\"url\":\"wasm://wasm/0\",\"lineNumber\":0,\"columnNumber\":0}}" +
+  "],\"samples\":[2,3,3,3],\"timeDeltas\":[1000,1000,1000,1000]}"
+  let wasm_names : Map[Int, String] = Map([
+    (10, "pion_fn_outer"),
+    (11, "pion_fn_inner"),
+  ])
+  let v8 = match prof_parse_v8_cpuprofile(v8_json, wasm_names) {
+    Ok(v) => v
+    Err(e) => {
+      abort("v8 parse failed: " + e)
+      return ()
+    }
+  }
+  assert_eq(v8.total_samples, 4L)
+  assert_eq(v8.stack_mode, "full")
+  assert_eq(v8.funcs.length(), 2)
+
+  // Merge into Wasm PIONPROF 1 report
+  let wasm_raw =
+  #|PIONPROF 1
+  #|META target=wasm32 modes=3 build_modes=3 cpu_stack_mode=full sample_rate=64 hz=1000 retained=0 wall_us=4000 cpu_us=4000 peak_rss_kb=0 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=0 peak_reserved_bytes=0 backing_alloc_bytes=0 backing_alloc_count=0 backing_free_bytes=0 backing_inuse_bytes=0
+  #|TAG 1 10 640 10 640 0 0 0 0 0 0 0 0
+  #|
+  let raw = match prof_parse_raw(wasm_raw) {
+    Ok(r) => r
+    Err(e) => { abort(e); return () }
+  }
+  let rep = prof_build_report(raw, None, Map([]), Some(v8))
+  assert_eq(rep.cpu_stack_mode, "full")
+  assert_eq(rep.total_cpu_samples, 4L)
+  // Top function by self CPU should be `inner` (75% self, 75% cum), followed by `outer` (25% self, 100% cum)
+  assert_eq(rep.top_functions.length(), 2)
+  assert_eq(rep.top_functions[0].name, "inner")
+  assert_eq(rep.top_functions[1].name, "outer")
+  match rep.top_functions[1].cum_cpu_pct {
+    Some(c) => assert_eq(c, 100.0)
+    None => abort("expected cum_cpu_pct for full V8 stack mode")
+  }
+}
+
+///|
+test "profile: native ELF64 symtab + ANCHOR slide symbolizes hex PCs and rc_partial" {
+  let elf = st_make_synth_elf64(true)
+  let st = match symtab_parse(elf) {
+    Ok(s) => s
+    Err(e) => { abort(e); return () }
+  }
+  // Anchor is at 0x401000 in ELF; simulate ASLR slide +0x10000000 -> runtime 0x10401000
+  // pion_fn_hot is at 0x401100 -> runtime 0x10401110 (+0x10)
+  // pion_clo_0  is at 0x401200 -> runtime 0x10401208 (+0x08)
+  let raw_txt =
+  #|PIONPROF 1
+  #|META target=amd64_sysv modes=7 build_modes=3 cpu_stack_mode=pc_only sample_rate=1 hz=997 retained=0 wall_us=10000 cpu_us=9000 peak_rss_kb=4096 dropped_cpu=0 dropped_alloc=0 dropped_rc=0 retained_truncated=0
+  #|META reserved_bytes=65536 peak_reserved_bytes=65536 backing_alloc_bytes=0 backing_alloc_count=0 backing_free_bytes=0 backing_inuse_bytes=0
+  #|ANCHOR 0x10401000 pion_prof_anchor
+  #|CPU_PC 0x10401110 80
+  #|CPU_PC 0x10401208 20
+  #|
+  let raw = match prof_parse_raw(raw_txt) {
+    Ok(r) => r
+    Err(e) => { abort(e); return () }
+  }
+  let sc = prof_parse_sidecar_syms("pion_clo_0\tapp::worker::clo0\tclosure\tapp\tsrc/w.pion\t19\n")
+  let rep = prof_build_report(raw, Some(st), sc, None)
+  assert_eq(rep.rc_partial, true)
+  assert_eq(rep.top_functions.length(), 2)
+  assert_eq(rep.top_functions[0].name, "hot")
+  assert_eq(rep.top_functions[0].self_cpu_pct, 80.0)
+  assert_eq(rep.top_functions[1].name, "app::worker::clo0")
+  assert_eq(rep.top_functions[1].file, "src/w.pion")
+  assert_eq(rep.top_functions[1].line, 19)
+}

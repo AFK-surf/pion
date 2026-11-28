@@ -183,6 +183,610 @@ function hashInt64(k, seed1, seed2) {
   return h === 0n ? 1n : h;
 }
 
+function parseWasmNameSection(bytes) {
+  const names = new Map();
+  if (!bytes || bytes.byteLength < 8) return names;
+  const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (buf[0] !== 0x00 || buf[1] !== 0x61 || buf[2] !== 0x73 || buf[3] !== 0x6d) return names;
+  let pos = 8;
+  const len = buf.length;
+  function readU32(limit) {
+    let res = 0;
+    let shift = 0;
+    while (pos < limit) {
+      const b = buf[pos++];
+      if (shift === 28 && (b & 0xf0) !== 0) return -1;
+      res |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) return res >>> 0;
+      shift += 7;
+      if (shift > 28) return -1;
+    }
+    return -1;
+  }
+  while (pos < len) {
+    const secId = buf[pos++];
+    const secLen = readU32(len);
+    if (secLen < 0 || secLen > len - pos) break;
+    const secEnd = pos + secLen;
+    if (secId === 0) {
+      const nameLen = readU32(secEnd);
+      if (nameLen >= 0 && nameLen <= secEnd - pos) {
+        const secName = textDecoder.decode(buf.subarray(pos, pos + nameLen));
+        pos += nameLen;
+        if (secName === "name") {
+          while (pos < secEnd) {
+            const subId = buf[pos++];
+            const subLen = readU32(secEnd);
+            if (subLen < 0 || subLen > secEnd - pos) break;
+            const subEnd = pos + subLen;
+            if (subId === 1) {
+              const count = readU32(subEnd);
+              if (count < 0) break;
+              for (let i = 0; i < count && pos < subEnd; i++) {
+                const fnIdx = readU32(subEnd);
+                const fnNameLen = readU32(subEnd);
+                if (fnIdx < 0 || fnNameLen < 0 || fnNameLen > subEnd - pos) break;
+                const fnName = textDecoder.decode(buf.subarray(pos, pos + fnNameLen));
+                pos += fnNameLen;
+                names.set(fnIdx, fnName);
+              }
+            }
+            pos = subEnd;
+          }
+        }
+      }
+    }
+    pos = secEnd;
+  }
+  return names;
+}
+
+function writeFileAtomicExclusive(fs, destPath, content, label) {
+  let tmpPath = "";
+  let fd = -1;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 32; attempt++) {
+    tmpPath = `${destPath}.tmp.${process.pid}.${Date.now()}.${attempt}`;
+    try {
+      fd = fs.openSync(tmpPath, "wx", 0o600);
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (!e || e.code !== "EEXIST") break;
+    }
+  }
+  if (fd < 0) {
+    if (typeof process !== "undefined" && process.stderr) {
+      process.stderr.write(`pion_prof: failed to create temp file for ${label} (${destPath}): ${lastErr ? lastErr.message : "unknown"}\n`);
+    }
+    return false;
+  }
+  try {
+    fs.writeFileSync(fd, content, "utf8");
+    fs.closeSync(fd);
+    fd = -1;
+    fs.renameSync(tmpPath, destPath);
+    return true;
+  } catch (e) {
+    if (fd >= 0) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    try { fs.unlinkSync(tmpPath); } catch {}
+    if (typeof process !== "undefined" && process.stderr) {
+      process.stderr.write(`pion_prof: failed to write ${label} (${destPath}): ${e ? e.message : "unknown"}\n`);
+    }
+    return false;
+  }
+}
+
+const PROF_LIVE_MAX = 500000;
+
+function createWasmProfiler(options, isNode, nodeFs) {
+  const env = isNode && typeof process !== "undefined" && process.env ? process.env : null;
+  const outPath = options.profOut || (env && env.PION_PROF_OUT ? env.PION_PROF_OUT : "");
+  if (!outPath) return null;
+
+  const parseIntOr = (v, dflt) => {
+    if (v === undefined || v === null || v === "") return dflt;
+    const n = Number.parseInt(String(v), 10);
+    return Number.isFinite(n) ? n : dflt;
+  };
+  const modes = options.profModes !== undefined
+    ? (options.profModes | 0)
+    : parseIntOr(env && env.PION_PROF_MODES, 2);
+  const explicitBuildModes = options.profBuildModes !== undefined
+    ? (options.profBuildModes | 0)
+    : (env && env.PION_PROF_BUILD_MODES !== undefined && env.PION_PROF_BUILD_MODES !== ""
+      ? parseIntOr(env.PION_PROF_BUILD_MODES, 0)
+      : null);
+  const buildModes = explicitBuildModes !== null ? explicitBuildModes : 0;
+  const cpuWinOut = env && env.PION_PROF_CPU_OUT ? env.PION_PROF_CPU_OUT : "";
+  const cpuWinInterval = Math.max(100, parseIntOr(env && env.PION_PROF_CPU_INTERVAL, 1000));
+  const sampleRate = Math.max(
+    1,
+    options.profSampleRate !== undefined
+      ? (options.profSampleRate | 0)
+      : parseIntOr(env && env.PION_PROF_SAMPLE_RATE, 64),
+  );
+  const retained = options.profRetained !== undefined
+    ? Boolean(options.profRetained)
+    : Boolean(env && env.PION_PROF_RETAINED === "1");
+  const inheritEnv = env && env.PION_PROF_INHERIT === "1";
+
+  if (env && !inheritEnv && !options.profOut) {
+    delete env.PION_PROF_OUT;
+    delete env.PION_PROF_MODES;
+    delete env.PION_PROF_BUILD_MODES;
+    delete env.PION_PROF_SAMPLE_RATE;
+    delete env.PION_PROF_RETAINED;
+    delete env.PION_PROF_HZ;
+    delete env.PION_PROF_INHERIT;
+    delete env.PION_PROF_CPU_OUT;
+    delete env.PION_PROF_CPU_INTERVAL;
+  }
+
+  const wasmFuncNames = parseWasmNameSection(options.wasmBytes);
+  const dropSymCache = new Map();
+
+  const nowMsFn = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+  const state = {
+    outPath,
+    modes,
+    buildModes,
+    hasExplicitBuildModes: explicitBuildModes !== null,
+    cpuWinOut,
+    cpuWinInterval,
+    cpuSession: null,
+    cpuProfile: null,
+    sampleRate,
+    retained,
+    paused: false,
+    flushed: false,
+    inHook: false,
+    wallAccumMs: 0,
+    cpuAccumUs: 0,
+    wallStartMs: nowMsFn(),
+    cpuStart: isNode && typeof process.cpuUsage === "function" ? process.cpuUsage() : null,
+    reservedBytes: 0,
+    peakReservedBytes: 0,
+    backingAllocBytes: 0,
+    backingAllocCount: 0,
+    backingFreeBytes: 0,
+    backingInuseBytes: 0,
+    allocSeq: 0,
+    rcSeq: 0,
+    backingSeq: 0,
+    droppedAlloc: 0,
+    droppedRc: 0,
+    retainedTruncated: 0,
+    tagStats: new Map(),
+    typeStats: new Map(),
+    allocStacks: new Map(),
+    rcStacks: new Map(),
+    backingStacks: new Map(),
+    liveMap: retained ? new Map() : null,
+  };
+
+  function getTagStat(tag) {
+    let st = state.tagStats.get(tag);
+    if (!st) {
+      st = {
+        alloc_count: 0, alloc_bytes: 0,
+        free_count: 0, free_bytes: 0,
+        inuse_count: 0, inuse_bytes: 0,
+        rc_inc: 0, rc_dec: 0,
+        rc_atomic_inc: 0, rc_atomic_dec: 0,
+        rc_destroy: 0, rc_immortal: 0,
+      };
+      state.tagStats.set(tag, st);
+    }
+    return st;
+  }
+
+  function resolveDropSym(dropIdx, exportsObj) {
+    if (!dropIdx) return "0";
+    let cached = dropSymCache.get(dropIdx);
+    if (cached !== undefined) return cached;
+    let sym;
+    if ((dropIdx & 0x80000000) !== 0) {
+      sym = "sym:pion_drop_slots_" + (dropIdx & 0x7fffffff);
+    } else if (exportsObj && exportsObj.__indirect_function_table) {
+      const fn = exportsObj.__indirect_function_table.get(dropIdx);
+      if (fn && fn.name !== undefined && fn.name !== "") {
+        const fnIdx = Number(fn.name);
+        if (Number.isInteger(fnIdx) && wasmFuncNames.has(fnIdx)) {
+          sym = "sym:" + wasmFuncNames.get(fnIdx);
+        } else {
+          sym = "sym:wasm-function[" + fn.name + "]";
+        }
+      } else {
+        sym = "sym:table_" + dropIdx;
+      }
+    } else {
+      sym = "sym:table_" + dropIdx;
+    }
+    dropSymCache.set(dropIdx, sym);
+    return sym;
+  }
+
+  function getTypeStat(tag, dropSym) {
+    const key = tag + "\0" + dropSym;
+    let st = state.typeStats.get(key);
+    if (!st) {
+      st = {
+        tag, dropSym,
+        alloc_count: 0, alloc_bytes: 0,
+        free_count: 0, free_bytes: 0,
+        inuse_count: 0, inuse_bytes: 0,
+      };
+      state.typeStats.set(key, st);
+    }
+    return st;
+  }
+
+  function captureStack(extraPrefix) {
+    const frames = [];
+    if (extraPrefix) frames.push("sym:" + extraPrefix);
+    const prevLimit = Error.stackTraceLimit;
+    const prevPrepare = Error.prepareStackTrace;
+    let sites = null;
+    try {
+      Error.stackTraceLimit = 48;
+      Error.prepareStackTrace = (_err, st) => st;
+      const holder = {};
+      Error.captureStackTrace(holder);
+      sites = holder.stack;
+    } finally {
+      Error.prepareStackTrace = prevPrepare;
+      Error.stackTraceLimit = prevLimit;
+    }
+    if (Array.isArray(sites)) {
+      for (let i = 0; i < sites.length; i++) {
+        const site = sites[i];
+        const fileName = (typeof site.getFileName === "function" ? site.getFileName() : "") || "";
+        const fnName = (typeof site.getFunctionName === "function" ? site.getFunctionName() : "") || "";
+        let isWasm = fileName.startsWith("wasm://") || fnName.includes("wasm-function[");
+        let siteStr = "";
+        if (!isWasm && typeof site.isWasm === "function") {
+          try { isWasm = Boolean(site.isWasm()); } catch {}
+        }
+        if (isWasm) {
+          let m = fnName.match(/wasm-function\[(\d+)\]/);
+          if (!m) {
+            siteStr = String(site);
+            m = siteStr.match(/wasm-function\[(\d+)\]/);
+          }
+          if (m) {
+            const fnIdx = Number.parseInt(m[1], 10);
+            const resolved = wasmFuncNames.get(fnIdx);
+            frames.push("sym:" + (resolved || ("wasm-function[" + fnIdx + "]")));
+          } else if (fnName.length > 0) {
+            const clean = fnName.startsWith("$") ? fnName.slice(1) : fnName;
+            frames.push("sym:" + clean);
+          }
+        }
+      }
+    }
+    if (frames.length === 0) frames.push("sym:unknown");
+    return frames.join(",");
+  }
+
+  function startCpuWindow() {
+    if (!state.cpuWinOut || state.cpuSession || !isNode) return;
+    const inspector = options.inspector || getBuiltin("node:inspector");
+    if (!inspector || typeof inspector.Session !== "function") return;
+    try {
+      const sess = new inspector.Session();
+      sess.connect();
+      sess.post("Profiler.enable");
+      sess.post("Profiler.setSamplingInterval", { interval: state.cpuWinInterval });
+      sess.post("Profiler.start");
+      state.cpuSession = sess;
+    } catch {
+      state.cpuSession = null;
+    }
+  }
+
+  function stopCpuWindow() {
+    if (!state.cpuSession) return;
+    const sess = state.cpuSession;
+    state.cpuSession = null;
+    try {
+      sess.post("Profiler.stop", (err, res) => {
+        if (!err && res && res.profile) {
+          state.cpuProfile = res.profile;
+        }
+      });
+    } catch {}
+    try { sess.disconnect(); } catch {}
+  }
+
+  return {
+    state,
+    setBuildModes(bm) {
+      if (!state.hasExplicitBuildModes) {
+        state.buildModes = bm | 0;
+      }
+    },
+    updateReserved(bytes) {
+      if (bytes > 0) {
+        state.reservedBytes = bytes;
+        if (bytes > state.peakReservedBytes) state.peakReservedBytes = bytes;
+      }
+    },
+    pause() {
+      if (!state.paused) {
+        const dt = nowMsFn() - state.wallStartMs;
+        if (dt > 0) state.wallAccumMs += dt;
+        if (state.cpuStart && isNode && typeof process.cpuUsage === "function") {
+          const u = process.cpuUsage(state.cpuStart);
+          const dc = u.user + u.system;
+          if (dc > 0) state.cpuAccumUs += dc;
+        }
+        stopCpuWindow();
+        state.paused = true;
+      }
+    },
+    resume() {
+      if (state.paused && !state.flushed) {
+        state.wallStartMs = nowMsFn();
+        state.cpuStart = isNode && typeof process.cpuUsage === "function" ? process.cpuUsage() : null;
+        state.paused = false;
+        startCpuWindow();
+      }
+    },
+    reset() {
+      stopCpuWindow();
+      state.cpuProfile = null;
+      state.wallAccumMs = 0;
+      state.cpuAccumUs = 0;
+      state.wallStartMs = nowMsFn();
+      state.cpuStart = isNode && typeof process.cpuUsage === "function" ? process.cpuUsage() : null;
+      state.peakReservedBytes = state.reservedBytes;
+      state.backingAllocBytes = 0;
+      state.backingAllocCount = 0;
+      state.backingFreeBytes = 0;
+      state.backingInuseBytes = 0;
+      state.allocSeq = 0;
+      state.rcSeq = 0;
+      state.backingSeq = 0;
+      state.droppedAlloc = 0;
+      state.droppedRc = 0;
+      state.retainedTruncated = 0;
+      state.tagStats.clear();
+      state.typeStats.clear();
+      state.allocStacks.clear();
+      state.rcStacks.clear();
+      state.backingStacks.clear();
+      if (state.liveMap) state.liveMap.clear();
+      if (!state.paused) startCpuWindow();
+    },
+    onManagedAlloc(hdr, allocSz, tag, dropIdx, exportsObj) {
+      if (state.paused || state.inHook || (state.modes & 2) === 0) return;
+      state.inHook = true;
+      try {
+        const ts = getTagStat(tag);
+        ts.alloc_count += 1;
+        ts.alloc_bytes += allocSz;
+        ts.inuse_count += 1;
+        ts.inuse_bytes += allocSz;
+
+        const dropSym = resolveDropSym(dropIdx, exportsObj);
+        const tys = getTypeStat(tag, dropSym);
+        tys.alloc_count += 1;
+        tys.alloc_bytes += allocSz;
+        tys.inuse_count += 1;
+        tys.inuse_bytes += allocSz;
+
+        const seq = state.allocSeq++;
+        const takeSample = (seq % state.sampleRate) === 0;
+        let frames = null;
+        if (takeSample) {
+          frames = captureStack(null);
+          const sk = tag + "\0" + frames;
+          let se = state.allocStacks.get(sk);
+          if (!se) {
+            se = { tag, frames, count: 0, bytes: 0 };
+            state.allocStacks.set(sk, se);
+          }
+          se.count += state.sampleRate;
+          se.bytes += allocSz * state.sampleRate;
+        }
+        if (state.liveMap) {
+          if (state.liveMap.size < PROF_LIVE_MAX) {
+            if (frames === null) frames = captureStack(null);
+            state.liveMap.set(hdr, { tag, bytes: allocSz, frames });
+          } else {
+            state.retainedTruncated = 1;
+          }
+        }
+      } finally {
+        state.inHook = false;
+      }
+    },
+    onManagedRetire(hdr, allocSz, tag, dropIdx, exportsObj) {
+      if (state.inHook) return;
+      if (state.liveMap && (state.modes & 2) !== 0) {
+        state.liveMap.delete(hdr);
+      }
+      if (state.paused) return;
+      state.inHook = true;
+      try {
+        const ts = getTagStat(tag);
+        if ((state.modes & 4) !== 0) {
+          ts.rc_destroy += 1;
+        }
+        if ((state.modes & 2) !== 0) {
+          ts.free_count += 1;
+          ts.free_bytes += allocSz;
+          ts.inuse_count -= 1;
+          ts.inuse_bytes -= allocSz;
+
+          const dropSym = resolveDropSym(dropIdx, exportsObj);
+          const tys = getTypeStat(tag, dropSym);
+          tys.free_count += 1;
+          tys.free_bytes += allocSz;
+          tys.inuse_count -= 1;
+          tys.inuse_bytes -= allocSz;
+        }
+      } finally {
+        state.inHook = false;
+      }
+    },
+    onBackingAlloc(allocSz, backingTag) {
+      if (state.paused || state.inHook || (state.modes & 2) === 0) return;
+      state.inHook = true;
+      try {
+        state.backingAllocCount += 1;
+        state.backingAllocBytes += allocSz;
+        state.backingInuseBytes += allocSz;
+        const seq = state.backingSeq++;
+        if ((seq % state.sampleRate) === 0) {
+          const frames = captureStack(backingTag);
+          let se = state.backingStacks.get(frames);
+          if (!se) {
+            se = { frames, count: 0, bytes: 0 };
+            state.backingStacks.set(frames, se);
+          }
+          se.count += state.sampleRate;
+          se.bytes += allocSz * state.sampleRate;
+        }
+      } finally {
+        state.inHook = false;
+      }
+    },
+    onBackingFree(allocSz) {
+      if (state.paused || state.inHook || (state.modes & 2) === 0) return;
+      state.backingFreeBytes += allocSz;
+      state.backingInuseBytes -= allocSz;
+    },
+    onRc(tag, isInc, isAtomic, isImmortal) {
+      if (state.paused || state.inHook || (state.modes & 4) === 0) return;
+      state.inHook = true;
+      try {
+        const ts = getTagStat(tag);
+        if (isImmortal) {
+          ts.rc_immortal += 1;
+          return;
+        }
+        if (isInc) {
+          if (isAtomic) ts.rc_atomic_inc += 1;
+          else ts.rc_inc += 1;
+        } else {
+          if (isAtomic) ts.rc_atomic_dec += 1;
+          else ts.rc_dec += 1;
+        }
+        const seq = state.rcSeq++;
+        if ((seq % state.sampleRate) === 0) {
+          const frames = captureStack(null);
+          const sk = tag + "\0" + frames;
+          let se = state.rcStacks.get(sk);
+          if (!se) {
+            se = { tag, frames, count: 0 };
+            state.rcStacks.set(sk, se);
+          }
+          se.count += state.sampleRate;
+        }
+      } finally {
+        state.inHook = false;
+      }
+    },
+    flush(memoryBytes) {
+      if (state.flushed) return;
+      state.flushed = true;
+      stopCpuWindow();
+      const fs = nodeFs || getBuiltin("node:fs");
+      if (!fs) return;
+      if (memoryBytes > 0) {
+        state.reservedBytes = memoryBytes;
+        if (memoryBytes > state.peakReservedBytes) state.peakReservedBytes = memoryBytes;
+      }
+      if (!state.paused) {
+        const dt = nowMsFn() - state.wallStartMs;
+        if (dt > 0) state.wallAccumMs += dt;
+        if (state.cpuStart && isNode && typeof process.cpuUsage === "function") {
+          const u = process.cpuUsage(state.cpuStart);
+          const dc = u.user + u.system;
+          if (dc > 0) state.cpuAccumUs += dc;
+        }
+        state.paused = true;
+      }
+      const wallUs = Math.max(0, Math.round(state.wallAccumMs * 1000));
+      const cpuUs = (state.cpuStart && isNode && typeof process.cpuUsage === "function")
+        ? Math.max(0, Math.round(state.cpuAccumUs))
+        : wallUs;
+      let peakRssKb = 0;
+      if (isNode && typeof process.resourceUsage === "function") {
+        peakRssKb = Math.max(0, Math.round(process.resourceUsage().maxRSS));
+      } else if (isNode && typeof process.memoryUsage === "function") {
+        peakRssKb = Math.max(0, Math.round(process.memoryUsage().rss / 1024));
+      }
+
+      const lines = [];
+      lines.push("PIONPROF 1");
+      lines.push(
+        `META target=wasm32 modes=${state.modes} build_modes=${state.buildModes} ` +
+        `cpu_stack_mode=full sample_rate=${state.sampleRate} hz=0 retained=${state.retained ? 1 : 0} ` +
+        `wall_us=${wallUs} cpu_us=${cpuUs} peak_rss_kb=${peakRssKb} ` +
+        `dropped_cpu=0 dropped_alloc=${state.droppedAlloc} dropped_rc=${state.droppedRc} ` +
+        `retained_truncated=${state.retainedTruncated}`,
+      );
+      lines.push(
+        `META reserved_bytes=${state.reservedBytes} peak_reserved_bytes=${state.peakReservedBytes} ` +
+        `backing_alloc_bytes=${state.backingAllocBytes} backing_alloc_count=${state.backingAllocCount} ` +
+        `backing_free_bytes=${state.backingFreeBytes} backing_inuse_bytes=${Math.max(0, state.backingInuseBytes)}`,
+      );
+
+      const tagIds = Array.from(state.tagStats.keys()).sort((a, b) => a - b);
+      for (const tid of tagIds) {
+        const t = state.tagStats.get(tid);
+        lines.push(
+          `TAG ${tid} ${t.alloc_count} ${t.alloc_bytes} ${t.free_count} ${t.free_bytes} ` +
+          `${Math.max(0, t.inuse_count)} ${Math.max(0, t.inuse_bytes)} ` +
+          `${t.rc_inc} ${t.rc_dec} ${t.rc_atomic_inc} ${t.rc_atomic_dec} ${t.rc_destroy} ${t.rc_immortal}`,
+        );
+      }
+      for (const ty of state.typeStats.values()) {
+        lines.push(
+          `TYPE ${ty.tag} ${ty.dropSym} ${ty.alloc_count} ${ty.alloc_bytes} ` +
+          `${ty.free_count} ${ty.free_bytes} ${Math.max(0, ty.inuse_count)} ${Math.max(0, ty.inuse_bytes)}`,
+        );
+      }
+      for (const se of state.allocStacks.values()) {
+        lines.push(`STACK alloc ${se.tag} ${se.count} ${se.bytes} ${se.frames}`);
+      }
+      for (const se of state.rcStacks.values()) {
+        lines.push(`STACK rc ${se.tag} ${se.count} 0 ${se.frames}`);
+      }
+      for (const se of state.backingStacks.values()) {
+        lines.push(`STACK backing 0 ${se.count} ${se.bytes} ${se.frames}`);
+      }
+      if (state.liveMap && state.liveMap.size > 0) {
+        const inuseAgg = new Map();
+        for (const item of state.liveMap.values()) {
+          const k = item.tag + "\0" + item.frames;
+          let agg = inuseAgg.get(k);
+          if (!agg) {
+            agg = { tag: item.tag, frames: item.frames, count: 0, bytes: 0 };
+            inuseAgg.set(k, agg);
+          }
+          agg.count += 1;
+          agg.bytes += item.bytes;
+        }
+        for (const agg of inuseAgg.values()) {
+          lines.push(`STACK inuse ${agg.tag} ${agg.count} ${agg.bytes} ${agg.frames}`);
+        }
+      }
+
+      const content = lines.join("\n") + "\n";
+      writeFileAtomicExclusive(fs, state.outPath, content, "raw profile");
+      if (state.cpuWinOut && state.cpuProfile) {
+        writeFileAtomicExclusive(fs, state.cpuWinOut, JSON.stringify(state.cpuProfile), "cpu profile");
+      }
+    },
+  };
+}
+
 export function createPionRuntime(options = {}) {
   let memory = options.memory || null;
   let exportsObj = options.exports || null;
@@ -208,6 +812,7 @@ export function createPionRuntime(options = {}) {
   let nodeCrypto = options.crypto || null;
   const nodeCp = options.child_process || null;
   const cliArgs = Array.isArray(options.args) ? options.args.map(String) : [];
+  const prof = createWasmProfiler(options, isNode, nodeFs);
 
   const printFn = options.print || (isNode
     ? (s) => process.stdout.write(s)
@@ -262,6 +867,11 @@ export function createPionRuntime(options = {}) {
         `Sync runtime/pion_wasm_rt*.mjs with the pionc version that built this .wasm.`
       );
     }
+    if (prof) {
+      const bm = exp.__pion_prof_build_modes;
+      const modBm = typeof bm === "number" ? bm : (bm && typeof bm.value === "number" ? bm.value : 0);
+      prof.setBuildModes(modBm);
+    }
     if (isNode && typeof process !== "undefined" && process.env && process.env.PION_HASH_SEED !== undefined && process.env.PION_HASH_SEED !== "") {
       hashSeed = BigInt.asUintN(64, BigInt(process.env.PION_HASH_SEED));
       hashSeed2 = splitmix64(hashSeed ^ 0x9e3779b97f4a7c15n);
@@ -290,6 +900,7 @@ export function createPionRuntime(options = {}) {
     largeFree.clear();
     rcDeferQueue.length = 0;
     jsDropDepth = 0;
+    if (prof && memory) prof.updateReserved(memory.buffer.byteLength);
   }
 
   function sizeClassIndex(totalSize) {
@@ -316,7 +927,7 @@ export function createPionRuntime(options = {}) {
   }
 
   // Raw allocation: stores 8-byte block header (size:u32 @ base, magic:u32 @ base+4) at ptr - 8.
-  function rawAlloc(size) {
+  function rawAlloc(size, isManaged = false, backingTag = null) {
     if (!Number.isFinite(size) || size < 0 || size > 0x7FFFFFE8) {
       pionDie("allocation size exceeds wasm32 limit");
     }
@@ -333,6 +944,7 @@ export function createPionRuntime(options = {}) {
           const allocSz = FREE_CLASSES[cls];
           dv.setUint32(head, allocSz, true);
           dv.setUint32(head + 4, ALLOC_MAGIC, true);
+          if (prof && !isManaged) prof.onBackingAlloc(allocSz, backingTag);
           return head + 8;
         }
       } else if (freeLists && freeLists[cls] && freeLists[cls].length > 0) {
@@ -340,6 +952,7 @@ export function createPionRuntime(options = {}) {
         const allocSz = FREE_CLASSES[cls];
         dv.setUint32(base, allocSz, true);
         dv.setUint32(base + 4, ALLOC_MAGIC, true);
+        if (prof && !isManaged) prof.onBackingAlloc(allocSz, backingTag);
         return base + 8;
       }
     }
@@ -350,6 +963,7 @@ export function createPionRuntime(options = {}) {
         const base = bucket.pop();
         dv.setUint32(base, allocSz, true);
         dv.setUint32(base + 4, ALLOC_MAGIC, true);
+        if (prof && !isManaged) prof.onBackingAlloc(allocSz, backingTag);
         return base + 8;
       }
     }
@@ -365,21 +979,23 @@ export function createPionRuntime(options = {}) {
       const growPages = minGrow > maxAllowed ? minGrow : Math.min(maxAllowed, targetGrow);
       memory.grow(growPages);
       syncViews();
+      if (prof) prof.updateReserved(memory.buffer.byteLength);
     }
     const base = hp;
     setHeapPtr(hp + allocSz);
     dv.setUint32(base, allocSz, true);
     dv.setUint32(base + 4, ALLOC_MAGIC, true);
+    if (prof && !isManaged) prof.onBackingAlloc(allocSz, backingTag);
     return base + 8;
   }
 
-  function rawAllocZero(size) {
-    const p = rawAlloc(size);
+  function rawAllocZero(size, isManaged = false, backingTag = null) {
+    const p = rawAlloc(size, isManaged, backingTag);
     u8.fill(0, p, p + size);
     return p;
   }
 
-  function rawFree(ptr) {
+  function rawFree(ptr, isManaged = false) {
     if (!ptr) return;
     syncViews();
     const hp = getHeapPtr();
@@ -391,6 +1007,7 @@ export function createPionRuntime(options = {}) {
     const allocSz = dv.getUint32(base, true);
     if (allocSz < 16 || base + allocSz > hp) return;
     dv.setUint32(base + 4, FREE_MAGIC, true);
+    if (prof && !isManaged) prof.onBackingFree(allocSz);
     if (base + allocSz === hp) {
       setHeapPtr(base);
       return;
@@ -433,25 +1050,31 @@ export function createPionRuntime(options = {}) {
 
   function pion_alloc(payloadSize, typeTag, dropFn) {
     const sz = payloadSize >>> 0;
-    const hdr = rawAllocZero(HEADER_SIZE + sz);
+    const hdr = rawAllocZero(HEADER_SIZE + sz, true);
+    const tag = typeTag & 0xffff;
+    const df = BigInt(dropFn || 0n);
     dv.setUint32(hdr + 0, 1, true);          // owner_tid = 1
     dv.setUint32(hdr + 4, 1, true);          // local_rc = 1
     dv.setUint32(hdr + 8, 0, true);          // shared_rc = 0
-    dv.setUint16(hdr + 12, typeTag & 0xffff, true);
+    dv.setUint16(hdr + 12, tag, true);
     dv.setUint16(hdr + 14, 0, true);         // flags = 0
-    dv.setBigInt64(hdr + 16, BigInt(dropFn || 0n), true);
+    dv.setBigInt64(hdr + 16, df, true);
+    if (prof) prof.onManagedAlloc(hdr, dv.getUint32(hdr - 8, true), tag, Number(df), exportsObj);
     return pBig(hdr + HEADER_SIZE);
   }
 
   function pion_alloc_uninit(payloadSize, typeTag, dropFn) {
     const sz = payloadSize >>> 0;
-    const hdr = rawAlloc(HEADER_SIZE + sz);
+    const hdr = rawAlloc(HEADER_SIZE + sz, true);
+    const tag = typeTag & 0xffff;
+    const df = BigInt(dropFn || 0n);
     dv.setUint32(hdr + 0, 1, true);
     dv.setUint32(hdr + 4, 1, true);
     dv.setUint32(hdr + 8, 0, true);
-    dv.setUint16(hdr + 12, typeTag & 0xffff, true);
+    dv.setUint16(hdr + 12, tag, true);
     dv.setUint16(hdr + 14, 0, true);
-    dv.setBigInt64(hdr + 16, BigInt(dropFn || 0n), true);
+    dv.setBigInt64(hdr + 16, df, true);
+    if (prof) prof.onManagedAlloc(hdr, dv.getUint32(hdr - 8, true), tag, Number(df), exportsObj);
     return pBig(hdr + HEADER_SIZE);
   }
 
@@ -461,8 +1084,12 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const hdr = p - HEADER_SIZE;
     const flags = dv.getUint16(hdr + 14, true);
-    if ((flags & FLAG_IMMORTAL) !== 0) return;
+    if ((flags & FLAG_IMMORTAL) !== 0) {
+      if (prof) prof.onRc(dv.getUint16(hdr + 12, true), true, false, true);
+      return;
+    }
     const tid = dv.getUint32(hdr + 0, true);
+    if (prof) prof.onRc(dv.getUint16(hdr + 12, true), true, tid === 0, false);
     if (tid === 0) {
       dv.setUint32(hdr + 8, (dv.getUint32(hdr + 8, true) + 1) >>> 0, true);
     } else {
@@ -485,7 +1112,9 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const hdr = p - HEADER_SIZE;
     const dropIdx = Number(dv.getBigInt64(hdr + 16, true));
+    const origDropIdx = dropIdx;
     const tag = dv.getUint16(hdr + 12, true);
+    const allocSz = prof ? dv.getUint32(hdr - 8, true) : 0;
     if (dropIdx !== 0) {
       dv.setBigInt64(hdr + 16, 0n, true);
       if ((dropIdx & 0x80000000) !== 0) {
@@ -554,7 +1183,8 @@ export function createPionRuntime(options = {}) {
         channels.delete(p);
       }
     }
-    rawFree(hdr);
+    if (prof) prof.onManagedRetire(hdr, allocSz, tag, origDropIdx, exportsObj);
+    rawFree(hdr, true);
   }
 
   function pion_rc_dec_drain() {
@@ -605,8 +1235,12 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const hdr = p - HEADER_SIZE;
     const flags = dv.getUint16(hdr + 14, true);
-    if ((flags & FLAG_IMMORTAL) !== 0) return;
+    if ((flags & FLAG_IMMORTAL) !== 0) {
+      if (prof) prof.onRc(dv.getUint16(hdr + 12, true), false, false, true);
+      return;
+    }
     const tid = dv.getUint32(hdr + 0, true);
+    if (prof) prof.onRc(dv.getUint16(hdr + 12, true), false, tid === 0, false);
     let rc;
     if (tid === 0) {
       rc = (dv.getUint32(hdr + 8, true) - 1) >>> 0;
@@ -1139,7 +1773,7 @@ export function createPionRuntime(options = {}) {
     if (len + extra <= cap) return;
     let newCap = Math.max(cap * 2, len + extra + 32);
     const oldDp = Number(dv.getBigInt64(p + 16, true));
-    const newDp = rawAlloc(newCap);
+    const newDp = rawAlloc(newCap, false, "pion_strbuf_grow");
     syncViews();
     if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len);
     if (oldDp) rawFree(oldDp);
@@ -1306,7 +1940,7 @@ export function createPionRuntime(options = {}) {
     const len = Number(dv.getBigInt64(p + 0, true));
     const esz = arrStride(p);
     const oldDp = Number(dv.getBigInt64(p + 24, true));
-    const newDp = rawAlloc(newCap * esz);
+    const newDp = rawAlloc(newCap * esz, false, "pion_arr_grow");
     syncViews();
     if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len * esz);
     if (oldDp) rawFree(oldDp);
@@ -1540,8 +2174,8 @@ export function createPionRuntime(options = {}) {
   }
 
   // --- Hash Map (32B PionMapEntry: key@0, hash@8, val@16, state@24) ---
-  function mapAllocEntries(cap) {
-    return rawAllocZero(cap * 32);
+  function mapAllocEntries(cap, backingTag = null) {
+    return rawAllocZero(cap * 32, false, backingTag);
   }
 
   function pion_map_new_common(valIsObj, keyIsInt) {
@@ -1584,7 +2218,7 @@ export function createPionRuntime(options = {}) {
     const oldCap = Number(dv.getBigInt64(p + 8, true));
     const oldEntries = Number(dv.getBigInt64(p + 24, true));
     const newCap = oldCap < 16 ? 16 : oldCap * 2;
-    const newEntries = mapAllocEntries(newCap);
+    const newEntries = mapAllocEntries(newCap, "pion_map_grow");
     syncViews();
     const mask = newCap - 1;
     for (let i = 0; i < oldCap; i++) {
@@ -2289,14 +2923,24 @@ export function createPionRuntime(options = {}) {
       pion_ptr_read_i32, pion_ptr_write_i32,
       pion_ptr_read_i64, pion_ptr_write_i64,
       pion_cstr_to_str,
+
+      // Profiler window control (optional imports, zero impact on unprofiled modules)
+      pion_prof_pause: () => { if (prof) prof.pause(); },
+      pion_prof_resume: () => { if (prof) prof.resume(); },
+      pion_prof_reset: () => { if (prof) prof.reset(); },
     },
   };
 
   if (exportsObj) bindExports(exportsObj);
 
+  function flushProfile() {
+    if (prof) prof.flush(memory ? memory.buffer.byteLength : 0);
+  }
+
   return {
     imports,
     bindExports,
+    flushProfile,
     getStdout: () => stdoutChunks.join(""),
     getStderr: () => stderrChunks.join(""),
   };
@@ -2305,7 +2949,7 @@ export function createPionRuntime(options = {}) {
 const SYNC_INSTANTIATE_LIMIT = 8 * 1024 * 1024;
 
 export function runWasmBytesSync(wasmBytes, args = [], options = {}) {
-  const rt = createPionRuntime({ ...options, args });
+  const rt = createPionRuntime({ ...options, args, wasmBytes });
   const mod = new WebAssembly.Module(wasmBytes);
   const instance = new WebAssembly.Instance(mod, rt.imports);
   rt.bindExports(instance.exports);
@@ -2313,7 +2957,12 @@ export function runWasmBytesSync(wasmBytes, args = [], options = {}) {
   if (typeof mainFn !== "function") {
     throw new Error("Wasm module does not export main()");
   }
-  const rc = mainFn(args.length | 0, 0n);
+  let rc;
+  try {
+    rc = mainFn(args.length | 0, 0n);
+  } finally {
+    rt.flushProfile();
+  }
   return { exitCode: typeof rc === "number" ? rc : 0, runtime: rt, instance };
 }
 
@@ -2321,14 +2970,19 @@ export async function runWasmBytes(wasmBytes, args = [], options = {}) {
   if (IS_NODE_ENV && wasmBytes && wasmBytes.byteLength <= SYNC_INSTANTIATE_LIMIT) {
     return runWasmBytesSync(wasmBytes, args, options);
   }
-  const rt = createPionRuntime({ ...options, args });
+  const rt = createPionRuntime({ ...options, args, wasmBytes });
   const { instance } = await WebAssembly.instantiate(wasmBytes, rt.imports);
   rt.bindExports(instance.exports);
   const mainFn = instance.exports.main || instance.exports._start || instance.exports.pion_main;
   if (typeof mainFn !== "function") {
     throw new Error("Wasm module does not export main()");
   }
-  const rc = mainFn(args.length | 0, 0n);
+  let rc;
+  try {
+    rc = mainFn(args.length | 0, 0n);
+  } finally {
+    rt.flushProfile();
+  }
   return { exitCode: typeof rc === "number" ? rc : 0, runtime: rt, instance };
 }
 
@@ -2339,7 +2993,13 @@ export async function runWasmFile(wasmPath, args = [], options = {}) {
     return runWasmBytes(wasmBytes, args, { fs, ...options });
   }
   const crypto = options.crypto || (await import("node:crypto"));
-  return runWasmBytes(wasmBytes, args, { fs, crypto, ...options });
+  let inspector = options.inspector || null;
+  if (!inspector && IS_NODE_ENV && process.env && process.env.PION_PROF_CPU_OUT) {
+    try {
+      inspector = await import("node:inspector");
+    } catch {}
+  }
+  return runWasmBytes(wasmBytes, args, { fs, crypto, inspector, ...options });
 }
 
 // CLI Runner: `node runtime/pion_wasm_rt.mjs <app.wasm> [args...]`
