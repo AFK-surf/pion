@@ -14672,6 +14672,156 @@ fn match_arms_have_unguarded_catchall(tokens : Array[Token], start : Int, end : 
   false
 }
 
+///| Return true iff pattern tokens `[start, end)` contain any token disallowed in B2d
+///| (struct `{`, array `[`, or range/rest `..`/`..<`/`..=`/`..<=`).
+fn pattern_has_b2d_disallowed_tok(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LBrace || kk == TokenKind::RBrace ||
+    kk == TokenKind::LBracket || kk == TokenKind::RBracket ||
+    kk == TokenKind::DotDot || kk == TokenKind::DotDotLt ||
+    kk == TokenKind::DotDotEq || kk == TokenKind::DotDotLtEq {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Expand top-level and parenthesized nested `|` or-patterns into separate token lists
+///| BEFORE float-literal substitution so each branch gets independent bindings and guards.
+fn expand_or_pat_tokens(tokens : Array[Token], start : Int, end : Int) -> Array[Array[Token]] {
+  let mut k = start
+  let mut d = 0
+  let pipe_positions : Array[Int] = []
+  let mut has_nested_pipe = false
+  let mut first_lp = -1
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      if d == 0 && kk == TokenKind::LParen && first_lp < 0 {
+        first_lp = k
+      }
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if kk == TokenKind::Pipe {
+      if d == 0 {
+        pipe_positions.push(k)
+      } else {
+        has_nested_pipe = true
+      }
+    }
+    k = k + 1
+  }
+  if pipe_positions.length() > 0 {
+    let out : Array[Array[Token]] = []
+    let mut seg_s = start
+    for pp in pipe_positions {
+      if pp > seg_s {
+        for br in expand_or_pat_tokens(tokens, seg_s, pp) {
+          if out.length() < 64 { out.push(br) }
+        }
+      }
+      seg_s = pp + 1
+    }
+    if end > seg_s {
+      for br in expand_or_pat_tokens(tokens, seg_s, end) {
+        if out.length() < 64 { out.push(br) }
+      }
+    }
+    return out
+  }
+  if !has_nested_pipe || first_lp < 0 {
+    let single : Array[Token] = []
+    let mut si = start
+    while si < end {
+      single.push(tokens[si])
+      si = si + 1
+    }
+    return [single]
+  }
+  let rp = find_matching_delim(tokens, first_lp)
+  if rp >= end {
+    let single : Array[Token] = []
+    let mut si = start
+    while si < end {
+      single.push(tokens[si])
+      si = si + 1
+    }
+    return [single]
+  }
+  let item_alts : Array[Array[Array[Token]]] = []
+  let mut ai = first_lp + 1
+  while ai < rp {
+    if tokens[ai].kind == TokenKind::Comma { ai = ai + 1; continue }
+    let mut ae = ai
+    let mut ad = 0
+    while ae < rp {
+      let ak = tokens[ae].kind
+      if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+      else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+      else if ad == 0 && ak == TokenKind::Comma { break }
+      ae = ae + 1
+    }
+    if ae > ai {
+      item_alts.push(expand_or_pat_tokens(tokens, ai, ae))
+    }
+    ai = ae + 1
+  }
+  let suffix_alts = if rp + 1 < end {
+    expand_or_pat_tokens(tokens, rp + 1, end)
+  } else {
+    [[]]
+  }
+  let comma_tok = Token::{
+    kind: TokenKind::Comma,
+    raw: ",",
+    leading_trivia: "",
+    newline_before: false,
+    line: tokens[first_lp].line,
+    col: tokens[first_lp].col,
+    start_byte: tokens[first_lp].start_byte,
+    end_byte: tokens[first_lp].start_byte,
+  }
+  let mut inner_combos : Array[Array[Token]] = [[]]
+  let mut ci = 0
+  while ci < item_alts.length() {
+    let next_combos : Array[Array[Token]] = []
+    for base in inner_combos {
+      for alt in item_alts[ci] {
+        if next_combos.length() >= 64 { break }
+        let row : Array[Token] = []
+        for bt in base { row.push(bt) }
+        if ci > 0 { row.push(comma_tok) }
+        for at in alt { row.push(at) }
+        next_combos.push(row)
+      }
+    }
+    inner_combos = next_combos
+    ci = ci + 1
+  }
+  let out : Array[Array[Token]] = []
+  for ic in inner_combos {
+    for sf in suffix_alts {
+      if out.length() >= 64 { break }
+      let full : Array[Token] = []
+      let mut pi = start
+      while pi < first_lp {
+        full.push(tokens[pi])
+        pi = pi + 1
+      }
+      full.push(tokens[first_lp])
+      for it in ic { full.push(it) }
+      full.push(tokens[rp])
+      for st in sf { full.push(st) }
+      out.push(full)
+    }
+  }
+  out
+}
+
 ///| Return true iff pattern tokens `[start, end)` contain any `Double` `FloatLit` (excludes Float32 `F`/`f`).
 fn pattern_has_float_lit(tokens : Array[Token], start : Int, end : Int) -> Bool {
   let mut k = start
@@ -15544,96 +15694,95 @@ fn lower_match_arms_with_ty(
       }
     }
 
-    // Special case B2d: nested float literal pattern (`Some((-2.0, _)) => ...`, `Some(Number(3.0, _)) => ...`,
-    // including or-patterns like `Some(-2.0) | Some(2.0) => ...`). Replaces each float literal (with optional
-    // unary `-`) by a fresh `__mbt_flt_N` binding and conjoins `__mbt_flt_N == <lit>` into the arm guard.
-    if !handled_special && pat_end > i && pattern_has_float_lit(tokens, i, pat_end) {
-      let flt_alts : Array[(Int, Int)] = []
-      let mut as_i = i
-      let mut adep = 0
-      let mut ak = i
-      while ak <= pat_end {
-        if ak == pat_end || (adep == 0 && tokens[ak].kind == TokenKind::Pipe) {
-          if ak > as_i {
-            flt_alts.push((as_i, ak))
-          }
-          as_i = ak + 1
-        } else {
-          let kk = tokens[ak].kind
-          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { adep = adep + 1 }
-          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if adep > 0 { adep = adep - 1 } }
-        }
-        ak = ak + 1
-      }
-      if flt_alts.length() > 0 {
-        let mut alt_idx = 0
-        while alt_idx < flt_alts.length() {
-          let (a0, a1) = flt_alts[alt_idx]
-          let arm_lead = if alt_idx == 0 { lead_triv } else { "\n    " }
-          let arm_sep = if alt_idx + 1 < flt_alts.length() { "," } else { trail_sep }
-          if !pattern_has_float_lit(tokens, a0, a1) {
-            let exp_a = expand_nested_or_pat(ctx, tokens, a0, a1, file)
-            if guard_str.length() == 0 && exp_a.length() == 1 && is_irrefutable_simple_pat(exp_a[0]) {
+    // Special case B2d: nested float literal pattern (`Some((-2.0, _)) => ...`, `Some((-2.0 | 2.0, x)) => ...`,
+    // `Some(-2.0) | Some(2.0) => ...`). Skips struct/array/range/rest patterns so B2b/B3/D/E handle them.
+    // Expands top-level & nested `|` BEFORE float substitution so every branch has its own bindings and guard.
+    if !handled_special && pat_end > i &&
+    pattern_has_float_lit(tokens, i, pat_end) &&
+    !pattern_has_b2d_disallowed_tok(tokens, i, pat_end) {
+      let flt_branches = expand_or_pat_tokens(tokens, i, pat_end)
+      if flt_branches.length() > 0 {
+        let mut br_idx = 0
+        while br_idx < flt_branches.length() {
+          let br = flt_branches[br_idx]
+          let arm_lead = if br_idx == 0 { lead_triv } else { "\n    " }
+          let arm_sep = if br_idx + 1 < flt_branches.length() { "," } else { trail_sep }
+          let br_len = br.length()
+          if !pattern_has_float_lit(br, 0, br_len) {
+            let br_with_eof : Array[Token] = []
+            for bt in br { br_with_eof.push(bt) }
+            let last_t = if br_len > 0 { br[br_len - 1] } else { tokens[i] }
+            br_with_eof.push(Token::{
+              kind: TokenKind::Eof,
+              raw: "",
+              leading_trivia: "",
+              newline_before: false,
+              line: last_t.line,
+              col: last_t.col,
+              start_byte: last_t.end_byte,
+              end_byte: last_t.end_byte,
+            })
+            let pat_s = lower_expr_range(ctx, br_with_eof, 0, br_len, file, true).trim()
+            if guard_str.length() == 0 && is_irrefutable_simple_pat(pat_s) {
               has_unguarded_catchall = true
             }
-            let pat_s = exp_a.join(" | ")
             let g_part = if guard_str.length() > 0 { " if " + guard_str } else { "" }
             let fa_triv = if guard_str.length() > 0 { guard_arrow_trivia(tokens[fa].leading_trivia) } else { tokens[fa].leading_trivia }
             sb.write_string(arm_lead + pat_s + g_part + fa_triv + "=>" + body_raw + arm_sep)
           } else {
             let rw_toks : Array[Token] = []
             let flt_conds : Array[String] = []
-            let mut k = a0
-            while k < a1 {
-              if k + 1 < a1 && tokens[k].kind == TokenKind::Minus && tokens[k + 1].kind == TokenKind::FloatLit &&
-              !tokens[k + 1].raw.ends_with("F") && !tokens[k + 1].raw.ends_with("f") {
+            let mut k = 0
+            while k < br_len {
+              if k + 1 < br_len && br[k].kind == TokenKind::Minus && br[k + 1].kind == TokenKind::FloatLit &&
+              !br[k + 1].raw.ends_with("F") && !br[k + 1].raw.ends_with("f") {
                 let flt_v = fresh_temp(ctx, "flt")
-                let lit_s = lower_expr_range(ctx, tokens, k, k + 2, file, false).trim()
+                let lit_s = lower_expr_range(ctx, br, k, k + 2, file, false).trim()
                 flt_conds.push(flt_v + " == " + lit_s)
                 rw_toks.push(Token::{
                   kind: TokenKind::Ident,
                   raw: flt_v,
-                  leading_trivia: tokens[k].leading_trivia,
-                  newline_before: tokens[k].newline_before,
-                  line: tokens[k].line,
-                  col: tokens[k].col,
-                  start_byte: tokens[k].start_byte,
-                  end_byte: tokens[k + 1].end_byte,
+                  leading_trivia: br[k].leading_trivia,
+                  newline_before: br[k].newline_before,
+                  line: br[k].line,
+                  col: br[k].col,
+                  start_byte: br[k].start_byte,
+                  end_byte: br[k + 1].end_byte,
                 })
                 k = k + 2
-              } else if tokens[k].kind == TokenKind::FloatLit &&
-              !tokens[k].raw.ends_with("F") && !tokens[k].raw.ends_with("f") {
+              } else if br[k].kind == TokenKind::FloatLit &&
+              !br[k].raw.ends_with("F") && !br[k].raw.ends_with("f") {
                 let flt_v = fresh_temp(ctx, "flt")
-                let lit_s = lower_expr_range(ctx, tokens, k, k + 1, file, false).trim()
+                let lit_s = lower_expr_range(ctx, br, k, k + 1, file, false).trim()
                 flt_conds.push(flt_v + " == " + lit_s)
                 rw_toks.push(Token::{
                   kind: TokenKind::Ident,
                   raw: flt_v,
-                  leading_trivia: tokens[k].leading_trivia,
-                  newline_before: tokens[k].newline_before,
-                  line: tokens[k].line,
-                  col: tokens[k].col,
-                  start_byte: tokens[k].start_byte,
-                  end_byte: tokens[k].end_byte,
+                  leading_trivia: br[k].leading_trivia,
+                  newline_before: br[k].newline_before,
+                  line: br[k].line,
+                  col: br[k].col,
+                  start_byte: br[k].start_byte,
+                  end_byte: br[k].end_byte,
                 })
                 k = k + 1
               } else {
-                rw_toks.push(tokens[k])
+                rw_toks.push(br[k])
                 k = k + 1
               }
             }
+            let last_t = if br_len > 0 { br[br_len - 1] } else { tokens[i] }
             rw_toks.push(Token::{
               kind: TokenKind::Eof,
               raw: "",
               leading_trivia: "",
               newline_before: false,
-              line: tokens[a1 - 1].line,
-              col: tokens[a1 - 1].col,
-              start_byte: tokens[a1 - 1].end_byte,
-              end_byte: tokens[a1 - 1].end_byte,
+              line: last_t.line,
+              col: last_t.col,
+              start_byte: last_t.end_byte,
+              end_byte: last_t.end_byte,
             })
-            let exp_a = expand_nested_or_pat(ctx, rw_toks, 0, rw_toks.length() - 1, file)
-            let pat_s = exp_a.join(" | ")
+            let pat_s = lower_expr_range(ctx, rw_toks, 0, rw_toks.length() - 1, file, true).trim()
             let flt_guard = flt_conds.join(" && ")
             let full_guard = if guard_str.length() > 0 {
               "(" + flt_guard + ") && (" + guard_str + ")"
@@ -15644,7 +15793,7 @@ fn lower_match_arms_with_ty(
             sb.write_string(arm_lead + pat_s + " if " + full_guard + fa_triv + "=>" + body_raw + arm_sep)
             had_guarded_struct_arm = true
           }
-          alt_idx = alt_idx + 1
+          br_idx = br_idx + 1
         }
         handled_special = true
       }
