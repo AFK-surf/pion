@@ -9304,11 +9304,7 @@ fn check_stmts_ex(
     match stmts[i] {
       SLet(name, is_mut, TyMissing(tsp), init, sp) =>
         if name != "_" {
-          let hint = if infer_empty_kind(init) != 0 {
-            infer_let_hint(env, stmts, i, name, expected, tail_used)
-          } else {
-            None
-          }
+          let hint = infer_let_hint(tc, env, stmts, i, name, expected, tail_used)
           last_ty = check_let(tc, env, name, is_mut, TyMissing(tsp), init, sp, hint)
           if tc.infer_pending.contains(span_key(sp)) {
             pending_keys.push(span_key(sp))
@@ -9798,11 +9794,376 @@ fn infer_kind_fits(kind : Int, t : Ty) -> Bool {
 }
 
 ///|
-/// Type an unannotated empty collection `let` takes from how it leaves its
-/// block: the block's tail expression is `name` (block type `expected`), or a
-/// later `return name` (the enclosing fn's return type). Pushes are handled
+fn infer_resolve_struct_canon(tc : TypeChecker, sname : String) -> String {
+  if sname == "" {
+    return ""
+  }
+  if tc_is_imported_pkg_alias(tc, sname) || !tc.structs.contains(sname) {
+    let qp = split_qual_name(sname)
+    if qp.prefix.length() > 0 {
+      if starts_with_str(qp.prefix, "@canon:") &&
+        slice_str(qp.prefix, 7, qp.prefix.length()) == tc.pkg_name {
+        if tc.structs.contains(qp.name) {
+          return qp.name
+        }
+      } else {
+        match resolve_pkg_for_lookup(tc, qp.prefix, true) {
+          Some(ipkg) => return ipkg.name + "::" + qp.name
+          None => ()
+        }
+      }
+    }
+  }
+  sname
+}
+
+///|
+fn infer_lookup_struct_info(
+  tc : TypeChecker,
+  canon_name : String,
+) -> Option[StructInfo] {
+  match tc.structs.get(canon_name) {
+    Some(si) => Some(si)
+    None => {
+      let qp = split_qual_name(canon_name)
+      if qp.prefix.length() > 0 {
+        let pkg_key = if starts_with_str(qp.prefix, "@canon:") {
+          slice_str(qp.prefix, 7, qp.prefix.length())
+        } else {
+          qp.prefix
+        }
+        match lookup_imported_pkg_transitive(tc, pkg_key) {
+          Some(ipkg) =>
+            match ipkg.tc.structs.get(qp.name) {
+              Some(si) => Some(qualify_imported_struct_info(ipkg.name, si))
+              None => None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+fn infer_pat_binds(pat : Pattern, name : String) -> Bool {
+  match pat {
+    PIdent(n, _) => n == name
+    PVariant(_, _, sub, _, _) | PTuple(sub, _) => {
+      let mut i = 0
+      while i < sub.length() {
+        if infer_pat_binds(sub[i], name) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn infer_cond_binds(cond : Expr, name : String) -> Bool {
+  match cond {
+    EIs(_, pat, _) => infer_pat_binds(pat, name)
+    EBinary("&&", l, r, _) => infer_cond_binds(l, name) || infer_cond_binds(r, name)
+    _ => false
+  }
+}
+
+///|
+/// Pure structural extraction of the expected type of binding `name` from a
+/// tail or `return` expression `e` given expected type `exp`.
+fn infer_expr_binding_hint(
+  tc : TypeChecker,
+  e : Expr,
+  name : String,
+  exp : Option[Ty],
+) -> Option[Ty] {
+  match e {
+    EIdent(n, _) =>
+      if n == name {
+        match exp {
+          Some(t) =>
+            if !ty_has_unresolved(t) && !ty_contains_never(t) {
+              Some(t)
+            } else {
+              None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    EStructLit(sname, _, fields, _) => {
+      let canon_sname = if sname == "" {
+        ""
+      } else {
+        infer_resolve_struct_canon(tc, sname)
+      }
+      let mut matched_exp = false
+      match exp {
+        Some(TStruct(en, eargs)) =>
+          if sname == "" || canon_sname == en {
+            matched_exp = true
+            match infer_lookup_struct_info(tc, en) {
+              Some(sinfo) =>
+                if eargs.length() == sinfo.decl.type_params.length() {
+                  let subst : Map[String, Ty] = Map([])
+                  let mut k = 0
+                  while k < eargs.length() {
+                    subst.set(sinfo.decl.type_params[k], eargs[k])
+                    k = k + 1
+                  }
+                  let mut fi = 0
+                  while fi < fields.length() {
+                    let fname = fields[fi].name
+                    let mut si_idx = 0
+                    while si_idx < sinfo.field_names.length() {
+                      if sinfo.field_names[si_idx] == fname {
+                        let raw_fty = sinfo.field_tys[si_idx]
+                        let fty = if subst.length() > 0 {
+                          subst_ty(raw_fty, subst)
+                        } else {
+                          raw_fty
+                        }
+                        match infer_expr_binding_hint(tc, fields[fi].value, name, Some(fty)) {
+                          Some(h) => return Some(h)
+                          None => ()
+                        }
+                        break
+                      }
+                      si_idx = si_idx + 1
+                    }
+                    fi = fi + 1
+                  }
+                }
+              None => ()
+            }
+          }
+        _ => ()
+      }
+      if !matched_exp && sname != "" {
+        match infer_lookup_struct_info(tc, canon_sname) {
+          Some(sinfo) =>
+            if sinfo.decl.type_params.length() == 0 {
+              let mut fi = 0
+              while fi < fields.length() {
+                let fname = fields[fi].name
+                let mut si_idx = 0
+                while si_idx < sinfo.field_names.length() {
+                  if sinfo.field_names[si_idx] == fname {
+                    match infer_expr_binding_hint(tc, fields[fi].value, name, Some(sinfo.field_tys[si_idx])) {
+                      Some(h) => return Some(h)
+                      None => ()
+                    }
+                    break
+                  }
+                  si_idx = si_idx + 1
+                }
+                fi = fi + 1
+              }
+            }
+          None => ()
+        }
+      }
+      None
+    }
+    ETuple(elems, _) =>
+      match exp {
+        Some(TTuple(ets)) =>
+          if elems.length() == ets.length() {
+            let mut i = 0
+            while i < elems.length() {
+              match infer_expr_binding_hint(tc, elems[i], name, Some(ets[i])) {
+                Some(h) => return Some(h)
+                None => ()
+              }
+              i = i + 1
+            }
+            None
+          } else {
+            None
+          }
+        _ => None
+      }
+    ECall(EIdent(cname, _), args, _) | EDotVariant(cname, args, _) =>
+      if args.length() == 1 {
+        if cname == "Some" {
+          match exp {
+            Some(TOption(inner)) => infer_expr_binding_hint(tc, args[0], name, Some(inner))
+            _ => None
+          }
+        } else if cname == "Ok" {
+          match exp {
+            Some(TResult(ok_t, _)) => infer_expr_binding_hint(tc, args[0], name, Some(ok_t))
+            _ => None
+          }
+        } else if cname == "Err" {
+          match exp {
+            Some(TResult(_, err_t)) => infer_expr_binding_hint(tc, args[0], name, Some(err_t))
+            _ => None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    ECall(EPath(qname, cname, _), args, _) =>
+      if args.length() == 1 {
+        if qname == "Option" && cname == "Some" {
+          match exp {
+            Some(TOption(inner)) => infer_expr_binding_hint(tc, args[0], name, Some(inner))
+            _ => None
+          }
+        } else if qname == "Result" && cname == "Ok" {
+          match exp {
+            Some(TResult(ok_t, _)) => infer_expr_binding_hint(tc, args[0], name, Some(ok_t))
+            _ => None
+          }
+        } else if qname == "Result" && cname == "Err" {
+          match exp {
+            Some(TResult(_, err_t)) => infer_expr_binding_hint(tc, args[0], name, Some(err_t))
+            _ => None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    EBlock(bstmts, _) =>
+      if bstmts.length() > 0 && !infer_stmts_shadow(bstmts, 0, bstmts.length() - 1, name) {
+        match bstmts[bstmts.length() - 1] {
+          SExpr(te, _) => infer_expr_binding_hint(tc, te, name, exp)
+          _ => None
+        }
+      } else {
+        None
+      }
+    EIf(cond, then_s, else_e, _) => {
+      if !infer_cond_binds(cond, name) &&
+        then_s.length() > 0 &&
+        !infer_stmts_shadow(then_s, 0, then_s.length() - 1, name) {
+        match then_s[then_s.length() - 1] {
+          SExpr(te, _) =>
+            match infer_expr_binding_hint(tc, te, name, exp) {
+              Some(h) => return Some(h)
+              None => ()
+            }
+          _ => ()
+        }
+      }
+      match else_e {
+        Some(el) => infer_expr_binding_hint(tc, el, name, exp)
+        None => None
+      }
+    }
+    EMatch(_, arms, _) => {
+      let mut ai = 0
+      while ai < arms.length() {
+        let guard_binds = match arms[ai].guard_expr {
+          Some(ge) => infer_cond_binds(ge, name)
+          None => false
+        }
+        if !infer_pat_binds(arms[ai].pat, name) && !guard_binds {
+          match infer_expr_binding_hint(tc, arms[ai].body, name, exp) {
+            Some(h) => return Some(h)
+            None => ()
+          }
+        }
+        ai = ai + 1
+      }
+      None
+    }
+    _ => None
+  }
+}
+
+///|
+/// Safety guard for non-empty (`kind == 0`) `let` bindings: only pass a
+/// forward hint when `t` is a generic/container type and `init` structurally
+/// matches (never coerce scalars across `let`, and never mask a struct type
+/// mismatch).
+fn infer_init_accepts_hint(tc : TypeChecker, init : Expr, t : Ty) -> Bool {
+  let is_generic_or_container = match t {
+    TStruct(_, args) | TEnum(_, args) => args.length() > 0
+    TOption(_) | TResult(_, _) | TArray(_) | TFixedArray(_) | TImmArray(_) | TMap(_, _) =>
+      true
+    _ => false
+  }
+  if !is_generic_or_container || ty_has_unresolved(t) || ty_contains_never(t) {
+    return false
+  }
+  match init {
+    EBlock(stmts, _) =>
+      if stmts.length() > 0 {
+        match stmts[stmts.length() - 1] {
+          SExpr(tail, _) => infer_init_accepts_hint(tc, tail, t)
+          _ => false
+        }
+      } else {
+        false
+      }
+    EIf(_, then_s, else_e, _) => {
+      let then_ok = if then_s.length() > 0 {
+        match then_s[then_s.length() - 1] {
+          SExpr(te, _) => infer_init_accepts_hint(tc, te, t)
+          _ => false
+        }
+      } else {
+        false
+      }
+      if then_ok {
+        true
+      } else {
+        match else_e {
+          Some(el) => infer_init_accepts_hint(tc, el, t)
+          None => false
+        }
+      }
+    }
+    EMatch(_, arms, _) => {
+      let mut ai = 0
+      while ai < arms.length() {
+        if infer_init_accepts_hint(tc, arms[ai].body, t) {
+          return true
+        }
+        ai = ai + 1
+      }
+      false
+    }
+    EStructLit(sname, _, _, _) =>
+      match t {
+        TStruct(en, _) => sname == "" || infer_resolve_struct_canon(tc, sname) == en
+        _ => false
+      }
+    ECall(_, _, _) | EMethodCall(_, _, _, _) | EDotVariant(_, _, _) | EArrayLit(_, _) | ETuple(_, _) =>
+      true
+    _ => false
+  }
+}
+
+///|
+fn infer_hint_fits(tc : TypeChecker, kind : Int, init : Expr, t : Ty) -> Bool {
+  if kind != 0 {
+    infer_kind_fits(kind, t)
+  } else {
+    infer_init_accepts_hint(tc, init, t)
+  }
+}
+
+///|
+/// Type an unannotated `let` takes from how it leaves its block: the block's
+/// tail expression (or a struct/tuple/`Some`/`Ok`/`Err` wrapper in it) or a
+/// later `return` expression. Empty collections without a hint are handled
 /// later by refinement on the first `push` / `set`.
 fn infer_let_hint(
+  tc : TypeChecker,
   env : Env,
   stmts : Array[Stmt],
   idx : Int,
@@ -9810,28 +10171,27 @@ fn infer_let_hint(
   expected : Option[Ty],
   tail_used : Bool,
 ) -> Option[Ty] {
-  let kind = infer_empty_kind(
-    match stmts[idx] {
-      SLet(_, _, _, init, _) => init
-      _ => EUnit(span_empty())
-    },
-  )
+  let init = match stmts[idx] {
+    SLet(_, _, _, init_e, _) => init_e
+    _ => EUnit(span_empty())
+  }
+  let kind = infer_empty_kind(init)
   let last = stmts.length() - 1
   if tail_used && last > idx && !infer_stmts_shadow(stmts, idx + 1, last, name) {
     match stmts[last] {
-      SExpr(EIdent(n, _), _) =>
-        if n == name {
-          match expected {
-            Some(t) => if infer_kind_fits(kind, t) { return Some(t) }
-            None => ()
-          }
+      SExpr(te, _) =>
+        match infer_expr_binding_hint(tc, te, name, expected) {
+          Some(t) => if infer_hint_fits(tc, kind, init, t) { return Some(t) }
+          None => ()
         }
       _ => ()
     }
   }
-  if infer_kind_fits(kind, env.ret_ty) &&
-    infer_stmts_return(stmts, idx + 1, name) {
-    return Some(env.ret_ty)
+  if !ty_has_unresolved(env.ret_ty) && !ty_contains_never(env.ret_ty) {
+    match infer_stmts_return_hint(tc, stmts, idx + 1, name, env.ret_ty) {
+      Some(t) => if infer_hint_fits(tc, kind, init, t) { return Some(t) }
+      None => ()
+    }
   }
   None
 }
@@ -9859,79 +10219,167 @@ fn infer_stmt_binds(st : Stmt, name : String) -> Bool {
   match st {
     SLet(n, _, _, _, _) => n == name
     SLetTuple(ns, _, _, _) => str_arr_contains(ns, name)
+    SGuard(cond, _, _) => infer_cond_binds(cond, name)
     _ => false
   }
 }
 
 ///|
-/// Whether `stmts[from..]` contains `return name` for this binding (descending
-/// into nested blocks, branches and loops, not closures; stops at a rebinding).
-fn infer_stmts_return(stmts : Array[Stmt], from : Int, name : String) -> Bool {
+/// Search `stmts[from..]` for a `return` expression that determines the
+/// expected type of `name` (descending into nested blocks, branches and loops,
+/// not closures; stops at a rebinding).
+fn infer_stmts_return_hint(
+  tc : TypeChecker,
+  stmts : Array[Stmt],
+  from : Int,
+  name : String,
+  ret_ty : Ty,
+) -> Option[Ty] {
   let mut i = from
   while i < stmts.length() {
     let st = stmts[i]
     match st {
-      SReturn(Some(EIdent(n, _)), _) => if n == name { return true }
+      SReturn(Some(re), _) =>
+        match infer_expr_binding_hint(tc, re, name, Some(ret_ty)) {
+          Some(h) => return Some(h)
+          None => ()
+        }
       SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) =>
-        if infer_expr_return(init, name) {
-          return true
+        match infer_expr_return_hint(tc, init, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
         }
       SAssign(_, rhs, _) | SCompoundAssign(_, _, rhs, _) =>
-        if infer_expr_return(rhs, name) {
-          return true
+        match infer_expr_return_hint(tc, rhs, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
         }
-      SGuard(c, body, _) | SWhile(c, body, _) =>
-        if infer_expr_return(c, name) || infer_stmts_return(body, 0, name) {
-          return true
+      SGuard(c, body, _) => {
+        match infer_expr_return_hint(tc, c, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
         }
-      SFor(_, c, _, body, _) =>
-        if infer_expr_return(c, name) || infer_stmts_return(body, 0, name) {
-          return true
+        match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
         }
+      }
+      SWhile(c, body, _) => {
+        match infer_expr_return_hint(tc, c, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
+        }
+        if !infer_cond_binds(c, name) {
+          match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
+        }
+      }
+      SFor(init_s, c, step_s, body, _) => {
+        match infer_stmts_return_hint(tc, [init_s], 0, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
+        }
+        if !infer_stmt_binds(init_s, name) {
+          match infer_expr_return_hint(tc, c, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
+          match infer_stmts_return_hint(tc, [step_s], 0, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
+          match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
+        }
+      }
       SForRange(v, _, _, _, body, _) =>
-        if v != name && infer_stmts_return(body, 0, name) {
-          return true
+        if v != name {
+          match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
         }
       SForIn(k, v, _, body, _) =>
-        if k != name && v != name && infer_stmts_return(body, 0, name) {
-          return true
+        if k != name && v != name {
+          match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+            Some(h) => return Some(h)
+            None => ()
+          }
         }
-      SExpr(e, _) => if infer_expr_return(e, name) { return true }
+      SExpr(e, _) =>
+        match infer_expr_return_hint(tc, e, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
+        }
       _ => ()
     }
     if infer_stmt_binds(st, name) {
-      return false
+      return None
     }
     i = i + 1
   }
-  false
+  None
 }
 
 ///|
-fn infer_expr_return(e : Expr, name : String) -> Bool {
+fn infer_expr_return_hint(
+  tc : TypeChecker,
+  e : Expr,
+  name : String,
+  ret_ty : Ty,
+) -> Option[Ty] {
   match e {
-    EBlock(stmts, _) => infer_stmts_return(stmts, 0, name)
-    EIf(c, then_s, else_e, _) =>
-      infer_expr_return(c, name) ||
-      infer_stmts_return(then_s, 0, name) ||
-      (match else_e {
-        Some(el) => infer_expr_return(el, name)
-        None => false
-      })
+    EBlock(stmts, _) => infer_stmts_return_hint(tc, stmts, 0, name, ret_ty)
+    EIf(c, then_s, else_e, _) => {
+      match infer_expr_return_hint(tc, c, name, ret_ty) {
+        Some(h) => return Some(h)
+        None => ()
+      }
+      if !infer_cond_binds(c, name) {
+        match infer_stmts_return_hint(tc, then_s, 0, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
+        }
+      }
+      match else_e {
+        Some(el) => infer_expr_return_hint(tc, el, name, ret_ty)
+        None => None
+      }
+    }
     EMatch(scrut, arms, _) => {
-      if infer_expr_return(scrut, name) {
-        return true
+      match infer_expr_return_hint(tc, scrut, name, ret_ty) {
+        Some(h) => return Some(h)
+        None => ()
       }
       let mut ai = 0
       while ai < arms.length() {
-        if infer_expr_return(arms[ai].body, name) {
-          return true
+        if !infer_pat_binds(arms[ai].pat, name) {
+          let guard_binds = match arms[ai].guard_expr {
+            Some(ge) => {
+              match infer_expr_return_hint(tc, ge, name, ret_ty) {
+                Some(h) => return Some(h)
+                None => ()
+              }
+              infer_cond_binds(ge, name)
+            }
+            None => false
+          }
+          if !guard_binds {
+            match infer_expr_return_hint(tc, arms[ai].body, name, ret_ty) {
+              Some(h) => return Some(h)
+              None => ()
+            }
+          }
         }
         ai = ai + 1
       }
-      false
+      None
     }
-    _ => false
+    _ => None
   }
 }
 
@@ -10008,7 +10456,12 @@ fn infer_refine_call(
   }
   tc.infer_hit.clear()
   let new_ty = match recv_ty {
-    TArray(_) => if method_name == "push" && hit.length() == 1 { TArray(hit[0]) } else { TError }
+    TArray(_) =>
+      if (method_name == "push" || method_name == "contains") && hit.length() == 1 {
+        TArray(hit[0])
+      } else {
+        TError
+      }
     TMap(_, _) =>
       if method_name == "set" && hit.length() == 2 {
         record_map_key_tparams(tc, env.fn_key, hit[0])
@@ -10067,6 +10520,64 @@ fn infer_refine_binding(tc : TypeChecker, env : Env, name : String, new_ty : Ty)
     }
     i = i - 1
   }
+}
+
+///|
+fn infer_opt_pending(tc : TypeChecker, env : Env, name : String) -> Bool {
+  match env_lookup(env, name) {
+    Some(b) =>
+      match b.ty {
+        TOption(_) =>
+          b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span))
+        _ => false
+      }
+    None => false
+  }
+}
+
+///|
+/// Pure `Option` tag check pattern that binds neither payload nor whole value
+/// (`_`, `None`, `Option::None`, `Some(_)`, `Option::Some(_)`).
+fn pat_is_pending_opt_tag_check(pat : Pattern) -> Bool {
+  match pat {
+    PWild(_) => true
+    PVariant(en, vn, subs, _, _) =>
+      if en == "" || en == "Option" {
+        if vn == "None" && subs.length() == 0 {
+          true
+        } else if vn == "Some" && subs.length() == 1 {
+          match subs[0] {
+            PWild(_) => true
+            _ => false
+          }
+        } else {
+          false
+        }
+      } else {
+        false
+      }
+    _ => false
+  }
+}
+
+///|
+fn check_is_scrut(
+  tc : TypeChecker,
+  env : Env,
+  scrut : Expr,
+  pat : Pattern,
+) -> Ty {
+  let saved_allow = tc.allow_pending_ident_span
+  match scrut {
+    EIdent(oname, osp) =>
+      if infer_opt_pending(tc, env, oname) && pat_is_pending_opt_tag_check(pat) {
+        tc.allow_pending_ident_span = span_key(osp)
+      }
+    _ => ()
+  }
+  let sty = check_expr(tc, env, scrut, None)
+  tc.allow_pending_ident_span = saved_allow
+  sty
 }
 
 ///|
@@ -10493,7 +11004,7 @@ fn check_cond_with_bindings(
           continue
         }
         EIs(scrut, pat, isp) => {
-          let sty = check_expr(tc, env, scrut, None)
+          let sty = check_is_scrut(tc, env, scrut, pat)
           bind_pattern(tc, env, pat, sty)
           if tc.record_types {
             qt_record_expr(tc, env, isp, "EIs", TBool, false, TError)
@@ -10611,6 +11122,14 @@ fn check_let(
         } else if !init_had_err && ty_is_pending_generic(final_ty) {
           tc.infer_pending.set(span_key(sp), true)
           tc.infer_pending_inits.set(span_key(sp), init)
+        } else {
+          match hint {
+            Some(_) =>
+              if !init_had_err && !ty_has_unresolved(final_ty) {
+                tc.let_infer.set(span_key(sp), final_ty)
+              }
+            None => ()
+          }
         }
       }
     Some(_) => ()
@@ -11352,18 +11871,180 @@ fn check_stmt(
           }
         }
         EField(obj, fname, lsp) => {
-          let lty = check_field_assign_target(tc, env, obj, fname, lsp)
-          let rty = check_expr(tc, env, rhs, Some(lty))
-          if !ty_compat(lty, rty) {
-            tc_err(
-              tc,
-              sp,
-              "E_TYPE_MISMATCH",
-              "type mismatch in assignment",
-              ty_to_string(lty),
-              ty_to_string(rty),
-              "assign a value of type `" + ty_to_string(lty) + "`",
-            )
+          let mut handled_pending = false
+          match obj {
+            EIdent(sname, osp) =>
+              match env_lookup(env, sname) {
+                Some(b) =>
+                  if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
+                    match b.ty {
+                      TStruct(st_name, cur_args) =>
+                        match tc_lookup_struct_info(tc, st_name) {
+                          Some(sinfo) => {
+                            handled_pending = true
+                            let mut fi = 0
+                            let mut found_fi = -1
+                            while fi < sinfo.field_names.length() {
+                              if sinfo.field_names[fi] == fname {
+                                found_fi = fi
+                                break
+                              }
+                              fi = fi + 1
+                            }
+                            if found_fi < 0 {
+                              tc_err(
+                                tc,
+                                lsp,
+                                "E_TYPE_MISMATCH",
+                                "struct `" + st_name + "` has no field `" + fname + "`",
+                                "valid field of `" + st_name + "`",
+                                fname,
+                                "check field name on `" + st_name + "`",
+                              )
+                              let _ = check_expr(tc, env, rhs, None)
+                            } else {
+                              tc.resolved_method_calls.set("fw:" + span_key(lsp), st_name)
+                              if has_qual_sep(st_name) &&
+                                !env.in_default_arg &&
+                                found_fi < sinfo.field_privs.length() &&
+                                sinfo.field_privs[found_fi] {
+                                tc_err(
+                                  tc,
+                                  lsp,
+                                  "E_PRIVATE_FIELD",
+                                  "cannot access private field `" +
+                                  fname +
+                                  "` of `" +
+                                  st_name +
+                                  "` outside its defining package",
+                                  "public field",
+                                  "private field `" + fname + "`",
+                                  "use a public method on `" + st_name + "` instead",
+                                )
+                              } else if !sinfo.field_muts[found_fi] {
+                                tc_err(
+                                  tc,
+                                  lsp,
+                                  "E_TYPE_MISMATCH",
+                                  "cannot assign to immutable field `" +
+                                  fname +
+                                  "` of struct `" +
+                                  st_name +
+                                  "`",
+                                  "`mut` field",
+                                  "immutable field `" + fname + "`",
+                                  "declare the field as `mut " + fname + " : ...`",
+                                )
+                              }
+                              let cur_subst = make_subst(sinfo.decl.type_params, cur_args)
+                              let cur_fty = subst_ty(sinfo.field_tys[found_fi], cur_subst)
+                              let rhs_exp : Option[Ty] = if !ty_has_unresolved(cur_fty) {
+                                Some(cur_fty)
+                              } else {
+                                None
+                              }
+                              let a_err_mark = tc.diagnostics.length()
+                              let rty = check_expr(tc, env, rhs, rhs_exp)
+                              let subst : Map[String, Ty] = Map([])
+                              let tp_tys : Array[Ty] = []
+                              let mut k = 0
+                              while k < sinfo.decl.type_params.length() {
+                                tp_tys.push(TParam(sinfo.decl.type_params[k]))
+                                k = k + 1
+                              }
+                              unify_tparams(TStruct(st_name, tp_tys), b.ty, subst)
+                              unify_tparams(sinfo.field_tys[found_fi], rty, subst)
+                              let cand_args : Array[Ty] = []
+                              k = 0
+                              while k < sinfo.decl.type_params.length() {
+                                match subst.get(sinfo.decl.type_params[k]) {
+                                  Some(t) => cand_args.push(t)
+                                  None => cand_args.push(TError)
+                                }
+                                k = k + 1
+                              }
+                              let cand_ty = TStruct(st_name, cand_args)
+                              if !ty_has_unresolved(cand_ty) &&
+                                !ty_contains_never(cand_ty) &&
+                                ty_compat(b.ty, cand_ty) {
+                                infer_refine_binding(tc, env, sname, cand_ty)
+                                let inst_fty = subst_ty(sinfo.field_tys[found_fi], subst)
+                                if tc.record_types {
+                                  qt_record_expr(tc, env, osp, "EIdent", cand_ty, false, TError)
+                                  qt_record_expr(tc, env, lsp, "EField", inst_fty, false, TError)
+                                }
+                                if !ty_compat(inst_fty, rty) {
+                                  tc_err(
+                                    tc,
+                                    sp,
+                                    "E_TYPE_MISMATCH",
+                                    "type mismatch in assignment",
+                                    ty_to_string(inst_fty),
+                                    ty_to_string(rty),
+                                    "assign a value of type `" + ty_to_string(inst_fty) + "`",
+                                  )
+                                }
+                              } else {
+                                let dk = span_key(b.decl_span)
+                                tc.infer_pending.remove(dk)
+                                match tc.infer_pending_inits.get(dk) {
+                                  Some(init_expr) => {
+                                    tc.infer_pending_inits.remove(dk)
+                                    tc_mark_gcall_err(tc, init_expr)
+                                  }
+                                  None => ()
+                                }
+                                if !ty_has_unresolved(cur_fty) && !ty_compat(cur_fty, rty) {
+                                  tc_err(
+                                    tc,
+                                    sp,
+                                    "E_TYPE_MISMATCH",
+                                    "type mismatch in assignment",
+                                    ty_to_string(cur_fty),
+                                    ty_to_string(rty),
+                                    "assign a value of type `" + ty_to_string(cur_fty) + "`",
+                                  )
+                                } else if tc.diagnostics.length() == a_err_mark {
+                                  tc_err(
+                                    tc,
+                                    lsp,
+                                    "E_MISSING_TYPE",
+                                    "cannot infer type arguments of `" +
+                                    sname +
+                                    "` from unresolved field assignment",
+                                    "concrete field value",
+                                    ty_to_string(rty),
+                                    "add an explicit type annotation to `let " +
+                                    sname +
+                                    "` or assign a concrete value first",
+                                  )
+                                }
+                              }
+                            }
+                          }
+                          None => ()
+                        }
+                      _ => ()
+                    }
+                  }
+                None => ()
+              }
+            _ => ()
+          }
+          if !handled_pending {
+            let lty = check_field_assign_target(tc, env, obj, fname, lsp)
+            let rty = check_expr(tc, env, rhs, Some(lty))
+            if !ty_compat(lty, rty) {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "type mismatch in assignment",
+                ty_to_string(lty),
+                ty_to_string(rty),
+                "assign a value of type `" + ty_to_string(lty) + "`",
+              )
+            }
           }
         }
         EIndex(obj, idx, lsp) => {
@@ -13428,7 +14109,7 @@ fn qt_record_builtin_method_sig(
       } else if method_name == "truncate" {
         targs = [elem]
         Some([TInt])
-      } else if method_name == "push" {
+      } else if method_name == "push" || method_name == "contains" {
         let pe = if ty_has_unresolved(elem) && tc.infer_hit.length() >= 1 {
           tc.infer_hit[0]
         } else {
@@ -13436,9 +14117,6 @@ fn qt_record_builtin_method_sig(
         }
         targs = [pe]
         Some([pe])
-      } else if method_name == "contains" {
-        targs = [elem]
-        Some([elem])
       } else if method_name == "swap" {
         targs = [elem]
         Some([TInt, TInt])
@@ -19469,21 +20147,24 @@ fn check_method_call(
         return TImmArray(elem)
       }
       if method_name == "contains" {
-        let tps : Array[String] = []
-        collect_eq_tparams_in_ty(tc, elem, tps, Map([]))
-        let mut cti = 0
-        while cti < tps.length() {
-          if env.fn_key != "" && str_arr_contains(env.type_params, tps[cti]) {
-            let _ = eq_tparams_add(tc, env.fn_key, tps[cti])
-            if env.in_verify {
-              let _ = verify_eq_tparams_add(tc, env.fn_key, tps[cti])
+        if !ty_has_unresolved(elem) {
+          let tps : Array[String] = []
+          collect_eq_tparams_in_ty(tc, elem, tps, Map([]))
+          let mut cti = 0
+          while cti < tps.length() {
+            if env.fn_key != "" && str_arr_contains(env.type_params, tps[cti]) {
+              let _ = eq_tparams_add(tc, env.fn_key, tps[cti])
+              if env.in_verify {
+                let _ = verify_eq_tparams_add(tc, env.fn_key, tps[cti])
+              }
             }
+            cti = cti + 1
           }
-          cti = cti + 1
+          let _ = record_eq_trait_obligations(tc, env.fn_key, elem)
         }
-        let _ = record_eq_trait_obligations(tc, env.fn_key, elem)
         if args.length() >= 1 {
-          let aty = check_expr(tc, env, args[0], Some(elem))
+          let arg_exp : Option[Ty] = if ty_has_unresolved(elem) { None } else { Some(elem) }
+          let aty = check_expr(tc, env, args[0], arg_exp)
           if !ty_compat(elem, aty) {
             tc_err(
               tc,
@@ -19494,6 +20175,25 @@ fn check_method_call(
               ty_to_string(aty),
               "pass a value of type `" + ty_to_string(elem) + "`",
             )
+          }
+          if ty_has_unresolved(elem) &&
+            !ty_has_unresolved(aty) &&
+            !ty_contains_never(aty) {
+            let tps : Array[String] = []
+            collect_eq_tparams_in_ty(tc, aty, tps, Map([]))
+            let mut cti = 0
+            while cti < tps.length() {
+              if env.fn_key != "" && str_arr_contains(env.type_params, tps[cti]) {
+                let _ = eq_tparams_add(tc, env.fn_key, tps[cti])
+                if env.in_verify {
+                  let _ = verify_eq_tparams_add(tc, env.fn_key, tps[cti])
+                }
+              }
+              cti = cti + 1
+            }
+            let _ = record_eq_trait_obligations(tc, env.fn_key, aty)
+            tc.infer_hit.clear()
+            tc.infer_hit.push(aty)
           }
         }
         return TBool
@@ -20958,7 +21658,7 @@ fn check_binary_chain(
           let lhs_needs_rhs = ((op == "==" || op == "!=") && expr_needs_rhs_ty_hint(lhs)) ||
             (is_arith_or_bit &&
               (match lhs_exp {
-                Some(_) => false
+                Some(t) => ty_has_unresolved(t)
                 None => true
               }) &&
               expr_is_pending_arr_index(tc, env, lhs))
@@ -24883,7 +25583,23 @@ fn check_expr_inner(
       match else_opt {
         None => TUnit
         Some(el) => {
-          let else_ty = check_expr(tc, env, el, expected)
+          let else_exp = match expected {
+            None =>
+              if !ty_has_unresolved(then_ty) && !ty_contains_never(then_ty) {
+                Some(then_ty)
+              } else {
+                None
+              }
+            Some(et) =>
+              if ty_has_unresolved(et) &&
+                !ty_has_unresolved(then_ty) &&
+                !ty_contains_never(then_ty) {
+                Some(then_ty)
+              } else {
+                expected
+              }
+          }
+          let else_ty = check_expr(tc, env, el, else_exp)
           let branch_ok = match then_ty {
             TNever => true
             _ => ty_compat(then_ty, else_ty)
@@ -24904,14 +25620,34 @@ fn check_expr_inner(
       }
     }
     EIs(scrut, pat, _) => {
-      let sty = check_expr(tc, env, scrut, None)
+      let sty = check_is_scrut(tc, env, scrut, pat)
       env_push(env)
       bind_pattern(tc, env, pat, sty)
       env_pop(env)
       TBool
     }
     EMatch(scrut, arms, sp) => {
+      let saved_allow = tc.allow_pending_ident_span
+      match scrut {
+        EIdent(oname, osp) =>
+          if infer_opt_pending(tc, env, oname) && arms.length() > 0 {
+            let mut all_tag = true
+            let mut ai = 0
+            while ai < arms.length() {
+              if !pat_is_pending_opt_tag_check(arms[ai].pat) {
+                all_tag = false
+                break
+              }
+              ai = ai + 1
+            }
+            if all_tag {
+              tc.allow_pending_ident_span = span_key(osp)
+            }
+          }
+        _ => ()
+      }
       let scrut_ty = check_expr(tc, env, scrut, None)
+      tc.allow_pending_ident_span = saved_allow
       let mut res_ty : Option[Ty] = expected
       let mut i = 0
       while i < arms.length() {
@@ -24973,8 +25709,16 @@ fn check_expr_inner(
                 ty_to_string(bty),
                 "return `" + ty_to_string(rt) + "` from every arm",
               )
+            } else if ty_has_unresolved(rt) &&
+              !ty_has_unresolved(bty) &&
+              !ty_contains_never(bty) {
+              res_ty = Some(bty)
+            } else {
+              match bty {
+                TNever => ()
+                _ => res_ty = Some(ty_prefer_concrete(rt, bty))
+              }
             }
-            res_ty = Some(ty_prefer_concrete(rt, bty))
           }
         }
         i = i + 1
