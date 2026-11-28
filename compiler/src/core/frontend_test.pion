@@ -17493,3 +17493,208 @@ test "deferred infer: gcall pending arg, non-indexable struct, closure param ref
   )
 }
 
+
+///|
+test "closure param refine: direct call args and expected result fill TError holes" {
+  let prelude =
+  #|enum Exit[X] { Succeeded(X), Cancelled }
+  #|struct Fiber[X] { item : Option[X] }
+  #|fn Fiber::interrupt[X](self : Fiber[X]) -> Unit { let _ = self.item }
+  #|struct Rt { id : Int }
+  #|fn Rt::fork[X](self : Rt, f : ((Exit[X]) -> Unit) -> Unit) -> Fiber[X] {
+  #|  let _ = self.id
+  #|  f(fn(_e) { () })
+  #|  Fiber::{ item: None }
+  #|}
+  #|fn next_frame_k(cb : (Exit[Unit]) -> Unit) -> Unit { cb(Exit::Succeeded(())) }
+  #|fn work() -> Unit { () }
+  #|
+
+  // Direct call in the closure body refines `k : (Exit[Unit]) -> Unit`.
+  let direct_ok =
+  #|pub fn run_direct(rt : Rt) -> () -> Unit {
+  #|  let f = rt.fork(fn(k) { k(Exit::Succeeded(())) })
+  #|  fn() { f.interrupt() }
+  #|}
+  let cr_direct = check_source_files("cpr_direct", ["cpr_direct.pion"], [
+    prelude + direct_ok,
+  ])
+  assert_true(cr_direct.diagnostics.length() == 0, check_result_to_json(cr_direct.diagnostics))
+
+  // Direct call from inside a nested CPS closure refines the outer `k`.
+  let nested_ok =
+  #|pub fn run_nested(rt : Rt) -> Unit {
+  #|  let f = rt.fork(fn(k) {
+  #|    next_frame_k(fn(ex) {
+  #|      match ex {
+  #|        Exit::Succeeded(_) => { work(); k(Exit::Succeeded(())) }
+  #|        _ => k(ex)
+  #|      }
+  #|    })
+  #|  })
+  #|  f.interrupt()
+  #|}
+  let cr_nested = check_source_files("cpr_nested", ["cpr_nested.pion"], [
+    prelude + nested_ok,
+  ])
+  assert_true(cr_nested.diagnostics.length() == 0, check_result_to_json(cr_nested.diagnostics))
+
+  // The expected result type of a direct call refines the closure param's return type.
+  let ret_ok =
+  #|struct Box[T] { v : Option[T] }
+  #|fn Box::size[T](self : Box[T]) -> Int { match self.v { Some(_) => 1, None => 0 } }
+  #|fn with_cb[T](f : (() -> T) -> Unit) -> Box[T] { let _ = f; Box::{ v: None } }
+  #|pub fn run_ret() -> Int {
+  #|  let b = with_cb(fn(g) { let x : Int = g(); let _ = x })
+  #|  b.size()
+  #|}
+  let cr_ret = check_source_files("cpr_ret", ["cpr_ret.pion"], [ret_ok])
+  assert_true(cr_ret.diagnostics.length() == 0, check_result_to_json(cr_ret.diagnostics))
+
+  // A conflicting second call sees the refined type and is rejected.
+  let conflict_bad =
+  #|pub fn run_conflict(rt : Rt) -> Unit {
+  #|  let f = rt.fork(fn(k) { k(Exit::Succeeded(1)); k(Exit::Succeeded("s")) })
+  #|  f.interrupt()
+  #|}
+  let cr_conflict = check_source_files("cpr_conflict", ["cpr_conflict.pion"], [
+    prelude + conflict_bad,
+  ])
+  assert_true(
+    cr_conflict.diagnostics.length() >= 1 &&
+    cr_conflict.diagnostics[0].code == "E_TYPE_MISMATCH",
+    "expected E_TYPE_MISMATCH for conflicting direct calls, got: " +
+    check_result_to_json(cr_conflict.diagnostics),
+  )
+
+  // Calls that leave the hole unconstrained stay fail-closed.
+  let unconstrained = [
+    "pub fn run_bad(rt : Rt) -> Unit {\n  let f = rt.fork(fn(k) { k(Exit::Cancelled) })\n  f.interrupt()\n}\n",
+    "pub fn run_bad(rt : Rt) -> Unit {\n  let f = rt.fork(fn(_k) { () })\n  f.interrupt()\n}\n",
+    "pub fn run_bad(rt : Rt) -> Unit {\n  let f = rt.fork(fn(k) {\n    let k = fn(_e : Exit[Int]) { () }\n    k(Exit::Succeeded(1))\n  })\n  f.interrupt()\n}\n",
+    "pub fn run_bad(rt : Rt) -> Unit {\n  let f = rt.fork(fn(k) { k(abort(\"\")) })\n  f.interrupt()\n}\n",
+  ]
+  let mut ui = 0
+  while ui < unconstrained.length() {
+    let cr_bad = check_source_files("cpr_bad", ["cpr_bad.pion"], [
+      prelude + unconstrained[ui],
+    ])
+    assert_true(
+      cr_bad.diagnostics.length() >= 1 &&
+      cr_bad.diagnostics[0].code == "E_MISSING_TYPE",
+      "expected E_MISSING_TYPE for unconstrained case " +
+      ui.to_string() +
+      ", got: " +
+      check_result_to_json(cr_bad.diagnostics),
+    )
+    ui = ui + 1
+  }
+
+  // Re-entrant calls: an argument that itself calls (and refines) the same
+  // parameter must never have its refinement erased or bypassed.
+  let reent_prelude =
+  #|enum Exit[X] { Succeeded(X), Cancelled }
+  #|struct Pair[X, Y] { a : Option[X], b : Option[Y] }
+  #|fn Pair::count[X, Y](self : Pair[X, Y]) -> Int { match self.a { Some(_) => 1, None => 0 } }
+  #|fn with_xy[X, Y](f : ((Exit[X]) -> Y) -> Unit) -> Pair[X, Y] { let _ = f; Pair::{ a: None, b: None } }
+  #|fn with_two[X](f : ((Int, Exit[X]) -> Unit) -> Unit) -> Pair[X, Int] { let _ = f; Pair::{ a: None, b: None } }
+  #|
+  let reent_ok = [
+    "pub fn run_reent() -> Int {\n  let p = with_xy(fn(k) {\n    let _ : Int = k({ let _ = k(Exit::Succeeded(1)); Exit::Cancelled })\n  })\n  let q : Pair[Int, Int] = p\n  q.count()\n}\n",
+    // The outer call's expected `Unit` must not overwrite the `Int` result the
+    // inner call already filled in.
+    "pub fn run_reent() -> Int {\n  let p = with_xy(fn(k) {\n    k({ let _ : Int = k(Exit::Succeeded(1)); Exit::Cancelled })\n  })\n  let q : Pair[Int, Int] = p\n  q.count()\n}\n",
+  ]
+  let mut ri = 0
+  while ri < reent_ok.length() {
+    let cr_reent = check_source_files("cpr_reent", ["cpr_reent.pion"], [
+      reent_prelude + reent_ok[ri],
+    ])
+    assert_true(
+      cr_reent.diagnostics.length() == 0,
+      "re-entrant case " +
+      ri.to_string() +
+      ": " +
+      check_result_to_json(cr_reent.diagnostics),
+    )
+    ri = ri + 1
+  }
+  let reent_bad1 =
+  #|pub fn run_reent_bad1() -> Int {
+  #|  let p = with_xy(fn(k) {
+  #|    let _ : Int = k({ let _ = k(Exit::Succeeded(1)); Exit::Succeeded("bad") })
+  #|  })
+  #|  p.count()
+  #|}
+  let cr_rb1 = check_source_files("cpr_rb1", ["cpr_rb1.pion"], [
+    reent_prelude + reent_bad1,
+  ])
+  assert_true(
+    cr_rb1.diagnostics.length() >= 1 &&
+    cr_rb1.diagnostics[0].code == "E_TYPE_MISMATCH",
+    "expected E_TYPE_MISMATCH for conflicting re-entrant call, got: " +
+    check_result_to_json(cr_rb1.diagnostics),
+  )
+  // Re-entrant and sequential spellings report the same conflict at `7`.
+  let reent_bad2 =
+  #|pub fn run_reent_bad2() -> Int {
+  #|  let p = with_two(fn(k) {
+  #|    k({ k(1, Exit::Succeeded("bad")); 2 }, Exit::Cancelled)
+  #|    k(3, Exit::Succeeded(7))
+  #|  })
+  #|  p.count()
+  #|}
+  let seq_bad2 =
+  #|pub fn run_reent_bad2() -> Int {
+  #|  let p = with_two(fn(k) {
+  #|    k(1, Exit::Succeeded("bad")); k(2, Exit::Cancelled)
+  #|    k(3, Exit::Succeeded(7))
+  #|  })
+  #|  p.count()
+  #|}
+  let bad2_srcs = [reent_bad2, seq_bad2]
+  let mut bi = 0
+  while bi < bad2_srcs.length() {
+    let cr_rb2 = check_source_files("cpr_rb2", ["cpr_rb2.pion"], [
+      reent_prelude + bad2_srcs[bi],
+    ])
+    assert_true(
+      cr_rb2.diagnostics.length() >= 1 &&
+      cr_rb2.diagnostics[0].code == "E_TYPE_MISMATCH" &&
+      cr_rb2.diagnostics[0].line == 9 &&
+      cr_rb2.diagnostics[0].col == 26 &&
+      cr_rb2.diagnostics[0].expected == "String",
+      "expected E_TYPE_MISMATCH at `7` (String) for case " +
+      bi.to_string() +
+      ", got: " +
+      check_result_to_json(cr_rb2.diagnostics),
+    )
+    bi = bi + 1
+  }
+
+  // 20 nested forks, each refined by its own direct call, plus a call of the
+  // outermost `k0` from the innermost body: must stay linear (closure cache).
+  let sb = StringBuilder()
+  sb.write_string(prelude)
+  sb.write_string("pub fn run_deep(rt : Rt) -> Unit {\n")
+  let mut nl = 0
+  while nl < 20 {
+    sb.write_string("  let _ = rt.fork(fn(k")
+    sb.write_string(nl.to_string())
+    sb.write_string(") { k")
+    sb.write_string(nl.to_string())
+    sb.write_string("(Exit::Succeeded(1)); ")
+    nl = nl + 1
+  }
+  sb.write_string("k0(Exit::Succeeded(1))")
+  nl = 0
+  while nl < 20 {
+    sb.write_string(" })")
+    nl = nl + 1
+  }
+  sb.write_string("\n}\n")
+  let cr_deep = check_source_files("cpr_deep", ["cpr_deep.pion"], [
+    sb.to_string(),
+  ])
+  assert_true(cr_deep.diagnostics.length() == 0, check_result_to_json(cr_deep.diagnostics))
+}
