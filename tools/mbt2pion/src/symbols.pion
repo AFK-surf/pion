@@ -334,7 +334,183 @@ fn net_bracket_delta(s : String) -> Int {
   delta
 }
 
-///| Parse declarative `recipes.toml` (supports `[ref]`, `[eq]`, `[derives]`, `[comments]`, `[[trait_impl]]`).
+///| Strip a trailing TOML `# ...` comment outside double-quoted strings.
+fn strip_toml_line_comment(s : String) -> String {
+  let mut in_str = false
+  let mut esc = false
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = s.code_unit_at(i)
+    if in_str {
+      if esc { esc = false }
+      else if c == 92 { esc = true }
+      else if c == 34 { in_str = false }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 35 {
+      return s.slice(0, i).trim()
+    }
+    i = i + 1
+  }
+  s.trim()
+}
+
+///| Parse target type name from a `[struct_defaults.<target>]` section header.
+///| Supports both quoted (`struct_defaults."pkg::Type"`) and bare (`struct_defaults.MyStruct`) forms.
+fn parse_struct_defaults_target(section : String) -> Result[String, String] {
+  let raw = section.slice(16, section.length()).trim()
+  if raw.length() == 0 {
+    return Err("empty target type in [struct_defaults.<target>]")
+  }
+  if raw.starts_with("\"") {
+    if !raw.ends_with("\"") || raw.length() < 2 {
+      return Err("unterminated quoted target type in [struct_defaults." + raw + "]")
+    }
+    match decode_toml_string_lit(raw) {
+      Ok(decoded) => {
+        let t = decoded.trim()
+        if t.length() == 0 {
+          return Err("empty quoted target type in [struct_defaults.\"\"]")
+        }
+        return Ok(t)
+      }
+      Err(e) => return Err("invalid quoted target type in [struct_defaults]: " + e)
+    }
+  }
+  let mut i = 0
+  while i < raw.length() {
+    let c = raw.code_unit_at(i)
+    if c == 32 || c == 9 || c == 34 || c == 39 || c == 91 || c == 93 {
+      return Err("invalid bare target type `" + raw + "` in [struct_defaults]")
+    }
+    i = i + 1
+  }
+  Ok(raw)
+}
+
+///| Parse `field = "<pion expr>"` inside a `[struct_defaults.<target>]` section.
+fn parse_struct_defaults_entry(key_raw : String, val_raw : String) -> Result[(String, String), String] {
+  let fk = if key_raw.starts_with("\"") {
+    if !key_raw.ends_with("\"") || key_raw.length() < 2 {
+      return Err("unterminated quoted field name in [struct_defaults]")
+    }
+    match decode_toml_string_lit(key_raw) {
+      Ok(s) => s.trim()
+      Err(e) => return Err("invalid quoted field name in [struct_defaults]: " + e)
+    }
+  } else {
+    key_raw.trim()
+  }
+  if fk.length() == 0 {
+    return Err("empty field name in [struct_defaults]")
+  }
+  let mut ki = 0
+  while ki < fk.length() {
+    let c = fk.code_unit_at(ki)
+    if c == 32 || c == 9 || c == 34 || c == 39 || c == 10 || c == 13 {
+      return Err("invalid field name `" + fk + "` in [struct_defaults]")
+    }
+    ki = ki + 1
+  }
+  let clean_val = strip_toml_line_comment(val_raw)
+  if !clean_val.starts_with("\"") || !clean_val.ends_with("\"") || clean_val.length() < 2 {
+    return Err("default expression for field `" + fk + "` in [struct_defaults] must be a quoted string")
+  }
+  match decode_toml_string_lit(clean_val) {
+    Ok(expr) => {
+      let trimmed_expr = expr.trim()
+      if trimmed_expr.length() == 0 {
+        return Err("empty default expression for field `" + fk + "` in [struct_defaults]")
+      }
+      Ok((fk, trimmed_expr))
+    }
+    Err(e) => Err("invalid default expression string for field `" + fk + "` in [struct_defaults]: " + e)
+  }
+}
+
+///| Compute deterministic canonical SHA-256 of parsed `Recipes` (including `struct_defaults`
+///| sorted lexicographically by target type name and then field name).
+pub fn recipes_canonical_sha256(recipes : Recipes) -> String {
+  let sb = StringBuilder()
+  sb.write_string("ref:")
+  sb.write_string(if recipes.ref_recipe.enabled { "1" } else { "0" })
+  sb.write_string("|")
+  sb.write_string(recipes.ref_recipe.ctor_call)
+  sb.write_string("|")
+  sb.write_string(recipes.ref_recipe.field_name)
+  sb.write_string("|")
+  sb.write_string(recipes.ref_recipe.type_name)
+  sb.write_string("\neq:")
+  sb.write_string(recipes.eq_recipe.wrapper_call)
+  sb.write_string("|")
+  sb.write_string(recipes.eq_recipe.helper_prefix)
+  sb.write_string("\nallowed_derives:")
+  for d in sort_strings(recipes.allowed_derives) {
+    sb.write_string(d)
+    sb.write_string(",")
+  }
+  sb.write_string("\nignored_derives:")
+  for d in sort_strings(recipes.ignored_derives) {
+    sb.write_string(d)
+    sb.write_string(",")
+  }
+  sb.write_string("\ntrait_recipes:")
+  for tr in recipes.trait_recipes {
+    sb.write_string(tr.derive_name + "|" + tr.target_trait + "|" + tr.method_name + "|" + tr.kind + ";")
+  }
+  sb.write_string("\nasset_bypass:")
+  for ab in recipes.asset_bypass {
+    sb.write_string(ab.path + "|" + ab.sha256 + "|" + ab.reason + "|")
+    for ad in sort_strings(ab.allowed_decls) {
+      sb.write_string(ad + ",")
+    }
+    sb.write_string(";")
+  }
+  sb.write_string("\ncomment_replaces:")
+  for cr in recipes.comment_replaces {
+    sb.write_string(cr.from + "=>" + cr.to + ";")
+  }
+  sb.write_string("\nstruct_defaults:")
+  let sd_map : Map[String, Map[String, String]] = Map()
+  for rule in recipes.struct_defaults {
+    let fmap = match sd_map.get(rule.target_type) {
+      Some(m) => m
+      None => {
+        let m : Map[String, String] = Map()
+        sd_map[rule.target_type] = m
+        m
+      }
+    }
+    for f in rule.fields {
+      fmap[f.field] = f.expr
+    }
+  }
+  for tname in sorted_map_keys(sd_map) {
+    sb.write_string("\n[")
+    sb.write_string(tname)
+    sb.write_string("]")
+    match sd_map.get(tname) {
+      Some(fmap) => {
+        for fname in sorted_map_keys(fmap) {
+          match fmap.get(fname) {
+            Some(fexpr) => {
+              sb.write_string("\n")
+              sb.write_string(fname)
+              sb.write_string("=")
+              sb.write_string(fexpr)
+            }
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  content_sha256(sb.to_string())
+}
+
+///| Parse declarative `recipes.toml` (supports `[ref]`, `[eq]`, `[derives]`, `[comments]`, `[struct_defaults.<Type>]`, `[[trait_impl]]`).
 pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) -> Recipes {
   let mut ref_enabled = false
   let mut ref_ctor = ""
@@ -347,6 +523,8 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
   let trait_recipes : Array[TraitRecipe] = []
   let asset_bypass : Array[AssetBypassRule] = []
   let comment_replaces : Array[CommentReplaceRule] = []
+  let sd_by_target : Map[String, Map[String, String]] = Map()
+  let mut cur_sd_target = ""
   let seen_comment_from : Map[String, Bool] = Map()
   let mut collecting_comments_arr = false
   let mut comments_arr_buf = StringBuilder()
@@ -406,6 +584,7 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
       section = line.slice(2, line.length() - 2).trim()
       in_trait_item = section == "trait_impl"
       in_asset_item = section == "asset_bypass" || section == "assets.bypass"
+      cur_sd_target = ""
       cur_derive = ""
       cur_trait = ""
       cur_method = ""
@@ -436,6 +615,27 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
       in_trait_item = false
       in_asset_item = false
       section = line.slice(1, line.length() - 1).trim()
+      if section == "struct_defaults" || section.starts_with("struct_defaults.") {
+        if section == "struct_defaults" {
+          cur_sd_target = ""
+          diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "missing target type in [struct_defaults.<target>]"))
+        } else {
+          match parse_struct_defaults_target(section) {
+            Ok(tname) => {
+              cur_sd_target = tname
+              if !sd_by_target.contains(tname) {
+                sd_by_target[tname] = Map()
+              }
+            }
+            Err(e) => {
+              cur_sd_target = ""
+              diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, e))
+            }
+          }
+        }
+      } else {
+        cur_sd_target = ""
+      }
       continue
     }
     let eq_idx = line.index_of("=")
@@ -445,7 +645,27 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
     }
     let key = line.slice(0, eq_idx).trim()
     let val_s = line.slice(eq_idx + 1, line.length()).trim()
-    if section == "ref" {
+    if cur_sd_target.length() > 0 {
+      match parse_struct_defaults_entry(key, val_s) {
+        Ok((fname, fexpr)) =>
+        match sd_by_target.get(cur_sd_target) {
+          Some(fmap) =>
+          if fmap.contains(fname) {
+            diags.push(diag_error(
+              "MBT2PION_RECIPE_ERROR",
+              path,
+              line_no,
+              1,
+              "duplicate field `" + fname + "` in [struct_defaults.\"" + cur_sd_target + "\"]",
+            ))
+          } else {
+            fmap[fname] = fexpr
+          }
+          None => ()
+        }
+        Err(e) => diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, e))
+      }
+    } else if section == "ref" {
       if key == "enabled" {
         ref_enabled = val_s == "true"
       } else if key == "ctor_call" {
@@ -562,6 +782,24 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
   if collecting_comments_arr {
     diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, comments_arr_line, 1, "unterminated [comments] `replace` array"))
   }
+  let struct_defaults : Array[StructDefaultsRule] = []
+  for tname in sorted_map_keys(sd_by_target) {
+    match sd_by_target.get(tname) {
+      Some(fmap) => {
+        let fields : Array[StructDefaultField] = []
+        for fname in sorted_map_keys(fmap) {
+          match fmap.get(fname) {
+            Some(fexpr) => fields.push(StructDefaultField::{ field: fname, expr: fexpr })
+            None => ()
+          }
+        }
+        if fields.length() > 0 {
+          struct_defaults.push(StructDefaultsRule::{ target_type: tname, fields: fields })
+        }
+      }
+      None => ()
+    }
+  }
   Recipes::{
     ref_recipe: RefRecipe::{ enabled: ref_enabled, ctor_call: ref_ctor, field_name: ref_field, type_name: ref_type },
     trait_recipes: trait_recipes,
@@ -570,6 +808,7 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
     ignored_derives: ignored_derives,
     asset_bypass: asset_bypass,
     comment_replaces: comment_replaces,
+    struct_defaults: struct_defaults,
   }
 }
 

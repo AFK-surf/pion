@@ -1204,6 +1204,129 @@ fn rename_struct_field(ctx : StageAContext, struct_name : String, raw_field : St
   rename_keyword_ident(raw_field)
 }
 
+///| Resolve declarative `[struct_defaults.<Type>]` entries for `struct_name`,
+///| matching full qualified names, package-alias / canonical-package mappings,
+///| `using` / type aliases, and local bare struct names.
+fn resolve_struct_defaults_for_type(
+  ctx : StageAContext,
+  struct_name : String,
+) -> Array[StructDefaultField] {
+  if ctx.recipes.struct_defaults.length() == 0 {
+    return []
+  }
+  let clean = strip_type_args_sym(struct_name.trim())
+  if clean.length() == 0 {
+    return []
+  }
+  let cands : Array[String] = []
+  let seen : Map[String, Bool] = Map()
+  let add_cand = fn(c : String) -> Unit {
+    let t = strip_type_args_sym(c.trim())
+    if t.length() > 0 && !seen.contains(t) {
+      seen[t] = true
+      cands.push(t)
+    }
+  }
+  add_cand(clean)
+  match ctx.symtab.using_types.get(clean) {
+    Some(u) => add_cand(u)
+    None => ()
+  }
+  match ctx.symtab.type_aliases.get(clean) {
+    Some(a) => add_cand(a)
+    None => ()
+  }
+  // Expand package-qualified candidates across package aliases and canonical package names.
+  let mut ci = 0
+  while ci < cands.length() {
+    let c = cands[ci]
+    let cc = c.index_of("::")
+    if cc > 0 && cc + 2 < c.length() {
+      let pkg = c.slice(0, cc)
+      let typ = c.slice(cc + 2, c.length())
+      let mapped = resolve_pkg_ref_alias(ctx.symtab, pkg)
+      if mapped.length() > 0 && mapped != pkg {
+        add_cand(mapped + "::" + typ)
+      }
+      match ctx.symtab.dep_alias_to_canon_pkg.get(pkg) {
+        Some(cp) => if cp.length() > 0 { add_cand(cp + "::" + typ) }
+        None => ()
+      }
+      if mapped.length() > 0 && mapped != pkg {
+        match ctx.symtab.dep_alias_to_canon_pkg.get(mapped) {
+          Some(cp) => if cp.length() > 0 { add_cand(cp + "::" + typ) }
+          None => ()
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  for rule in ctx.recipes.struct_defaults {
+    if seen.contains(rule.target_type) {
+      return rule.fields
+    }
+    let rcc = rule.target_type.index_of("::")
+    if rcc > 0 && rcc + 2 < rule.target_type.length() {
+      let rpkg = rule.target_type.slice(0, rcc)
+      let rtyp = rule.target_type.slice(rcc + 2, rule.target_type.length())
+      let rmapped = resolve_pkg_ref_alias(ctx.symtab, rpkg)
+      if rmapped.length() > 0 && seen.contains(rmapped + "::" + rtyp) {
+        return rule.fields
+      }
+      match ctx.symtab.dep_alias_to_canon_pkg.get(rpkg) {
+        Some(rcp) => if rcp.length() > 0 && seen.contains(rcp + "::" + rtyp) { return rule.fields }
+        None => ()
+      }
+      if rmapped.length() > 0 && rmapped != rpkg {
+        match ctx.symtab.dep_alias_to_canon_pkg.get(rmapped) {
+          Some(rcp) => if rcp.length() > 0 && seen.contains(rcp + "::" + rtyp) { return rule.fields }
+          None => ()
+        }
+      }
+    }
+  }
+  []
+}
+
+///| Append missing `[struct_defaults]` fields to a non-spread struct value literal.
+///| Returns true iff at least one default field was appended.
+fn append_missing_struct_defaults(
+  ctx : StageAContext,
+  struct_name : String,
+  present_fields : Map[String, Bool],
+  emitted_any_field_in : Bool,
+  ends_with_comma_in : Bool,
+  sb : StringBuilder,
+) -> Bool {
+  let defaults = resolve_struct_defaults_for_type(ctx, struct_name)
+  if defaults.length() == 0 {
+    return false
+  }
+  let mut emitted_any = emitted_any_field_in
+  let mut ends_with_comma = ends_with_comma_in
+  let mut appended = false
+  for df in defaults {
+    let df_renamed = rename_struct_field(ctx, struct_name, df.field)
+    if present_fields.contains(df.field) || present_fields.contains(df_renamed) {
+      continue
+    }
+    if emitted_any {
+      if ends_with_comma {
+        sb.write_string(" ")
+      } else {
+        sb.write_string(", ")
+      }
+    } else {
+      sb.write_string(" ")
+    }
+    sb.write_string(df_renamed + ": " + df.expr)
+    emitted_any = true
+    ends_with_comma = false
+    appended = true
+  }
+  appended
+}
+
 ///| Lower a struct literal or destructuring pattern `{ field: expr, .. }` with collision-free
 ///| field renaming for `struct_name`.
 fn lower_struct_brace(
@@ -1217,16 +1340,22 @@ fn lower_struct_brace(
 ) -> String {
   let sb = StringBuilder()
   sb.write_string("{")
+  let mut has_spread = false
+  let present_fields : Map[String, Bool] = Map()
+  let mut emitted_any_field = false
+  let mut ends_with_comma = false
   let mut i = open_b + 1
   while i < close_b {
     let t = tokens[i]
     if t.kind == TokenKind::Comma {
       sb.write_string(t.leading_trivia + ",")
+      ends_with_comma = true
       i = i + 1
       continue
     }
     // Spread `..base`
     if t.kind == TokenKind::DotDot {
+      has_spread = true
       sb.write_string(t.leading_trivia + "..")
       let mut e = i + 1
       let mut d = 0
@@ -1242,6 +1371,8 @@ fn lower_struct_brace(
         e = e + 1
       }
       sb.write_string(lower_expr_range(ctx, tokens, i + 1, e, file, in_pattern))
+      emitted_any_field = true
+      ends_with_comma = false
       i = e
       continue
     }
@@ -1250,6 +1381,8 @@ fn lower_struct_brace(
       let raw_f = t.raw
       let renamed_f = rename_struct_field(ctx, struct_name, raw_f)
       if i + 1 < close_b && tokens[i + 1].kind == TokenKind::Colon {
+        present_fields[raw_f] = true
+        present_fields[renamed_f] = true
         sb.write_string(t.leading_trivia + renamed_f + tokens[i + 1].leading_trivia + ":")
         let mut e = i + 2
         let mut d = 0
@@ -1271,24 +1404,45 @@ fn lower_struct_brace(
         push_expected_type(ctx, field_exp_ty)
         sb.write_string(lower_expr_range(ctx, tokens, i + 2, e, file, in_pattern))
         pop_expected_type(ctx)
+        emitted_any_field = true
+        ends_with_comma = false
         i = e
         continue
       }
       // Shorthand `field` (followed by `,` or `}`)
       if i + 1 == close_b || tokens[i + 1].kind == TokenKind::Comma {
+        present_fields[raw_f] = true
+        present_fields[renamed_f] = true
         let local_var = resolve_ident_in_scope(ctx, raw_f)
         if renamed_f != local_var {
           sb.write_string(t.leading_trivia + renamed_f + ": " + local_var)
         } else {
           sb.write_string(t.leading_trivia + renamed_f)
         }
+        emitted_any_field = true
+        ends_with_comma = false
         i = i + 1
         continue
       }
     }
     let (piece, next_i) = lower_one_token_or_form(ctx, tokens, i, close_b, file, in_pattern)
     sb.write_string(piece)
+    emitted_any_field = true
+    ends_with_comma = false
     i = next_i
+  }
+  if !in_pattern && !has_spread {
+    let appended = append_missing_struct_defaults(
+      ctx,
+      struct_name,
+      present_fields,
+      emitted_any_field,
+      ends_with_comma,
+      sb,
+    )
+    if appended && tokens[close_b].leading_trivia.length() == 0 {
+      sb.write_string(" ")
+    }
   }
   sb.write_string(tokens[close_b].leading_trivia + "}")
   sb.to_string()
@@ -1774,15 +1928,21 @@ fn lower_anon_shorthand_struct_lit(
 ) -> String {
   let sb = StringBuilder()
   sb.write_string("{")
+  let mut has_spread = false
+  let present_fields : Map[String, Bool] = Map()
+  let mut emitted_any_field = false
+  let mut ends_with_comma = false
   let mut i = open_b + 1
   while i < close_b {
     let t = tokens[i]
     if t.kind == TokenKind::Comma {
       sb.write_string(t.leading_trivia + ",")
+      ends_with_comma = true
       i = i + 1
       continue
     }
     if t.kind == TokenKind::DotDot {
+      has_spread = true
       sb.write_string(t.leading_trivia + "..")
       let mut e = i + 1
       let mut d = 0
@@ -1794,12 +1954,16 @@ fn lower_anon_shorthand_struct_lit(
         e = e + 1
       }
       sb.write_string(lower_expr_range(ctx, tokens, i + 1, e, file, false))
+      emitted_any_field = true
+      ends_with_comma = false
       i = e
       continue
     }
     if (t.kind == TokenKind::Ident || t.kind == TokenKind::Keyword) && i + 1 < close_b && tokens[i + 1].kind == TokenKind::Colon {
       let raw_f = t.raw
       let renamed_f = if struct_name.length() > 0 { rename_struct_field(ctx, struct_name, raw_f) } else { rename_keyword_ident(raw_f) }
+      present_fields[raw_f] = true
+      present_fields[renamed_f] = true
       sb.write_string(t.leading_trivia + renamed_f + tokens[i + 1].leading_trivia + ":")
       let mut e = i + 2
       let mut d = 0
@@ -1821,19 +1985,40 @@ fn lower_anon_shorthand_struct_lit(
       } else {
         sb.write_string(lower_expr_range(ctx, tokens, i + 2, e, file, false))
       }
+      emitted_any_field = true
+      ends_with_comma = false
       i = e
       continue
     }
     if t.kind == TokenKind::Ident && (i + 1 == close_b || tokens[i + 1].kind == TokenKind::Comma) {
       let renamed_f = if struct_name.length() > 0 { rename_struct_field(ctx, struct_name, t.raw) } else { rename_keyword_ident(t.raw) }
+      present_fields[t.raw] = true
+      present_fields[renamed_f] = true
       let local_v = resolve_ident_in_scope(ctx, t.raw)
       sb.write_string(t.leading_trivia + renamed_f + ": " + local_v)
+      emitted_any_field = true
+      ends_with_comma = false
       i = i + 1
       continue
     }
     let (piece, next_i) = lower_one_token_or_form(ctx, tokens, i, close_b, file, false)
     sb.write_string(piece)
+    emitted_any_field = true
+    ends_with_comma = false
     i = next_i
+  }
+  if struct_name.length() > 0 && !has_spread {
+    let appended = append_missing_struct_defaults(
+      ctx,
+      struct_name,
+      present_fields,
+      emitted_any_field,
+      ends_with_comma,
+      sb,
+    )
+    if appended && tokens[close_b].leading_trivia.length() == 0 {
+      sb.write_string(" ")
+    }
   }
   sb.write_string(tokens[close_b].leading_trivia + "}")
   sb.to_string()
@@ -2196,6 +2381,17 @@ fn resolve_anon_struct_literal_name(
         None => exp_base
       }
     }
+    let defaults = resolve_struct_defaults_for_type(ctx, cand)
+    let def_set : Map[String, Bool] = Map()
+    for df in defaults {
+      def_set[df.field] = true
+      def_set[rename_struct_field(ctx, cand, df.field)] = true
+    }
+    let user_set : Map[String, Bool] = Map()
+    for f in fields {
+      user_set[f] = true
+      user_set[rename_struct_field(ctx, cand, f)] = true
+    }
     match ctx.struct_field_renames.get(cand) {
       Some(rmap) => {
         let mut all_present = true
@@ -2205,35 +2401,67 @@ fn resolve_anon_struct_literal_name(
             break
           }
         }
-        if all_present && fields.length() == rmap.length() {
-          return Some(cand)
+        if all_present {
+          if fields.length() == rmap.length() {
+            return Some(cand)
+          }
+          if defaults.length() > 0 {
+            let mut all_covered = true
+            for rf in rmap.keys() {
+              let rf_ren = match rmap.get(rf) { Some(r) => r, None => rf }
+              if !user_set.contains(rf) && !user_set.contains(rf_ren) &&
+              !def_set.contains(rf) && !def_set.contains(rf_ren) {
+                all_covered = false
+                break
+              }
+            }
+            if all_covered {
+              return Some(cand)
+            }
+          }
         }
       }
       None =>
       if str_has(cand, "::") && !str_has(cand, "[") && !str_has(cand, "->") && !str_has(cand, "(") {
         match symtab_query_foreign_struct_update(ctx.symtab, cand) {
           ForeignStructUpdateInfo::Expandable(schema) => {
-            if fields.length() == schema.fields.length() {
-              let mut all_present = true
-              for f in fields {
-                let mut found_f = false
-                for sf in schema.fields {
-                  if sf.src_name == f {
-                    found_f = true
-                    break
-                  }
-                }
-                if !found_f {
-                  all_present = false
+            let mut all_present = true
+            for f in fields {
+              let mut found_f = false
+              for sf in schema.fields {
+                if sf.src_name == f {
+                  found_f = true
                   break
                 }
               }
-              if all_present {
+              if !found_f {
+                all_present = false
+                break
+              }
+            }
+            if all_present {
+              if fields.length() == schema.fields.length() {
                 return Some(cand)
+              }
+              if defaults.length() > 0 {
+                let mut all_covered = true
+                for sf in schema.fields {
+                  if !user_set.contains(sf.src_name) && !user_set.contains(sf.emit_name) &&
+                  !def_set.contains(sf.src_name) && !def_set.contains(sf.emit_name) {
+                    all_covered = false
+                    break
+                  }
+                }
+                if all_covered {
+                  return Some(cand)
+                }
               }
             }
           }
-          _ => ()
+          _ =>
+          if defaults.length() > 0 && (has_colon || has_comma) {
+            return Some(cand)
+          }
         }
         return None
       }
@@ -8333,6 +8561,224 @@ fn lower_struct_pat_guards(
   sb.to_string()
 }
 
+///| True iff `ty` denotes MoonBit's built-in `Json` (`mbt_compat::MbtJson`), not shadowed by a
+///| local type or active generic parameter named `Json`.
+fn is_unshadowed_mbt_json_type(ctx : StageAContext, ty : String) -> Bool {
+  let t = ty.trim()
+  if t == "mbt_compat::MbtJson" {
+    return true
+  }
+  if (t == "Json" || t == "MbtJson") &&
+  !ctx.symtab.local_types.contains("Json") &&
+  !ctx.active_generics.contains("Json") {
+    return true
+  }
+  false
+}
+
+///| Strip balanced outer grouping parentheses `(expr)` (not tuples) from `[start, end)`.
+fn unwrap_outer_parens_range(tokens : Array[Token], start : Int, end : Int) -> (Int, Int) {
+  let mut s = start
+  let mut e = end
+  while s + 2 <= e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e - 1 {
+    if range_has_top_comma(tokens, s + 1, e - 1) {
+      break
+    }
+    s = s + 1
+    e = e - 1
+  }
+  (s, e)
+}
+
+///| Lower one non-`MbtJson` operand `[os, oe)` of an `MbtJson` `==`/`!=` comparison under
+///| expected type `mbt_compat::MbtJson`, isolating it from adjacent `==`/`!=` tokens so
+///| JSON literal wrapping and `maybe_wrap_mbt_json_expr` both apply cleanly.
+fn lower_mbt_json_eq_operand(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  os : Int,
+  oe : Int,
+  file : String,
+) -> String {
+  if os >= oe {
+    return ""
+  }
+  let lead = tokens[os].leading_trivia
+  let sub_toks : Array[Token] = []
+  let mut k = os
+  while k < oe {
+    let tk = tokens[k]
+    if k == os {
+      sub_toks.push(Token::{
+        kind: tk.kind,
+        raw: tk.raw,
+        leading_trivia: "",
+        newline_before: false,
+        line: tk.line,
+        col: tk.col,
+        start_byte: tk.start_byte,
+        end_byte: tk.end_byte,
+      })
+    } else {
+      sub_toks.push(tk)
+    }
+    k = k + 1
+  }
+  let last_tk = tokens[oe - 1]
+  sub_toks.push(Token::{
+    kind: TokenKind::Eof,
+    raw: "",
+    leading_trivia: "",
+    newline_before: false,
+    line: last_tk.line,
+    col: last_tk.col,
+    start_byte: last_tk.end_byte,
+    end_byte: last_tk.end_byte,
+  })
+  let sub_len = sub_toks.length() - 1
+  let saved_exp = ctx.expected_type_stack.length()
+  push_expected_type(ctx, "mbt_compat::MbtJson")
+  let raw_s = lower_expr_range(ctx, sub_toks, 0, sub_len, file, false)
+  restore_expected_type_stack(ctx, saved_exp)
+  let trimmed = raw_s.trim()
+  let wrapped = maybe_wrap_mbt_json_expr(ctx, sub_toks, 0, sub_len, trimmed)
+  if wrapped != trimmed {
+    lead + wrapped
+  } else {
+    lead + raw_s
+  }
+}
+
+///| Lower non-pattern `==`/`!=` comparisons (including `&&`/`||` chains) where exactly one side
+///| has static type `mbt_compat::MbtJson` (unshadowed) so literals and scalar/array/map expressions
+///| on the other side are implicitly wrapped into `mbt_compat::MbtJson`.
+fn try_lower_mbt_json_eq_expr(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> Option[String] {
+  let mut has_eq_op = false
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+      d = d + 1
+    } else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 {
+      if tk == TokenKind::EqEq || tk == TokenKind::BangEq {
+        has_eq_op = true
+      } else if tk == TokenKind::Comma || tk == TokenKind::Semi || tk == TokenKind::FatArrow ||
+      tk == TokenKind::Eq || tk == TokenKind::AssignOp || tk == TokenKind::PipeGt || tk == TokenKind::QuestionEq ||
+      (tk == TokenKind::Keyword &&
+        (tokens[k].raw == "let" || tokens[k].raw == "fn" || tokens[k].raw == "while" ||
+          tokens[k].raw == "for" || tokens[k].raw == "guard" || tokens[k].raw == "if" ||
+          tokens[k].raw == "match" || tokens[k].raw == "return" || tokens[k].raw == "break" ||
+          tokens[k].raw == "continue" || tokens[k].raw == "is" || tokens[k].raw == "in" ||
+          tokens[k].raw == "else")) {
+        return None
+      }
+    }
+    k = k + 1
+  }
+  if !has_eq_op {
+    return None
+  }
+  // Split into `&&` / `||` segments and classify each segment.
+  let segs : Array[(Int, Int, Int, Int)] = []
+  let mut s = start
+  let mut any_json_eq = false
+  while s < end {
+    let mut e = s
+    let mut sd = 0
+    while e < end {
+      let ek = tokens[e].kind
+      if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace {
+        sd = sd + 1
+      } else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace {
+        if sd > 0 { sd = sd - 1 }
+      } else if sd == 0 && (ek == TokenKind::AmpAmp || ek == TokenKind::PipePipe) {
+        break
+      }
+      e = e + 1
+    }
+    // Check if `[s, e)` has exactly one depth-0 `==`/`!=` and no other relational op.
+    let mut op_i = -1
+    let mut op_count = 0
+    let mut bad_rel = false
+    let mut si = s
+    let mut rd = 0
+    while si < e {
+      let rk = tokens[si].kind
+      if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace {
+        rd = rd + 1
+      } else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace {
+        if rd > 0 { rd = rd - 1 }
+      } else if rd == 0 {
+        if rk == TokenKind::EqEq || rk == TokenKind::BangEq {
+          op_i = si
+          op_count = op_count + 1
+        } else if rk == TokenKind::Lt || rk == TokenKind::LtEq || rk == TokenKind::Gt || rk == TokenKind::GtEq {
+          bad_rel = true
+        }
+      }
+      si = si + 1
+    }
+    // mode: 0 = normal, 1 = lhs is Json (wrap rhs), 2 = rhs is Json (wrap lhs)
+    let mut mode = 0
+    if op_count == 1 && !bad_rel && op_i > s && op_i + 1 < e {
+      let (ls, le) = unwrap_outer_parens_range(tokens, s, op_i)
+      let (rs, re) = unwrap_outer_parens_range(tokens, op_i + 1, e)
+      let lty = infer_simple_expr_type(ctx, tokens, ls, le).trim()
+      let rty = infer_simple_expr_type(ctx, tokens, rs, re).trim()
+      let l_is_j = is_unshadowed_mbt_json_type(ctx, lty)
+      let r_is_j = is_unshadowed_mbt_json_type(ctx, rty)
+      if l_is_j && !r_is_j {
+        mode = 1
+        any_json_eq = true
+      } else if r_is_j && !l_is_j {
+        mode = 2
+        any_json_eq = true
+      }
+    }
+    segs.push((s, e, op_i, mode))
+    s = if e < end { e + 1 } else { end }
+  }
+  if !any_json_eq {
+    return None
+  }
+  let sb = StringBuilder()
+  let mut idx = 0
+  while idx < segs.length() {
+    let (seg_s, seg_e, op_i, mode) = segs[idx]
+    if mode == 1 {
+      let saved_l = ctx.expected_type_stack.length()
+      push_expected_type(ctx, "")
+      let lhs_s = lower_expr_range(ctx, tokens, seg_s, op_i, file, false)
+      restore_expected_type_stack(ctx, saved_l)
+      let rhs_s = lower_mbt_json_eq_operand(ctx, tokens, op_i + 1, seg_e, file)
+      sb.write_string(lhs_s + tokens[op_i].leading_trivia + tokens[op_i].raw + rhs_s)
+    } else if mode == 2 {
+      let lhs_s = lower_mbt_json_eq_operand(ctx, tokens, seg_s, op_i, file)
+      let saved_r = ctx.expected_type_stack.length()
+      push_expected_type(ctx, "")
+      let rhs_s = lower_expr_range(ctx, tokens, op_i + 1, seg_e, file, false)
+      restore_expected_type_stack(ctx, saved_r)
+      sb.write_string(lhs_s + tokens[op_i].leading_trivia + tokens[op_i].raw + rhs_s)
+    } else {
+      sb.write_string(lower_expr_range(ctx, tokens, seg_s, seg_e, file, false))
+    }
+    if seg_e < end {
+      sb.write_string(tokens[seg_e].leading_trivia + tokens[seg_e].raw)
+    }
+    idx = idx + 1
+  }
+  Some(sb.to_string())
+}
+
 ///| Lower an expression range `[start, end)`.
 pub fn lower_expr_range(
   ctx : StageAContext,
@@ -8426,6 +8872,10 @@ pub fn lower_expr_range(
         }
       }
       return sb_and.to_string()
+    }
+    match try_lower_mbt_json_eq_expr(ctx, tokens, start, end, file) {
+      Some(eq_code) => return eq_code
+      None => ()
     }
   }
   let sb = StringBuilder()
@@ -12217,10 +12667,15 @@ fn lower_one_token_or_form(
     // Struct literal or struct destructuring pattern `S::{ ... }` (with collision-free field renaming & cascade)
     if i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::LBrace {
       let close_b = find_matching_delim(tokens, i + 2)
+      let brace_sname = if prev_colon2 && i >= 2 && tokens[i - 2].kind == TokenKind::Ident {
+        tokens[i - 2].raw + "::" + t.raw
+      } else {
+        rename_priv_type(ctx.symtab, t.raw)
+      }
       let struct_lit = if !in_pattern && close_b > i + 4 && tokens[i + 3].kind == TokenKind::DotDot {
         lower_struct_update_expr(ctx, head_name, tokens, i + 2, close_b, file)
       } else {
-        head_name + "::" + lower_struct_brace(ctx, rename_priv_type(ctx.symtab, t.raw), tokens, i + 2, close_b, file, in_pattern)
+        head_name + "::" + lower_struct_brace(ctx, brace_sname, tokens, i + 2, close_b, file, in_pattern)
       }
       if !in_pattern && close_b + 1 < end && tokens[close_b + 1].kind == TokenKind::DotDot &&
       close_b + 2 < end && tokens[close_b + 2].kind == TokenKind::Ident {
@@ -15421,7 +15876,30 @@ fn maybe_wrap_mbt_json_expr(
   if ls.length() == 0 || es >= ee {
     return lowered
   }
-  if ls.starts_with("mbt_compat::MbtJson::") || ls.starts_with("MbtJson::") {
+  let mut inner_ls = ls
+  while inner_ls.length() >= 2 && inner_ls.starts_with("(") && inner_ls.ends_with(")") {
+    let mut pd = 0
+    let mut wraps_whole = true
+    let mut pi = 0
+    let pn = inner_ls.length()
+    while pi < pn {
+      let pc = inner_ls.code_unit_at(pi)
+      if pc == 40 { pd = pd + 1 }
+      else if pc == 41 {
+        pd = pd - 1
+        if pd == 0 && pi < pn - 1 {
+          wraps_whole = false
+          break
+        }
+      }
+      pi = pi + 1
+    }
+    if !wraps_whole || pd != 0 {
+      break
+    }
+    inner_ls = inner_ls.slice(1, pn - 1).trim()
+  }
+  if inner_ls.starts_with("mbt_compat::MbtJson::") || inner_ls.starts_with("MbtJson::") {
     return lowered
   }
   if tokens[es].kind == TokenKind::Keyword && (tokens[es].raw == "if" || tokens[es].raw == "match") {
@@ -15452,7 +15930,6 @@ fn maybe_wrap_mbt_json_expr(
   lowered
 }
 
-///| Walk backwards from a `.` token at `dot_idx` to locate the start of its receiver expression.
 ///| Resolve the instantiated value parameter type `T` for a 1-arg `.set(v)` call on receiver type `rty`:
 ///| - Built-in `Ref[T]` / `mbt_compat::Ref[T]` -> `T`
 ///| - Any local or imported type whose `Type::set(self, v : T)` in `fn_param_types` takes exactly
@@ -15539,6 +16016,7 @@ fn resolve_single_arg_set_param_ty(ctx : StageAContext, rty : String) -> String 
   ""
 }
 
+///| Walk backwards from a `.` token at `dot_idx` to locate the start of its receiver expression.
 fn find_dot_receiver_start(tokens : Array[Token], dot_idx : Int) -> Int {
   let mut cur = dot_idx - 1
   if cur < 0 {
