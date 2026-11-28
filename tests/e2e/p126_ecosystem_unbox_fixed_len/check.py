@@ -12,11 +12,12 @@ variant (release): the cross-file `Result` / `Option` callees are inlined into
   `ret`); `opt_match` calls nothing at all; `through` loads the callee's
   top-level `bias` (7), not the caller's parameter of the same name.
 tuple (release): `project`, `second_only`, `loop_mix`, `use_wide` and
-  `use_pair` keep the destructured tuple in a private `alloc8` stack buffer and
-  call nothing (no `pion_alloc*`, no `mix` / `wide` / `pair_scale`); `escape`
-  and `use_named` still allocate a heap box; `use_drop_pair` inlines
-  `drop_pair` without a box and releases its first string (`pion_rc_dec`)
-  between the two `pion_int_to_str` calls (last-use early drop).
+  `use_pair` keep the destructured tuple in private stack slots (`alloc4`/`alloc8`)
+  and call nothing (no `pion_alloc*`, no `mix` / `wide` / `pair_scale`); `escape`
+  still allocates a heap box; `use_named` inlines `named` with no heap tuple box
+  while preserving `String` / `Array` allocation and `pion_rc_dec` cleanup;
+  `use_drop_pair` inlines `drop_pair` without a box and releases its first string
+  (`pion_rc_dec`) between the two `pion_int_to_str` calls (last-use early drop).
 tuple (dev and release): `scaled` / `use_pair` inline their callee with the
   callee's top-level `scale` (3): `mul ..., 3` and no call of `add_scale` /
   `pair_scale`.
@@ -98,12 +99,17 @@ def check_tuple(fns, label, release):
         fn = need(fns, label, name)
         if calls(fn):
             fail(f'{label}: {name} calls {sorted(set(calls(fn)))}\n{fn}')
-        if not re.search(r'=l alloc8 \d+$', fn, re.M):
-            fail(f'{label}: {name} has no private tuple buffer\n{fn}')
-    for name in ['escape', 'use_named']:
-        fn = need(fns, label, name)
-        if not any(c.startswith('$pion_alloc') for c in calls(fn)):
-            fail(f'{label}: {name} lost its heap tuple box\n{fn}')
+        if not re.search(r'=l alloc(?:4|8) \d+$', fn, re.M):
+            fail(f'{label}: {name} has no private stack tuple slot/buffer\n{fn}')
+    fn_esc = need(fns, label, 'escape')
+    if not any(c.startswith('$pion_alloc') for c in calls(fn_esc)):
+        fail(f'{label}: escape lost its heap tuple box\n{fn_esc}')
+    fn_named = need(fns, label, 'use_named')
+    cs_named = calls(fn_named)
+    if any(c.startswith('$pion_alloc') or c == '$pion_fn_named' for c in cs_named):
+        fail(f'{label}: use_named should unbox the destructured tuple without calling named/pion_alloc: {sorted(set(cs_named))}\n{fn_named}')
+    if cs_named.count('$pion_rc_dec') < 2:
+        fail(f'{label}: use_named lost RC release for String/Array elements: {cs_named}\n{fn_named}')
     fn = need(fns, label, 'use_drop_pair')
     cs = calls(fn)
     if any(c.startswith('$pion_alloc') or c == '$pion_fn_drop_pair' for c in cs):
