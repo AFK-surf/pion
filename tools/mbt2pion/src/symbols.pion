@@ -2083,7 +2083,20 @@ pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit 
                     while ci > 0 && !(name.code_unit_at(ci) == 58 && name.code_unit_at(ci + 1) == 58) {
                       ci = ci - 1
                     }
-                    st.dep_method_names[name.slice(ci + 2, name.length())] = true
+                    let mname = name.slice(ci + 2, name.length())
+                    st.dep_method_names[mname] = true
+                    if mname == "iter" && pkg_name.length() > 0 {
+                      let arrow = sig.index_of("->")
+                      if arrow >= 0 {
+                        let rty = sig.slice(arrow + 2, sig.length()).trim()
+                        if str_has(rty, "MbtIter[") || str_has(rty, "Iter[") {
+                          let tname = name.slice(0, ci).trim()
+                          if tname.length() > 0 {
+                            st.dep_method_names[" iter_type:" + pkg_name + "::" + tname] = true
+                          }
+                        }
+                      }
+                    }
                   }
                   if kind == "impl" {
                     if name.starts_with("Eq ") || str_has(sig, "impl Eq ") {
@@ -2490,6 +2503,38 @@ pub fn lookup_ctor_arity(st : SymbolTable, ctor_name : String) -> Int {
   }
 }
 
+pub fn lookup_ctor_arity_resolved(
+  st : SymbolTable,
+  ctor_name : String,
+  head_name : String,
+  explicit_arity : Int,
+) -> Int {
+  match st.ctors.get(ctor_name) {
+    None => -1
+    Some(targets) => {
+      if str_has(head_name, "::") {
+        for t in targets {
+          let full_nm = if !t.is_local && t.pkg.length() > 0 && t.enum_name.length() > 0 {
+            t.pkg + "::" + t.enum_name + "::" + t.ctor_name
+          } else if t.enum_name.length() > 0 {
+            t.enum_name + "::" + t.ctor_name
+          } else {
+            t.ctor_name
+          }
+          if full_nm == head_name && t.arity >= 0 {
+            return t.arity
+          }
+        }
+      }
+      let shaped = filter_ctors_by_shape(targets, true, explicit_arity, true)
+      if shaped.length() == 1 && shaped[0].arity >= 0 {
+        return shaped[0].arity
+      }
+      lookup_ctor_arity(st, ctor_name)
+    }
+  }
+}
+
 fn strip_type_args_sym(ty : String) -> String {
   let t = ty.trim()
   let br = t.index_of("[")
@@ -2504,11 +2549,59 @@ fn strip_type_args_sym(ty : String) -> String {
 ///| 3. At unguided use sites, resolves by lexical scope (`Local::Some` shadows builtin `Option::Some`),
 ///|    then builtin `Option`/`Result`, then external `--dep` / `.mbti` / `api_map` enums.
 ///| 4. Emits `MBT2PION_AMBIGUOUS_CTOR` on any ambiguous pattern or unresolved conflict.
+fn filter_ctors_by_shape(
+  targets : Array[CtorTarget],
+  has_parens : Bool,
+  explicit_arity : Int,
+  has_rest : Bool,
+) -> Array[CtorTarget] {
+  if explicit_arity < 0 {
+    return targets
+  }
+  for t in targets {
+    if t.arity < 0 {
+      return targets
+    }
+  }
+  let out : Array[CtorTarget] = []
+  for t in targets {
+    if !has_parens {
+      if t.arity == 0 {
+        out.push(t)
+      }
+    } else if !has_rest {
+      if t.arity > 0 && t.arity == explicit_arity {
+        out.push(t)
+      }
+    } else if t.arity > 0 && t.arity >= explicit_arity {
+      out.push(t)
+    }
+  }
+  out
+}
+
 pub fn resolve_ctor_at_site(
   st : SymbolTable,
   name : String,
   expected_ty : String,
   in_pattern : Bool,
+  active_generics : Map[String, Bool],
+  file : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+) -> Option[String] {
+  resolve_ctor_at_site_shaped(st, name, expected_ty, in_pattern, false, -1, false, active_generics, file, line, col, diags)
+}
+
+pub fn resolve_ctor_at_site_shaped(
+  st : SymbolTable,
+  name : String,
+  expected_ty : String,
+  in_pattern : Bool,
+  has_parens : Bool,
+  explicit_arity : Int,
+  has_rest : Bool,
   active_generics : Map[String, Bool],
   file : String,
   line : Int,
@@ -2549,7 +2642,13 @@ pub fn resolve_ctor_at_site(
           }
         }
         // When expected type is unqualified (`Tone`), a unique local enum with that name wins over external deps!
-        let best = if !exp_has_pkg && local_matched.length() == 1 { local_matched } else { matched }
+        let best0 = if !exp_has_pkg && local_matched.length() == 1 { local_matched } else { matched }
+        let best = if best0.length() > 1 {
+          let shaped = filter_ctors_by_shape(best0, has_parens, explicit_arity, has_rest)
+          if shaped.length() == 1 { shaped } else { best0 }
+        } else {
+          best0
+        }
         if best.length() == 1 {
           let t = best[0]
           if force_qual && !in_pattern {
@@ -2602,21 +2701,52 @@ pub fn resolve_ctor_at_site(
           local_targets.push(t)
         }
       }
-      if local_targets.length() == 1 {
-        let lt = local_targets[0]
-        if !in_pattern && (name == "Some" || name == "None" || name == "Ok" || name == "Err") {
-          return Some(lt.enum_name + "::" + lt.ctor_name)
+      if local_targets.length() > 0 {
+        let shaped_local = if explicit_arity >= 0 && targets.length() > 1 {
+          filter_ctors_by_shape(local_targets, has_parens, explicit_arity, has_rest)
+        } else {
+          local_targets
         }
-        return None
-      }
-      if local_targets.length() > 1 {
-        diags.push(diag_error(
-          "MBT2PION_AMBIGUOUS_CTOR",
-          file,
-          line,
-          col,
-          "ambiguous local constructor `" + name + "` matches " + local_targets.length().to_string() + " local enums without expected type",
-        ))
+        if shaped_local.length() == 1 {
+          let lt = shaped_local[0]
+          if local_targets.length() > 1 || (!in_pattern && (name == "Some" || name == "None" || name == "Ok" || name == "Err")) {
+            return Some(lt.enum_name + "::" + lt.ctor_name)
+          }
+          return None
+        }
+        if shaped_local.length() > 1 {
+          diags.push(diag_error(
+            "MBT2PION_AMBIGUOUS_CTOR",
+            file,
+            line,
+            col,
+            "ambiguous local constructor `" + name + "` matches " + shaped_local.length().to_string() + " local enums without expected type",
+          ))
+          return None
+        }
+        // `shaped_local.length() == 0`: local constructor's arity does not match call/pattern shape;
+        // try arity-shape disambiguation across all candidates (fail-closed if any candidate has unknown arity).
+        let shaped_all = filter_ctors_by_shape(targets, has_parens, explicit_arity, has_rest)
+        if shaped_all.length() == 1 {
+          let t = shaped_all[0]
+          if !t.is_local && t.pkg.length() > 0 && t.enum_name.length() > 0 {
+            return Some(t.pkg + "::" + t.enum_name + "::" + t.ctor_name)
+          }
+          if t.enum_name.length() > 0 {
+            return Some(t.enum_name + "::" + t.ctor_name)
+          }
+          return Some("." + t.ctor_name)
+        }
+        if local_targets.length() > 1 {
+          diags.push(diag_error(
+            "MBT2PION_AMBIGUOUS_CTOR",
+            file,
+            line,
+            col,
+            "ambiguous local constructor `" + name + "` matches " + local_targets.length().to_string() + " local enums without expected type",
+          ))
+          return None
+        }
         return None
       }
       // Never let external enum variants (e.g. `mbt_compat::MbtJson::Array`/`String`) hijack builtin type names unguided!
@@ -2642,6 +2772,17 @@ pub fn resolve_ctor_at_site(
         return Some("." + t.ctor_name)
       }
       if targets.length() > 1 {
+        let shaped = filter_ctors_by_shape(targets, has_parens, explicit_arity, has_rest)
+        if shaped.length() == 1 {
+          let t = shaped[0]
+          if !t.is_local && t.pkg.length() > 0 && t.enum_name.length() > 0 {
+            return Some(t.pkg + "::" + t.enum_name + "::" + t.ctor_name)
+          }
+          if t.enum_name.length() > 0 {
+            return Some(t.enum_name + "::" + t.ctor_name)
+          }
+          return Some("." + t.ctor_name)
+        }
         if !in_pattern {
           return Some("." + name)
         }
@@ -2736,6 +2877,56 @@ pub fn symtab_sources_complete(st : SymbolTable) -> Bool {
 
 ///| E1-2: Compute the intersection of candidate enum keys across bare constructors `ctors`,
 ///| plus whether any constructor in `ctors` has >= 2 distinct candidate enums.
+pub fn symtab_intersect_ctor_enums_shaped(
+  st : SymbolTable,
+  ctors : Array[(String, Bool, Int, Bool)],
+) -> (Array[String], Bool) {
+  let mut any_ambig = false
+  let mut has_init = false
+  let mut inter : Array[String] = []
+  for item in ctors {
+    let (cname, has_parens, explicit_arity, has_rest) = item
+    match st.ctors.get(cname) {
+      None => {
+        has_init = true
+        inter = []
+      }
+      Some(targets0) => {
+        let targets = filter_ctors_by_shape(targets0, has_parens, explicit_arity, has_rest)
+        let eff_targets = if targets.length() > 0 { targets } else { targets0 }
+        let cur : Array[String] = []
+        let seen : Map[String, Bool] = Map()
+        for t in eff_targets {
+          if t.enum_name.length() == 0 {
+            continue
+          }
+          let ek = if t.pkg.length() > 0 { t.pkg + "::" + t.enum_name } else { t.enum_name }
+          if !seen.contains(ek) {
+            seen[ek] = true
+            cur.push(ek)
+          }
+        }
+        if cur.length() >= 2 {
+          any_ambig = true
+        }
+        if !has_init {
+          has_init = true
+          inter = cur
+        } else {
+          let next_inter : Array[String] = []
+          for e in inter {
+            if seen.contains(e) {
+              next_inter.push(e)
+            }
+          }
+          inter = next_inter
+        }
+      }
+    }
+  }
+  (inter, any_ambig)
+}
+
 pub fn symtab_intersect_ctor_enums(st : SymbolTable, ctors : Array[String]) -> (Array[String], Bool) {
   let mut any_ambig = false
   let mut has_init = false
