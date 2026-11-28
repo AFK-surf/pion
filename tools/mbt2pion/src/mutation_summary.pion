@@ -96,23 +96,152 @@ pub fn summary_may_mutate_array(sum : FnMutationSummary, target_elem_ty : String
   sum.mutated_elem_types.contains(t)
 }
 
-///| Context-aware `summary_may_mutate_array`: fails closed when `target_elem_ty` is empty,
-///| contains an active generic type parameter (e.g. `Array[T]` aliasing `Array[Int]`),
-///| or is not a ground canonical type in `pkg`.
+///| Recursively canonicalize a type string in `pkg` by expanding unambiguous local `type` aliases,
+///| `using` type imports, and package import aliases (`<alias>::<T>` -> `<canon>::<T>`) across
+///| nested generic arguments `[...]` and tuples `(...)`. Returns `""` (fail-closed) on any
+///| unexpandable/ambiguous alias, cyclic alias, or function type.
+pub fn ms_canonicalize_type(pkg : PkgMutationSummary, ty : String) -> String {
+  ms_canonicalize_type_rec(pkg, ty, 0)
+}
+
+fn ms_canonicalize_type_rec(pkg : PkgMutationSummary, ty : String, depth : Int) -> String {
+  if depth > 16 {
+    return ""
+  }
+  let t0 = qt_strip_pkg_hash(ms_strip_trailing_comma(ty.trim()))
+  if t0.length() == 0 || t0 == "__AMBIG__" {
+    return ""
+  }
+  if ms_ty_is_fn_type(t0) || ms_ty_is_dyn(t0) {
+    return ""
+  }
+  // Tuple `(A, B, ...)`
+  if t0.starts_with("(") && t0.ends_with(")") {
+    let inner = ms_strip_trailing_comma(t0.slice(1, t0.length() - 1))
+    if inner.length() == 0 {
+      return "()"
+    }
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() == 0 {
+      return ""
+    }
+    let canon_parts : Array[String] = []
+    for p in parts {
+      let cp = ms_canonicalize_type_rec(pkg, p, depth + 1)
+      if cp.length() == 0 {
+        return ""
+      }
+      canon_parts.push(cp)
+    }
+    return "(" + join_comma(canon_parts) + ")"
+  }
+  // Parameterized type `Head[A, B, ...]`
+  let lb = t0.index_of("[")
+  if lb > 0 {
+    if !t0.ends_with("]") {
+      return ""
+    }
+    let head = t0.slice(0, lb).trim()
+    let chead = ms_canonicalize_type_rec(pkg, head, depth + 1)
+    if chead.length() == 0 {
+      return ""
+    }
+    let inner = ms_strip_trailing_comma(t0.slice(lb + 1, t0.length() - 1))
+    let parts = qt_split_top_level_type_args(inner)
+    if parts.length() == 0 {
+      return ""
+    }
+    let canon_parts : Array[String] = []
+    for p in parts {
+      let cp = ms_canonicalize_type_rec(pkg, p, depth + 1)
+      if cp.length() == 0 {
+        return ""
+      }
+      canon_parts.push(cp)
+    }
+    return chead + "[" + join_comma(canon_parts) + "]"
+  }
+  // Qualified type `pkg::Type` / `@pkg.Type` / `pkg.Type`
+  let qnorm = ms_qualified_type_head(t0)
+  let cc = qnorm.index_of("::")
+  if cc > 0 {
+    let p = qnorm.slice(0, cc).trim()
+    let nm = qnorm.slice(cc + 2, qnorm.length()).trim()
+    if p.length() == 0 || nm.length() == 0 {
+      return ""
+    }
+    match pkg.pkg_aliases.get(p) {
+      Some(canon) =>
+      if canon == "__AMBIG__" {
+        return ""
+      } else if canon.length() > 0 && canon != p {
+        return ms_canonicalize_type_rec(pkg, canon + "::" + nm, depth + 1)
+      }
+      None => ()
+    }
+    return p + "::" + nm
+  }
+  // Bare local `type` alias: expand if unambiguous, otherwise fail-closed (`""`).
+  if pkg.type_alias_names.contains(t0) {
+    match pkg.type_aliases.get(t0) {
+      Some(rhs) =>
+      if rhs.length() > 0 && rhs != "__AMBIG__" {
+        return ms_canonicalize_type_rec(pkg, rhs, depth + 1)
+      } else {
+        return ""
+      }
+      None => return ""
+    }
+  }
+  // Bare `using`-imported type: expand to qualified target and canonicalize, else fail-closed.
+  if pkg.using_types.contains(t0) {
+    match pkg.using_type_targets.get(t0) {
+      Some(target) =>
+      if target.length() > 0 && target != "__AMBIG__" {
+        return ms_canonicalize_type_rec(pkg, target, depth + 1)
+      } else {
+        return ""
+      }
+      None => return ""
+    }
+  }
+  t0
+}
+
+///| Context-aware `summary_may_mutate_array`: recursively canonicalizes both `target_elem_ty`
+///| and `sum.mutated_elem_types` across package aliases, `using` type imports, and local `type`
+///| aliases, failing closed on empty/unknown/generic/ambiguous/unexpandable types.
 pub fn summary_may_mutate_array_in_ctx(
   pkg : PkgMutationSummary,
   sum : FnMutationSummary,
   target_elem_ty : String,
   active_generics : Map[String, Bool],
 ) -> Bool {
-  let t = target_elem_ty.trim()
-  let elem_check = if t.length() == 0 || ms_ty_contains_generic(t, active_generics) ||
-  !qt_is_ground_canon_type(t, pkg.declared_types, active_generics) {
+  if sum.unknown || sum.mutates_any_array {
+    return true
+  }
+  let canon_t = ms_canonicalize_type(pkg, target_elem_ty)
+  let elem_check = if canon_t.length() == 0 ||
+  ms_ty_contains_generic(canon_t, active_generics) ||
+  !qt_is_ground_canon_type(canon_t, pkg.declared_types, active_generics) ||
+  pkg.type_alias_names.contains(canon_t) {
     ""
   } else {
-    t
+    canon_t
   }
-  summary_may_mutate_array(sum, elem_check)
+  if elem_check.length() == 0 {
+    return sum.mutated_elem_types.length() > 0
+  }
+  if sum.mutated_elem_types.contains(elem_check) {
+    return true
+  }
+  for raw_m in sum.mutated_elem_types.keys() {
+    let cm = ms_canonicalize_type(pkg, raw_m)
+    if cm.length() == 0 || cm == elem_check {
+      return true
+    }
+  }
+  false
 }
 
 pub struct PkgMutationSummary {
@@ -145,6 +274,14 @@ pub struct PkgMutationSummary {
   pure_map_fields : Map[String, Bool]
   pure_map_globals : Map[String, Bool]
   top_level_var_types : Map[String, String]
+  pub_fn_keys : Map[String, Bool]
+  top_level_value_bindings : Map[String, Bool]
+  cross_pkg_summaries : Map[String, FnMutationSummary]
+  using_value_targets : Map[String, String]
+  using_type_targets : Map[String, String]
+  pkg_aliases : Map[String, String]
+  type_alias_names : Map[String, Bool]
+  type_aliases : Map[String, String]
 }
 
 pub fn PkgMutationSummary::empty() -> PkgMutationSummary {
@@ -178,6 +315,14 @@ pub fn PkgMutationSummary::empty() -> PkgMutationSummary {
     pure_map_fields: Map(),
     pure_map_globals: Map(),
     top_level_var_types: Map(),
+    pub_fn_keys: Map(),
+    top_level_value_bindings: Map(),
+    cross_pkg_summaries: Map(),
+    using_value_targets: Map(),
+    using_type_targets: Map(),
+    pkg_aliases: Map(),
+    type_alias_names: Map(),
+    type_aliases: Map(),
   }
 }
 
@@ -878,6 +1023,163 @@ fn ms_type_head(ty : String) -> String {
   if lb > 0 { t.slice(0, lb).trim() } else { t }
 }
 
+fn ms_strip_pkg_ref_name(raw : String) -> String {
+  let mut s = raw.trim()
+  if s.starts_with("@") {
+    s = s.slice(1, s.length())
+  }
+  let mut last_slash = -1
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == 47 {
+      last_slash = i
+    }
+    i = i + 1
+  }
+  if last_slash >= 0 {
+    s = s.slice(last_slash + 1, s.length())
+  }
+  s.trim()
+}
+
+fn ms_qualified_type_head(ty : String) -> String {
+  let t = qt_strip_pkg_hash(ty.trim())
+  let lb = t.index_of("[")
+  let head = if lb > 0 { t.slice(0, lb).trim() } else { t }
+  if str_has(head, "::") {
+    return head
+  }
+  let dot = head.index_of(".")
+  if dot > 0 {
+    let pfx = ms_strip_pkg_ref_name(head.slice(0, dot))
+    let rest = head.slice(dot + 1, head.length()).trim()
+    if pfx.length() > 0 && rest.length() > 0 {
+      return pfx + "::" + rest
+    }
+  }
+  head
+}
+
+fn ms_extract_pkg_and_type(ty : String) -> Option[(String, String)] {
+  let head = ms_qualified_type_head(ty)
+  let cc = head.index_of("::")
+  if cc > 0 {
+    let p = head.slice(0, cc).trim()
+    let t = head.slice(cc + 2, head.length()).trim()
+    if p.length() > 0 && t.length() > 0 {
+      return Some((p, t))
+    }
+  }
+  None
+}
+
+fn ms_lookup_cross_pkg_summary(pkg : PkgMutationSummary, q : String, name : String) -> Option[FnMutationSummary] {
+  if q.length() == 0 || name.length() == 0 {
+    return None
+  }
+  match pkg.cross_pkg_summaries.get(q + "::" + name) {
+    Some(s) => return Some(s)
+    None => ()
+  }
+  match pkg.pkg_aliases.get(q) {
+    Some(target) =>
+    if target.length() > 0 && target != q {
+      return pkg.cross_pkg_summaries.get(target + "::" + name)
+    }
+    None => ()
+  }
+  None
+}
+
+fn ms_lookup_using_value_summary(pkg : PkgMutationSummary, name : String) -> Option[FnMutationSummary] {
+  match pkg.using_value_targets.get(name) {
+    Some(target) => {
+      if target.length() == 0 || target == "__AMBIG__" {
+        return None
+      }
+      let cc = target.index_of("::")
+      if cc > 0 {
+        let q = target.slice(0, cc).trim()
+        let fn_nm = target.slice(cc + 2, target.length()).trim()
+        return ms_lookup_cross_pkg_summary(pkg, q, fn_nm)
+      }
+      None
+    }
+    None => None
+  }
+}
+
+fn ms_fn_mutation_summary_equal(a : FnMutationSummary, b : FnMutationSummary) -> Bool {
+  if a.unknown != b.unknown || a.mutates_any_array != b.mutates_any_array ||
+  a.reaches_shrink != b.reaches_shrink ||
+  a.mutated_elem_types.length() != b.mutated_elem_types.length() {
+    return false
+  }
+  for k in a.mutated_elem_types.keys() {
+    if !b.mutated_elem_types.contains(k) {
+      return false
+    }
+  }
+  true
+}
+
+fn ms_record_cross_pkg_summary(
+  pkg : PkgMutationSummary,
+  key : String,
+  s : FnMutationSummary,
+  conflict_unknown : Bool,
+) -> Unit {
+  match pkg.cross_pkg_summaries.get(key) {
+    Some(prev) =>
+    if !ms_fn_mutation_summary_equal(prev, s) {
+      let _ = fn_mutation_summary_merge(prev, s)
+      if conflict_unknown {
+        prev.unknown = true
+      }
+    }
+    None => pkg.cross_pkg_summaries[key] = fn_mutation_summary_clone(s)
+  }
+}
+
+fn ms_record_qualified_field_type(pkg : PkgMutationSummary, full_key : String, ty_s : String) -> Unit {
+  if full_key.length() == 0 || ty_s.length() == 0 {
+    return
+  }
+  match pkg.field_types.get(full_key) {
+    Some(prev) => if prev != ty_s { pkg.field_types[full_key] = "__AMBIG__" }
+    None => pkg.field_types[full_key] = ty_s
+  }
+}
+
+fn ms_resolve_cross_pkg_method_call(
+  pkg : PkgMutationSummary,
+  m : String,
+  recv_ty : String,
+  recv_head : String,
+  sum : FnMutationSummary,
+) -> Unit {
+  match ms_extract_pkg_and_type(recv_ty) {
+    Some((ext_pkg, ext_type)) =>
+    match ms_lookup_cross_pkg_summary(pkg, ext_pkg, ext_type + "::" + m) {
+      Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+      None => sum.unknown = true
+    }
+    None =>
+    match pkg.using_type_targets.get(recv_head) {
+      Some(target) =>
+      match ms_extract_pkg_and_type(target) {
+        Some((ext_pkg, ext_type)) =>
+        match ms_lookup_cross_pkg_summary(pkg, ext_pkg, ext_type + "::" + m) {
+          Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+          None => sum.unknown = true
+        }
+        None => sum.unknown = true
+      }
+      None => sum.unknown = true
+    }
+  }
+}
+
 ///| Extract element type `E` from `Array[E]` / `FixedArray[E]` / `ArrayBuf[E]` / `ArrayView[E]`, or "".
 pub fn ms_extract_array_elem_ty(ty : String) -> String {
   let t = ms_strip_pkg_prefix(ty)
@@ -1228,13 +1530,43 @@ fn ms_infer_expr_ty(
       None => ()
     }
   }
-  // Field access `base.field` (only when `base_ty` is a known non-external type; never fall back to bare field name)
+  // Field access `base.field` (supports local structs, cross-package ABI structs, and `using` structs; never bare field name)
   if tk.kind == TokenKind::Ident && end_i >= 2 && tokens[end_i - 1].kind == TokenKind::Dot {
     let base_ty = ms_infer_expr_ty(pkg, tokens, end_i - 2, content, qfi_opt, local_var_types)
     let base_head = ms_type_head(base_ty)
-    if base_head.length() > 0 && !ms_is_qualified_external_ty(base_ty) {
+    if ms_is_qualified_external_ty(base_ty) {
+      let qhead = ms_qualified_type_head(base_ty)
+      match pkg.field_types.get(qhead + "::" + tk.raw) {
+        Some(ft) => if ft != "__AMBIG__" && ft.length() > 0 { return ft }
+        None => ()
+      }
+      match ms_extract_pkg_and_type(qhead) {
+        Some((epkg, etype)) =>
+        match pkg.pkg_aliases.get(epkg) {
+          Some(apkg) =>
+          match pkg.field_types.get(apkg + "::" + etype + "::" + tk.raw) {
+            Some(ft) => if ft != "__AMBIG__" && ft.length() > 0 { return ft }
+            None => ()
+          }
+          None => ()
+        }
+        None => ()
+      }
+    } else if base_head.length() > 0 {
+      if pkg.using_type_targets.contains(base_head) {
+        match pkg.using_type_targets.get(base_head) {
+          Some(target_ty) =>
+          if target_ty != "__AMBIG__" && target_ty.length() > 0 {
+            match pkg.field_types.get(target_ty + "::" + tk.raw) {
+              Some(ft) => if ft != "__AMBIG__" && ft.length() > 0 { return ft }
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
       match pkg.field_types.get(base_head + "::" + tk.raw) {
-        Some(ft) => return ft
+        Some(ft) => if ft != "__AMBIG__" && ft.length() > 0 { return ft }
         None => ()
       }
     }
@@ -2742,143 +3074,152 @@ fn ms_scan_span(
           // Leading-dot enum constructor / pattern `.Variant(...)` — pure data constructor
           ()
         } else if prev_dot {
-          // Method call `recv.m(args...)`
+          // Method call `recv.m(args...)` or MoonBit `@pkg.fn(args...)`
           let m = tk.raw
           let recv_end = i - 2
-          let recv_ty = ms_infer_expr_ty(pkg, tokens, recv_end, content, qfi_opt, local_var_types)
-          let recv_head = ms_type_head(recv_ty)
-          // Class 1: `dyn Trait` or generic type parameter receiver -> fail-closed!
-          if ms_ty_is_dyn(recv_ty) || (recv_ty.length() > 0 && active_generics.contains(recv_ty.trim())) {
-            sum.unknown = true
-          } else if pkg.fn_typed_fields.contains(m) && !pkg.method_overloads.contains(m) {
-            // Class 3: calling a function-typed struct field `s.cb(...)`
-            sum.unknown = true
-          } else if ms_is_array_mutating_method(m) || (m == "add" && recv_head == "OrderedSet") {
-            let is_builtin_mut_container = ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics) &&
-            (recv_head == "Array" || recv_head == "FixedArray" ||
-              recv_head == "ArrayBuf" || recv_head == "ArrayView" || recv_head == "Map" ||
-              recv_head == "OrderedMap" || recv_head == "OrderedSet" || recv_head == "StringBuilder")
-            if is_builtin_mut_container {
-              // Class 7: mutating built-in container method
-              if ms_is_shrink_method(m) {
-                sum.reaches_shrink = true
-              }
-              if recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet" {
-                // Map::set / Map::remove / Map::clear: check if value holds Array or key/instance callbacks could mutate
-                let kty = ms_extract_map_key_ty(recv_ty)
-                if m != "clear" && (!ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics)) {
-                  sum.unknown = true
+          if recv_end >= s && tokens[recv_end].kind == TokenKind::PkgRef {
+            let pkg_nm = ms_strip_pkg_ref_name(tokens[recv_end].raw)
+            match ms_lookup_cross_pkg_summary(pkg, pkg_nm, m) {
+              Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+              None => sum.unknown = true
+            }
+          } else {
+            let recv_ty = ms_infer_expr_ty(pkg, tokens, recv_end, content, qfi_opt, local_var_types)
+            let recv_head = ms_type_head(recv_ty)
+            // Class 1: `dyn Trait` or generic type parameter receiver -> fail-closed!
+            if ms_ty_is_dyn(recv_ty) || (recv_ty.length() > 0 && active_generics.contains(recv_ty.trim())) {
+              sum.unknown = true
+            } else if pkg.fn_typed_fields.contains(m) && !pkg.method_overloads.contains(m) {
+              // Class 3: calling a function-typed struct field `s.cb(...)`
+              sum.unknown = true
+            } else if ms_is_array_mutating_method(m) || (m == "add" && recv_head == "OrderedSet") {
+              let is_builtin_mut_container = ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics) &&
+              (recv_head == "Array" || recv_head == "FixedArray" ||
+                recv_head == "ArrayBuf" || recv_head == "ArrayView" || recv_head == "Map" ||
+                recv_head == "OrderedMap" || recv_head == "OrderedSet" || recv_head == "StringBuilder")
+              if is_builtin_mut_container {
+                // Class 7: mutating built-in container method
+                if ms_is_shrink_method(m) {
+                  sum.reaches_shrink = true
                 }
-                let nested = ms_extract_nested_array_elem_ty(recv_ty)
-                if nested.length() > 0 || str_has(recv_ty, "Array") {
-                  ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+                if recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet" {
+                  // Map::set / Map::remove / Map::clear: check if value holds Array or key/instance callbacks could mutate
+                  let kty = ms_extract_map_key_ty(recv_ty)
+                  if m != "clear" && (!ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics)) {
+                    sum.unknown = true
+                  }
+                  let nested = ms_extract_nested_array_elem_ty(recv_ty)
+                  if nested.length() > 0 || str_has(recv_ty, "Array") {
+                    ms_record_array_mutation(sum, nested, active_generics, pkg.declared_types)
+                  }
+                } else if recv_head == "StringBuilder" {
+                  ()
+                } else {
+                  let elem = ms_extract_array_elem_ty(recv_ty)
+                  ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
                 }
-              } else if recv_head == "StringBuilder" {
-                ()
+                // If this mutating method takes a callback (`retain`, `sort_by`, `sort_by_key`, `map_in_place`),
+                // also analyze its callback argument!
+                if m == "retain" || m == "sort_by" || m == "sort_by_key" || m == "map_in_place" {
+                  let cargs = ms_split_call_args(tokens, lp, rp)
+                  if cargs.length() >= 1 {
+                    let last_a = cargs[cargs.length() - 1]
+                    ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+                  }
+                }
+              } else if recv_head.length() > 0 {
+                // User-defined or external type method named `clear`/`push`/`set`/...:
+                // resolve via method call so `reaches_shrink` / `unknown` propagate!
+                ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
               } else {
-                let elem = ms_extract_array_elem_ty(recv_ty)
-                ms_record_array_mutation(sum, elem, active_generics, pkg.declared_types)
+                // Unknown receiver type: fail-closed on both mutation and unknown!
+                if ms_is_shrink_method(m) {
+                  sum.reaches_shrink = true
+                }
+                sum.mutates_any_array = true
+                sum.unknown = true
               }
-              // If this mutating method takes a callback (`retain`, `sort_by`, `sort_by_key`, `map_in_place`),
-              // also analyze its callback argument!
-              if m == "retain" || m == "sort_by" || m == "sort_by_key" || m == "map_in_place" {
+            } else if m == "map" || m == "mapi" || m == "filter" || m == "filter_map" ||
+            m == "each" || m == "eachi" || m == "fold" || m == "any" || m == "all" ||
+            m == "find_first" || m == "search_by" || m == "map_or" || m == "bind" {
+              // Higher-order read-only method on built-in containers / fresh iterators:
+              // never exempt user-declared types, overridden methods, or opaque/adapted iterators!
+              let is_iter_recv = recv_head == "MbtIter" || recv_head == "Iter"
+              let is_direct_container_recv = recv_head == "Array" || recv_head == "FixedArray" ||
+              recv_head == "ArrayView" || recv_head == "ArrayBuf" ||
+              recv_head == "Option" || recv_head == "Result"
+              let not_user_override = !pkg.trait_methods.contains(m) &&
+              ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics)
+              let is_known_builtin_recv = not_user_override && (
+                is_direct_container_recv ||
+                (is_iter_recv && ms_is_fresh_builtin_iter_expr(pkg, tokens, recv_end, content, qfi_opt, local_var_types, active_generics))
+              )
+              if !is_known_builtin_recv {
+                if is_iter_recv && !pkg.declared_types.contains(recv_head) && !pkg.fn_keys.contains(recv_head + "::" + m) {
+                  // Opaque/adapted `Iter`/`MbtIter` (param, local, field, call result, lazy chain) -> fail-closed!
+                  sum.unknown = true
+                } else {
+                  ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
+                }
+              } else {
                 let cargs = ms_split_call_args(tokens, lp, rp)
                 if cargs.length() >= 1 {
                   let last_a = cargs[cargs.length() - 1]
-                  ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics, ms_extract_array_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+                  ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics, ms_extract_hof_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+                } else {
+                  sum.unknown = true
                 }
               }
-            } else if recv_head.length() > 0 {
-              // User-defined or external type method named `clear`/`push`/`set`/...:
-              // resolve via method call so `reaches_shrink` / `unknown` propagate!
-              ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
-            } else {
-              // Unknown receiver type: fail-closed on both mutation and unknown!
-              if ms_is_shrink_method(m) {
-                sum.reaches_shrink = true
-              }
-              sum.mutates_any_array = true
-              sum.unknown = true
-            }
-          } else if m == "map" || m == "mapi" || m == "filter" || m == "filter_map" ||
-          m == "each" || m == "eachi" || m == "fold" || m == "any" || m == "all" ||
-          m == "find_first" || m == "search_by" || m == "map_or" || m == "bind" {
-            // Higher-order read-only method on built-in containers / fresh iterators:
-            // never exempt user-declared types, overridden methods, or opaque/adapted iterators!
-            let is_iter_recv = recv_head == "MbtIter" || recv_head == "Iter"
-            let is_direct_container_recv = recv_head == "Array" || recv_head == "FixedArray" ||
-            recv_head == "ArrayView" || recv_head == "ArrayBuf" ||
-            recv_head == "Option" || recv_head == "Result"
-            let not_user_override = !pkg.trait_methods.contains(m) &&
-            ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics)
-            let is_known_builtin_recv = not_user_override && (
-              is_direct_container_recv ||
-              (is_iter_recv && ms_is_fresh_builtin_iter_expr(pkg, tokens, recv_end, content, qfi_opt, local_var_types, active_generics))
-            )
-            if !is_known_builtin_recv {
-              if is_iter_recv && !pkg.declared_types.contains(recv_head) && !pkg.fn_keys.contains(recv_head + "::" + m) {
-                // Opaque/adapted `Iter`/`MbtIter` (param, local, field, call result, lazy chain) -> fail-closed!
-                sum.unknown = true
+            } else if m == "contains" || m == "search" {
+              // `String::contains` / `Bytes::contains` never invoke user `Eq`; `Array`/`Map`/`Set` check element/key Eq & Hash purity + instance provenance!
+              let is_unqualified_builtin = ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics)
+              if is_unqualified_builtin && (recv_head == "String" || recv_head == "StrView" || recv_head == "StringView" || recv_head == "Bytes") {
+                ()
+              } else if is_unqualified_builtin && (recv_head == "Array" || recv_head == "FixedArray" || recv_head == "ArrayBuf" || recv_head == "ArrayView") {
+                let elem = ms_extract_array_elem_ty(recv_ty)
+                if pkg.custom_ops.contains("==") && !ms_ty_is_pure_eq(elem, pkg.pure_eq_types, active_generics) {
+                  sum.unknown = true
+                }
+              } else if is_unqualified_builtin && (recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet") {
+                let kty = ms_extract_map_key_ty(recv_ty)
+                if !ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics) {
+                  sum.unknown = true
+                }
               } else {
                 ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
               }
-            } else {
-              let cargs = ms_split_call_args(tokens, lp, rp)
-              if cargs.length() >= 1 {
-                let last_a = cargs[cargs.length() - 1]
-                ms_analyze_callback_arg_into(pkg, tokens, last_a.0, last_a.1, fn_body_open, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics, ms_extract_hof_elem_ty(recv_ty), sum, callees_out, collect_edges, depth + 1)
+            } else if ms_is_derive_method(m) {
+              if pkg.declared_traits.contains(recv_head) || active_generics.contains(recv_head) {
+                sum.unknown = true
+              } else if ms_is_qualified_external_ty(recv_ty) || pkg.using_types.contains(recv_head) {
+                ms_resolve_cross_pkg_method_call(pkg, m, recv_ty, recv_head, sum)
+              } else if ms_is_builtin_scalar_ty(recv_ty) ||
+              (m == "equal" && ms_ty_is_pure_eq(recv_ty, pkg.pure_eq_types, active_generics) && !pkg.fn_keys.contains(recv_head + "::" + m)) {
+                ()
+              } else if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
+                ms_add_call_effect(pkg, recv_head + "::" + m, sum, callees_out, collect_edges)
               } else {
+                // Class 1: derive-generated or external Show/Compare/Eq/Hash method -> fail-closed!
                 sum.unknown = true
               }
-            }
-          } else if m == "contains" || m == "search" {
-            // `String::contains` / `Bytes::contains` never invoke user `Eq`; `Array`/`Map`/`Set` check element/key Eq & Hash purity + instance provenance!
-            let is_unqualified_builtin = ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics)
-            if is_unqualified_builtin && (recv_head == "String" || recv_head == "StrView" || recv_head == "StringView" || recv_head == "Bytes") {
-              ()
-            } else if is_unqualified_builtin && (recv_head == "Array" || recv_head == "FixedArray" || recv_head == "ArrayBuf" || recv_head == "ArrayView") {
-              let elem = ms_extract_array_elem_ty(recv_ty)
-              if pkg.custom_ops.contains("==") && !ms_ty_is_pure_eq(elem, pkg.pure_eq_types, active_generics) {
-                sum.unknown = true
-              }
-            } else if is_unqualified_builtin && (recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet") {
-              let kty = ms_extract_map_key_ty(recv_ty)
-              if !ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics) {
+            } else if ms_is_pure_builtin_method(m) &&
+            ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics) &&
+            (ms_is_builtin_scalar_ty(recv_ty) ||
+              ms_is_builtin_container_head(recv_head) ||
+              ((recv_head == "MbtIter" || recv_head == "Iter") &&
+                ms_is_fresh_builtin_iter_expr(pkg, tokens, recv_end, content, qfi_opt, local_var_types, active_generics))) {
+              if ((m == "get" || m == "contains_key") && (recv_head == "Map" || recv_head == "OrderedMap")) ||
+              (m == "copy" && recv_head == "OrderedSet") {
+                let kty = ms_extract_map_key_ty(recv_ty)
+                if !ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics) {
+                  sum.unknown = true
+                }
+              } else if m == "size" && !(recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet") {
                 sum.unknown = true
               }
             } else {
               ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
             }
-          } else if ms_is_derive_method(m) {
-            if ms_is_qualified_external_ty(recv_ty) || pkg.using_types.contains(recv_head) ||
-            pkg.declared_traits.contains(recv_head) || active_generics.contains(recv_head) {
-              sum.unknown = true
-            } else if ms_is_builtin_scalar_ty(recv_ty) ||
-            (m == "equal" && ms_ty_is_pure_eq(recv_ty, pkg.pure_eq_types, active_generics) && !pkg.fn_keys.contains(recv_head + "::" + m)) {
-              ()
-            } else if recv_head.length() > 0 && pkg.fn_keys.contains(recv_head + "::" + m) {
-              ms_add_call_effect(pkg, recv_head + "::" + m, sum, callees_out, collect_edges)
-            } else {
-              // Class 1: derive-generated or external Show/Compare/Eq/Hash method -> fail-closed!
-              sum.unknown = true
-            }
-          } else if ms_is_pure_builtin_method(m) &&
-          ms_is_unshadowed_builtin_head(pkg, recv_ty, recv_head, m, active_generics) &&
-          (ms_is_builtin_scalar_ty(recv_ty) ||
-            ms_is_builtin_container_head(recv_head) ||
-            ((recv_head == "MbtIter" || recv_head == "Iter") &&
-              ms_is_fresh_builtin_iter_expr(pkg, tokens, recv_end, content, qfi_opt, local_var_types, active_generics))) {
-            if ((m == "get" || m == "contains_key") && (recv_head == "Map" || recv_head == "OrderedMap")) ||
-            (m == "copy" && recv_head == "OrderedSet") {
-              let kty = ms_extract_map_key_ty(recv_ty)
-              if !ms_ty_is_pure_map_key(kty, pkg, active_generics) || !ms_is_proven_pure_map_recv(pkg, tokens, recv_end, content, qfi_opt, local_var_types, pure_map_vars, callables, active_generics) {
-                sum.unknown = true
-              }
-            } else if m == "size" && !(recv_head == "Map" || recv_head == "OrderedMap" || recv_head == "OrderedSet") {
-              sum.unknown = true
-            }
-          } else {
-            ms_resolve_method_call(pkg, m, recv_ty, recv_head, active_generics, sum, callees_out, collect_edges)
           }
         } else if prev_cc {
           // Qualified call `Q::name(args...)`
@@ -2893,6 +3234,12 @@ fn ms_scan_span(
             if is_ctor_name(name) {
               // Qualified enum constructor `dep::Enum::Variant(...)`
               ()
+            } else if i >= s + 4 {
+              let pkg_nm = ms_strip_pkg_ref_name(tokens[i - 4].raw)
+              match ms_lookup_cross_pkg_summary(pkg, pkg_nm, q + "::" + name) {
+                Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+                None => sum.unknown = true
+              }
             } else {
               // Cross-package static call `@dep.Iter::any(...)` / `dep::Foo::bar(...)` -> fail-closed!
               sum.unknown = true
@@ -2901,7 +3248,18 @@ fn ms_scan_span(
             sum.unknown = true
           } else if pkg.using_types.contains(q) {
             if !is_ctor_name(name) {
-              sum.unknown = true
+              match pkg.using_type_targets.get(q) {
+                Some(target_ty) =>
+                match ms_extract_pkg_and_type(target_ty) {
+                  Some((tpkg, ttype)) =>
+                  match ms_lookup_cross_pkg_summary(pkg, tpkg, ttype + "::" + name) {
+                    Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+                    None => sum.unknown = true
+                  }
+                  None => sum.unknown = true
+                }
+                None => sum.unknown = true
+              }
             }
           } else if q == "mbt_compat" {
             if ms_is_mbt_compat_arr_mutating(name) {
@@ -3072,6 +3430,11 @@ fn ms_scan_span(
             ()
           } else if pkg.fn_keys.contains(q + "::" + name) {
             ms_add_call_effect(pkg, q + "::" + name, sum, callees_out, collect_edges)
+          } else if !pkg.declared_types.contains(q) && !pkg.declared_traits.contains(q) && !active_generics.contains(q) {
+            match ms_lookup_cross_pkg_summary(pkg, q, name) {
+              Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+              None => sum.unknown = true
+            }
           } else {
             // Class 4: Cross-package / external call -> fail-closed!
             sum.unknown = true
@@ -3127,6 +3490,11 @@ fn ms_scan_span(
             } else if name == "panic" || name == "abort" ||
             (name == "physical_equal" && !pkg.top_level_bindings.contains(name) && !local_var_types.contains(name)) {
               ()
+            } else if !pkg.top_level_value_bindings.contains(name) && pkg.using_value_targets.contains(name) {
+              match ms_lookup_using_value_summary(pkg, name) {
+                Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+                None => sum.unknown = true
+              }
             } else {
               // Unknown bare function -> fail-closed!
               sum.unknown = true
@@ -3185,11 +3553,12 @@ fn ms_resolve_method_call(
   callees_out : Array[String],
   collect_edges : Bool,
 ) -> Unit {
-  if ms_is_qualified_external_ty(recv_ty) ||
-  pkg.using_types.contains(recv_head) ||
-  pkg.declared_traits.contains(recv_head) ||
-  active_generics.contains(recv_head) {
+  if pkg.declared_traits.contains(recv_head) || active_generics.contains(recv_head) {
     sum.unknown = true
+    return
+  }
+  if ms_is_qualified_external_ty(recv_ty) || pkg.using_types.contains(recv_head) {
+    ms_resolve_cross_pkg_method_call(pkg, m, recv_ty, recv_head, sum)
     return
   }
   if recv_head.length() == 0 {
@@ -3353,8 +3722,33 @@ fn ms_analyze_callback_arg_into(
       ms_add_call_effect(pkg, nm, sum, callees_out, collect_edges)
       return
     }
+    if !pkg.top_level_value_bindings.contains(nm) && pkg.using_value_targets.contains(nm) {
+      match ms_lookup_using_value_summary(pkg, nm) {
+        Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+        None => sum.unknown = true
+      }
+      return
+    }
     sum.unknown = true
     return
+  }
+  // Case 3: Cross-package function reference `dep::pred` or `@dep.pred`
+  if arg_e == arg_s + 3 && tokens[arg_s + 2].kind == TokenKind::Ident {
+    if tokens[arg_s + 1].kind == TokenKind::ColonColon && tokens[arg_s].kind == TokenKind::Ident {
+      match ms_lookup_cross_pkg_summary(pkg, tokens[arg_s].raw, tokens[arg_s + 2].raw) {
+        Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+        None => sum.unknown = true
+      }
+      return
+    }
+    if tokens[arg_s].kind == TokenKind::PkgRef && tokens[arg_s + 1].kind == TokenKind::Dot {
+      let pkg_nm = ms_strip_pkg_ref_name(tokens[arg_s].raw)
+      match ms_lookup_cross_pkg_summary(pkg, pkg_nm, tokens[arg_s + 2].raw) {
+        Some(cs) => { let _ = fn_mutation_summary_merge(sum, cs) }
+        None => sum.unknown = true
+      }
+      return
+    }
   }
   // Anything else (field closure `s.cb`, array element `cbs[0]`, call result `get_cb()`, etc.) -> fail-closed!
   sum.unknown = true
@@ -3426,7 +3820,7 @@ fn ms_record_enum_ctor(pkg : PkgMutationSummary, ctor_name : String, enum_name :
 }
 
 pub fn collect_pkg_mutation_summary_tokens(all_tokens : Array[Array[Token]]) -> PkgMutationSummary {
-  collect_pkg_mutation_summary(all_tokens, [], [], empty_pkg_query_types(), Map(), Map())
+  collect_pkg_mutation_summary_with_cross_pkg(all_tokens, [], [], empty_pkg_query_types(), Map(), Map(), CrossPkgMutationContext::empty())
 }
 
 pub fn collect_pkg_mutation_summary(
@@ -3437,7 +3831,103 @@ pub fn collect_pkg_mutation_summary(
   dep_methods : Map[String, Bool],
   op_lookup : Map[String, String],
 ) -> PkgMutationSummary {
+  collect_pkg_mutation_summary_with_cross_pkg(
+    all_tokens,
+    rel_paths,
+    contents,
+    pkg_qt,
+    dep_methods,
+    op_lookup,
+    CrossPkgMutationContext::empty(),
+  )
+}
+
+pub fn collect_pkg_mutation_summary_with_cross_pkg(
+  all_tokens : Array[Array[Token]],
+  rel_paths : Array[String],
+  contents : Array[String],
+  pkg_qt : PkgQueryTypes,
+  dep_methods : Map[String, Bool],
+  op_lookup : Map[String, String],
+  cross_pkg : CrossPkgMutationContext,
+) -> PkgMutationSummary {
   let pkg = PkgMutationSummary::empty()
+  for k in cross_pkg.pkg_aliases.keys() {
+    match cross_pkg.pkg_aliases.get(k) {
+      Some(v) => pkg.pkg_aliases[k] = v
+      None => ()
+    }
+  }
+  for k in cross_pkg.using_values.keys() {
+    match cross_pkg.using_values.get(k) {
+      Some(v) => pkg.using_value_targets[k] = v
+      None => ()
+    }
+  }
+  for k in cross_pkg.using_types.keys() {
+    match cross_pkg.using_types.get(k) {
+      Some(v) => {
+        pkg.using_types[k] = true
+        pkg.using_type_targets[k] = v
+      }
+      None => ()
+    }
+  }
+  // Pre-seed dep_name -> canonical package_name aliases before canonicalizing summaries.
+  for dabi in cross_pkg.dep_abis {
+    let dep_name = dabi.0
+    let abi = dabi.1
+    let canon_pkg = if abi.package_name.length() > 0 { abi.package_name } else { dep_name }
+    if dep_name.length() > 0 && canon_pkg.length() > 0 && dep_name != canon_pkg {
+      match pkg.pkg_aliases.get(dep_name) {
+        Some(prev) => if prev != canon_pkg { pkg.pkg_aliases[dep_name] = "__AMBIG__" }
+        None => pkg.pkg_aliases[dep_name] = canon_pkg
+      }
+    }
+  }
+  for dabi in cross_pkg.dep_abis {
+    let dep_name = dabi.0
+    let abi = dabi.1
+    let canon_pkg = if abi.package_name.length() > 0 { abi.package_name } else { dep_name }
+    for fms in abi.fn_mutation_summaries {
+      let s_dep = FnMutationSummary::{
+        mutated_elem_types: Map(),
+        mutates_any_array: fms.mutates_any_array,
+        reaches_shrink: fms.reaches_shrink,
+        unknown: fms.unknown,
+      }
+      let s_canon = FnMutationSummary::{
+        mutated_elem_types: Map(),
+        mutates_any_array: fms.mutates_any_array,
+        reaches_shrink: fms.reaches_shrink,
+        unknown: fms.unknown,
+      }
+      for et in fms.mutated_elem_types {
+        if et.length() > 0 {
+          let cet = ms_canonicalize_type(pkg, et)
+          let store_et = if cet.length() > 0 { cet } else { et }
+          s_canon.mutated_elem_types[store_et] = true
+          s_dep.mutated_elem_types[store_et] = true
+          if cet.length() == 0 {
+            s_canon.mutates_any_array = true
+            s_dep.mutates_any_array = true
+          }
+          if canon_pkg.length() > 0 && dep_name.length() > 0 && canon_pkg != dep_name {
+            let remapped = remap_abi_pkg_prefix(store_et, canon_pkg, dep_name)
+            if remapped.length() > 0 {
+              s_dep.mutated_elem_types[remapped] = true
+            }
+          }
+        }
+      }
+      if dep_name.length() > 0 {
+        ms_record_cross_pkg_summary(pkg, dep_name + "::" + fms.name, s_dep, false)
+      }
+      if canon_pkg.length() > 0 && canon_pkg != dep_name {
+        ms_record_cross_pkg_summary(pkg, canon_pkg + "::" + fms.name, s_canon, true)
+      }
+    }
+  }
   for k in dep_methods.keys() {
     pkg.dep_methods[k] = true
     if k == "eq" || k == "equal" || k == "op_equal" {
@@ -3487,8 +3977,26 @@ pub fn collect_pkg_mutation_summary(
           if str_has(helper, "::") {
             pkg.custom_ops[sym] = true
             pkg.ext_custom_ops[sym] = true
+            if sym == "==" {
+              pkg.custom_ops["!="] = true
+              pkg.ext_custom_ops["!="] = true
+            } else if sym == "<" {
+              pkg.custom_ops["<="] = true
+              pkg.custom_ops[">"] = true
+              pkg.custom_ops[">="] = true
+              pkg.ext_custom_ops["<="] = true
+              pkg.ext_custom_ops[">"] = true
+              pkg.ext_custom_ops[">="] = true
+            }
           } else {
             ms_add_op_impl_fn(pkg, sym, helper)
+            if sym == "==" {
+              ms_add_op_impl_fn(pkg, "!=", helper)
+            } else if sym == "<" {
+              ms_add_op_impl_fn(pkg, "<=", helper)
+              ms_add_op_impl_fn(pkg, ">", helper)
+              ms_add_op_impl_fn(pkg, ">=", helper)
+            }
           }
         }
       }
@@ -3540,6 +4048,40 @@ pub fn collect_pkg_mutation_summary(
         if is_generic_ty {
           derive_eq_invalid[tname] = true
           derive_hash_invalid[tname] = true
+        }
+        if tk.raw == "type" {
+          pkg.type_alias_names[tname] = true
+          if is_generic_ty {
+            pkg.type_aliases[tname] = "__AMBIG__"
+          } else {
+            let mut eq_i = i + 2
+            while eq_i < n && ts[eq_i].kind != TokenKind::Eq && ts[eq_i].kind != TokenKind::Semi && !ts[eq_i].newline_before {
+              eq_i = eq_i + 1
+            }
+            if eq_i < n && ts[eq_i].kind == TokenKind::Eq {
+              let rhs_s = eq_i + 1
+              let mut rhs_e = rhs_s
+              let mut rd = 0
+              while rhs_e < n {
+                let rk = ts[rhs_e].kind
+                if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+                else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } else { break } }
+                else if rd == 0 && (rk == TokenKind::Semi || (rhs_e > rhs_s && ts[rhs_e].newline_before)) { break }
+                rhs_e = rhs_e + 1
+              }
+              let rhs_ty = ms_join_token_slice(ts, rhs_s, rhs_e)
+              if rhs_ty.length() > 0 {
+                match pkg.type_aliases.get(tname) {
+                  Some(prev) => if prev != rhs_ty { pkg.type_aliases[tname] = "__AMBIG__" }
+                  None => pkg.type_aliases[tname] = rhs_ty
+                }
+              } else {
+                pkg.type_aliases[tname] = "__AMBIG__"
+              }
+            } else {
+              pkg.type_aliases[tname] = "__AMBIG__"
+            }
+          }
         }
         if tk.raw == "struct" {
           let mut struct_is_pub_all = false
@@ -3910,6 +4452,7 @@ pub fn collect_pkg_mutation_summary(
         (ni + 1 >= n || ts[ni + 1].kind == TokenKind::Eq || ts[ni + 1].kind == TokenKind::Colon) {
           let vname = ts[ni].raw
           pkg.top_level_bindings[vname] = true
+          pkg.top_level_value_bindings[vname] = true
           let is_dup_top = top_level_var_seen.contains(vname)
           top_level_var_seen[vname] = true
           if is_mut || is_dup_top {
@@ -3962,6 +4505,7 @@ pub fn collect_pkg_mutation_summary(
             ms_add_pat_idents(ts, ni, eq_i, pat_names)
             for pn in pat_names.keys() {
               pkg.top_level_bindings[pn] = true
+              pkg.top_level_value_bindings[pn] = true
               top_level_var_seen[pn] = true
               top_level_var_mut[pn] = true
               pkg.top_level_var_types[pn] = "__AMBIG__"
@@ -3971,15 +4515,37 @@ pub fn collect_pkg_mutation_summary(
       }
       if tk.raw == "using" && i + 1 < n {
         let mut lb = i + 1
-        while lb < n && ts[lb].kind != TokenKind::LBrace && !ts[lb].newline_before { lb = lb + 1 }
+        let mut using_pkg = ""
+        while lb < n && ts[lb].kind != TokenKind::LBrace && !ts[lb].newline_before {
+          if ts[lb].kind == TokenKind::PkgRef {
+            using_pkg = ms_strip_pkg_ref_name(ts[lb].raw)
+          } else if using_pkg.length() == 0 && ts[lb].kind == TokenKind::Ident {
+            using_pkg = ts[lb].raw
+          }
+          lb = lb + 1
+        }
         if lb < n && ts[lb].kind == TokenKind::LBrace {
           let rb = find_matching_delim(ts, lb)
           let mut k = lb + 1
           while k < rb && k < n {
             if ts[k].kind == TokenKind::Ident && !ms_is_pattern_kw(ts[k].raw) {
               pkg.top_level_bindings[ts[k].raw] = true
+              if using_pkg.length() > 0 {
+                let target = using_pkg + "::" + ts[k].raw
+                match pkg.using_value_targets.get(ts[k].raw) {
+                  Some(prev) => if prev != target { pkg.using_value_targets[ts[k].raw] = "__AMBIG__" }
+                  None => pkg.using_value_targets[ts[k].raw] = target
+                }
+              }
             } else if ts[k].kind == TokenKind::UpperIdent {
               pkg.using_types[ts[k].raw] = true
+              if using_pkg.length() > 0 {
+                let target = using_pkg + "::" + ts[k].raw
+                match pkg.using_type_targets.get(ts[k].raw) {
+                  Some(prev) => if prev != target { pkg.using_type_targets[ts[k].raw] = "__AMBIG__" }
+                  None => pkg.using_type_targets[ts[k].raw] = target
+                }
+              }
             }
             k = k + 1
           }
@@ -3989,9 +4555,13 @@ pub fn collect_pkg_mutation_summary(
       }
       // Top-level `fn` / `fn[T]` / `fn Type::method`
       if tk.raw == "fn" && i + 1 < n && ts[i + 1].kind != TokenKind::LParen {
+        let fn_is_pub = is_decl_pub(ts, i)
         let (next_i, decl_opt) = ms_parse_fn_decl(pkg, ts, i, n, fi, "")
         match decl_opt {
           Some(dc) => {
+            if fn_is_pub {
+              pkg.pub_fn_keys[dc.key] = true
+            }
             decls.push(dc)
             // Detect Stage A operator pre-pass functions `mbt_op_<op>_<Type>` (and legacy `__mbt_op_`)
             if dc.bare_name.starts_with("mbt_op_") || dc.bare_name.starts_with("__mbt_op_") {
@@ -4031,6 +4601,62 @@ pub fn collect_pkg_mutation_summary(
       i = i + 1
     }
     fi = fi + 1
+  }
+
+  // Pass 1.1: Load exported struct field types & fn-typed fields from dependency ABIs.
+  for dabi in cross_pkg.dep_abis {
+    let dep_name = dabi.0
+    let abi = dabi.1
+    let canon_pkg = if abi.package_name.length() > 0 { abi.package_name } else { dep_name }
+    match abi.structs {
+      Some(sts) => {
+        let dep_local_types : Map[String, Bool] = Map()
+        for en in abi.enums { dep_local_types[en.name] = true }
+        for s0 in sts { dep_local_types[s0.name] = true }
+        for s in sts {
+          let tparam_set : Map[String, Bool] = Map()
+          for tp in s.type_params { tparam_set[tp] = true }
+          for f in s.fields {
+            if f.visibility != "pub" || f.ty.length() == 0 {
+              continue
+            }
+            let mut q_ty = qualify_abi_local_type_names(f.ty, dep_name, dep_local_types, tparam_set)
+            if canon_pkg.length() > 0 && dep_name.length() > 0 && canon_pkg != dep_name {
+              q_ty = remap_abi_pkg_prefix(q_ty, canon_pkg, dep_name)
+            }
+            let cq_ty = qualify_abi_local_type_names(f.ty, canon_pkg, dep_local_types, tparam_set)
+            if ms_ty_is_fn_type(f.ty) || ms_ty_is_fn_type(q_ty) {
+              if f.src_name.length() > 0 {
+                pkg.fn_typed_fields[f.src_name] = true
+              }
+              if f.emit_name.length() > 0 {
+                pkg.fn_typed_fields[f.emit_name] = true
+              }
+            }
+            // Never expose a generic struct's type parameter as a concrete field type.
+            let is_generic_field = tparam_set.length() > 0 && ms_ty_contains_generic(q_ty, tparam_set)
+            let eff_q_ty = if is_generic_field { "__AMBIG__" } else { q_ty }
+            let eff_cq_ty = if is_generic_field { "__AMBIG__" } else { cq_ty }
+            let fnames : Array[String] = []
+            if f.src_name.length() > 0 { fnames.push(f.src_name) }
+            if f.emit_name.length() > 0 && f.emit_name != f.src_name { fnames.push(f.emit_name) }
+            for fnm in fnames {
+              if dep_name.length() > 0 {
+                ms_record_qualified_field_type(pkg, dep_name + "::" + s.name + "::" + fnm, eff_q_ty)
+              }
+              if canon_pkg.length() > 0 && canon_pkg != dep_name {
+                ms_record_qualified_field_type(pkg, canon_pkg + "::" + s.name + "::" + fnm, eff_cq_ty)
+              }
+              if !pkg.declared_types.contains(s.name) {
+                ms_record_qualified_field_type(pkg, s.name + "::" + fnm, eff_q_ty)
+              }
+              ms_record_qualified_field_type(pkg, fnm, eff_q_ty)
+            }
+          }
+        }
+      }
+      None => ()
+    }
   }
 
   // Fixed-point purity check for local non-generic `derive(Eq)` types without custom `impl Eq`.

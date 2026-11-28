@@ -322,6 +322,110 @@ fn sort_abi_raising_fns(xs : Array[AbiRaisingFn]) -> Array[AbiRaisingFn] {
   out
 }
 
+fn sort_abi_fn_mutation_summaries(xs : Array[AbiFnMutationSummary]) -> Array[AbiFnMutationSummary] {
+  let out : Array[AbiFnMutationSummary] = []
+  for x in xs {
+    out.push(x)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].name, key.name) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| Export conservative mutation summaries for every top-level `pub fn` and `pub fn Type::method`
+///| in non-test generated `.pion` files, qualifying local type names in `mutated_elem_types`
+///| as `<self_pkg>::<Type>` and normalizing dependency alias prefixes to canonical package names.
+pub fn collect_exported_abi_fn_mutation_summaries(
+  gen_files : Array[GeneratedFile],
+  self_pkg : String,
+  symtab : SymbolTable,
+  op_lookup : Map[String, String],
+  cross_pkg : CrossPkgMutationContext,
+  pkg_qt : PkgQueryTypes,
+) -> Array[AbiFnMutationSummary] {
+  let all_tokens : Array[Array[Token]] = []
+  let rel_paths : Array[String] = []
+  let contents : Array[String] = []
+  for gf in gen_files {
+    if is_abi_library_pion(gf.rel_path) {
+      all_tokens.push(lex_moonbit(gf.content))
+      rel_paths.push(gf.rel_path)
+      contents.push(gf.content)
+    }
+  }
+  if all_tokens.length() == 0 {
+    return []
+  }
+  let ms = collect_pkg_mutation_summary_with_cross_pkg(
+    all_tokens,
+    rel_paths,
+    contents,
+    pkg_qt,
+    symtab.dep_method_names,
+    op_lookup,
+    cross_pkg,
+  )
+  let nominal_local_types : Map[String, Bool] = Map()
+  for lt in symtab.local_types.keys() {
+    if !symtab.type_aliases.contains(lt) {
+      nominal_local_types[lt] = true
+    }
+  }
+  for dt in ms.declared_types.keys() {
+    if !symtab.type_aliases.contains(dt) {
+      nominal_local_types[dt] = true
+    }
+  }
+  let empty_g : Map[String, Bool] = Map()
+  let out : Array[AbiFnMutationSummary] = []
+  for fn_name in sort_strings(ms.pub_fn_keys.keys()) {
+    match ms.summaries.get(fn_name) {
+      Some(s) => {
+        let seen_met : Map[String, Bool] = Map()
+        let mut export_mutates_any = s.mutates_any_array
+        for raw_et in s.mutated_elem_types.keys() {
+          let canon_et = ms_canonicalize_type(ms, raw_et)
+          if canon_et.length() == 0 {
+            export_mutates_any = true
+            continue
+          }
+          let mut et = qualify_abi_local_type_names(canon_et, self_pkg, nominal_local_types, empty_g)
+          for alias_nm in symtab.dep_alias_to_canon_pkg.keys() {
+            match symtab.dep_alias_to_canon_pkg.get(alias_nm) {
+              Some(canon_nm) =>
+              if canon_nm.length() > 0 && canon_nm != alias_nm {
+                et = remap_abi_pkg_prefix(et, alias_nm, canon_nm)
+              }
+              None => ()
+            }
+          }
+          if et.length() > 0 {
+            seen_met[et] = true
+          }
+        }
+        out.push(AbiFnMutationSummary::{
+          name: fn_name,
+          mutates_any_array: export_mutates_any,
+          reaches_shrink: s.reaches_shrink,
+          unknown: s.unknown,
+          mutated_elem_types: sort_strings(seen_met.keys()),
+        })
+      }
+      None => ()
+    }
+  }
+  sort_abi_fn_mutation_summaries(out)
+}
+
 ///| True iff `s` is complete, externally constructible & updatable, and has zero `priv` fields.
 pub fn abi_struct_is_externally_expandable(s : AbiStructSchema) -> Bool {
   if !s.complete || !s.can_construct || !s.can_update {
@@ -1114,6 +1218,7 @@ fn abi_payload_to_json_opts(
   include_reexports : Bool,
   include_values : Bool,
   include_raising_fns : Bool,
+  include_fn_mutation_summaries : Bool,
   include_empty_target_pkg : Bool,
   include_empty_target : Bool,
 ) -> json::JsonValue {
@@ -1239,6 +1344,27 @@ fn abi_payload_to_json_opts(
     }
     fields.push(json_field("raising_fns", json_arr(rf_arr)))
   }
+  if schema_ver >= 2 && (include_fn_mutation_summaries || abi.fn_mutation_summaries.length() > 0) {
+    let fms_arr : Array[json::JsonValue] = []
+    for fms in sort_abi_fn_mutation_summaries(abi.fn_mutation_summaries) {
+      let met_arr : Array[json::JsonValue] = []
+      let mut prev_met = ""
+      for met in sort_strings(fms.mutated_elem_types) {
+        if met.length() > 0 && met != prev_met {
+          met_arr.push(json_str(met))
+          prev_met = met
+        }
+      }
+      fms_arr.push(json_obj([
+        json_field("name", json_str(fms.name)),
+        json_field("mutates_any_array", json_bool(fms.mutates_any_array)),
+        json_field("reaches_shrink", json_bool(fms.reaches_shrink)),
+        json_field("unknown", json_bool(fms.unknown)),
+        json_field("mutated_elem_types", json_arr(met_arr)),
+      ]))
+    }
+    fields.push(json_field("fn_mutation_summaries", json_arr(fms_arr)))
+  }
   if schema_ver >= 2 && abi.ffi_shim_prefix.length() > 0 {
     fields.push(json_field("ffi_shim_prefix", json_str(abi.ffi_shim_prefix)))
   }
@@ -1255,7 +1381,7 @@ fn abi_payload_to_json_opts(
 }
 
 fn abi_payload_to_json_versioned(abi : PackageAbi, schema_ver : Int) -> json::JsonValue {
-  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0, abi.values.length() > 0, abi.raising_fns.length() > 0, abi.empty_target_pkg, abi.empty_target.length() > 0)
+  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0, abi.values.length() > 0, abi.raising_fns.length() > 0, abi.fn_mutation_summaries.length() > 0, abi.empty_target_pkg, abi.empty_target.length() > 0)
 }
 
 fn abi_payload_to_json(abi : PackageAbi) -> json::JsonValue {
@@ -2053,6 +2179,85 @@ pub fn verify_and_parse_dep_abi_for_target(
     }
   }
 
+  let fn_mutation_summaries : Array[AbiFnMutationSummary] = []
+  let seen_fms : Map[String, Bool] = Map()
+  let mut has_fms_field = false
+  if sv >= 2 {
+    match json::obj_get(payload_v, "fn_mutation_summaries") {
+      Some(fmsv) => {
+        has_fms_field = true
+        let fms_items = match json::as_arr(fmsv) {
+          Some(a) => a
+          None => {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `fn_mutation_summaries` field in dep `" + dep_name + "`"))
+            return None
+          }
+        }
+        for fmsit in fms_items {
+          let fname = j_str(fmsit, "name", "")
+          let mut_any = match json::obj_get(fmsit, "mutates_any_array") {
+            Some(v) =>
+            match json::as_bool(v) {
+              Some(b) => Some(b)
+              None => None
+            }
+            None => None
+          }
+          let r_shrink = match json::obj_get(fmsit, "reaches_shrink") {
+            Some(v) =>
+            match json::as_bool(v) {
+              Some(b) => Some(b)
+              None => None
+            }
+            None => None
+          }
+          let unk = match json::obj_get(fmsit, "unknown") {
+            Some(v) =>
+            match json::as_bool(v) {
+              Some(b) => Some(b)
+              None => None
+            }
+            None => None
+          }
+          let met_list : Array[String] = []
+          let mut met_ok = true
+          match json::obj_get(fmsit, "mutated_elem_types") {
+            Some(mv) =>
+            match json::as_arr(mv) {
+              Some(mitems) => {
+                for mit in mitems {
+                  match json::as_str(mit) {
+                    Some(ms) => if ms.length() > 0 { met_list.push(ms) } else { met_ok = false }
+                    None => met_ok = false
+                  }
+                }
+              }
+              None => met_ok = false
+            }
+            None => met_ok = false
+          }
+          let ok_bools = match (mut_any, r_shrink, unk) {
+            (Some(_), Some(_), Some(_)) => true
+            _ => false
+          }
+          if fname.length() == 0 || seen_fms.contains(fname) || !ok_bools || !met_ok {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `fn_mutation_summaries` entry `" + fname + "` in dep `" + dep_name + "`"))
+            return None
+          }
+          seen_fms[fname] = true
+          fn_mutation_summaries.push(AbiFnMutationSummary::{
+            name: fname,
+            mutates_any_array: match mut_any { Some(b) => b, None => true },
+            reaches_shrink: match r_shrink { Some(b) => b, None => false },
+            unknown: match unk { Some(b) => b, None => true },
+            mutated_elem_types: sort_strings(met_list),
+          })
+        }
+      }
+      None => ()
+    }
+  }
+
   let mut parsed_ffi_shim_prefix = ""
   if sv >= 2 {
     match json::obj_get(payload_v, "ffi_shim_prefix") {
@@ -2128,13 +2333,14 @@ pub fn verify_and_parse_dep_abi_for_target(
     reexports: reexports,
     values: values,
     raising_fns: raising_fns,
+    fn_mutation_summaries: fn_mutation_summaries,
     ffi_shim_prefix: parsed_ffi_shim_prefix,
     publishable: is_publishable,
     empty_target_pkg: is_empty_target_pkg,
     empty_target: parsed_empty_target,
   }
   // Direction 1: canonical payload SHA-256 MUST equal `abi_sha256`!
-  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field, has_values_field, has_raising_fns_field, has_empty_target_pkg_field, has_empty_target_field)))
+  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field, has_values_field, has_raising_fns_field, has_fms_field, has_empty_target_pkg_field, has_empty_target_field)))
   if actual_abi_sha != decl_abi_sha {
     diags.push(diag_error(
       "MBT2PION_DEP_ABI_ERROR",
