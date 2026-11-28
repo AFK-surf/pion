@@ -1,0 +1,308 @@
+///| Unit tests for `String::pad_start` / `String::pad_end` lowering and
+///| hygienic `defer` statement LIFO lowering (including fail-closed guardrails).
+
+fn pad_defer_transpile_ok(name : String, src : String) -> String {
+  let res = transpile_package(
+    [SourceFile::{ rel_path: name, content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, name + " should transpile with 0 blockers")
+  res.files[0].content
+}
+
+fn pad_defer_transpile_raw(name : String, src : String) -> TranspileResult {
+  transpile_package(
+    [SourceFile::{ rel_path: name, content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+}
+
+test "str-pad-a: Stage A lowers String::pad_start and String::pad_end including known-int to_string(radix=16)" {
+  let src = "pub fn fmt_hex(k : Int64) -> String {\n" +
+  "  k.to_string(radix=16).pad_start(6, '0') + \"ff\"\n" +
+  "}\n" +
+  "pub fn fmt_chain(s : String) -> String {\n" +
+  "  s.pad_start(4, '0').pad_end(6, '_')\n" +
+  "}\n" +
+  "pub fn fmt_lit() -> String {\n" +
+  "  \"hi\".pad_end(5, '!')\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("pad_stage_a.mbt", src)
+  assert_true(
+    str_has(out, "mbt_compat::str_pad_start(k.__mbt_int_to_string(radix=16), 6, '0') + \"ff\""),
+    "known-int to_string(radix=16).pad_start lowered in Stage A",
+  )
+  assert_true(
+    str_has(out, "mbt_compat::str_pad_end(mbt_compat::str_pad_start(s, 4, '0'), 6, '_')"),
+    "chained pad_start + pad_end lowered in Stage A",
+  )
+  assert_true(
+    str_has(out, "mbt_compat::str_pad_end(\"hi\", 5, '!')"),
+    "string literal pad_end lowered in Stage A",
+  )
+}
+
+test "str-pad-b: Stage B fallback, mutation_summary purity, and no method-name guessing for Custom::trim().pad_end()" {
+  assert_true(lookup_missing_method_helper("String", "pad_start") == Some("mbt_compat::str_pad_start"), "String::pad_start Stage B mapping")
+  assert_true(lookup_missing_method_helper("String", "pad_end") == Some("mbt_compat::str_pad_end"), "String::pad_end Stage B mapping")
+  assert_true(lookup_missing_method_helper("CustomBuf", "pad_start") is None, "custom type pad_start not hijacked")
+  assert_true(lookup_missing_method_helper("CustomBuf", "pad_end") is None, "custom type pad_end not hijacked")
+  assert_true(lookup_missing_method_helper("Int64", "__mbt_int_to_string") == Some("mbt_compat::int64_to_string_radix"), "Int64 radix to_string mapping")
+  assert_true(ms_is_mbt_compat_pure_ro("str_pad_start"), "str_pad_start must be pure_ro")
+  assert_true(ms_is_mbt_compat_pure_ro("str_pad_end"), "str_pad_end must be pure_ro")
+  assert_true(ms_is_mbt_compat_pure_ro("int64_to_string_radix"), "int64_to_string_radix must be pure_ro")
+  let pkg = PkgMutationSummary::empty()
+  let toks_s = lex_moonbit("mbt_compat::str_pad_start(s, 6, '0')")
+  assert_true(ms_infer_expr_ty(pkg, toks_s, toks_s.length() - 2, "", None, Map()) == "String", "str_pad_start infers String")
+  let toks_e = lex_moonbit("mbt_compat::str_pad_end(s, 6, '0')")
+  assert_true(ms_infer_expr_ty(pkg, toks_e, toks_e.length() - 2, "", None, Map()) == "String", "str_pad_end infers String")
+
+  // Negative: Custom::trim() -> Custom followed by .pad_end(3, '0') must NOT be hijacked in Stage A.
+  let src_custom = "struct Custom {\n" +
+  "  v : Int\n" +
+  "}\n" +
+  "pub fn Custom::trim(self : Custom) -> Custom { self }\n" +
+  "pub fn Custom::pad_end(self : Custom, w : Int, _ch : Char) -> Int { self.v + w }\n" +
+  "pub fn use_custom(c : Custom) -> Int {\n" +
+  "  c.trim().pad_end(3, '0')\n" +
+  "}\n"
+  let out_c = pad_defer_transpile_ok("pad_custom.mbt", src_custom)
+  assert_true(!str_has(out_c, "mbt_compat::str_pad_end"), "Custom::trim().pad_end() must not be hijacked")
+  assert_true(str_has(out_c, "c.trim().pad_end(3, '0')"), "Custom::trim().pad_end() preserved intact")
+
+  // Negative: Own::to_string(radix=16) -> Own followed by .pad_end(3, '0') must NOT be hijacked in Stage A.
+  let src_own = "struct Own {\n" +
+  "  v : Int\n" +
+  "}\n" +
+  "pub fn Own::to_string(self : Own, radix~ : Int = 10) -> Own { Own::{ v: self.v + radix } }\n" +
+  "pub fn Own::pad_end(self : Own, width : Int, _ch : Char) -> Int { self.v + width }\n" +
+  "pub fn use_own(o : Own) -> Int {\n" +
+  "  o.to_string(radix=16).pad_end(3, '0')\n" +
+  "}\n"
+  let out_o = pad_defer_transpile_ok("pad_own.mbt", src_own)
+  assert_true(!str_has(out_o, "mbt_compat::str_pad_end"), "Own::to_string(radix=16).pad_end() must not be hijacked in Stage A")
+}
+
+test "defer-a: single and multiple defers emit in-place closures called in LIFO order after tail value" {
+  let src = "pub fn with_tail(log : Array[String]) -> Int {\n" +
+  "  defer log.push(\"first\")\n" +
+  "  defer {\n" +
+  "    log.push(\"second\")\n" +
+  "  }\n" +
+  "  log.push(\"body\")\n" +
+  "  42\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("defer_lifo.mbt", src)
+  assert_true(!str_has(out, "defer "), "no raw defer keyword left in output")
+  assert_true(str_has(out, "let __mbt_defer_fn_1 = fn() -> Unit"), "first defer lowered to in-place closure")
+  assert_true(str_has(out, "let __mbt_defer_fn_2 = fn() -> Unit"), "second defer lowered to in-place closure")
+  let idx_res = out.index_of("__mbt_defer_res_")
+  let idx_call2 = out.index_of("__mbt_defer_fn_2()")
+  let idx_call1 = out.index_of("__mbt_defer_fn_1()")
+  assert_true(idx_res >= 0 && idx_call2 > idx_res && idx_call1 > idx_call2, "defers run in LIFO order after tail value")
+}
+
+test "defer-b: early return, same-block shadowing, and mutable capture boxing" {
+  let src = "pub fn shadow_and_mut(flag : Bool, log : Array[String]) -> Int {\n" +
+  "  let x = 1\n" +
+  "  let mut y = 1\n" +
+  "  defer log.push(\"x=\" + x.to_string())\n" +
+  "  defer {\n" +
+  "    y = y + 1\n" +
+  "    log.push(\"y=\" + y.to_string())\n" +
+  "  }\n" +
+  "  let x = 2\n" +
+  "  y = 10\n" +
+  "  if flag {\n" +
+  "    let x = 3\n" +
+  "    return x\n" +
+  "  }\n" +
+  "  x\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("defer_hygiene.mbt", src)
+  assert_true(str_has(out, "mbt_compat::MbtCell::{ v: 1 }"), "let mut y captured by defer is boxed in MbtCell")
+  assert_true(str_has(out, "let __mbt_defer_fn_1 = fn() -> Unit"), "first defer closure declared before shadowing let x = 2")
+  assert_true(str_has(out, "__mbt_defer_ret_"), "early return binds temp before calling defer closures")
+
+  // `test` blocks must also prescan and box `let mut` variables captured by `defer`.
+  let src_test_blk = "test \"mut_in_test_defer\" {\n" +
+  "  let log : Array[Int] = []\n" +
+  "  let mut x = 1\n" +
+  "  defer log.push(x)\n" +
+  "  x = 2\n" +
+  "}\n"
+  let res_tb = transpile_package(
+    [SourceFile::{ rel_path: "defer_test_blk.mbt", content: src_test_blk, is_test: true }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    TranspileOptions::{
+      target: "native",
+      mode: "audit",
+      with_tests: true,
+      src_prefix: "",
+      moon_pkg_content: "",
+      ffi_shim_prefix: "",
+      header: default_header_meta("native"),
+    },
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res_tb.blockers == 0, "test block with defer + let mut transpiles cleanly")
+  assert_true(str_has(res_tb.files[0].content, "mbt_compat::MbtCell::{ v: 1 }"), "test block let mut captured by defer is boxed in MbtCell")
+}
+
+test "defer-c: loop break and continue unwind loop-scoped defers without outer function defers" {
+  let src = "pub fn loop_defer(log : Array[String]) -> Unit {\n" +
+  "  defer log.push(\"fn_end\")\n" +
+  "  let mut i = 0\n" +
+  "  while i < 4 {\n" +
+  "    defer log.push(\"iter\")\n" +
+  "    i = i + 1\n" +
+  "    if i == 2 { continue }\n" +
+  "    if i == 3 { break }\n" +
+  "  }\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("defer_loop.mbt", src)
+  assert_true(!str_has(out, "defer "), "all defers lowered")
+  assert_true(str_has(out, "__mbt_defer_fn_2()\ncontinue"), "continue runs loop defer closure")
+  assert_true(str_has(out, "__mbt_defer_fn_2()\nbreak"), "break runs loop defer closure")
+}
+
+test "defer-d: nested closure return is isolated from outer function defer" {
+  let src = "pub fn closure_iso(log : Array[String]) -> Int {\n" +
+  "  defer log.push(\"outer\")\n" +
+  "  let f = fn(x : Int) -> Int {\n" +
+  "    defer log.push(\"inner\")\n" +
+  "    if x == 0 { return 10 }\n" +
+  "    x + 1\n" +
+  "  }\n" +
+  "  f(0) + f(2)\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("defer_closure.mbt", src)
+  let fn_pos = out.index_of("let f = fn(")
+  let outer_call_pos = out.index_of("f(0) + f(2)")
+  assert_true(fn_pos >= 0 && outer_call_pos > fn_pos, "closure and call present")
+  let clo_slice = out.slice(fn_pos, outer_call_pos)
+  assert_true(str_has(clo_slice, "__mbt_defer_fn_2()"), "closure runs its own defer")
+  assert_true(!str_has(clo_slice, "__mbt_defer_fn_1()"), "closure return must NOT trigger outer defer")
+}
+
+test "defer-e: multiline defer, postfix chain on block defer, semicolon separator, and non-keyword .defer" {
+  let src = "struct Holder {\n" +
+  "  defer_v : Int\n" +
+  "}\n" +
+  "pub fn syntax_forms(log : Array[Int], mark : (Array[Int], Int) -> Unit, h : Holder) -> (Int, String) {\n" +
+  "  let x = h.defer_v; defer log.push(1); (mark)(log, x); log.push(2)\n" +
+  "  defer\n" +
+  "    log.push(3)\n" +
+  "  defer { let a = log; a }.push(4)\n" +
+  "  (x, \"defer not a stmt\")\n" +
+  "}\n"
+  let out = pad_defer_transpile_ok("defer_syntax.mbt", src)
+  assert_true(!str_has(out, "defer log.push") && !str_has(out, "defer\n") && !str_has(out, "defer {"), "all three defer forms lowered")
+  assert_true(str_has(out, "let __mbt_defer_fn_3 = fn() -> Unit"), "all three defer closures emitted")
+  assert_true(str_has(out, "h.defer_v"), "field name preserved")
+  assert_true(str_has(out, "\"defer not a stmt\""), "string literal preserved")
+  assert_true(str_has(out, ".push(4)"), "postfix chain on block defer preserved inside closure")
+}
+
+test "defer-f: fail-closed on return in defer, labeled break, value-carrying continue, and raising/try defer" {
+  let src_ret_in_defer = "pub fn bad1() -> Int {\n" +
+  "  defer {\n" +
+  "    return 1\n" +
+  "  }\n" +
+  "  0\n" +
+  "}\n"
+  let r1 = pad_defer_transpile_raw("bad_defer_ret.mbt", src_ret_in_defer)
+  assert_true(r1.blockers > 0, "return inside defer body must fail closed")
+
+  let src_labeled_break = "pub fn bad2(log : Array[String]) -> Unit {\n" +
+  "  outer~: while true {\n" +
+  "    defer log.push(\"d\")\n" +
+  "    break outer~\n" +
+  "  }\n" +
+  "}\n"
+  let r2 = pad_defer_transpile_raw("bad_defer_lbl.mbt", src_labeled_break)
+  assert_true(r2.blockers > 0, "labeled break crossing defer must fail closed")
+
+  let src_val_continue = "pub fn bad3(log : Array[Int]) -> Unit {\n" +
+  "  let mut i = 0\n" +
+  "  while i < 3 {\n" +
+  "    defer log.push(i)\n" +
+  "    continue { log.push(99); i + 1 }\n" +
+  "  }\n" +
+  "}\n"
+  let r3 = pad_defer_transpile_raw("bad_defer_cont.mbt", src_val_continue)
+  assert_true(r3.blockers > 0, "value-carrying continue crossing defer must fail closed")
+  let mut has_unsup3 = false
+  for d in r3.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_unsup3 = true }
+  }
+  assert_true(has_unsup3, "expected MBT2PION_UNSUPPORTED_SYNTAX for value-carrying continue")
+
+  let src_raising = "suberror MyErr { Boom }\n" +
+  "fn may_fail() -> Unit raise MyErr { raise MyErr::Boom }\n" +
+  "pub fn bad4(log : Array[String]) -> Unit raise MyErr {\n" +
+  "  defer log.push(\"cleanup\")\n" +
+  "  may_fail()\n" +
+  "}\n"
+  let r4 = pad_defer_transpile_raw("bad_defer_raise.mbt", src_raising)
+  assert_true(r4.blockers > 0, "defer in raising fn must fail closed")
+  let mut has_unsup4 = false
+  for d in r4.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_unsup4 = true }
+  }
+  assert_true(has_unsup4, "expected MBT2PION_UNSUPPORTED_SYNTAX for defer in raising fn")
+
+  let src_try = "suberror MyErr { Boom }\n" +
+  "fn may_fail() -> Unit raise MyErr { raise MyErr::Boom }\n" +
+  "pub fn bad5(log : Array[String]) -> Unit {\n" +
+  "  try {\n" +
+  "    defer log.push(\"cleanup\")\n" +
+  "    may_fail()\n" +
+  "  } catch {\n" +
+  "    _ => ()\n" +
+  "  }\n" +
+  "}\n"
+  let r5 = pad_defer_transpile_raw("bad_defer_try.mbt", src_try)
+  assert_true(r5.blockers > 0, "defer in try block must fail closed")
+  let mut has_unsup5 = false
+  for d in r5.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_unsup5 = true }
+  }
+  assert_true(has_unsup5, "expected MBT2PION_UNSUPPORTED_SYNTAX for defer in try block")
+
+  let src_local_raising_clo = "suberror MyErr { Boom }\n" +
+  "fn may_fail() -> Unit raise MyErr { raise MyErr::Boom }\n" +
+  "pub fn bad6(log : Array[String]) -> Unit {\n" +
+  "  let f = fn() -> Unit raise MyErr {\n" +
+  "    defer log.push(\"cleanup\")\n" +
+  "    may_fail()\n" +
+  "  }\n" +
+  "  try { f() } catch { _ => () }\n" +
+  "}\n"
+  let r6 = pad_defer_transpile_raw("bad_defer_local_clo.mbt", src_local_raising_clo)
+  assert_true(r6.blockers > 0, "defer in local raising closure must fail closed")
+  let mut has_unsup6 = false
+  for d in r6.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_unsup6 = true }
+  }
+  assert_true(has_unsup6, "expected MBT2PION_UNSUPPORTED_SYNTAX for defer in local raising closure")
+}
