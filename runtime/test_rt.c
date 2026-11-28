@@ -1628,6 +1628,95 @@ static void test_mt_world_exec(int argc, char **argv) {
     printf("[PASS] mt_world_exec (8 threads concurrent posix_spawnp)\n");
 }
 
+#ifndef _WIN32
+/* Regression: a child spawned by one thread must not inherit another thread's
+ * in-flight capture pipe (pipe() .. FD_CLOEXEC window), or that capture's
+ * read() blocks until the unrelated child exits. Each capture child lists
+ * its open fds; under 8-thread spawn/capture churn that set must always
+ * equal the single-threaded baseline. */
+#define FD_PROBE_SH "echo /dev/fd/*"
+
+static void *fd_probe_cmd(void) {
+    const char *parts[3] = {PION_TEST_SH, "-c", FD_PROBE_SH};
+    void *cmd = pion_arr_new(3, 1);
+    for (int i = 0; i < 3; i++) {
+        void *s = pion_str_from_cstr(parts[i], -1);
+        pion_arr_push(cmd, (int64_t)(uintptr_t)s);
+        pion_rc_dec(s);
+    }
+    return cmd;
+}
+
+typedef struct FdLeakEnv {
+    void *world;
+    void *bad_cnt;
+    const char *baseline; /* plain C copy: Pion strings stay thread-local */
+    int iters;
+} FdLeakEnv;
+
+static void fd_leak_env_drop(void *p) {
+    FdLeakEnv *e = (FdLeakEnv *)p;
+    pion_rc_dec(e->world);
+    pion_rc_dec(e->bad_cnt);
+}
+
+static void fd_leak_worker(void *arg) {
+    FdLeakEnv *e = (FdLeakEnv *)arg;
+    void *probe = fd_probe_cmd();
+    void *cmd_true = pion_arr_new(1, 1);
+    void *s_true = pion_str_from_cstr(PION_TEST_TRUE, -1);
+    pion_arr_push(cmd_true, (int64_t)(uintptr_t)s_true);
+    for (int i = 0; i < e->iters; i++) {
+        int32_t code = -1;
+        void *out = pion_world_exec_capture(e->world, probe, &code);
+        if (code != 0 || strcmp(((PionString *)out)->data, e->baseline) != 0) {
+            if (pion_atomic_fetch_add(e->bad_cnt, 1) == 0) {
+                fprintf(stderr, "fd leak: child saw fds [%s], baseline [%s]\n",
+                        ((PionString *)out)->data, e->baseline);
+            }
+        }
+        pion_rc_dec(out);
+        assert(pion_world_exec(e->world, cmd_true) == 0);
+    }
+    pion_rc_dec(s_true);
+    pion_rc_dec(cmd_true);
+    pion_rc_dec(probe);
+}
+
+static void test_mt_exec_capture_no_fd_leak(int argc, char **argv) {
+    void *w = pion_world_init(argc, argv);
+    void *probe = fd_probe_cmd();
+    int32_t code = -1;
+    void *base_s = pion_world_exec_capture(w, probe, &code);
+    assert(code == 0 && pion_str_len(base_s) > 0 && pion_str_len(base_s) < 1024);
+    char baseline[1024];
+    memcpy(baseline, ((PionString *)base_s)->data, (size_t)pion_str_len(base_s) + 1);
+    pion_rc_dec(base_s);
+    pion_rc_dec(probe);
+    void *bad_cnt = pion_atomic_new(0);
+
+    void *sc = pion_scope_begin();
+    for (int i = 0; i < 8; i++) {
+        FdLeakEnv *e = (FdLeakEnv *)pion_alloc_uninit(
+            (uint32_t)sizeof(FdLeakEnv), PION_TAG_STRUCT, fd_leak_env_drop);
+        pion_rc_inc(w);
+        pion_rc_inc(bad_cnt);
+        e->world = w;
+        e->baseline = baseline;
+        e->bad_cnt = bad_cnt;
+        e->iters = 40;
+        pion_scope_spawn(sc, fd_leak_worker, e);
+        pion_rc_dec(e);
+    }
+    pion_scope_end(sc);
+
+    assert(pion_atomic_load(bad_cnt) == 0);
+    pion_rc_dec(bad_cnt);
+    pion_rc_dec(w);
+    printf("[PASS] mt_exec_capture_no_fd_leak (8 threads x 40 capture+spawn, no inherited pipe fds)\n");
+}
+#endif
+
 static void run_slab_bench(void) {
     const int64_t N = 1000000;
     void *ring[64];
@@ -4593,6 +4682,9 @@ int main(int argc, char **argv) {
     test_mt_slab_stress();
     test_med_cache_and_mt_frozen();
     test_mt_world_exec(argc, argv);
+#ifndef _WIN32
+    test_mt_exec_capture_no_fd_leak(argc, argv);
+#endif
     test_tcp_loopback_mt(argc, argv);
     test_event_loop_nb(argc, argv);
 
