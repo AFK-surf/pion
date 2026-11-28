@@ -9182,7 +9182,7 @@ fn lower_struct_pat_guards(
       e = e + 1
     }
     if (tokens[i].kind == TokenKind::Ident || tokens[i].kind == TokenKind::Keyword) &&
-    i + 1 < e && tokens[i + 1].kind == TokenKind::Colon {
+    i + 2 < e && tokens[i + 1].kind == TokenKind::Colon {
       let fname = rename_keyword_ident(tokens[i].raw)
       let fexpr = var_name + "." + fname
       let vs = i + 2
@@ -9202,6 +9202,15 @@ fn lower_struct_pat_guards(
           }
         }
       }
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[i].line,
+        tokens[i].col,
+        "unsupported field pattern inside struct pattern",
+      ))
+      return "false"
     }
     i = e + 1
   }
@@ -9228,6 +9237,470 @@ fn is_unshadowed_mbt_json_type(ctx : StageAContext, ty : String) -> Bool {
     return true
   }
   false
+}
+
+///| True iff `ty` denotes MoonBit's built-in `Map` or `OrderedMap`, not shadowed by a
+///| local type or active generic parameter.
+fn is_unshadowed_mbt_map_type(ctx : StageAContext, ty : String) -> Bool {
+  let base = strip_type_args_sym(ty)
+  if base == "mbt_compat::OrderedMap" {
+    return true
+  }
+  if base == "Map" &&
+  !ctx.symtab.local_types.contains("Map") &&
+  !ctx.active_generics.contains("Map") {
+    return true
+  }
+  if base == "OrderedMap" &&
+  !ctx.symtab.local_types.contains("OrderedMap") &&
+  !ctx.active_generics.contains("OrderedMap") {
+    return true
+  }
+  false
+}
+
+///| Extract `(K, V)` from `Map[K, V]` / `OrderedMap[K, V]` / `mbt_compat::OrderedMap[K, V]`.
+///| Returns `("", "")` if no balanced two-argument type list is present.
+fn extract_map_kv_types(ty : String) -> (String, String) {
+  let t = ty.trim()
+  let lb = t.index_of("[")
+  if lb < 0 || !t.ends_with("]") {
+    return ("", "")
+  }
+  let inner = t.slice(lb + 1, t.length() - 1)
+  let mut k = 0
+  let mut d = 0
+  let mut comma = -1
+  while k < inner.length() {
+    let ch = inner.code_unit_at(k)
+    if ch == 40 || ch == 91 || ch == 123 { d = d + 1 }
+    else if ch == 41 || ch == 93 || ch == 125 { if d > 0 { d = d - 1 } }
+    else if d == 0 && ch == 44 { comma = k; break }
+    k = k + 1
+  }
+  if comma < 0 {
+    return ("", "")
+  }
+  (inner.slice(0, comma).trim(), inner.slice(comma + 1, inner.length()).trim())
+}
+
+///| True iff `sname` is a statically known struct type (local or imported ABI struct).
+fn is_known_struct_type_for_pat(ctx : StageAContext, sname : String) -> Bool {
+  let s = strip_type_args_sym(sname)
+  if s.length() == 0 {
+    return false
+  }
+  ctx.struct_field_renames.contains(s) ||
+  ctx.symtab.struct_field_types.contains(s) ||
+  ctx.symtab.struct_schemas.contains(s)
+}
+
+///| True iff `ty` is a built-in immutable primitive type whose operators (`==`, `<`, `+`, etc.)
+///| cannot invoke user-overloaded side effects.
+fn is_builtin_imm_prim_ty(ty : String) -> Bool {
+  let t = ty.trim()
+  t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" ||
+  t == "Float" || t == "Double" || t == "Bool" || t == "Char" ||
+  t == "Byte" || t == "String"
+}
+
+///| Decode a MoonBit string literal token `"..."` into `(canonical_dedup_key, pion_string_literal)`.
+///| Handles `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\b` (U+0008), `\0`, `\xHH`, `\uHHHH` (with UTF-16
+///| surrogate pairs), `\u{H...}`, and raw UTF-8 scalars. Fails closed on unknown escapes, malformed
+///| hex/unicode escapes, unpaired surrogates, or invalid UTF-8.
+fn decode_and_reencode_mbt_string_key(
+  raw : String,
+  file : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+) -> Option[(String, String)] {
+  let n = raw.length()
+  if n < 2 || raw.code_unit_at(0) != 34 || raw.code_unit_at(n - 1) != 34 {
+    diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "malformed string literal key in map/JSON object pattern"))
+    return None
+  }
+  let dedup_sb = StringBuilder()
+  let pion_sb = StringBuilder()
+  pion_sb.write_string("\"")
+  let end = n - 1
+  let mut idx = 1
+  while idx < end {
+    let c = raw.code_unit_at(idx)
+    let mut cp = -1
+    if c == 92 {
+      if idx + 1 >= end {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "unterminated escape in map/JSON string key"))
+        return None
+      }
+      let nxt = raw.code_unit_at(idx + 1)
+      if nxt == 92 {
+        cp = 0x5C
+        idx = idx + 2
+      } else if nxt == 34 {
+        cp = 0x22
+        idx = idx + 2
+      } else if nxt == 39 {
+        cp = 0x27
+        idx = idx + 2
+      } else if nxt == 110 {
+        cp = 0x0A
+        idx = idx + 2
+      } else if nxt == 114 {
+        cp = 0x0D
+        idx = idx + 2
+      } else if nxt == 116 {
+        cp = 0x09
+        idx = idx + 2
+      } else if nxt == 98 {
+        cp = 0x08
+        idx = idx + 2
+      } else if nxt == 48 {
+        cp = 0x00
+        idx = idx + 2
+      } else if nxt == 120 {
+        if idx + 3 >= end {
+          diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid \\x escape in map/JSON string key"))
+          return None
+        }
+        let d1 = hex_digit_val(raw.code_unit_at(idx + 2))
+        let d2 = hex_digit_val(raw.code_unit_at(idx + 3))
+        if d1 < 0 || d2 < 0 {
+          diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid \\x hex digits in map/JSON string key"))
+          return None
+        }
+        cp = d1 * 16 + d2
+        idx = idx + 4
+      } else if nxt == 117 {
+        if idx + 2 < end && raw.code_unit_at(idx + 2) == 123 {
+          let mut p = idx + 3
+          let mut uval = 0
+          let mut digits = 0
+          while p < end && raw.code_unit_at(p) != 125 {
+            let dv = hex_digit_val(raw.code_unit_at(p))
+            if dv < 0 || digits >= 6 {
+              diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid \\u{...} escape in map/JSON string key"))
+              return None
+            }
+            uval = uval * 16 + dv
+            digits = digits + 1
+            p = p + 1
+          }
+          if p >= end || raw.code_unit_at(p) != 125 || digits == 0 || uval > 0x10FFFF || (uval >= 0xD800 && uval <= 0xDFFF) {
+            diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid \\u{...} unicode scalar in map/JSON string key"))
+            return None
+          }
+          cp = uval
+          idx = p + 1
+        } else {
+          if idx + 5 >= end {
+            diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "truncated \\uHHHH escape in map/JSON string key"))
+            return None
+          }
+          let d1 = hex_digit_val(raw.code_unit_at(idx + 2))
+          let d2 = hex_digit_val(raw.code_unit_at(idx + 3))
+          let d3 = hex_digit_val(raw.code_unit_at(idx + 4))
+          let d4 = hex_digit_val(raw.code_unit_at(idx + 5))
+          if d1 < 0 || d2 < 0 || d3 < 0 || d4 < 0 {
+            diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid \\uHHHH hex digits in map/JSON string key"))
+            return None
+          }
+          let u1 = (d1 << 12) | (d2 << 8) | (d3 << 4) | d4
+          if u1 >= 0xD800 && u1 <= 0xDBFF {
+            if idx + 11 < end && raw.code_unit_at(idx + 6) == 92 && raw.code_unit_at(idx + 7) == 117 && raw.code_unit_at(idx + 8) != 123 {
+              let l1 = hex_digit_val(raw.code_unit_at(idx + 8))
+              let l2 = hex_digit_val(raw.code_unit_at(idx + 9))
+              let l3 = hex_digit_val(raw.code_unit_at(idx + 10))
+              let l4 = hex_digit_val(raw.code_unit_at(idx + 11))
+              if l1 >= 0 && l2 >= 0 && l3 >= 0 && l4 >= 0 {
+                let u2 = (l1 << 12) | (l2 << 8) | (l3 << 4) | l4
+                if u2 >= 0xDC00 && u2 <= 0xDFFF {
+                  cp = 0x10000 + ((u1 - 0xD800) << 10) + (u2 - 0xDC00)
+                  idx = idx + 12
+                }
+              }
+            }
+            if cp < 0 {
+              diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "unpaired high surrogate in map/JSON string key"))
+              return None
+            }
+          } else if u1 >= 0xDC00 && u1 <= 0xDFFF {
+            diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "unpaired low surrogate in map/JSON string key"))
+            return None
+          } else {
+            cp = u1
+            idx = idx + 6
+          }
+        }
+      } else {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "unsupported escape sequence in map/JSON string key"))
+        return None
+      }
+    } else if c < 0x80 {
+      cp = c
+      idx = idx + 1
+    } else if c >= 0xC2 && c <= 0xDF && idx + 1 < end {
+      let b1 = raw.code_unit_at(idx + 1)
+      if (b1 & 0xC0) != 0x80 {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 in map/JSON string key"))
+        return None
+      }
+      cp = ((c & 0x1F) << 6) | (b1 & 0x3F)
+      idx = idx + 2
+    } else if c >= 0xE0 && c <= 0xEF && idx + 2 < end {
+      let b1 = raw.code_unit_at(idx + 1)
+      let b2 = raw.code_unit_at(idx + 2)
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 in map/JSON string key"))
+        return None
+      }
+      let v = ((c & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+      if v < 0x800 || (v >= 0xD800 && v <= 0xDFFF) {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 scalar in map/JSON string key"))
+        return None
+      }
+      cp = v
+      idx = idx + 3
+    } else if c >= 0xF0 && c <= 0xF4 && idx + 3 < end {
+      let b1 = raw.code_unit_at(idx + 1)
+      let b2 = raw.code_unit_at(idx + 2)
+      let b3 = raw.code_unit_at(idx + 3)
+      if (b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80 {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 in map/JSON string key"))
+        return None
+      }
+      let v = ((c & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+      if v < 0x10000 || v > 0x10FFFF {
+        diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 scalar in map/JSON string key"))
+        return None
+      }
+      cp = v
+      idx = idx + 4
+    } else {
+      diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", file, line, col, "invalid UTF-8 byte in map/JSON string key"))
+      return None
+    }
+    dedup_sb.write_string(hex_upper_cp(cp) + ";")
+    if cp == 0x5C {
+      pion_sb.write_string("\\\\")
+    } else if cp == 0x22 {
+      pion_sb.write_string("\\\"")
+    } else if cp == 0x0A {
+      pion_sb.write_string("\\n")
+    } else if cp == 0x0D {
+      pion_sb.write_string("\\r")
+    } else if cp == 0x09 {
+      pion_sb.write_string("\\t")
+    } else if cp == 0x00 {
+      pion_sb.write_string("\\0")
+    } else if cp >= 0x20 && cp <= 0x7E {
+      pion_sb.write_byte(cp.to_byte())
+    } else {
+      pion_sb.write_string("\\u{" + hex_upper_cp(cp) + "}")
+    }
+  }
+  pion_sb.write_string("\"")
+  Some((dedup_sb.to_string(), pion_sb.to_string()))
+}
+
+///| Return true if any token in `[start, end)` is the `is` keyword.
+fn b3m_guard_has_is_kw(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "is" {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Verify that if a `B3m` guard `[start, end)` uses any overloadable operator (`==`, `!=`,
+///| `<`, `<=`, `>`, `>=`, `+`, `-`, `*`, `/`, `%`), every identifier operand has a statically
+///| proven immutable primitive type (and no field access `.` is present), preventing custom
+///| `Eq`/`Compare`/arithmetic impls from mutating the map between guard and body lookup.
+fn b3m_guard_ops_are_prim_pure(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  arm_binder_tys : Map[String, String],
+) -> Bool {
+  let mut has_overloadable_op = false
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::EqEq || tk == TokenKind::BangEq ||
+    tk == TokenKind::Lt || tk == TokenKind::LtEq ||
+    tk == TokenKind::Gt || tk == TokenKind::GtEq ||
+    tk == TokenKind::Plus || tk == TokenKind::Minus ||
+    tk == TokenKind::Star || tk == TokenKind::Slash || tk == TokenKind::Percent {
+      has_overloadable_op = true
+      break
+    }
+    k = k + 1
+  }
+  if !has_overloadable_op {
+    return true
+  }
+  let mut j = start
+  while j < end {
+    let tj = tokens[j]
+    if tj.kind == TokenKind::Dot {
+      return false
+    }
+    if tj.kind == TokenKind::Ident && tj.raw != "_" &&
+    !(j > start && (tokens[j - 1].kind == TokenKind::Dot || tokens[j - 1].kind == TokenKind::ColonColon)) {
+      let ty = match arm_binder_tys.get(tj.raw) {
+        Some(bt) => bt
+        None => lookup_ident_static_type(ctx, tj.raw)
+      }
+      if !is_builtin_imm_prim_ty(ty) {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| Record static types of binders introduced by a single `B3m` value pattern `[vs, ve)`
+///| into `out` for guard operator purity verification.
+fn record_b3m_val_binder_types(
+  tokens : Array[Token],
+  vs : Int,
+  ve : Int,
+  val_ty : String,
+  is_opt_key : Bool,
+  is_json_val : Bool,
+  out : Map[String, String],
+) -> Unit {
+  let (a, b) = unwrap_outer_parens_range(tokens, vs, ve)
+  if a >= b {
+    return
+  }
+  let entry_ty = if is_opt_key {
+    if val_ty.length() > 0 { "Option[" + val_ty + "]" } else { "" }
+  } else {
+    val_ty
+  }
+  if b == a + 1 && tokens[a].kind == TokenKind::Ident && tokens[a].raw != "_" {
+    out[tokens[a].raw] = entry_ty
+    return
+  }
+  let mut top_as = -1
+  let mut k = a
+  let mut d = 0
+  while k < b {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+    else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+    else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "as" { top_as = k }
+    k = k + 1
+  }
+  if top_as > a && top_as + 2 == b && tokens[top_as + 1].kind == TokenKind::Ident && tokens[top_as + 1].raw != "_" {
+    out[tokens[top_as + 1].raw] = entry_ty
+    record_b3m_val_binder_types(tokens, a, top_as, val_ty, is_opt_key, is_json_val, out)
+    return
+  }
+  if is_opt_key && a + 2 < b &&
+  tokens[a].kind == TokenKind::UpperIdent && tokens[a].raw == "Some" &&
+  tokens[a + 1].kind == TokenKind::LParen && find_matching_delim(tokens, a + 1) == b - 1 {
+    record_b3m_val_binder_types(tokens, a + 2, b - 1, val_ty, false, is_json_val, out)
+    return
+  }
+  if !is_opt_key && is_json_val && a + 2 < b &&
+  tokens[a].kind == TokenKind::UpperIdent && tokens[a + 1].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, a + 1) == b - 1 {
+    let cname = tokens[a].raw
+    if cname == "String" && a + 3 == b - 1 && tokens[a + 2].kind == TokenKind::Ident && tokens[a + 2].raw != "_" {
+      out[tokens[a + 2].raw] = "String"
+    } else if cname == "Number" && tokens[a + 2].kind == TokenKind::Ident && tokens[a + 2].raw != "_" &&
+    (a + 3 == b - 1 || tokens[a + 3].kind == TokenKind::Comma) {
+      out[tokens[a + 2].raw] = "Double"
+    } else if cname == "Object" && a + 3 == b - 1 && tokens[a + 2].kind == TokenKind::Ident && tokens[a + 2].raw != "_" {
+      out[tokens[a + 2].raw] = "mbt_compat::OrderedMap[String, mbt_compat::MbtJson]"
+    } else if cname == "Array" && a + 3 == b - 1 && tokens[a + 2].kind == TokenKind::Ident && tokens[a + 2].raw != "_" {
+      out[tokens[a + 2].raw] = "Array[mbt_compat::MbtJson]"
+    }
+  }
+}
+
+///| Check whether `[s, e)` contains any sub-pattern token unsupported inside a map/JSON object
+///| value pattern (nested `{...}`, array `[...]`, float literal, range operator, or or-pattern `|`).
+fn map_val_pat_has_unsupported_tok(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if pattern_contains_struct_pat(tokens, s, e) || pattern_has_float_lit(tokens, s, e) {
+    return true
+  }
+  let mut k = s
+  while k < e {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LBracket || kk == TokenKind::Pipe || kk == TokenKind::DotDotEq ||
+    kk == TokenKind::DotDotLt || kk == TokenKind::DotDotLtEq {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Lower a single non-`as` value pattern `[vs, ve)` of a map/JSON object pattern entry.
+///| When `is_json_val` is true, maps JSON boolean/string literals to `mbt_compat::MbtJson::*`
+///| and rejects unsupported bare numeric literals (fail-closed).
+fn lower_map_val_pat_b3m(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  vs : Int,
+  ve : Int,
+  file : String,
+  is_json_val : Bool,
+  is_opt_json : Bool,
+) -> (String, Bool) {
+  let (a, b) = unwrap_outer_parens_range(tokens, vs, ve)
+  if a >= b {
+    return ("", false)
+  }
+  if is_json_val {
+    if b == a + 1 && tokens[a].kind == TokenKind::Keyword && tokens[a].raw == "true" {
+      return ("mbt_compat::MbtJson::True", true)
+    }
+    if b == a + 1 && tokens[a].kind == TokenKind::Keyword && tokens[a].raw == "false" {
+      return ("mbt_compat::MbtJson::False", true)
+    }
+    if b == a + 1 && tokens[a].kind == TokenKind::StringLit {
+      match decode_and_reencode_mbt_string_key(tokens[a].raw, file, tokens[a].line, tokens[a].col, ctx.diags) {
+        Some((_, enc_s)) => return ("mbt_compat::MbtJson::String(" + enc_s + ")", true)
+        None => return ("", false)
+      }
+    }
+    if (b == a + 1 && tokens[a].kind == TokenKind::IntLit) ||
+    (b == a + 2 && tokens[a].kind == TokenKind::Minus && tokens[a + 1].kind == TokenKind::IntLit) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[a].line,
+        tokens[a].col,
+        "numeric literal pattern inside Json object pattern is not supported; use `Number(n, ..) if n == ...` (fail-closed)",
+      ))
+      return ("", false)
+    }
+  } else if is_opt_json && a + 2 < b &&
+  tokens[a].kind == TokenKind::UpperIdent && tokens[a].raw == "Some" &&
+  tokens[a + 1].kind == TokenKind::LParen && find_matching_delim(tokens, a + 1) == b - 1 {
+    let saved_opt_e = ctx.expected_type_stack.length()
+    push_expected_type(ctx, "mbt_compat::MbtJson")
+    let (inner_s, inner_ok) = lower_map_val_pat_b3m(ctx, tokens, a + 2, b - 1, file, true, false)
+    restore_expected_type_stack(ctx, saved_opt_e)
+    if !inner_ok {
+      return ("", false)
+    }
+    return ("Some(" + inner_s + ")", true)
+  }
+  let pat_s = lower_expr_range(ctx, tokens, a, b, file, true).trim()
+  if pat_s.length() == 0 {
+    return ("", false)
+  }
+  (pat_s, true)
 }
 
 ///| Strip balanced outer grouping parentheses `(expr)` (not tuples) from `[start, end)`.
@@ -18371,6 +18844,393 @@ fn lower_match_arms_with_ty(
       }
     }
 
+    // Special case B3m: top-level string-keyed Map / JSON object pattern
+    // `{ "k1": pat1, "k2"?: pat2, .. }` (with optional outer grouping parens, trailing `..`,
+    // and optional outer `as whole`).
+    // Strictly requires statically known unshadowed `Json` or `Map[String, V]` / `OrderedMap[String, V]`;
+    // unknown scrutinee types, duplicate decoded keys, non-string keys, empty `{}`/`{ .. }` on Json/Map,
+    // unsupported sub-patterns (including `|` and nested `as`), `is` in guard, or non-primitive
+    // overloaded-operator guards with bindings all fail closed with `MBT2PION_UNSUPPORTED_SYNTAX`.
+    if !handled_special && pat_end > i {
+      let (p0, p1) = unwrap_outer_parens_range(tokens, i, pat_end)
+      let mut b3m_open = -1
+      let mut b3m_close = -1
+      let mut outer_as_tok = -1
+      if p1 - p0 >= 3 && tokens[p1 - 2].kind == TokenKind::Keyword && tokens[p1 - 2].raw == "as" &&
+      (tokens[p1 - 1].kind == TokenKind::Ident || tokens[p1 - 1].kind == TokenKind::Underscore) {
+        let (q0, q1) = unwrap_outer_parens_range(tokens, p0, p1 - 2)
+        if q0 < q1 && tokens[q0].kind == TokenKind::LBrace && find_matching_delim(tokens, q0) == q1 - 1 {
+          b3m_open = q0
+          b3m_close = q1 - 1
+          outer_as_tok = p1 - 1
+        }
+      } else if p0 < p1 && tokens[p0].kind == TokenKind::LBrace && find_matching_delim(tokens, p0) == p1 - 1 {
+        b3m_open = p0
+        b3m_close = p1 - 1
+      }
+      if b3m_open >= 0 {
+        let cb = b3m_close
+        let outer_has_as = outer_as_tok >= 0
+        let mut saw_str_key = false
+        let mut saw_non_str_entry = false
+        let mut saw_bad_entry = false
+        let mut saw_dotdot = false
+        let mut bad_dotdot = false
+        let raw_entries : Array[(Int, Int, Int, Bool)] = []
+        let mut mi = b3m_open + 1
+        while mi < cb {
+          if tokens[mi].kind == TokenKind::Comma {
+            mi = mi + 1
+            continue
+          }
+          let mut me = mi
+          let mut md = 0
+          while me < cb {
+            let mk = tokens[me].kind
+            if mk == TokenKind::LParen || mk == TokenKind::LBracket || mk == TokenKind::LBrace { md = md + 1 }
+            else if mk == TokenKind::RParen || mk == TokenKind::RBracket || mk == TokenKind::RBrace { md = md - 1 }
+            else if md == 0 && mk == TokenKind::Comma { break }
+            me = me + 1
+          }
+          if me == mi + 1 && tokens[mi].kind == TokenKind::DotDot {
+            if saw_dotdot { bad_dotdot = true } else { saw_dotdot = true }
+          } else if tokens[mi].kind == TokenKind::StringLit {
+            saw_str_key = true
+            if mi + 2 < me && tokens[mi + 1].kind == TokenKind::Colon {
+              raw_entries.push((mi, mi + 2, me, false))
+            } else if mi + 3 < me && tokens[mi + 1].kind == TokenKind::Question && tokens[mi + 2].kind == TokenKind::Colon {
+              raw_entries.push((mi, mi + 3, me, true))
+            } else {
+              saw_bad_entry = true
+            }
+          } else {
+            saw_non_str_entry = true
+          }
+          mi = me + 1
+        }
+        let is_json_scrut = is_unshadowed_mbt_json_type(ctx, scrut_ty)
+        let is_map_scrut = !is_json_scrut && is_unshadowed_mbt_map_type(ctx, scrut_ty)
+        let is_empty_brace_on_map_or_json = raw_entries.length() == 0 && !saw_non_str_entry && (is_json_scrut || is_map_scrut)
+        if saw_str_key || is_empty_brace_on_map_or_json {
+          if is_empty_brace_on_map_or_json {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[b3m_open].line,
+              tokens[b3m_open].col,
+              "empty map/JSON object pattern `{}` / `{ .. }` is not supported (fail-closed)",
+            ))
+            handled_special = true
+          } else if saw_non_str_entry || saw_bad_entry || bad_dotdot {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[b3m_open].line,
+              tokens[b3m_open].col,
+              "unsupported or malformed entry inside map/JSON object pattern (fail-closed)",
+            ))
+            handled_special = true
+          } else if !is_json_scrut && !is_map_scrut {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[b3m_open].line,
+              tokens[b3m_open].col,
+              "map/JSON object pattern requires statically known Json or Map[String, V] scrutinee type (fail-closed)",
+            ))
+            handled_special = true
+          } else {
+            let (map_k_ty, map_v_ty) = if is_map_scrut { extract_map_kv_types(scrut_ty) } else { ("", "") }
+            let is_json_val_entry = is_json_scrut || (is_map_scrut && is_unshadowed_mbt_json_type(ctx, map_v_ty))
+            let mut b3m_ok = true
+            if is_map_scrut && map_k_ty != "String" {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_SYNTAX",
+                file,
+                tokens[b3m_open].line,
+                tokens[b3m_open].col,
+                "string-keyed map pattern requires explicit String key type `Map[String, V]` (fail-closed)",
+              ))
+              b3m_ok = false
+            }
+            if b3m_ok && if_idx >= 0 && b3m_guard_has_is_kw(tokens, if_idx + 1, fa) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_SYNTAX",
+                file,
+                tokens[if_idx].line,
+                tokens[if_idx].col,
+                "`is` pattern inside map/JSON object match guard is not supported (fail-closed)",
+              ))
+              b3m_ok = false
+            }
+            // Decode keys strictly, re-encode for Pion lexer, and dedup on decoded scalar values
+            let seen_keys : Map[String, Bool] = Map()
+            let decoded_key_lits : Array[String] = []
+            if b3m_ok {
+              for ent in raw_entries {
+                let kt = tokens[ent.0]
+                match decode_and_reencode_mbt_string_key(kt.raw, file, kt.line, kt.col, ctx.diags) {
+                  None => {
+                    b3m_ok = false
+                    break
+                  }
+                  Some((dedup_k, pion_lit)) => {
+                    if seen_keys.contains(dedup_k) {
+                      ctx.diags.push(diag_error(
+                        "MBT2PION_UNSUPPORTED_SYNTAX",
+                        file,
+                        kt.line,
+                        kt.col,
+                        "duplicate key " + kt.raw + " in map/JSON object pattern (fail-closed)",
+                      ))
+                      b3m_ok = false
+                      break
+                    }
+                    seen_keys[dedup_k] = true
+                    decoded_key_lits.push(pion_lit)
+                  }
+                }
+              }
+            }
+            // Always allocate hygienic `obj_var` so outer `as whole` never collides with inner binders
+            let obj_var = fresh_temp(ctx, "jm")
+            let outer_as_raw = if outer_has_as && tokens[outer_as_tok].kind == TokenKind::Ident && tokens[outer_as_tok].raw != "_" {
+              resolve_ident_in_scope(ctx, tokens[outer_as_tok].raw)
+            } else {
+              ""
+            }
+            let arm_binder_tys : Map[String, String] = Map()
+            let mut whole_bind_stmt = ""
+            if b3m_ok && outer_as_raw.length() > 0 {
+              if is_json_scrut {
+                if ctx.match_scrut_var.length() == 0 {
+                  ctx.diags.push(diag_error(
+                    "MBT2PION_UNSUPPORTED_SYNTAX",
+                    file,
+                    tokens[outer_as_tok].line,
+                    tokens[outer_as_tok].col,
+                    "outer `as` binding on Json object pattern is not supported in this context (fail-closed)",
+                  ))
+                  b3m_ok = false
+                } else {
+                  let top_idx = ctx.match_scrut_var.length() - 1
+                  let scrut_v = if ctx.match_scrut_var[top_idx].length() > 0 {
+                    ctx.match_scrut_var[top_idx]
+                  } else {
+                    let sv = fresh_temp(ctx, "scrut")
+                    ctx.match_scrut_var[top_idx] = sv
+                    sv
+                  }
+                  whole_bind_stmt = "let " + outer_as_raw + " = " + scrut_v + "; "
+                  arm_binder_tys[tokens[outer_as_tok].raw] = "mbt_compat::MbtJson"
+                }
+              } else {
+                whole_bind_stmt = "let " + outer_as_raw + " = " + obj_var + "; "
+                arm_binder_tys[tokens[outer_as_tok].raw] = scrut_ty.trim()
+              }
+            }
+            let chain_entries : Array[(String, String, Bool)] = []
+            let all_as_obls : Array[(String, String, Bool)] = []
+            let mut has_any_binders = outer_as_raw.length() > 0
+            let eff_val_ty = if is_json_val_entry { "mbt_compat::MbtJson" } else { map_v_ty }
+            if b3m_ok {
+              let mut eidx = 0
+              while eidx < raw_entries.length() {
+                let (_, vs, ve, is_opt_key) = raw_entries[eidx]
+                let key_lit = decoded_key_lits[eidx]
+                eidx = eidx + 1
+                if map_val_pat_has_unsupported_tok(tokens, vs, ve) {
+                  ctx.diags.push(diag_error(
+                    "MBT2PION_UNSUPPORTED_SYNTAX",
+                    file,
+                    tokens[vs].line,
+                    tokens[vs].col,
+                    "unsupported sub-pattern (nested object/struct, array, float, range, or `|`) inside map/JSON object pattern (fail-closed)",
+                  ))
+                  b3m_ok = false
+                  break
+                }
+                if pat_tokens_have_binders(tokens, vs, ve) {
+                  has_any_binders = true
+                }
+                record_b3m_val_binder_types(tokens, vs, ve, eff_val_ty, is_opt_key, is_json_val_entry, arm_binder_tys)
+                let val_exp = if is_json_val_entry {
+                  if is_opt_key { "Option[mbt_compat::MbtJson]" } else { "mbt_compat::MbtJson" }
+                } else if map_v_ty.length() > 0 {
+                  if is_opt_key { "Option[" + map_v_ty + "]" } else { map_v_ty }
+                } else {
+                  ""
+                }
+                let saved_ve = ctx.expected_type_stack.length()
+                if val_exp.length() > 0 {
+                  push_expected_type(ctx, val_exp)
+                }
+                if pattern_contains_as_kw_f42(tokens, vs, ve) {
+                  let (va, vb) = unwrap_outer_parens_range(tokens, vs, ve)
+                  let mut top_as = -1
+                  let mut ak = va
+                  let mut ad = 0
+                  while ak < vb {
+                    let akk = tokens[ak].kind
+                    if akk == TokenKind::LParen || akk == TokenKind::LBracket || akk == TokenKind::LBrace { ad = ad + 1 }
+                    else if akk == TokenKind::RParen || akk == TokenKind::RBracket || akk == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+                    else if ad == 0 && akk == TokenKind::Keyword && tokens[ak].raw == "as" { top_as = ak }
+                    ak = ak + 1
+                  }
+                  if top_as > va && top_as + 2 == vb &&
+                  tokens[top_as + 1].kind == TokenKind::Ident && tokens[top_as + 1].raw != "_" &&
+                  !pattern_contains_as_kw_f42(tokens, va, top_as) {
+                    let as_name = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
+                    let (inner_p, inner_ok) = lower_map_val_pat_b3m(
+                      ctx,
+                      tokens,
+                      va,
+                      top_as,
+                      file,
+                      is_json_val_entry && !is_opt_key,
+                      is_json_val_entry && is_opt_key,
+                    )
+                    restore_expected_type_stack(ctx, saved_ve)
+                    if !inner_ok {
+                      b3m_ok = false
+                      break
+                    }
+                    has_any_binders = true
+                    all_as_obls.push((as_name, inner_p, pat_tokens_have_binders(tokens, va, top_as)))
+                    chain_entries.push((key_lit, as_name, is_opt_key))
+                  } else if is_opt_key && top_as < 0 && va + 2 < vb &&
+                  tokens[va].kind == TokenKind::UpperIdent && tokens[va].raw == "Some" &&
+                  tokens[va + 1].kind == TokenKind::LParen && find_matching_delim(tokens, va + 1) == vb - 1 {
+                    let (sa, sb) = unwrap_outer_parens_range(tokens, va + 2, vb - 1)
+                    let mut inner_as = -1
+                    let mut sk = sa
+                    let mut sd = 0
+                    while sk < sb {
+                      let skk = tokens[sk].kind
+                      if skk == TokenKind::LParen || skk == TokenKind::LBracket || skk == TokenKind::LBrace { sd = sd + 1 }
+                      else if skk == TokenKind::RParen || skk == TokenKind::RBracket || skk == TokenKind::RBrace { if sd > 0 { sd = sd - 1 } }
+                      else if sd == 0 && skk == TokenKind::Keyword && tokens[sk].raw == "as" { inner_as = sk }
+                      sk = sk + 1
+                    }
+                    if inner_as > sa && inner_as + 2 == sb &&
+                    tokens[inner_as + 1].kind == TokenKind::Ident && tokens[inner_as + 1].raw != "_" &&
+                    !pattern_contains_as_kw_f42(tokens, sa, inner_as) {
+                      let as_name = resolve_ident_in_scope(ctx, tokens[inner_as + 1].raw)
+                      if is_json_val_entry {
+                        push_expected_type(ctx, "mbt_compat::MbtJson")
+                      } else if map_v_ty.length() > 0 {
+                        push_expected_type(ctx, map_v_ty)
+                      }
+                      let (inner_p, inner_ok) = lower_map_val_pat_b3m(
+                        ctx,
+                        tokens,
+                        sa,
+                        inner_as,
+                        file,
+                        is_json_val_entry,
+                        false,
+                      )
+                      restore_expected_type_stack(ctx, saved_ve)
+                      if !inner_ok {
+                        b3m_ok = false
+                        break
+                      }
+                      has_any_binders = true
+                      all_as_obls.push((as_name, inner_p, pat_tokens_have_binders(tokens, sa, inner_as)))
+                      chain_entries.push((key_lit, "Some(" + as_name + ")", true))
+                    } else {
+                      restore_expected_type_stack(ctx, saved_ve)
+                      ctx.diags.push(diag_error(
+                        "MBT2PION_UNSUPPORTED_SYNTAX",
+                        file,
+                        tokens[vs].line,
+                        tokens[vs].col,
+                        "unsupported nested `as` pattern inside map/JSON object pattern (fail-closed)",
+                      ))
+                      b3m_ok = false
+                      break
+                    }
+                  } else {
+                    restore_expected_type_stack(ctx, saved_ve)
+                    ctx.diags.push(diag_error(
+                      "MBT2PION_UNSUPPORTED_SYNTAX",
+                      file,
+                      tokens[vs].line,
+                      tokens[vs].col,
+                      "unsupported nested `as` pattern inside map/JSON object pattern (fail-closed)",
+                    ))
+                    b3m_ok = false
+                    break
+                  }
+                } else {
+                  let (pat_s, pat_ok) = lower_map_val_pat_b3m(
+                    ctx,
+                    tokens,
+                    vs,
+                    ve,
+                    file,
+                    is_json_val_entry && !is_opt_key,
+                    is_json_val_entry && is_opt_key,
+                  )
+                  restore_expected_type_stack(ctx, saved_ve)
+                  if !pat_ok {
+                    b3m_ok = false
+                    break
+                  }
+                  chain_entries.push((key_lit, pat_s, is_opt_key))
+                }
+              }
+            }
+            if b3m_ok && if_idx >= 0 && has_any_binders &&
+            (!guard_tokens_are_pure(tokens, if_idx + 1, fa) ||
+              !b3m_guard_ops_are_prim_pure(ctx, tokens, if_idx + 1, fa, arm_binder_tys)) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_SYNTAX",
+                file,
+                tokens[if_idx].line,
+                tokens[if_idx].col,
+                "map/JSON object pattern with bindings and non-pure or non-primitive-operator `if` guard is not supported (fail-closed)",
+              ))
+              b3m_ok = false
+            }
+            if b3m_ok {
+              let outer_pat = if is_json_scrut {
+                "mbt_compat::MbtJson::Object(" + obj_var + ")"
+              } else {
+                obj_var
+              }
+              let eff_guard = if whole_bind_stmt.length() > 0 && guard_str.length() > 0 {
+                "{ " + whole_bind_stmt + guard_str + " }"
+              } else {
+                guard_str
+              }
+              let eff_body = if whole_bind_stmt.length() > 0 {
+                "{ " + whole_bind_stmt + body_raw.trim() + " }"
+              } else {
+                body_raw.trim()
+              }
+              let (as_g, as_b) = if all_as_obls.length() > 0 {
+                expand_as_pat_obligations(ctx, all_as_obls, 0, eff_guard, eff_body)
+              } else {
+                let g0 = if eff_guard.length() > 0 { "(" + eff_guard + ")" } else { "true" }
+                (g0, eff_body)
+              }
+              let full_g = lower_string_map_pattern_chain(obj_var, chain_entries, as_g, "false")
+              let full_b = if has_any_binders {
+                lower_string_map_pattern_chain(obj_var, chain_entries, as_b, "panic(\"unreachable\")")
+              } else {
+                as_b
+              }
+              had_guarded_struct_arm = true
+              let fa_triv = guard_arrow_trivia(tokens[fa].leading_trivia)
+              sb.write_string(lead_triv + outer_pat + " if (" + full_g + ")" + fa_triv + "=> " + full_b + trail_sep)
+            }
+            handled_special = true
+          }
+        }
+      }
+    }
+
     // Special case B3 (P1-2): top-level struct pattern `{ f1, f2: pat, .. }` or `S::{ f1, f2: pat, .. }`
     // Pion does not support struct patterns in `match`, so lower to a hygienic binding `sp` with
     // `rename_struct_field` field accesses and collision-free local binders (`val` -> `val_1`, `val_` -> `val_`).
@@ -18389,7 +19249,7 @@ fn lower_match_arms_with_ty(
         sp_explicit_sname = rename_priv_type(ctx.symtab, tokens[i].raw)
       }
     }
-    if !handled_special && sp_open_b >= 0 {
+    if !handled_special && sp_open_b >= 0 && !pattern_contains_struct_pat(tokens, sp_open_b + 1, find_matching_delim(tokens, sp_open_b)) {
       let cb = find_matching_delim(tokens, sp_open_b)
       // Resolve struct name: explicit `S::` > `scrut_ty` > unique field-set superset in `ctx.struct_field_renames`
       let mut resolved_sname = sp_explicit_sname
@@ -18444,6 +19304,8 @@ fn lower_match_arms_with_ty(
       let bind_var = fresh_temp(ctx, "sp")
       let non_bind_guards : Array[String] = []
       let bind_fields : Array[(String, String)] = []
+      let mut valid_field_count = 0
+      let mut has_invalid_field = false
       let mut fi = sp_open_b + 1
       while fi < cb {
         if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot { fi = fi + 1; continue }
@@ -18467,6 +19329,7 @@ fn lower_match_arms_with_ty(
         let fexpr = bind_var + "." + access_f
         if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
         fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
+          valid_field_count = valid_field_count + 1
           let vs = fi + 2
           let mut has_binder = false
           let mut bi = vs
@@ -18494,69 +19357,93 @@ fn lower_match_arms_with_ty(
             }
           }
         } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
+          valid_field_count = valid_field_count + 1
           let local_b = resolve_ident_in_scope(ctx, raw_f)
           bind_fields.push((fexpr, local_b))
+        } else {
+          ctx.diags.push(diag_error(
+            "MBT2PION_UNSUPPORTED_SYNTAX",
+            file,
+            tokens[fi].line,
+            tokens[fi].col,
+            "unsupported field pattern inside struct pattern",
+          ))
+          has_invalid_field = true
         }
         fi = fe + 1
       }
-      let nbg_sb = StringBuilder()
-      let mut ni = 0
-      while ni < non_bind_guards.length() {
-        if ni > 0 { nbg_sb.write_string(" && ") }
-        nbg_sb.write_string(non_bind_guards[ni])
-        ni = ni + 1
+      if !has_invalid_field && valid_field_count == 0 && !is_known_struct_type_for_pat(ctx, resolved_sname) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          tokens[sp_open_b].line,
+          tokens[sp_open_b].col,
+          "empty object/struct pattern `{}` / `{ .. }` on non-struct or unknown type is not supported (fail-closed)",
+        ))
+        has_invalid_field = true
       }
-      let fguards = nbg_sb.to_string()
-      if bind_fields.length() > 0 {
-        let mut all_irrefutable = true
-        for bf in bind_fields {
-          if !is_irrefutable_simple_pat(bf.1) {
-            all_irrefutable = false
-            break
-          }
-        }
-        let scrut_e = if bind_fields.length() == 1 {
-          bind_fields[0].0
-        } else {
-          let es : Array[String] = []
-          for bf in bind_fields { es.push(bf.0) }
-          "(" + join_comma(es) + ")"
-        }
-        let pat_e = if bind_fields.length() == 1 {
-          bind_fields[0].1
-        } else {
-          let ps : Array[String] = []
-          for bf in bind_fields { ps.push(bf.1) }
-          "(" + join_comma(ps) + ")"
-        }
-        if all_irrefutable && fguards.length() == 0 && guard_str.length() == 0 {
-          has_unguarded_catchall = true
-          sb.write_string(lead_triv + bind_var + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
-        } else {
-          had_guarded_struct_arm = true
-          let guard_rhs = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
-          let match_g = "(match " + scrut_e + " { " + pat_e + " => " + guard_rhs + ", _ => false })"
-          let full_g = if fguards.length() > 0 { "(" + fguards + ") && " + match_g } else { match_g }
-          sb.write_string(lead_triv + bind_var + " if " + full_g + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
-        }
+      if has_invalid_field {
+        handled_special = true
       } else {
-        let full_g = if fguards.length() > 0 && guard_str.length() > 0 {
-          "(" + fguards + ") && (" + guard_str + ")"
-        } else if fguards.length() > 0 {
-          fguards
-        } else {
-          guard_str
+        let nbg_sb = StringBuilder()
+        let mut ni = 0
+        while ni < non_bind_guards.length() {
+          if ni > 0 { nbg_sb.write_string(" && ") }
+          nbg_sb.write_string(non_bind_guards[ni])
+          ni = ni + 1
         }
-        let g_part = if full_g.length() > 0 {
-          had_guarded_struct_arm = true
-          " if " + full_g
+        let fguards = nbg_sb.to_string()
+        if bind_fields.length() > 0 {
+          let mut all_irrefutable = true
+          for bf in bind_fields {
+            if !is_irrefutable_simple_pat(bf.1) {
+              all_irrefutable = false
+              break
+            }
+          }
+          let scrut_e = if bind_fields.length() == 1 {
+            bind_fields[0].0
+          } else {
+            let es : Array[String] = []
+            for bf in bind_fields { es.push(bf.0) }
+            "(" + join_comma(es) + ")"
+          }
+          let pat_e = if bind_fields.length() == 1 {
+            bind_fields[0].1
+          } else {
+            let ps : Array[String] = []
+            for bf in bind_fields { ps.push(bf.1) }
+            "(" + join_comma(ps) + ")"
+          }
+          if all_irrefutable && fguards.length() == 0 && guard_str.length() == 0 {
+            has_unguarded_catchall = true
+            sb.write_string(lead_triv + bind_var + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
+          } else {
+            had_guarded_struct_arm = true
+            let guard_rhs = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
+            let match_g = "(match " + scrut_e + " { " + pat_e + " => " + guard_rhs + ", _ => false })"
+            let full_g = if fguards.length() > 0 { "(" + fguards + ") && " + match_g } else { match_g }
+            sb.write_string(lead_triv + bind_var + " if " + full_g + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
+          }
         } else {
-          has_unguarded_catchall = true
-          ""
+          let full_g = if fguards.length() > 0 && guard_str.length() > 0 {
+            "(" + fguards + ") && (" + guard_str + ")"
+          } else if fguards.length() > 0 {
+            fguards
+          } else {
+            guard_str
+          }
+          let g_part = if full_g.length() > 0 {
+            had_guarded_struct_arm = true
+            " if " + full_g
+          } else {
+            has_unguarded_catchall = true
+            ""
+          }
+          sb.write_string(lead_triv + bind_var + g_part + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
         }
-        sb.write_string(lead_triv + bind_var + g_part + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
+        handled_special = true
       }
-      handled_special = true
     }
 
     // Special case A: top-level or nested/parenthesized `as` pattern (`pat as x`, `(pat as x)`,
@@ -24450,6 +25337,8 @@ fn expand_struct_pat_obligations(
     next_obls.push(obls[oi])
     oi = oi + 1
   }
+  let mut valid_field_count = 0
+  let mut has_invalid_field = false
   let mut fi = open_b + 1
   while fi < close_b {
     if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot {
@@ -24473,6 +25362,7 @@ fn expand_struct_pat_obligations(
     }
     if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
     fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
+      valid_field_count = valid_field_count + 1
       let fexpr = bind_var + "." + access_f
       let vs = fi + 2
       let sp_field_exp = lookup_struct_field_ty_f3d2(ctx, explicit_sname, raw_f)
@@ -24515,6 +25405,7 @@ fn expand_struct_pat_obligations(
       }
       restore_expected_type_stack(ctx, saved_sp_fexp)
     } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
+      valid_field_count = valid_field_count + 1
       let bind_name = resolve_ident_in_scope(ctx, raw_f)
       bind_fields.push((bind_var + "." + access_f, bind_name))
     } else {
@@ -24525,8 +25416,22 @@ fn expand_struct_pat_obligations(
         tokens[fi].col,
         "unsupported field pattern inside struct pattern",
       ))
+      has_invalid_field = true
     }
     fi = fe + 1
+  }
+  if has_invalid_field {
+    return ("false", "panic(\"unreachable\")")
+  }
+  if valid_field_count == 0 && !is_known_struct_type_for_pat(ctx, explicit_sname) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[open_b].line,
+      tokens[open_b].col,
+      "empty object/struct pattern `{}` / `{ .. }` on non-struct or unknown type is not supported (fail-closed)",
+    ))
+    return ("false", "panic(\"unreachable\")")
   }
   let (inner_g, inner_b) = expand_struct_pat_obligations(
     ctx,
