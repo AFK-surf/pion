@@ -755,6 +755,9 @@ pub struct TypeChecker {
   /// Initializer expressions of pending generic `let` bindings for deferred
   /// relay refinement (`tc_refine_fn_values`) once concrete type args are known.
   infer_pending_inits : Map[String, Expr]
+  /// Span keys of unannotated closure parameters whose inferred type contains
+  /// unresolved `TError` holes and may be refined from body usages.
+  closure_param_refine : Map[String, Ty]
   /// Generic calls that left one or more type parameters unbound at check time;
   /// verified fail-closed after all deferred refinements complete.
   pending_gcalls : Array[PendingGCall]
@@ -1052,6 +1055,69 @@ fn env_define_param(
     _ => ()
   }
   env_record_define_moved_shadow(env, name, already_in_top)
+}
+
+///|
+fn env_define_param_at(
+  env : Env,
+  name : String,
+  ty : Ty,
+  is_mut : Bool,
+  decl_span : Span,
+) -> Unit {
+  let top = env.scopes[env.scopes.length() - 1]
+  let already_in_top = top.contains(name)
+  top.set(name, VarBinding::{
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    is_param: true,
+    decl_span: decl_span,
+    decl_line: decl_span.line,
+    ty_span: span_empty(),
+    ty_end_col: -1,
+    init_span: span_empty(),
+    init_end_col: -1,
+  })
+  match ty {
+    TWorld => env.has_world = true
+    _ => ()
+  }
+  env_record_define_moved_shadow(env, name, already_in_top)
+}
+
+///|
+fn env_update_closure_param_ty(
+  env : Env,
+  name : String,
+  decl_span : Span,
+  new_ty : Ty,
+) -> Unit {
+  let want_key = span_key(decl_span)
+  let mut i = env.scopes.length() - 1
+  while i >= 0 {
+    match env.scopes[i].get(name) {
+      Some(b) => {
+        if span_key(b.decl_span) == want_key {
+          env.scopes[i].set(name, VarBinding::{
+            name: b.name,
+            ty: new_ty,
+            is_mut: b.is_mut,
+            is_param: b.is_param,
+            decl_span: b.decl_span,
+            decl_line: b.decl_line,
+            ty_span: b.ty_span,
+            ty_end_col: b.ty_end_col,
+            init_span: b.init_span,
+            init_end_col: b.init_end_col,
+          })
+        }
+        return
+      }
+      None => ()
+    }
+    i = i - 1
+  }
 }
 
 ///|
@@ -6662,6 +6728,120 @@ fn ty_prefer_concrete(a : Ty, b : Ty) -> Ty {
 }
 
 ///|
+/// Fills `TError` holes in `cur` from matching non-`TNever` positions of `exp`
+/// without overwriting any already-concrete parts of `cur`.
+fn ty_fill_unresolved(cur : Ty, exp : Ty) -> Ty {
+  match cur {
+    TError => if !ty_contains_never(exp) { exp } else { TError }
+    TFn(cp, cr) =>
+      match exp {
+        TFn(ep, er) =>
+          if cp.length() == ep.length() {
+            let out : Array[Ty] = []
+            let mut i = 0
+            while i < cp.length() {
+              out.push(ty_fill_unresolved(cp[i], ep[i]))
+              i = i + 1
+            }
+            TFn(out, ty_fill_unresolved(cr, er))
+          } else {
+            cur
+          }
+        _ => cur
+      }
+    TEnum(cn, ca) =>
+      match exp {
+        TEnum(en, ea) =>
+          if cn == en && ca.length() == ea.length() {
+            let out : Array[Ty] = []
+            let mut i = 0
+            while i < ca.length() {
+              out.push(ty_fill_unresolved(ca[i], ea[i]))
+              i = i + 1
+            }
+            TEnum(cn, out)
+          } else {
+            cur
+          }
+        _ => cur
+      }
+    TStruct(cn, ca) =>
+      match exp {
+        TStruct(en, ea) =>
+          if cn == en && ca.length() == ea.length() {
+            let out : Array[Ty] = []
+            let mut i = 0
+            while i < ca.length() {
+              out.push(ty_fill_unresolved(ca[i], ea[i]))
+              i = i + 1
+            }
+            TStruct(cn, out)
+          } else {
+            cur
+          }
+        _ => cur
+      }
+    TArray(ce) =>
+      match exp {
+        TArray(ee) => TArray(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TFixedArray(ce) =>
+      match exp {
+        TFixedArray(ee) => TFixedArray(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TImmArray(ce) =>
+      match exp {
+        TImmArray(ee) => TImmArray(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TOption(ce) =>
+      match exp {
+        TOption(ee) => TOption(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TResult(co, ce) =>
+      match exp {
+        TResult(eo, ee) => TResult(ty_fill_unresolved(co, eo), ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TMap(ck, cv) =>
+      match exp {
+        TMap(ek, ev) => TMap(ty_fill_unresolved(ck, ek), ty_fill_unresolved(cv, ev))
+        _ => cur
+      }
+    TTuple(ca) =>
+      match exp {
+        TTuple(ea) =>
+          if ca.length() == ea.length() {
+            let out : Array[Ty] = []
+            let mut i = 0
+            while i < ca.length() {
+              out.push(ty_fill_unresolved(ca[i], ea[i]))
+              i = i + 1
+            }
+            TTuple(out)
+          } else {
+            cur
+          }
+        _ => cur
+      }
+    TChannel(ce) =>
+      match exp {
+        TChannel(ee) => TChannel(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    TMutex(ce) =>
+      match exp {
+        TMutex(ee) => TMutex(ty_fill_unresolved(ce, ee))
+        _ => cur
+      }
+    _ => cur
+  }
+}
+
+///|
 fn ty_compat(expected : Ty, found : Ty) -> Bool {
   match expected {
     TError => return true
@@ -9321,7 +9501,14 @@ fn check_stmts_ex(
   let pending_lets : Array[Stmt] = []
   while i < stmts.length() {
     let is_last = i == stmts.length() - 1
-    let exp = if is_last { expected } else { None }
+    let exp = if !is_last || !tail_used {
+      match stmts[i] {
+        SExpr(ETry(_, _), _) => Some(TUnit)
+        _ => if is_last { expected } else { None }
+      }
+    } else {
+      expected
+    }
     match stmts[i] {
       SLet(name, is_mut, TyMissing(tsp), init, sp) =>
         if name != "_" {
@@ -10625,6 +10812,46 @@ fn infer_map_pending(tc : TypeChecker, env : Env, name : String) -> Bool {
 }
 
 ///|
+fn infer_non_indexable_pending(
+  tc : TypeChecker,
+  env : Env,
+  name : String,
+  for_assign : Bool,
+) -> Bool {
+  match env_lookup(env, name) {
+    Some(b) =>
+      if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
+        match b.ty {
+          TArray(_) | TFixedArray(_) | TImmArray(_) | TMap(_, _) | TBytes => false
+          TString | TStrView | TBytesView => for_assign
+          _ => true
+        }
+      } else {
+        false
+      }
+    None => false
+  }
+}
+
+///|
+fn infer_clear_pending_for_err(tc : TypeChecker, env : Env, name : String) -> Unit {
+  match env_lookup(env, name) {
+    Some(b) => {
+      let dk = span_key(b.decl_span)
+      tc.infer_pending.remove(dk)
+      match tc.infer_pending_inits.get(dk) {
+        Some(init_expr) => {
+          tc.infer_pending_inits.remove(dk)
+          tc_mark_gcall_err(tc, init_expr)
+        }
+        None => ()
+      }
+    }
+    None => ()
+  }
+}
+
+///|
 fn ty_contains_never(t : Ty) -> Bool {
   match t {
     TNever => true
@@ -11775,7 +12002,7 @@ fn check_stmt(
                   "declare `" + name + "` with `let mut " + name + "`",
                 )
                 // `let x` -> `let mut x` at the declaration.
-                if b.decl_span.line > 0 {
+                if !b.is_param && b.decl_span.line > 0 {
                   tc_add_edit(tc, text_edit_insert(b.decl_span, 4, "mut "))
                 }
               }
@@ -12084,7 +12311,21 @@ fn check_stmt(
           }
         }
         EIndex(obj, idx, lsp) => {
+          let mut non_idx_pending_name = ""
+          let saved_allow = tc.allow_pending_ident_span
+          match obj {
+            EIdent(oname, osp) =>
+              if infer_non_indexable_pending(tc, env, oname, true) {
+                non_idx_pending_name = oname
+                tc.allow_pending_ident_span = span_key(osp)
+              }
+            _ => ()
+          }
           let oty = check_expr(tc, env, obj, None)
+          tc.allow_pending_ident_span = saved_allow
+          if non_idx_pending_name != "" {
+            infer_clear_pending_for_err(tc, env, non_idx_pending_name)
+          }
           let lty = match oty {
             TImmArray(elem) => {
               let _ = check_expr(tc, env, idx, Some(TInt))
@@ -12213,7 +12454,21 @@ fn check_stmt(
           }
         EField(obj, fname, lsp) => check_field_assign_target(tc, env, obj, fname, lsp)
         EIndex(obj, idx, lsp) => {
+          let mut non_idx_pending_name = ""
+          let saved_allow = tc.allow_pending_ident_span
+          match obj {
+            EIdent(oname, osp) =>
+              if infer_non_indexable_pending(tc, env, oname, true) {
+                non_idx_pending_name = oname
+                tc.allow_pending_ident_span = span_key(osp)
+              }
+            _ => ()
+          }
           let oty = check_expr(tc, env, obj, None)
+          tc.allow_pending_ident_span = saved_allow
+          if non_idx_pending_name != "" {
+            infer_clear_pending_for_err(tc, env, non_idx_pending_name)
+          }
           let t = match oty {
             TImmArray(elem) => {
               let _ = check_expr(tc, env, idx, Some(TInt))
@@ -14785,7 +15040,7 @@ fn check_mut_place(tc : TypeChecker, env : Env, e : Expr, check_index : Bool) ->
               "immutable `" + name + "`",
               "declare `" + name + "` with `let mut " + name + "`",
             )
-            if b.decl_span.line > 0 {
+            if !b.is_param && b.decl_span.line > 0 {
               tc_add_edit(tc, text_edit_insert(b.decl_span, 4, "mut "))
             }
           }
@@ -14964,7 +15219,28 @@ fn check_call_arg(
   match arg {
     EMutArg(inner, msp) =>
       if p_is_mut {
-        let ty = check_mut_place(tc, env, inner, true)
+        let mut ty = check_mut_place(tc, env, inner, true)
+        match inner {
+          EIdent(name, _) =>
+            match env_lookup(env, name) {
+              Some(b) =>
+                if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
+                  match exp {
+                    Some(exp_ty) =>
+                      if !ty_has_unresolved(exp_ty) &&
+                        !ty_contains_never(exp_ty) &&
+                        ty_compat(b.ty, exp_ty) {
+                        infer_refine_binding(tc, env, name, exp_ty)
+                        ty = exp_ty
+                        tc_record_ty(tc, env, inner, ty)
+                      }
+                    None => ()
+                  }
+                }
+              None => ()
+            }
+          _ => ()
+        }
         tc_record_ty(tc, env, arg, ty)
         ty
       } else {
@@ -15755,6 +16031,9 @@ fn tc_refine_relay(
   tc_check_type_bounds(tc, env, cf.decl, fresh, call_sp, cf.is_imported)
   tc_push_eq_uses(tc, env, cf.decl, cf.decl.name, fresh, call_sp)
   tc.let_infer.set(key, TTuple(targs))
+  if tc.record_analyze || env.in_verify {
+    tc.call_type_args.set(span_key(call_sp), targs)
+  }
   // Bind arguments to parameters exactly like the call did (named, optional
   // `v=x` wrapped as `Some(x)`, positional skipping labelled params); no
   // diagnostics, defaults and missing slots are not refined.
@@ -17191,6 +17470,38 @@ fn expr_is_unannotated_closure_arg(e : Expr, is_opt_wrap : Bool) -> Bool {
 }
 
 ///|
+fn expr_is_pending_ident_arg(
+  tc : TypeChecker,
+  env : Env,
+  e : Expr,
+  is_opt_wrap : Bool,
+) -> Bool {
+  let mut inner = e
+  if is_opt_wrap {
+    match inner {
+      ECall(_, some_args, _) =>
+        if some_args.length() == 1 {
+          inner = some_args[0]
+        }
+      _ => ()
+    }
+  }
+  match inner {
+    EMutArg(x, _) => inner = x
+    _ => ()
+  }
+  match inner {
+    EIdent(name, _) =>
+      match env_lookup(env, name) {
+        Some(b) =>
+          b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span))
+        None => false
+      }
+    _ => false
+  }
+}
+
+///|
 fn ty_has_tparam(t : Ty) -> Bool {
   match t {
     TParam(_) => true
@@ -18520,7 +18831,8 @@ fn check_fn_call(
     let dcl = !is_miss &&
       !is_def &&
       p_has_tp &&
-      expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap)
+      (expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap) ||
+        expr_is_pending_ident_arg(tc, env, resolved_args[di_init], is_opt_wrap))
     defer_flags.push(dcl)
     if dcl {
       has_deferred = true
@@ -18645,7 +18957,8 @@ fn check_fn_call(
       let unbound_param_tps : Array[String] = if pass == 1 &&
         defer_cl &&
         !is_def &&
-        i < finfo.param_tys.length() {
+        i < finfo.param_tys.length() &&
+        expr_is_unannotated_closure_arg(resolved_args[i], is_opt_wrap) {
         collect_unbound_fn_param_tparams(
           finfo.param_tys[i],
           is_opt_wrap,
@@ -20768,7 +21081,8 @@ fn check_method_call(
             let dcl = !is_miss &&
               !is_def &&
               p_has_tp &&
-              expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap)
+              (expr_is_unannotated_closure_arg(resolved_args[di_init], is_opt_wrap) ||
+                expr_is_pending_ident_arg(tc, env, resolved_args[di_init], is_opt_wrap))
             defer_flags.push(dcl)
             if dcl {
               has_deferred = true
@@ -20921,7 +21235,8 @@ fn check_method_call(
               let unbound_param_tps : Array[String] = if pass == 1 &&
                 defer_cl &&
                 !is_def &&
-                p_idx < minfo.param_tys.length() {
+                p_idx < minfo.param_tys.length() &&
+                expr_is_unannotated_closure_arg(resolved_args[i], is_opt_wrap) {
                 collect_unbound_fn_param_tparams(
                   minfo.param_tys[p_idx],
                   is_opt_wrap,
@@ -22114,6 +22429,15 @@ fn closure_build_cache_key(
         if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
           return None
         }
+        if b.is_param && b.decl_span.line > 0 {
+          match tc.closure_param_refine.get(span_key(b.decl_span)) {
+            Some(rty) =>
+              if ty_has_unresolved(rty) {
+                return None
+              }
+            None => ()
+          }
+        }
         sb.write_string(ty_to_string(b.ty))
         sb.write_string(":")
         sb.write_string(if b.is_mut { "1" } else { "0" })
@@ -22556,6 +22880,27 @@ fn check_expr_inner(
             }
             if tc.record_types && ty_has_error(b.ty) {
               qt_add_pending_ref(tc, b.decl_span, span_key(sp) + "#EIdent")
+            }
+          }
+          if b.is_param && b.decl_span.line > 0 {
+            let rk = span_key(b.decl_span)
+            match tc.closure_param_refine.get(rk) {
+              Some(cur_ty) =>
+                if ty_has_unresolved(cur_ty) {
+                  match expected {
+                    Some(exp_ty) =>
+                      if !ty_contains_never(exp_ty) && ty_compat(b.ty, exp_ty) {
+                        let refined = ty_fill_unresolved(b.ty, exp_ty)
+                        if ty_to_string(refined) != ty_to_string(b.ty) {
+                          env_update_closure_param_ty(env, name, b.decl_span, refined)
+                          tc.closure_param_refine.set(rk, refined)
+                          return refined
+                        }
+                      }
+                    None => ()
+                  }
+                }
+              None => ()
             }
           }
           return b.ty
@@ -25177,17 +25522,24 @@ fn check_expr_inner(
     }
     EIndex(obj, idx, sp) => {
       let mut pending_arr_name = ""
+      let mut non_idx_pending_name = ""
       let saved_allow = tc.allow_pending_ident_span
       match obj {
         EIdent(oname, osp) =>
           if infer_arr_pending(tc, env, oname) {
             pending_arr_name = oname
             tc.allow_pending_ident_span = span_key(osp)
+          } else if infer_non_indexable_pending(tc, env, oname, false) {
+            non_idx_pending_name = oname
+            tc.allow_pending_ident_span = span_key(osp)
           }
         _ => ()
       }
       let oty = check_expr(tc, env, obj, None)
       tc.allow_pending_ident_span = saved_allow
+      if non_idx_pending_name != "" {
+        infer_clear_pending_for_err(tc, env, non_idx_pending_name)
+      }
       if pending_arr_name != "" {
         let ity = check_expr(tc, env, idx, Some(TInt))
         if !ty_compat(TInt, ity) {
@@ -25738,7 +26090,10 @@ fn check_expr_inner(
           "use a `Bool` condition",
         )
       }
-      let then_ty = check_stmts(tc, env, then_stmts, expected)
+      let then_ty = match else_opt {
+        None => check_stmts_ex(tc, env, then_stmts, None, false)
+        Some(_) => check_stmts(tc, env, then_stmts, expected)
+      }
       env_pop(env)
       match else_opt {
         None => TUnit
@@ -25980,6 +26335,8 @@ fn check_expr_inner(
       env.in_bench_loop = false
       env.in_default_expr = false
       env_push(env)
+      let refine_param_idxs : Array[Int] = []
+      let refine_param_keys : Array[String] = []
       let mut j = 0
       while j < params.length() {
         let mut pty_def = ptys[j]
@@ -26000,7 +26357,25 @@ fn check_expr_inner(
             _ => ()
           }
         }
-        env_define_param(env, params[j].name, pty_def, false, params[j].span.line)
+        let track_refine = params[j].name != "_" &&
+          params[j].span.line > 0 &&
+          match params[j].ty {
+            TyMissing(_) =>
+              match pty_def {
+                TError => false
+                _ => ty_has_unresolved(pty_def)
+              }
+            _ => false
+          }
+        if track_refine {
+          let rk = span_key(params[j].span)
+          env_define_param_at(env, params[j].name, pty_def, false, params[j].span)
+          tc.closure_param_refine.set(rk, pty_def)
+          refine_param_idxs.push(j)
+          refine_param_keys.push(rk)
+        } else {
+          env_define_param(env, params[j].name, pty_def, false, params[j].span.line)
+        }
         if tc.record_types && params[j].name != "_" {
           qt_record_binding(tc, env, params[j].span, "closure_param", j, params[j].name, pty_def)
         }
@@ -26023,6 +26398,17 @@ fn check_expr_inner(
         _ => ()
       }
       let clo_inferred_ret = env.inferred_ret
+      let mut ri = 0
+      while ri < refine_param_idxs.length() {
+        let rj = refine_param_idxs[ri]
+        let rk = refine_param_keys[ri]
+        match tc.closure_param_refine.get(rk) {
+          Some(rty) => ptys[rj] = rty
+          None => ()
+        }
+        tc.closure_param_refine.remove(rk)
+        ri = ri + 1
+      }
       env_pop(env)
       if env.mut_params.length() > 0 || (tc.record_analyze && !env.in_default_arg) {
         let cl_locals : Map[String, Bool] = Map([])
@@ -26399,7 +26785,28 @@ fn check_expr_inner(
         )
         return TError
       }
-      let ity = check_expr(tc, env, inner, None)
+      let inner_exp : Option[Ty] = match expected {
+        Some(exp_ok) =>
+          match exp_ok {
+            TUnit => None
+            _ =>
+              if !ty_has_unresolved(exp_ok) && !ty_contains_never(exp_ok) {
+                match env.ret_ty {
+                  TResult(_, _) => Some(TResult(exp_ok, TError))
+                  TOption(_) => Some(TOption(exp_ok))
+                  _ => None
+                }
+              } else {
+                None
+              }
+          }
+        None => None
+      }
+      let exp_is_unit = match expected {
+        Some(TUnit) => true
+        _ => false
+      }
+      let ity = check_expr(tc, env, inner, inner_exp)
       match ity {
         TError => TError
         TResult(ok_ty, err_ty) =>
@@ -26427,7 +26834,12 @@ fn check_expr_inner(
                     }
                 }
               }
-              ok_ty
+              if exp_is_unit && ty_has_unresolved(ok_ty) {
+                tc_refine_fn_values(tc, env, inner, TResult(TUnit, err_ty), "in `?` expression")
+                TUnit
+              } else {
+                ok_ty
+              }
             }
             _ => {
               tc_err(
@@ -26448,7 +26860,13 @@ fn check_expr_inner(
           }
         TOption(inner_ty) =>
           match env.ret_ty {
-            TOption(_) => inner_ty
+            TOption(_) =>
+              if exp_is_unit && ty_has_unresolved(inner_ty) {
+                tc_refine_fn_values(tc, env, inner, TOption(TUnit), "in `?` expression")
+                TUnit
+              } else {
+                inner_ty
+              }
             _ => {
               tc_err(
                 tc,
@@ -26672,6 +27090,7 @@ fn check_package_with_imports_mapped_plan_qt(
     dot_variant_resolve: Map([]),
     infer_pending: Map([]),
     infer_pending_inits: Map([]),
+    closure_param_refine: Map([]),
     pending_gcalls: [],
     allow_pending_ident_span: "",
     infer_hit: [],

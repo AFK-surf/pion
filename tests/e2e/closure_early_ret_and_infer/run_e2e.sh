@@ -225,6 +225,92 @@ fn check_nested_fix_cache_e2e() -> Int {
   })
 }
 
+struct StrIter[T] {
+  items : Array[T]
+}
+
+fn make_str_iter[T](xs : Array[T]) -> StrIter[T] {
+  StrIter::{ items: xs }
+}
+
+fn arr_push_iter[T](out : Array[T], it : StrIter[T]) -> Unit {
+  let mut i = 0
+  while i < it.items.length() {
+    out.push(it.items[i])
+    i = i + 1
+  }
+}
+
+enum ForkExit[X] {
+  Done(X)
+}
+
+struct ForkFiber[X] {
+  mut ran : Int
+  item : Option[X]
+}
+
+struct ForkScope {
+  base : Int
+}
+
+fn ForkScope::fork[X](
+  self : ForkScope,
+  f : ((ForkExit[X]) -> Unit) -> Unit,
+  name~ : String = "",
+) -> ForkFiber[X] {
+  let hits = [self.base + name.length()]
+  f(fn(_e) { hits[0] = hits[0] + 10 })
+  ForkFiber::{ ran: hits[0], item: None }
+}
+
+fn fork_handler(s : ForkScope, k : (ForkExit[Unit]) -> Unit) -> Unit {
+  let _ = s.base
+  k(ForkExit::Done(()))
+}
+
+struct MiniParser {
+  i : Int
+}
+
+fn MiniParser::fail[T](self : MiniParser, msg : String) -> Result[T, String] {
+  Err(msg + ":" + self.i.to_string())
+}
+
+fn check_try_stmt(p : MiniParser, fail_early : Bool) -> Result[Int, String] {
+  if fail_early {
+    p.fail("a name wanted")?
+  }
+  let mut k = 0
+  while k < 1 {
+    if p.i < 0 {
+      p.fail("neg")?
+    }
+    k = k + 1
+  }
+  if p.i == 99 {
+    let x : Int = p.fail("typed")?
+    return Ok(x)
+  }
+  Ok(p.i + 1)
+}
+
+fn check_deferred_infer_e2e() -> String {
+  let out = []
+  arr_push_iter(out, make_str_iter(["a", "bb", "ccc"]))
+  let s = ForkScope::{ base: 7 }
+  let fb = s.fork(fn(k) { fork_handler(s, k) }, name="job")
+  let t1 = match check_try_stmt(MiniParser::{ i: 4 }, true) {
+    Ok(_) => "ok"
+    Err(e) => e
+  }
+  let t2 = match check_try_stmt(MiniParser::{ i: 4 }, false) {
+    Ok(v) => v.to_string()
+    Err(e) => e
+  }
+  out.length().to_string() + ":" + out[2] + ":" + fb.ran.to_string() + ":" + t1 + ":" + t2
+}
+
 pub fn main(w : World) -> Unit {
   let u = check_unit_pat(true) * 100 + check_unit_pat(false)
   let c1 = wrap_computed(
@@ -255,18 +341,20 @@ pub fn main(w : World) -> Unit {
   let d = check_double_clo(true) + check_double_clo(false)
   let fl = (check_float_clo(true) + check_float_clo(false)).to_double()
   let nf = check_nested_fix_cache_e2e()
+  let di = check_deferred_infer_e2e()
   let out = "u=" + u.to_string() +
     " c1=" + c1.item.0.to_string() + ":" + c1.item.1.to_string() +
     " c2=" + c2.item.0.to_string() + ":" + c2.item.1.to_string() +
     " r=" + r1.to_string() + ":" + r2.to_string() + ":" + r3.to_string() +
     " o=" + o1 + "|" + o2 + "|" + o3 +
     " f=" + d.to_string() + ":" + fl.to_string() +
-    " nf=" + nf.to_string()
+    " nf=" + nf.to_string() +
+    " di=" + di
   io_println(w, out)
 }
 EOF
 
-EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4 nf=145"
+EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4 nf=145 di=3:ccc:20:a name wanted:4:5"
 
 "$PIONC" build -o "$TMP_DIR/app_dev" "$TMP_DIR/main.pion"
 "$PIONC" build --release -o "$TMP_DIR/app_rel" "$TMP_DIR/main.pion"
