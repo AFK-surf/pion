@@ -109,6 +109,7 @@ CASES = {
     "interp_index_compat": ("ok", 16),
     "method_args_ctor_compat": ("ok", 17),
     "str_repeat_neg_abort": ("panic:abort", 0),
+    "cfor_let_mut_shadowing": ("ok", 4),
 }
 
 MOON_TRAPS = {
@@ -2335,6 +2336,65 @@ pub fn p3_stdlib_compat() -> (Int, Int, String, String, Bool, Bool, Int, Int, Bo
   let map_ok = m1 == m2 && m_iter2.length() == 2 && m_iter2[0].0 == "a"
   (it_sum + idx_sum, rev_sum, s_rev, s_rep, ccu_ok, rev_it_ok, flat_sum, cmp_code, map_ok)
 }
+
+// C-style `for v = init; ...` always declares a fresh loop-scoped `v` shadowing any outer `v`.
+pub fn cfor_nested_same_name(n : Int) -> (Int, Int) {
+  let mut total = 0
+  let mut outer_iters = 0
+  for ai = 0; ai < n; ai = ai + 1 {
+    outer_iters = outer_iters + 1
+    for ai = 0; ai < 3; ai = ai + 1 {
+      if ai == 1 {
+        continue
+      }
+      total = total + ai * 10
+    }
+    for ai = 0; ai < 10; ai = ai + 1 {
+      if ai == 2 {
+        break
+      }
+      total = total + ai
+    }
+    total = total + ai * 100
+  }
+  (total, outer_iters)
+}
+
+pub fn cfor_shadow_outer_mut() -> (Int, Int) {
+  let mut x = 10
+  let mut seen = 0
+  for x = x + 1; x < 14; x = x + 1 {
+    seen = seen * 100 + x
+  }
+  x = x + 1
+  (x, seen)
+}
+
+pub fn cfor_shadow_outer_immut() -> (Int, Int) {
+  let i = 99
+  let mut s = 0
+  for i = 0; i < 3; i = i + 1 {
+    s = s + i
+  }
+  (i, s)
+}
+
+pub fn cfor_shadow_boxed_capture() -> (Int, Int) {
+  let mut x = 1
+  fn bump(k : Int) -> Unit {
+    if k > 0 {
+      x = x + 10
+      bump(k - 1)
+    }
+  }
+  let mut acc = 0
+  for x = x + 1; x < 5; x = x + 1 {
+    acc = acc * 10 + x
+    // The recursive local fn still mutates the OUTER boxed `x`, never the loop counter.
+    bump(1)
+  }
+  (x, acc)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -3021,6 +3081,16 @@ fn main {
   } else if kase == "str_repeat_neg_abort" {
     trace("str_repeat_neg", "before")
     let _ = @m12.p3_str_repeat_neg()
+  } else if kase == "cfor_let_mut_shadowing" {
+    let (nt, no) = @m12.cfor_nested_same_name(5)
+    let (mx, ms) = @m12.cfor_shadow_outer_mut()
+    let (ii, isum) = @m12.cfor_shadow_outer_immut()
+    let (bx, ba) = @m12.cfor_shadow_boxed_capture()
+    trace("cfor", "\{nt}:\{no},\{mx}:\{ms},\{ii}:\{isum},\{bx}:\{ba}")
+    check("cfor.nested_same_name", nt == 1105 && no == 5)
+    check("cfor.shadow_outer_mut", mx == 11 && ms == 111213)
+    check("cfor.shadow_outer_immut", ii == 99 && isum == 3)
+    check("cfor.shadow_boxed_capture", bx == 31 && ba == 234)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3720,6 +3790,16 @@ pub fn main(w : World) -> Int {
   } else if kase == "str_repeat_neg_abort" {
     trace(w, "str_repeat_neg", "before")
     let _ = m12::p3_str_repeat_neg()
+  } else if kase == "cfor_let_mut_shadowing" {
+    let (nt, no) = m12::cfor_nested_same_name(5)
+    let (mx, ms) = m12::cfor_shadow_outer_mut()
+    let (ii, isum) = m12::cfor_shadow_outer_immut()
+    let (bx, ba) = m12::cfor_shadow_boxed_capture()
+    trace(w, "cfor", nt.to_string() + ":" + no.to_string() + "," + mx.to_string() + ":" + ms.to_string() + "," + ii.to_string() + ":" + isum.to_string() + "," + bx.to_string() + ":" + ba.to_string())
+    check(w, "cfor.nested_same_name", nt == 1105 && no == 5)
+    check(w, "cfor.shadow_outer_mut", mx == 11 && ms == 111213)
+    check(w, "cfor.shadow_outer_immut", ii == 99 && isum == 3)
+    check(w, "cfor.shadow_boxed_capture", bx == 31 && ba == 234)
   } else {
     panic("abort: unknown case " + kase)
   }
