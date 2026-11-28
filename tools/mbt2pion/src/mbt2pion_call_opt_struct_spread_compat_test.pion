@@ -1,0 +1,374 @@
+///| Unit tests for parenthesized callable expected-type propagation, double-wrapped
+///| optional parameters, cross-package anonymous struct literal resolution, typed
+///| spread-array bindings, empty map literals in match arms, guarded constructor-struct
+///| match exhaustiveness, and `StringBuilder::is_empty` / `Result::map` compatibility.
+
+test "parenthesized callable (obj.field)(args...) propagates expected arg types" {
+  let src = SourceFile::{
+    rel_path: "paren_call.mbt",
+    content: "pub struct Client {\n" +
+    "  send : (String, Json, (Int) -> Unit) -> Unit\n" +
+    "}\n\n" +
+    "pub struct Wrapper {\n" +
+    "  client : Client\n" +
+    "}\n\n" +
+    "pub fn dispatch(c : Client, w : Wrapper, v : String) -> Unit {\n" +
+    "  (c.send)(\"cmd\", { \"k\": Json::string(v) }, fn(n) { let _ = n })\n" +
+    "  (w.client.send)(\"nested\", { \"a\": Json::string(v) }, fn(n) { let _ = n })\n" +
+    "}\n\n" +
+    "pub fn unknown_callee(f : Any) -> Unit {\n" +
+    "  (f)(1, \"ok\")\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "paren call blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "(c.send)(\"cmd\", mbt_compat::MbtJson::Object("), "single-hop (c.send) must propagate MbtJson expected type: " + out)
+  assert_true(str_has(out, "(w.client.send)(\"nested\", mbt_compat::MbtJson::Object("), "multi-hop (w.client.send) must propagate MbtJson expected type: " + out)
+  assert_true(str_has(out, "(f)(1, \"ok\")"), "unknown callee must still lower cleanly: " + out)
+}
+
+test "optional parameter x? : T? preserves double Option[Option[T]] in lifted local fn" {
+  let src = SourceFile::{
+    rel_path: "opt_double.mbt",
+    content: "pub fn walk(n : Int, pt? : (Double, Double)?, flag? : Int) -> Int {\n" +
+    "  fn go(k : Int) -> Int {\n" +
+    "    if k <= 0 {\n" +
+    "      match pt {\n" +
+    "        Some(Some((x, _))) => x.to_int()\n" +
+    "        _ => match flag { Some(v) => v, None => 0 }\n" +
+    "      }\n" +
+    "    } else {\n" +
+    "      go(k - 1)\n" +
+    "    }\n" +
+    "  }\n" +
+    "  go(n)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "opt_double blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "pt : Option[Option[(Double, Double)]]"), "lifted local fn must capture pt as Option[Option[(Double, Double)]]: " + out)
+  assert_true(str_has(out, "flag : Option[Int]"), "single optional param stays Option[Int]: " + out)
+}
+
+test "anon struct literal prefers cross-package expected type over same-field local struct" {
+  let dep_src = SourceFile::{
+    rel_path: "dep.mbt",
+    content: "pub(all) struct Read {\n  value : Int\n  error : String\n  version : Int\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(dep_res.blockers == 0, "dep transpile must succeed")
+  let src = SourceFile::{
+    rel_path: "cross_struct.mbt",
+    content: "pub struct Topic {\n" +
+    "  value : Int\n" +
+    "  error : String\n" +
+    "  version : Int\n" +
+    "}\n\n" +
+    "pub fn make_read(t : Topic) -> () -> @dep.Read {\n" +
+    "  fn() -> @dep.Read {\n" +
+    "    { value: t.value, error: t.error, version: t.version }\n" +
+    "  }\n" +
+    "}\n\n" +
+    "pub fn make_unknown(t : Topic) -> () -> @dep.Opaque {\n" +
+    "  fn() -> @dep.Opaque {\n" +
+    "    { value: t.value, error: t.error, version: t.version }\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_with_abis([src], empty_api_map(), default_recipes(), [], [], [], [("dep", dep_res.abi)], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "cross_struct blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "dep::Read::{"), "expected cross-package struct must resolve to dep::Read: " + out)
+  assert_true(!str_has(out, "Topic::{"), "must never mis-resolve cross-package expected struct to local Topic: " + out)
+}
+
+test "spread array binds typed temp for ..expr when expected Array[T] is known" {
+  let src = SourceFile::{
+    rel_path: "spread_typed.mbt",
+    content: "pub fn build(cond : Bool, first : (String, Map[String, Json])) -> Array[(String, Map[String, Json])] {\n" +
+    "  let out : Array[(String, Map[String, Json])] = [\n" +
+    "    first,\n" +
+    "    ..if cond { [(\"k\", {})] } else { [] },\n" +
+    "  ]\n" +
+    "  out\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "spread_typed blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "let __mbt_sps_") && str_has(out, " : Array[(String, mbt_compat::OrderedMap[String, mbt_compat::MbtJson])] = "), "spread expr must bind explicitly typed temp: " + out)
+  assert_true(str_has(out, "mbt_compat::ordered_map_new()"), "empty map inside spread branch must lower to ordered_map_new(): " + out)
+}
+
+test "empty map literal {} in match arm lowers when sibling returns Map/OrderedMap, preserves Unit match" {
+  let src = SourceFile::{
+    rel_path: "match_empty_map.mbt",
+    content: "pub fn get_map(k : Int) -> Map[String, Int] {\n" +
+    "  { \"a\": k }\n" +
+    "}\n\n" +
+    "pub fn from_opt(opt : Int?) -> Map[String, Int] {\n" +
+    "  let read = match opt {\n" +
+    "    Some(w) => get_map(w)\n" +
+    "    None => {}\n" +
+    "  }\n" +
+    "  read\n" +
+    "}\n\n" +
+    "pub fn from_json(opt : Json?) -> Map[String, Json] {\n" +
+    "  let r = match opt {\n" +
+    "    Some(Object(m)) => m.copy()\n" +
+    "    _ => {}\n" +
+    "  }\n" +
+    "  r\n" +
+    "}\n\n" +
+    "pub fn unit_match(flag : Bool) -> Unit {\n" +
+    "  match flag {\n" +
+    "    true => ()\n" +
+    "    false => {}\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "match_empty_map blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "None => mbt_compat::ordered_map_new()"), "sibling get_map arm must lower None => {} to ordered_map_new(): " + out)
+  assert_true(str_has(out, "_ => mbt_compat::ordered_map_new()"), "sibling Object(m) => m.copy() arm must lower _ => {} to ordered_map_new(): " + out)
+  assert_true(str_has(out, "false => {}"), "Unit match must preserve {} untouched: " + out)
+}
+
+test "guarded constructor-nested struct pattern arms append unreachable catchall" {
+  let src = SourceFile::{
+    rel_path: "ctor_struct_exh.mbt",
+    content: "pub struct Size {\n" +
+    "  width : Int\n" +
+    "  height : Int?\n" +
+    "}\n\n" +
+    "pub fn measure(v : Size?) -> Int {\n" +
+    "  match v {\n" +
+    "    None => 0\n" +
+    "    Some({ width, height: None }) => width\n" +
+    "    Some({ width, height: Some(h) }) => width + h\n" +
+    "  }\n" +
+    "}\n\n" +
+    "pub fn measure_with_wild(v : Size?) -> Int {\n" +
+    "  match v {\n" +
+    "    Some({ width, height: Some(h) }) => width + h\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "ctor_struct_exh blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  let idx_wild = out.index_of("pub fn measure_with_wild")
+  assert_true(idx_wild > 0, "output must contain measure_with_wild: " + out)
+  let part1 = out.slice(0, idx_wild)
+  let part2 = out.slice(idx_wild, out.length())
+  assert_true(str_has(part1, "\n    _ => panic(\"unreachable\")"), "exhaustive Some({ ... }) match must append _ => panic(\"unreachable\"): " + part1)
+  assert_true(!str_has(part2, "\n    _ => panic(\"unreachable\")"), "match with explicit _ arm must not append duplicate catchall: " + part2)
+}
+
+fn find_line_col(content : String, needle : String) -> (Int, Int) {
+  let lines = content.split("\n")
+  let mut li = 0
+  while li < lines.length() {
+    let idx = lines[li].index_of(needle)
+    if idx >= 0 {
+      return (li + 1, idx + 1)
+    }
+    li = li + 1
+  }
+  (1, 1)
+}
+
+test "Stage B rewrites StringBuilder::is_empty and Result::map and ignores unrelated types" {
+  let src = SourceFile::{
+    rel_path: "compat_methods.mbt",
+    content: "pub fn check_sb(sb : StringBuilder) -> Bool {\n" +
+    "  sb.is_empty()\n" +
+    "}\n\n" +
+    "pub fn map_res(r : Result[Int, String]) -> Result[Int, String] {\n" +
+    "  r.map(fn(x) { x + 1 })\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let body = files[0].1
+    let diags : Array[String] = []
+    if str_has(body, "sb.is_empty()") {
+      let (l1, c1) = find_line_col(body, ".is_empty(")
+      diags.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"compat_methods.pion\",\"line\":" + l1.to_string() + ",\"col\":" + c1.to_string() + ",\"message\":\"unknown method `is_empty` on type `StringBuilder`\"}")
+    }
+    if str_has(body, "r.map(") {
+      let (l2, c2) = find_line_col(body, ".map(")
+      diags.push("{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"compat_methods.pion\",\"line\":" + l2.to_string() + ",\"col\":" + c2.to_string() + ",\"message\":\"unknown method `map` on type `Result[Int, String]`\"}")
+    }
+    if diags.length() > 0 {
+      return "{\"ok\":false,\"diagnostics\":[" + join_comma(diags) + "]}"
+    }
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], true, mock_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "compat_methods blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::sb_is_empty(sb)"), "StringBuilder::is_empty must rewrite to mbt_compat::sb_is_empty(sb): " + out)
+  assert_true(str_has(out, "mbt_compat::result_map(r, fn(x) { x + 1 })"), "Result::map must rewrite to mbt_compat::result_map(r, ...): " + out)
+
+  // Negative: unrelated user type should not be rewritten by lookup_missing_method_helper
+  assert_true(lookup_missing_method_helper("CustomBox", "is_empty") == None, "CustomBox::is_empty must not map to sb_is_empty")
+  assert_true(lookup_missing_method_helper("CustomBox", "map") == None, "CustomBox::map must not map to result_map")
+}
+
+test "Stage B match arm type mismatch fallback rewrites {} only with OrderedMap evidence" {
+  let src = SourceFile::{
+    rel_path: "match_stage_b.mbt",
+    content: "pub fn f(o : Int?) -> Json {\n" +
+    "  let m = match o {\n" +
+    "    Some(x) => get_ext(x)\n" +
+    "    None => {}\n" +
+    "  }\n" +
+    "  Json::object(m)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(files : Array[(String, String)]) -> String {
+    let body = files[0].1
+    if str_has(body, "Option::None => {}") {
+      let (l1, c1) = find_line_col(body, "{}")
+      return "{\"ok\":false,\"diagnostics\":[" +
+      "{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"match_stage_b.pion\",\"line\":" + l1.to_string() + ",\"col\":" + c1.to_string() + ",\"message\":\"`match` arm type mismatch\"}" +
+      "]}"
+    }
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], true, mock_check)
+  let out = res.files[0].content
+  assert_true(str_has(out, "Option::None => mbt_compat::ordered_map_new()"), "Stage B fallback must rewrite None => {} when bound var is passed to MbtJson::object: " + out)
+
+  // Negative: Array::copy() sibling arm must NOT trigger OrderedMap rewrite
+  let neg_src = SourceFile::{
+    rel_path: "match_arr_copy.mbt",
+    content: "pub fn g(xs : Array[Int], flag : Bool) -> Unit {\n" +
+    "  let _ = match flag {\n" +
+    "    true => xs.copy()\n" +
+    "    false => {}\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let neg_check = fn(files : Array[(String, String)]) -> String {
+    let body = files[0].1
+    let (l1, c1) = find_line_col(body, "{}")
+    "{\"ok\":false,\"diagnostics\":[" +
+    "{\"severity\":\"error\",\"code\":\"E_TYPE_MISMATCH\",\"file\":\"match_arr_copy.pion\",\"line\":" + l1.to_string() + ",\"col\":" + c1.to_string() + ",\"message\":\"`match` arm type mismatch\"}" +
+    "]}"
+  }
+  let neg_res = transpile_package_ex([neg_src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], true, neg_check)
+  let neg_out = neg_res.files[0].content
+  assert_true(!str_has(neg_out, "ordered_map_new"), "Array::copy() sibling arm must NOT rewrite {} to ordered_map_new: " + neg_out)
+}
+
+test "spread array skips typed Array temp for FixedArray and ArrayView sources" {
+  let src = SourceFile::{
+    rel_path: "spread_non_array.mbt",
+    content: "pub fn merge_sources(a : Int, fa : FixedArray[Int], av : ArrayView[Int]) -> Array[Int] {\n" +
+    "  let r1 : Array[Int] = [a, ..fa]\n" +
+    "  let r2 : Array[Int] = [a, ..av]\n" +
+    "  [..r1, ..r2]\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "spread_non_array blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "in fa {"), "FixedArray spread must iterate fa directly without Array temp: " + out)
+  assert_true(str_has(out, "in av {"), "ArrayView spread must iterate av directly without Array temp: " + out)
+  assert_true(!str_has(out, " : Array[Int] = fa"), "must not bind FixedArray to Array[Int] temp: " + out)
+  assert_true(!str_has(out, " : Array[Int] = av"), "must not bind ArrayView to Array[Int] temp: " + out)
+}
+
+test "Json Object(m) match binding uses scrutinee type even when dep enum defines Object" {
+  let dep_other = "{\"packages\":[{\"name\":\"other\",\"items\":[" +
+  "{\"kind\":\"enum\",\"name\":\"OtherEnum\",\"sig\":\"pub enum OtherEnum { Object(Array[Int]); Empty }\"}" +
+  "]}]}"
+  let dep_json = "{\"packages\":[{\"name\":\"mbt_compat\",\"items\":[" +
+  "{\"kind\":\"enum\",\"name\":\"MbtJson\",\"sig\":\"pub enum MbtJson { Null; Object(OrderedMap[String, MbtJson]) }\"}" +
+  "]}]}"
+  let src = SourceFile::{
+    rel_path: "json_obj_scrut.mbt",
+    content: "pub fn from_opt_json(opt : Json?) -> Map[String, Json] {\n" +
+    "  let r = match opt {\n" +
+    "    Some(Object(m)) => m.copy()\n" +
+    "    _ => {}\n" +
+    "  }\n" +
+    "  r\n" +
+    "}\n\n" +
+    "pub fn from_other(o : @other.OtherEnum) -> Unit {\n" +
+    "  let _ = match o {\n" +
+    "    @other.OtherEnum::Object(x) => { let _ = x.copy(); () }\n" +
+    "    _ => {}\n" +
+    "  }\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [dep_json, dep_other], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "json_obj_scrut blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  let idx2 = out.index_of("pub fn from_other")
+  assert_true(idx2 > 0, "output must contain from_other: " + out)
+  let part1 = out.slice(0, idx2)
+  let part2 = out.slice(idx2, out.length())
+  assert_true(str_has(part1, "_ => mbt_compat::ordered_map_new()"), "Option[Json] scrutinee must lower _ => {} to ordered_map_new() even when Object is in enum_schemas_by_ctor: " + part1)
+  assert_true(!str_has(part2, "ordered_map_new"), "OtherEnum::Object(x) must not inject OrderedMap: " + part2)
+}
+
+test "infer_match_expr_type_f3d2 unwraps Option and Result bindings for downstream paren call" {
+  let src = SourceFile::{
+    rel_path: "match_unwrap_call.mbt",
+    content: "pub struct Handler {\n" +
+    "  call : (String, Json) -> Unit\n" +
+    "}\n\n" +
+    "pub struct Holder {\n" +
+    "  cb : Handler?\n" +
+    "  res : Result[Handler, String]\n" +
+    "}\n\n" +
+    "pub fn invoke_opt(holder : Holder) -> Unit {\n" +
+    "  let h = match holder.cb {\n" +
+    "    Some(s) => s\n" +
+    "    None => return\n" +
+    "  }\n" +
+    "  (h.call)(\"k\", { \"flag\": Json::boolean(true) })\n" +
+    "}\n\n" +
+    "pub fn invoke_res(holder : Holder) -> Unit {\n" +
+    "  let h = match holder.res {\n" +
+    "    Ok(s) => s\n" +
+    "    Err(_) => return\n" +
+    "  }\n" +
+    "  (h.call)(\"r\", { \"ok\": Json::boolean(true) })\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package_ex([src], empty_api_map(), default_recipes(), [], [], [], [], default_options(), [], false, noop_check)
+  let dmsg = if res.diagnostics.length() > 0 { res.diagnostics[0].code + ": " + res.diagnostics[0].message } else { "" }
+  assert_true(res.blockers == 0, "match_unwrap_call blockers=" + res.blockers.to_string() + " " + dmsg)
+  let out = res.files[0].content
+  assert_true(str_has(out, "(h.call)(\"k\", mbt_compat::MbtJson::Object("), "Option match unwrap must type h as Handler and propagate MbtJson into (h.call): " + out)
+  assert_true(str_has(out, "(h.call)(\"r\", mbt_compat::MbtJson::Object("), "Result match unwrap must type h as Handler and propagate MbtJson into (h.call): " + out)
+}
