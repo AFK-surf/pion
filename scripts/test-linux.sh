@@ -878,6 +878,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/closure_early_ret_and_infer/run_e2e.sh
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC"
 # Round 232: untyped tuple array literal -> generic Array[(K, V)] monomorphization (dev, --release, wasm32, ASan/LSan).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC"
+# `Bytes` / `BytesView` value equality + built-in `Eq` bound (dev, --release, wasm32, ASan/LSan).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/bytes_eq/run_e2e.sh" "$PIONC"
 # PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC"
 # CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.

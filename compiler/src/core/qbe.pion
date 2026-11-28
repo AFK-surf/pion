@@ -30284,7 +30284,7 @@ fn qbe_contains_may_call_custom(
       match subst_ty(raw_ty, g.cur_type_subst) {
         TArray(el) | TFixedArray(el) | TImmArray(el) =>
           qbe_ty_has_error(el) || qbe_ty_has_custom_eq(g, el, Map([]))
-        TString | TStrView => false
+        TString | TStrView | TBytes | TBytesView => false
         _ => true
       }
     None => true
@@ -30307,6 +30307,7 @@ fn qbe_type_needs_eq_fn(g : QbeGen, ty : Ty) -> Bool {
   let rty = subst_ty(ty, g.cur_type_subst)
   match rty {
     TImmArray(_) | TArray(_) | TFixedArray(_) | TOption(_) | TResult(_, _) | TTuple(_) => true
+    TStrView | TBytes | TBytesView => true
     TStruct(sname, _) =>
       match qbe_lookup_builtin_eq_impl(g, rty) {
         Some(_) => true
@@ -30389,7 +30390,7 @@ fn qbe_emit_eq_field_cmp_ptrs(
       sb.write_string("    %bv_" + pfx + " =l loadl " + bp + "\n")
       sb.write_string("    %ok_" + pfx + " =w call $pion_str_eq(l %av_" + pfx + ", l %bv_" + pfx + ")\n")
     }
-    TStrView => {
+    TStrView | TBytesView => {
       let eq_bytes_sym = qbe_ensure_view_eq_bytes_fn(g)
       sb.write_string("    %av_" + pfx + " =l loadl " + ap + "\n")
       sb.write_string("    %bv_" + pfx + " =l loadl " + bp + "\n")
@@ -30668,6 +30669,34 @@ fn qbe_ensure_eq_fn_resolved(g : QbeGen, rty : Ty) -> String {
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
+    // `Bytes` (`+0` len, `+8` cap, `+16` data) compares length + content,
+    // never `cap`; `StrView` / `BytesView` (`+0` owner, `+8` ptr, `+16` len)
+    // compare the viewed range. `view_eq_bytes` returns 1 for `n == 0` before
+    // touching data.
+    TBytes | TStrView | TBytesView => {
+      let eq_bytes_sym = qbe_ensure_view_eq_bytes_fn(g)
+      let is_view = match rty {
+        TStrView | TBytesView => true
+        _ => false
+      }
+      let data_off = if is_view { "8" } else { "16" }
+      let sb = StringBuilder()
+      sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+      sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_len\n@cmp_len\n")
+      if is_view {
+        sb.write_string("    %lap =l add %a, 16\n    %la =l loadl %lap\n")
+        sb.write_string("    %lbp =l add %b, 16\n    %lb =l loadl %lbp\n")
+      } else {
+        sb.write_string("    %la =l loadl %a\n    %lb =l loadl %b\n")
+      }
+      sb.write_string("    %leq =w ceql %la, %lb\n    jnz %leq, @cmp_data, @ret_false\n@cmp_data\n")
+      sb.write_string("    %pap =l add %a, " + data_off + "\n    %pa =l loadl %pap\n")
+      sb.write_string("    %pbp =l add %b, " + data_off + "\n    %pb =l loadl %pbp\n")
+      sb.write_string("    %ok =w call " + eq_bytes_sym + "(l %pa, l %pb, l %la)\n    ret %ok\n")
+      sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
     TOption(inner) => {
       let sb = StringBuilder()
       sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
@@ -30699,7 +30728,7 @@ fn qbe_ensure_eq_fn_resolved(g : QbeGen, rty : Ty) -> String {
           match inner {
             TString =>
               sb.write_string("    %ok =w call $pion_str_eq(l %a, l %b)\n    ret %ok\n")
-            TStrView => {
+            TStrView | TBytesView => {
               let eq_bytes_sym = qbe_ensure_view_eq_bytes_fn(g)
               sb.write_string("    %l1p =l add %a, 16\n    %l1 =l loadl %l1p\n")
               sb.write_string("    %l2p =l add %b, 16\n    %l2 =l loadl %l2p\n")
@@ -38424,7 +38453,13 @@ fn qbe_emit_pat_test(
               qbe_emit(g, eq + " =w call $pion_str_eq(l " + vreg + ", l " + cval + ")")
               qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
             }
-            TStrView => {
+            TBytes => {
+              let eq_sym = qbe_ensure_eq_fn(g, TBytes)
+              let eq = qbe_tmp(g)
+              qbe_emit(g, eq + " =w call " + eq_sym + "(l " + vreg + ", l " + cval + ")")
+              qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
+            }
+            TStrView | TBytesView => {
               let p1a = qbe_tmp(g)
               let p1 = qbe_tmp(g)
               let l1a = qbe_tmp(g)
@@ -40140,7 +40175,7 @@ fn qbe_emit_cond_branch_leaf(
             qbe_emit_term(g, "jnz " + cw + ", " + l_true + ", " + l_false)
             return
           }
-          TStrView => {
+          TStrView | TBytesView => {
             let p1a = qbe_tmp(g)
             let p1 = qbe_tmp(g)
             let l1a = qbe_tmp(g)
@@ -43102,7 +43137,7 @@ fn qbe_emit_binary_combine(
     qbe_emit_verify_arith_check(g, op, lv, rv, qbe_eval_verify_const_rhs(g, rhs), bin_sp)
   }
   match lv.ty {
-    TStrView => {
+    TStrView | TBytesView => {
       let p1a = qbe_tmp(g)
       let p1 = qbe_tmp(g)
       let l1a = qbe_tmp(g)
