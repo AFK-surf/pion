@@ -359,7 +359,8 @@ assert d["rc_partial"] is True, f"expected rc_partial==True when running RC mode
 print("OK native build_modes=3 rc_partial=True")
 PY
 
-# Multi-RC setup locals must stay alive across bench_loop and teardown (Native + Wasm32)
+# Multi-RC setup locals must stay alive across bench_loop and teardown (Native + Wasm32).
+# Uses --iters 5 (multiple iterations, still <1ms) to reliably exercise loop-backedge RC lifetime.
 cat > "$TMP/multi_rc_bench.pion" <<'EOF'
 fn pair_len(a : String, b : String) -> Int {
   a.length() + b.length()
