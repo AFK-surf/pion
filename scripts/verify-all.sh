@@ -552,6 +552,8 @@ sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC2"
 # Round 232: untyped tuple array literal -> generic Array[(K, V)] monomorphization (dev, --release, wasm32, ASan).
 sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC2"
+# `Bytes` / `BytesView` value equality + built-in `Eq` bound (dev, --release, wasm32, ASan).
+sh "$ROOT_DIR/tests/e2e/bytes_eq/run_e2e.sh" "$PIONC2"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC2"
 # P125: native String slice spans + scalar Map[String, Int|Int64] entries + managed String file reads + native Channel[String].send without duplicate deep freeze (6 programs in --release and dev: exact exit status / stdout / stderr, slice-panic side-effect traces, call-mutated map fallback, 5 file kinds vs fs_read_bytes, SSA primitive presence).
