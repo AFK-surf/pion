@@ -379,3 +379,121 @@ test "ref unwrap and empty map: Ref::new / { val: e } expected-type unwrapping a
   assert_true(str_has(final_src, "{ let _x = 1 }"), "Stage B must NOT touch non-empty block { let _x = 1 }")
   assert_true(str_has(final_src, "fn empty_fn_body() -> mbt_compat::OrderedMap[String, Int] {}"), "Stage B must NOT rewrite empty function body {}")
 }
+
+test "generic ret guard: uninstantiated generic calls never leak T into closure or method type inference" {
+  // 1. Cross-package generic `pub fn[T] wrap(f : () -> T) -> T` in match arm alongside `None => 0.0`
+  let dep_opts = TranspileOptions::{
+    target: "native",
+    mode: "publish",
+    with_tests: false,
+    src_prefix: "dep",
+    moon_pkg_content: "",
+    ffi_shim_prefix: "",
+    header: default_header_meta("native"),
+  }
+  let dep_src = SourceFile::{
+    rel_path: "dep.mbt",
+    content: "pub fn[T] wrap(f : () -> T) -> T {\n  f()\n}\n",
+    is_test: false,
+  }
+  let dep_res = transpile_package([dep_src], empty_api_map(), default_recipes(), [], [], dep_opts, [], false, or_rest_noop_check)
+  assert_true(dep_res.blockers == 0, "dep package with generic wrap transpiles cleanly")
+  let dep_doc = "{\"packages\":[{\"name\":\"dep\",\"items\":[{\"kind\":\"fn\",\"name\":\"wrap\",\"sig\":\"pub fn[T] wrap(f : () -> T) -> T\"}]}]}"
+
+  let cross_src = SourceFile::{
+    rel_path: "cross_gen.mbt",
+    content: "pub struct Cell {\n  val : Double\n}\n" +
+    "pub fn run(opt : Option[Cell]) -> Double {\n" +
+    "  let get_val = fn() {\n" +
+    "    match opt {\n" +
+    "      Some(v) => @dep.wrap(fn() { v.val })\n" +
+    "      None => 0.0\n" +
+    "    }\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Double {\n" +
+    "    if n <= 0 { get_val() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(2)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let cross_res = transpile_package_with_abis([cross_src], empty_api_map(), default_recipes(), [], [], [dep_doc], [("dep", dep_res.abi)], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(cross_res.blockers == 0, "cross-package generic wrap alongside concrete sibling arm must infer () -> Double")
+  let cross_out = or_rest_find_file(cross_res, "cross_gen.pion")
+  assert_true(str_has(cross_out, "_get_val : () -> Double"), "lifted capture get_val must be typed () -> Double")
+  assert_true(!str_has(cross_out, "_get_val : () -> T"), "must never leak formal type param T")
+
+  // 2. Local generic `fn[T] id(x : T) -> T` alongside `None => 42` -> infers () -> Int
+  let local_src = SourceFile::{
+    rel_path: "local_gen.mbt",
+    content: "fn[T] id(x : T) -> T {\n  x\n}\n" +
+    "pub fn run_local(opt : Option[Int]) -> Int {\n" +
+    "  let pick = fn() {\n" +
+    "    match opt {\n" +
+    "      Some(v) => id(v)\n" +
+    "      None => 42\n" +
+    "    }\n" +
+    "  }\n" +
+    "  fn loop_fn(n : Int) -> Int {\n" +
+    "    if n <= 0 { pick() } else { loop_fn(n - 1) }\n" +
+    "  }\n" +
+    "  loop_fn(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let local_res = transpile_package([local_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(local_res.blockers == 0, "local generic id alongside concrete Int arm must infer () -> Int")
+  let local_out = or_rest_find_file(local_res, "local_gen.pion")
+  assert_true(str_has(local_out, "_pick : () -> Int"), "lifted capture pick must be typed () -> Int")
+  assert_true(!str_has(local_out, "_pick : () -> T"), "must never leak formal type param T for local fn")
+
+  // 3. Negative: uninstantiated generic call with no concrete sibling arm MUST fail closed (never emit () -> T)
+  let neg_src = SourceFile::{
+    rel_path: "neg_gen.mbt",
+    content: "fn[T] make_any() -> T {\n  abort(\"unreachable\")\n}\n" +
+    "pub fn run_neg() -> Int {\n" +
+    "  let get_any = fn() {\n" +
+    "    make_any()\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Int {\n" +
+    "    if n <= 0 { get_any() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let neg_res = transpile_package([neg_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  let mut saw_unsup = false
+  for d in neg_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" && str_has(d.message, "lacks a statically known type") {
+      saw_unsup = true
+    }
+  }
+  let neg_out = or_rest_find_file(neg_res, "neg_gen.pion")
+  assert_true(saw_unsup && neg_res.blockers >= 1, "uninstantiated generic-only closure must fail closed with MBT2PION_UNSUPPORTED_SYNTAX")
+  assert_true(!str_has(neg_out, ": () -> T"), "must never emit illegal : () -> T")
+
+  // 4. Generic method `Box[T]::untracked(self : Box[T]) -> T` must not leak T and must resolve concrete Double
+  let meth_src = SourceFile::{
+    rel_path: "meth_gen.mbt",
+    content: "pub struct Box[T] {\n  val : T\n}\n" +
+    "pub fn[T] Box::untracked(self : Box[T]) -> T {\n" +
+    "  self.val\n" +
+    "}\n" +
+    "pub fn read_box(b : Box[Double]) -> Double {\n" +
+    "  let read = fn() {\n" +
+    "    b.untracked()\n" +
+    "  }\n" +
+    "  fn step(n : Int) -> Double {\n" +
+    "    if n <= 0 { read() } else { step(n - 1) }\n" +
+    "  }\n" +
+    "  step(1)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let meth_res = transpile_package([meth_src], empty_api_map(), default_recipes(), [], [], or_rest_default_opts(), [], false, or_rest_noop_check)
+  assert_true(meth_res.blockers == 0, "Box[Double].untracked() inside lifted closure must resolve Double cleanly")
+  let meth_out = or_rest_find_file(meth_res, "meth_gen.pion")
+  assert_true(str_has(meth_out, "_read : () -> Double"), "Box[Double].untracked() must resolve to () -> Double")
+  assert_true(!str_has(meth_out, "_read : () -> T"), "Box::untracked must never leak formal type param T")
+}

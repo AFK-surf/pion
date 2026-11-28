@@ -1849,6 +1849,18 @@ fn static_ret_mentions_generic(ty : String, gparams : Array[String]) -> Bool {
   type_mentions_any_generic(ty, gset)
 }
 
+///| True iff `ty` mentions any formal type parameter registered for `fn_key` in `tparams_map`.
+fn fn_ret_mentions_formal_generic(
+  ty : String,
+  tparams_map : Map[String, Array[String]],
+  fn_key : String,
+) -> Bool {
+  match tparams_map.get(fn_key) {
+    Some(tps) => static_ret_mentions_generic(ty, tps)
+    None => false
+  }
+}
+
 ///| Look up the concrete (non-generic-param-leaking) return type of a static method `Type::method`
 ///| or cross-package `pkg::Type::method`, honoring blackbox shadowing and `--dep` alias -> canon pkg mapping.
 ///| Returns `""` (fail-closed) when unknown or when the declared return type mentions a formal type parameter.
@@ -4507,17 +4519,17 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       None => ()
     }
   }
-  // Cross-package static method call `@pkg.Type::fn(...)` -> look up `symtab.fn_ret_types`
+  // Cross-package static method call `@pkg.Type::fn(...)` -> concrete return type (guarding generic params)
   if t.kind == TokenKind::PkgRef && start + 6 <= end &&
   tokens[start + 1].kind == TokenKind::Dot && tokens[start + 2].kind == TokenKind::UpperIdent &&
   tokens[start + 3].kind == TokenKind::ColonColon && tokens[start + 4].kind == TokenKind::Ident &&
   tokens[start + 5].kind == TokenKind::LParen && find_matching_delim(tokens, start + 5) == end - 1 {
     let raw_pkg = t.raw.slice(1, t.raw.length())
     let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
-    let fk = mapped_pkg + "::" + tokens[start + 2].raw + "::" + tokens[start + 4].raw
-    match ctx.symtab.fn_ret_types.get(fk) {
-      Some(rt) => if rt.length() > 0 { return rt }
-      None => ()
+    let pkg_cands = if mapped_pkg == raw_pkg { [mapped_pkg] } else { [mapped_pkg, raw_pkg] }
+    let rt = lookup_static_method_concrete_ret_type(ctx, pkg_cands, tokens[start + 2].raw, tokens[start + 4].raw)
+    if rt.length() > 0 {
+      return rt
     }
   }
   // Sound Ref literal `{ val: expr }` or `Ref::new(expr)` -> `mbt_compat::Ref` (when unshadowed)
@@ -4779,7 +4791,8 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     }
     match ctx.symtab.fn_ret_types.get(t.raw) {
       Some(rty) =>
-      if rty.length() > 0 && (rty.starts_with("Option[") || rty.starts_with("Array[") || rty.starts_with("(") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
+      if rty.length() > 0 && !fn_ret_mentions_formal_generic(rty, ctx.symtab.fn_type_params, t.raw) &&
+      (rty.starts_with("Option[") || rty.starts_with("Array[") || rty.starts_with("(") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
         return rty
       }
       None => ()
@@ -4810,9 +4823,11 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       find_matching_delim(tokens, start + 9) + 1 == find_matching_delim(tokens, start + 8) {
         return rbase
       }
-      match ctx.symtab.fn_ret_types.get(strip_type_args_sym(rbase) + "::" + tokens[start + 2].raw) {
+      let mkey = strip_type_args_sym(rbase) + "::" + tokens[start + 2].raw
+      match ctx.symtab.fn_ret_types.get(mkey) {
         Some(rty) =>
-        if rty.length() > 0 && (rty.starts_with("(") || rty.starts_with("Array[") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
+        if rty.length() > 0 && !fn_ret_mentions_formal_generic(rty, ctx.symtab.fn_type_params, mkey) &&
+        (rty.starts_with("(") || rty.starts_with("Array[") || ctx.struct_field_renames.contains(strip_type_args_sym(rty))) {
           return rty
         }
         None => ()
@@ -4826,22 +4841,37 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     let raw_pkg = t.raw.slice(1, t.raw.length())
     let mapped_pkg = resolve_pkg_ref_alias(ctx.symtab, raw_pkg)
     let fname = tokens[start + 2].raw
-    let rty = match ctx.symtab.fn_ret_types.get(mapped_pkg + "::" + fname) {
+    let mapped_key = mapped_pkg + "::" + fname
+    let raw_key = raw_pkg + "::" + fname
+    let rty = match ctx.symtab.fn_ret_types.get(mapped_key) {
       Some(r) => r
-      None => ""
+      None =>
+      if raw_pkg != mapped_pkg {
+        match ctx.symtab.fn_ret_types.get(raw_key) {
+          Some(r) => r
+          None => ""
+        }
+      } else {
+        ""
+      }
     }
     if rty.length() > 0 {
+      let mut resolved = rty
       // Substitute single type param `[T]` from first argument when possible (e.g. `Signal[T]` -> `Signal[Double]`)
-      if str_has(rty, "[T]") {
+      if str_has(resolved, "[T]") {
         let cp = find_matching_delim(tokens, start + 3)
         if cp > start + 4 {
           let arg_ty = infer_simple_expr_type(ctx, tokens, start + 4, cp)
           if arg_ty.length() > 0 {
-            return str_replace_all(rty, "[T]", "[" + arg_ty + "]")
+            resolved = str_replace_all(resolved, "[T]", "[" + arg_ty + "]")
           }
         }
       }
-      return rty
+      let leaks_gen = fn_ret_mentions_formal_generic(resolved, ctx.symtab.fn_type_params, mapped_key) ||
+      (raw_pkg != mapped_pkg && fn_ret_mentions_formal_generic(resolved, ctx.symtab.fn_type_params, raw_key))
+      if !leaks_gen {
+        return resolved
+      }
     }
   }
   // Local function call `f(...)` -> look up `symtab.fn_ret_types` (ONLY when no trailing `.method(...)` chain!)
@@ -4850,18 +4880,18 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
     let fname = rename_keyword_ident(t.raw)
     if ctx.cur_is_blackbox {
       match ctx.symtab.blackbox_fn_ret_types.get(fname) {
-        Some(r) => if r.length() > 0 { return r }
+        Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.blackbox_fn_type_params, fname) { return r }
         None => ()
       }
       if !ctx.symtab.blackbox_decls.contains(t.raw) {
         match ctx.symtab.fn_ret_types.get(fname) {
-          Some(r) => if r.length() > 0 { return r }
+          Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.fn_type_params, fname) { return r }
           None => ()
         }
       }
     } else {
       match ctx.symtab.fn_ret_types.get(fname) {
-        Some(r) => if r.length() > 0 { return r }
+        Some(r) => if r.length() > 0 && !fn_ret_mentions_formal_generic(r, ctx.symtab.fn_type_params, fname) { return r }
         None => ()
       }
     }
