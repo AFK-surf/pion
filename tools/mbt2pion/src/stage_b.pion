@@ -3785,7 +3785,8 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
 
   let file_has_capacity_marker = fn(content : String) -> Bool {
     str_has(content, "shrink_to_fit") || str_has(content, ".iter(") ||
-    str_has(content, "__mbt_slice_borrow") || str_has(content, ".search_by(")
+    str_has(content, "__mbt_slice_borrow") || str_has(content, ".search_by(") ||
+    str_has(content, ".filter_map(")
   }
   let update_qt_snap = fn(parsed_qt : PkgQueryTypes) -> Unit {
     qt_snap = parsed_qt
@@ -4003,6 +4004,38 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
 
     let mut changed = false
     let changed_rels : Array[String] = []
+    // Lower pure sealed-`MapKey` `.get`/`.contains` on `mbt_compat::OrderedMap`/`OrderedSet`
+    // before Gate B/C mutation-summary checks so same-package helpers export `unknown: false`.
+    let mut has_map_lookup_candidate = false
+    for f in cur_files {
+      if str_has(f.content, ".get(") || str_has(f.content, ".contains(") {
+        has_map_lookup_candidate = true
+        break
+      }
+    }
+    if has_map_lookup_candidate {
+      let qt_lk = get_round_qt()
+      if qt_lk.ok {
+        let (lk_files, lk_changed) = stage_b_lower_pure_mapkey_lookups(cur_files, qt_lk, dep_methods, op_lookup, cross_pkg)
+        if lk_changed {
+          let mut lki = 0
+          while lki < lk_files.length() && lki < cur_files.length() {
+            if lk_files[lki].content != cur_files[lki].content {
+              let old_v = match file_vers.get(lk_files[lki].rel_path) {
+                Some(v) => v
+                None => 0
+              }
+              file_vers[lk_files[lki].rel_path] = old_v + 1
+            }
+            lki = lki + 1
+          }
+          cur_files = lk_files
+          qt_snap_dirty = true
+          qt_used_prev_round = true
+          continue
+        }
+      }
+    }
     let next_files : Array[GeneratedFile] = []
     let pending_bound_relax_reqs : Array[BoundRelaxReq] = []
     for f in cur_files {
@@ -4213,12 +4246,12 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
                         m
                       }
                     }
-                    if helper == "mbt_compat::arr_search_by" {
+                    if helper == "mbt_compat::arr_search_by" || helper == "mbt_compat::arr_filter_map" {
                       let probe_diags : Array[Diag] = []
                       stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, probe_diags)
                       let ftoks_b = stage_b_get_file_tokens(round_file_tokens, token_cache, file_vers, f.rel_path, f.content)
                       let elem_ty_b = ms_extract_array_elem_ty(rty)
-                      let ms_safe = stage_b_check_search_by_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), elem_ty_b, d.line, d.col, probe_diags.length() > 0, drift_ledger)
+                      let ms_safe = stage_b_check_array_cb_with_summary(ftoks_b, get_mut_summary(), f.rel_path, f.content, get_file_qfi(), elem_ty_b, mname, helper, d.line, d.col, probe_diags.length() > 0, drift_ledger)
                       if !ms_safe {
                         if probe_diags.length() > 0 {
                           for pd in probe_diags {
@@ -4247,7 +4280,7 @@ pub fn run_stage_b_with_ops_deps_qt_and_cross_pkg(
                               f.rel_path,
                               d.line,
                               d.col,
-                              "callback in `Array::search_by(...)` may mutate receiver or aliased array (fail-closed by mutation_summary)",
+                              "callback in `Array::" + mname + "(...)` may mutate receiver or aliased array (fail-closed by mutation_summary)",
                             ))
                           }
                         }
@@ -6412,14 +6445,17 @@ fn stage_b_check_shrink_snapshot_with_summary(
   false
 }
 
-///| Gate B: `Array::search_by(cb)` callback purity backed by `PkgMutationSummary` + allow ledger.
-fn stage_b_check_search_by_with_summary(
+///| Gate B: `Array::search_by(cb)` / `Array::filter_map(cb)` callback purity backed by
+///| `PkgMutationSummary` + allow ledger.
+fn stage_b_check_array_cb_with_summary(
   tokens : Array[Token],
   mut_summary : PkgMutationSummary,
   f_rel : String,
   content : String,
   qfi_opt : Option[QtFileIndex],
   elem_ty : String,
+  method_name : String,
+  helper_name : String,
   line : Int,
   col : Int,
   record_allow : Bool,
@@ -6430,7 +6466,7 @@ fn stage_b_check_search_by_with_summary(
   let mut best_dist = 1000000
   let mut ti = 0
   while ti + 2 < n {
-    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == "search_by" &&
+    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == method_name &&
     tokens[ti + 2].kind == TokenKind::LParen && tokens[ti + 1].line == line {
       let dist = if tokens[ti + 1].col >= col { tokens[ti + 1].col - col } else { col - tokens[ti + 1].col }
       if dist < best_dist {
@@ -6462,14 +6498,464 @@ fn stage_b_check_search_by_with_summary(
         f_rel,
         line,
         col,
-        "search_by",
-        "mbt_compat::arr_search_by",
-        "mutation_summary proved search_by callback cannot mutate Array[" + elem_ty + "]",
+        method_name,
+        helper_name,
+        "mutation_summary proved " + method_name + " callback cannot mutate Array[" + elem_ty + "]",
       )
     }
     return true
   }
   false
+}
+
+///| Gate B wrapper for `Array::search_by(cb)`.
+fn stage_b_check_search_by_with_summary(
+  tokens : Array[Token],
+  mut_summary : PkgMutationSummary,
+  f_rel : String,
+  content : String,
+  qfi_opt : Option[QtFileIndex],
+  elem_ty : String,
+  line : Int,
+  col : Int,
+  record_allow : Bool,
+  drift_ledger : Array[DriftEntry],
+) -> Bool {
+  stage_b_check_array_cb_with_summary(
+    tokens,
+    mut_summary,
+    f_rel,
+    content,
+    qfi_opt,
+    elem_ty,
+    "search_by",
+    "mbt_compat::arr_search_by",
+    line,
+    col,
+    record_allow,
+    drift_ledger,
+  )
+}
+
+struct MapKeyEdit {
+  call_s : Int
+  call_e : Int
+  recv_s : Int
+  recv_e : Int
+  arg_s : Int
+  arg_e : Int
+  helper : String
+}
+
+fn stage_b_is_ident_shadowed_in_fn(tokens : Array[Token], body_open : Int, ident : String) -> Bool {
+  if body_open < 0 || body_open >= tokens.length() {
+    return false
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  if body_close <= body_open {
+    return false
+  }
+  // Check function parameter names before `body_open`.
+  let mut h = body_open - 1
+  let mut fn_kw = -1
+  while h >= 0 {
+    if tokens[h].raw == "fn" && (tokens[h].kind == TokenKind::Keyword || tokens[h].kind == TokenKind::Ident) {
+      fn_kw = h
+      break
+    }
+    if tokens[h].kind == TokenKind::RBrace {
+      break
+    }
+    h = h - 1
+  }
+  if fn_kw >= 0 {
+    let mut k = fn_kw + 1
+    while k + 1 < body_open {
+      if tokens[k].kind == TokenKind::Ident && tokens[k].raw == ident && tokens[k + 1].kind == TokenKind::Colon {
+        return true
+      }
+      k = k + 1
+    }
+  }
+  // Check local `let [mut] <ident>` and pattern bindings inside body.
+  let mut i = body_open + 1
+  while i + 1 < body_close {
+    if tokens[i].raw == "let" {
+      let mut ni = i + 1
+      if ni < body_close && tokens[ni].raw == "mut" {
+        ni = ni + 1
+      }
+      if ni < body_close && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == ident {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  let pats : Map[String, Bool] = Map()
+  ms_collect_pattern_bound_idents(tokens, body_open, pats)
+  pats.contains(ident)
+}
+
+fn stage_b_collect_new_by_taint(all_tokens : Array[Array[Token]]) -> (Bool, Map[String, Bool]) {
+  // Returns `(pkg_has_top_level_new_by, tainted_body_keys)` where key is `<file_idx>:<body_open>`.
+  let mut top_level_new_by = false
+  let fn_records : Array[(Int, Int, Int, String)] = []
+  let tainted_fn_names : Map[String, Bool] = Map()
+  let tainted_bodies : Map[String, Bool] = Map()
+  let mut fi = 0
+  while fi < all_tokens.length() {
+    let toks = all_tokens[fi]
+    let n = toks.length() - 1
+    let mut depth = 0
+    let mut i = 0
+    while i < n {
+      let tk = toks[i]
+      if depth == 0 && tk.raw == "fn" && (tk.kind == TokenKind::Keyword || tk.kind == TokenKind::Ident) {
+        // Parse top-level fn name (`name` or `Type::name`) and find its `{ ... }` body.
+        let mut j = i + 1
+        let mut fname = ""
+        if j < n && toks[j].kind == TokenKind::LBracket {
+          let rb = find_matching_delim(toks, j)
+          if rb > j { j = rb + 1 }
+        }
+        if j < n && (toks[j].kind == TokenKind::Ident || toks[j].kind == TokenKind::UpperIdent) {
+          fname = toks[j].raw
+          j = j + 1
+          if j + 1 < n && toks[j].kind == TokenKind::ColonColon &&
+          (toks[j + 1].kind == TokenKind::Ident || toks[j + 1].kind == TokenKind::UpperIdent) {
+            fname = toks[j + 1].raw
+            j = j + 2
+          }
+        }
+        let mut bo = -1
+        let mut d2 = 0
+        while j < n {
+          let jk = toks[j].kind
+          if d2 == 0 && jk == TokenKind::LBrace {
+            bo = j
+            break
+          }
+          if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { d2 = d2 + 1 }
+          else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { if d2 > 0 { d2 = d2 - 1 } }
+          j = j + 1
+        }
+        if bo >= 0 {
+          let bc = find_matching_delim(toks, bo)
+          if bc > bo {
+            fn_records.push((fi, bo, bc, fname))
+            let mut k = bo + 1
+            while k < bc {
+              if toks[k].raw == "new_by" {
+                tainted_bodies[fi.to_string() + ":" + bo.to_string()] = true
+                if fname.length() > 0 {
+                  tainted_fn_names[fname] = true
+                }
+                break
+              }
+              k = k + 1
+            }
+            i = bc + 1
+            continue
+          }
+        }
+      }
+      if tk.raw == "new_by" {
+        top_level_new_by = true
+      }
+      if tk.kind == TokenKind::LBrace { depth = depth + 1 }
+      else if tk.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 } }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  // Propagate `new_by` taint through same-package helper calls.
+  if tainted_fn_names.length() > 0 {
+    let mut round = 0
+    while round < 8 {
+      let mut grew = false
+      for rec in fn_records {
+        let rfi = rec.0
+        let bo = rec.1
+        let bc = rec.2
+        let fname = rec.3
+        let bkey = rfi.to_string() + ":" + bo.to_string()
+        if tainted_bodies.contains(bkey) {
+          continue
+        }
+        let toks = all_tokens[rfi]
+        let mut k = bo + 1
+        while k < bc {
+          if toks[k].kind == TokenKind::Ident && tainted_fn_names.contains(toks[k].raw) {
+            tainted_bodies[bkey] = true
+            if fname.length() > 0 {
+              tainted_fn_names[fname] = true
+            }
+            grew = true
+            break
+          }
+          k = k + 1
+        }
+      }
+      if !grew {
+        break
+      }
+      round = round + 1
+    }
+  }
+  (top_level_new_by, tainted_bodies)
+}
+
+fn apply_nested_mapkey_edits(
+  src : String,
+  s : Int,
+  e : Int,
+  edits : Array[MapKeyEdit],
+  exclude_idx : Int,
+) -> String {
+  let top_idxs : Array[Int] = []
+  let mut i = 0
+  while i < edits.length() {
+    if i != exclude_idx {
+      let ed = edits[i]
+      if ed.call_s >= s && ed.call_e <= e {
+        let mut nested = false
+        let mut j = 0
+        while j < edits.length() {
+          if j != i && j != exclude_idx {
+            let other = edits[j]
+            if other.call_s >= s && other.call_e <= e &&
+            other.call_s <= ed.call_s && other.call_e >= ed.call_e &&
+            (other.call_s < ed.call_s || other.call_e > ed.call_e) {
+              nested = true
+              break
+            }
+          }
+          j = j + 1
+        }
+        if !nested {
+          top_idxs.push(i)
+        }
+      }
+    }
+    i = i + 1
+  }
+  if top_idxs.length() == 0 {
+    return src.slice(s, e)
+  }
+  let mut k = 1
+  while k < top_idxs.length() {
+    let cur = top_idxs[k]
+    let mut m = k - 1
+    while m >= 0 && edits[top_idxs[m]].call_s > edits[cur].call_s {
+      top_idxs[m + 1] = top_idxs[m]
+      m = m - 1
+    }
+    top_idxs[m + 1] = cur
+    k = k + 1
+  }
+  let sb = StringBuilder()
+  let mut pos = s
+  for idx in top_idxs {
+    let ed = edits[idx]
+    if ed.call_s < pos {
+      continue
+    }
+    if ed.call_s > pos {
+      sb.write_string(src.slice(pos, ed.call_s))
+    }
+    let recv_rendered = apply_nested_mapkey_edits(src, ed.recv_s, ed.recv_e, edits, idx)
+    let arg_rendered = apply_nested_mapkey_edits(src, ed.arg_s, ed.arg_e, edits, idx)
+    sb.write_string(ed.helper)
+    sb.write_string("(")
+    sb.write_string(recv_rendered)
+    sb.write_string(", ")
+    sb.write_string(arg_rendered)
+    sb.write_string(")")
+    pos = ed.call_e
+  }
+  if pos < e {
+    sb.write_string(src.slice(pos, e))
+  }
+  sb.to_string()
+}
+
+///| Lower `.get(k)` / `.contains(k)` on `mbt_compat::OrderedMap[K, V]` and `.contains(k)` on
+///| `mbt_compat::OrderedSet[K]` to `mbt_compat::ordered_map_get_mapkey` /
+///| `ordered_map_contains_mapkey` / `ordered_set_contains_mapkey` whenever `QtFileIndex` proves
+///| the receiver is `mbt_compat::OrderedMap`/`OrderedSet`, canonicalized key `K` is a sealed
+///| built-in `MapKey` type, `mbt_compat` is not shadowed, and no `new_by` construction taints the
+///| enclosing function or package globals.
+pub fn stage_b_lower_pure_mapkey_lookups(
+  cur_files : Array[GeneratedFile],
+  pkg_qt : PkgQueryTypes,
+  dep_methods : Map[String, Bool],
+  op_lookup : Map[String, String],
+  cross_pkg : CrossPkgMutationContext,
+) -> (Array[GeneratedFile], Bool) {
+  if !pkg_qt.ok {
+    return (cur_files, false)
+  }
+  let mut has_cand = false
+  for f in cur_files {
+    if str_has(f.content, ".get(") || str_has(f.content, ".contains(") {
+      has_cand = true
+      break
+    }
+  }
+  if !has_cand {
+    return (cur_files, false)
+  }
+  let all_tokens : Array[Array[Token]] = []
+  let rels : Array[String] = []
+  let contents : Array[String] = []
+  for f in cur_files {
+    all_tokens.push(lex_moonbit(f.content))
+    rels.push(f.rel_path)
+    contents.push(f.content)
+  }
+  let pkg_ms = collect_pkg_mutation_summary_with_cross_pkg(
+    all_tokens,
+    rels,
+    contents,
+    pkg_qt,
+    dep_methods,
+    op_lookup,
+    cross_pkg,
+  )
+  let pkg_mbt_compat_shadowed = pkg_ms.declared_types.contains("mbt_compat") ||
+  pkg_ms.top_level_value_bindings.contains("mbt_compat")
+  if pkg_mbt_compat_shadowed {
+    return (cur_files, false)
+  }
+  let (top_level_new_by, tainted_bodies) = stage_b_collect_new_by_taint(all_tokens)
+  if top_level_new_by {
+    return (cur_files, false)
+  }
+
+  let out_files : Array[GeneratedFile] = []
+  let mut any_changed = false
+  let mut fi = 0
+  while fi < cur_files.length() {
+    let f = cur_files[fi]
+    if !str_has(f.content, ".get(") && !str_has(f.content, ".contains(") {
+      out_files.push(f)
+      fi = fi + 1
+      continue
+    }
+    let qfi = match pkg_qt.files.get(f.rel_path) {
+      Some(q) => q
+      None => {
+        out_files.push(f)
+        fi = fi + 1
+        continue
+      }
+    }
+    let tokens = all_tokens[fi]
+    let n = tokens.length() - 1
+    let edits : Array[MapKeyEdit] = []
+    let mut ti = 1
+    while ti + 2 < n {
+      if tokens[ti].kind == TokenKind::Dot &&
+      (tokens[ti + 1].raw == "get" || tokens[ti + 1].raw == "contains") &&
+      tokens[ti + 2].kind == TokenKind::LParen {
+        let mname = tokens[ti + 1].raw
+        let rp_ti = find_matching_delim(tokens, ti + 2)
+        if rp_ti > ti + 2 {
+          let cargs = ms_split_call_args(tokens, ti + 2, rp_ti)
+          if cargs.length() == 1 && cargs[0].0 < cargs[0].1 {
+            let arg_s_b = tokens[cargs[0].0].start_byte
+            let arg_e_b = tokens[cargs[0].1 - 1].end_byte
+            let arg_src = f.content.slice(arg_s_b, arg_e_b)
+            if !unsafe_index_arg_is_labelled(arg_src) {
+              let recv_start_ti = find_receiver_start_token(tokens, ti)
+              if recv_start_ti >= 0 && recv_start_ti < ti {
+                let body_open = outermost_body_open(tokens, ti)
+                let body_tainted = if body_open >= 0 {
+                  tainted_bodies.contains(fi.to_string() + ":" + body_open.to_string())
+                } else {
+                  false
+                }
+                let shadowed = if body_open >= 0 {
+                  stage_b_is_ident_shadowed_in_fn(tokens, body_open, "mbt_compat")
+                } else {
+                  false
+                }
+                if !body_tainted && !shadowed {
+                  let active_gen = if body_open >= 0 {
+                    enclosing_fn_generic_params_at(tokens, body_open, ti)
+                  } else {
+                    Map()
+                  }
+                  let recv_s_b = tokens[recv_start_ti].start_byte
+                  let recv_e_b = tokens[ti - 1].end_byte
+                  match qt_lookup_receiver_ty_at_op(qfi, f.content, tokens[ti + 1].start_byte, recv_s_b, tokens[rp_ti].end_byte, true) {
+                    Some(raw_rty) => {
+                      let rty_canon = qt_strip_pkg_hash(raw_rty).trim()
+                      let mut raw_k = ""
+                      let mut helper = ""
+                      if rty_canon.starts_with("mbt_compat::OrderedMap[") && rty_canon.ends_with("]") {
+                        let inner = rty_canon.slice(23, rty_canon.length() - 1).trim()
+                        let parts = qt_split_top_level_type_args(inner)
+                        if parts.length() == 2 {
+                          raw_k = parts[0].trim()
+                          helper = if mname == "get" {
+                            "mbt_compat::ordered_map_get_mapkey"
+                          } else {
+                            "mbt_compat::ordered_map_contains_mapkey"
+                          }
+                        }
+                      } else if mname == "contains" && rty_canon.starts_with("mbt_compat::OrderedSet[") && rty_canon.ends_with("]") {
+                        let inner = rty_canon.slice(23, rty_canon.length() - 1).trim()
+                        let parts = qt_split_top_level_type_args(inner)
+                        if parts.length() == 1 {
+                          raw_k = parts[0].trim()
+                          helper = "mbt_compat::ordered_set_contains_mapkey"
+                        }
+                      }
+                      if helper.length() > 0 && raw_k.length() > 0 && !active_gen.contains(raw_k) {
+                        let canon_k = ms_canonicalize_type(pkg_ms, raw_k)
+                        if canon_k.length() > 0 && !active_gen.contains(canon_k) && ms_is_sealed_builtin_map_key(canon_k) {
+                          edits.push(MapKeyEdit::{
+                            call_s: recv_s_b,
+                            call_e: tokens[rp_ti].end_byte,
+                            recv_s: recv_s_b,
+                            recv_e: recv_e_b,
+                            arg_s: arg_s_b,
+                            arg_e: arg_e_b,
+                            helper: helper,
+                          })
+                        }
+                      }
+                    }
+                    None => ()
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      ti = ti + 1
+    }
+    if edits.length() > 0 {
+      let rewritten = apply_nested_mapkey_edits(f.content, 0, f.content.length(), edits, -1)
+      if rewritten != f.content {
+        any_changed = true
+        out_files.push(GeneratedFile::{
+          rel_path: f.rel_path,
+          content: rewritten,
+          source_file: f.source_file,
+          anchors: f.anchors,
+        })
+      } else {
+        out_files.push(f)
+      }
+    } else {
+      out_files.push(f)
+    }
+    fi = fi + 1
+  }
+  (out_files, any_changed)
 }
 
 ///| Gate C: Immediate `.iter().(any|all|find_first)(cb)` backed by `PkgMutationSummary` + allow ledger.

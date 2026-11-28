@@ -1,0 +1,339 @@
+///| Pure `MapKey` lookup lowering, `mutation_summary` recognition, Gate B `filter_map`,
+///| and non-bare-ident `Array::push_iter(<expr>.iter())` tests (positive + negative adversaries).
+
+fn mk_qt_json_for_file(rel_path : String, exprs_json : String) -> String {
+  "{\"id\":1,\"ok\":true,\"diagnostics\":[],\"types\":[{\"file\":\"" + rel_path + "\",\"expr_tys\":[" + exprs_json + "],\"call_targets\":[]}]}"
+}
+
+fn mk_qt_expr_entry(op_byte : Int, start_byte : Int, end_byte : Int, recv_ty : String) -> String {
+  "{\"start_byte\":" + start_byte.to_string() +
+  ",\"end_byte\":" + end_byte.to_string() +
+  ",\"op_byte\":" + op_byte.to_string() +
+  ",\"role\":\"method_call\",\"ty\":\"Option[Int]\",\"ty_canon\":\"Option[Int]\",\"receiver_ty\":\"" + recv_ty +
+  "\",\"receiver_ty_canon\":\"" + recv_ty + "\",\"ambiguous\":false}"
+}
+
+test "mapkey_pure_lookup: upstream zero-error pkg lowers .get/.contains and exports unknown=false; downstream Gates B & C pass" {
+  // Upstream package with 0 Stage A errors: `field` reads `m.get(key)` on `MbtJson::Object(m)`,
+  // `has_both` has two `.contains(...)` calls on one line, `has_set` uses `OrderedSet::contains`.
+  let up_src = "pub fn field(v : Option[mbt_compat::MbtJson], key : String) -> Option[mbt_compat::MbtJson] {\n" +
+  "  match v {\n" +
+  "    Some(mbt_compat::MbtJson::Object(m)) => m.get(key)\n" +
+  "    _ => None\n" +
+  "  }\n" +
+  "}\n" +
+  "pub fn has_both(m : mbt_compat::OrderedMap[String, Int]) -> Bool {\n" +
+  "  m.contains(\"a\") && m.contains(\"b\")\n" +
+  "}\n" +
+  "pub fn has_set(s : mbt_compat::OrderedSet[Int], k : Int) -> Bool {\n" +
+  "  s.contains(k)\n" +
+  "}\n" +
+  "pub fn nested_bool(m1 : mbt_compat::OrderedMap[Bool, Int], m2 : mbt_compat::OrderedMap[String, Int]) -> Bool {\n" +
+  "  m1.contains(m2.contains(\"k\"))\n" +
+  "}\n"
+
+  let qt_cb = fn(batch : Array[(String, String)]) -> String {
+    if batch.length() == 0 {
+      return ""
+    }
+    let rel = batch[0].0
+    let src = batch[0].1
+    let entries : Array[String] = []
+    let g_idx = src.index_of("m.get(key)")
+    if g_idx >= 0 {
+      entries.push(mk_qt_expr_entry(g_idx + 2, g_idx, g_idx + 10, "mbt_compat::OrderedMap[String, mbt_compat::MbtJson]"))
+    }
+    let c1_idx = src.index_of("m.contains(\"a\")")
+    if c1_idx >= 0 {
+      entries.push(mk_qt_expr_entry(c1_idx + 2, c1_idx, c1_idx + 15, "mbt_compat::OrderedMap[String, Int]"))
+    }
+    let c2_idx = src.index_of("m.contains(\"b\")")
+    if c2_idx >= 0 {
+      entries.push(mk_qt_expr_entry(c2_idx + 2, c2_idx, c2_idx + 15, "mbt_compat::OrderedMap[String, Int]"))
+    }
+    let s_idx = src.index_of("s.contains(k)")
+    if s_idx >= 0 {
+      entries.push(mk_qt_expr_entry(s_idx + 2, s_idx, s_idx + 13, "mbt_compat::OrderedSet[Int]"))
+    }
+    let n1_idx = src.index_of("m1.contains(m2.contains(\"k\"))")
+    if n1_idx >= 0 {
+      entries.push(mk_qt_expr_entry(n1_idx + 3, n1_idx, n1_idx + 29, "mbt_compat::OrderedMap[Bool, Int]"))
+    }
+    let n2_idx = src.index_of("m2.contains(\"k\")")
+    if n2_idx >= 0 {
+      entries.push(mk_qt_expr_entry(n2_idx + 3, n2_idx, n2_idx + 16, "mbt_compat::OrderedMap[String, Int]"))
+    }
+    mk_qt_json_for_file(rel, entries.join(","))
+  }
+
+  let up_res = transpile_package_with_query_types(
+    [SourceFile::{ rel_path: "up.mbt", content: up_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    default_options(),
+    [],
+    true,
+    noop_check,
+    qt_cb,
+  )
+  assert_true(up_res.blockers == 0, "upstream package must have 0 blockers")
+  let up_out = up_res.files[0].content
+  assert_true(str_has(up_out, "mbt_compat::ordered_map_get_mapkey(m, key)"), "m.get(key) lowered to ordered_map_get_mapkey")
+  assert_true(
+    str_has(up_out, "mbt_compat::ordered_map_contains_mapkey(m, \"a\") && mbt_compat::ordered_map_contains_mapkey(m, \"b\")"),
+    "multiple .contains calls on one line lowered cleanly",
+  )
+  assert_true(str_has(up_out, "mbt_compat::ordered_set_contains_mapkey(s, k)"), "OrderedSet::contains lowered")
+  assert_true(
+    str_has(up_out, "mbt_compat::ordered_map_contains_mapkey(m1, mbt_compat::ordered_map_contains_mapkey(m2, \"k\"))"),
+    "nested .contains calls lowered in one pass",
+  )
+
+  // Exported ABI must mark all four functions `unknown: false`.
+  let mut field_ok = false
+  let mut has_both_ok = false
+  let mut has_set_ok = false
+  let mut nested_ok = false
+  for fms in up_res.abi.fn_mutation_summaries {
+    if fms.name == "field" && !fms.unknown && !fms.mutates_any_array && fms.mutated_elem_types.length() == 0 {
+      field_ok = true
+    }
+    if fms.name == "has_both" && !fms.unknown && !fms.mutates_any_array {
+      has_both_ok = true
+    }
+    if fms.name == "has_set" && !fms.unknown && !fms.mutates_any_array {
+      has_set_ok = true
+    }
+    if fms.name == "nested_bool" && !fms.unknown && !fms.mutates_any_array {
+      nested_ok = true
+    }
+  }
+  assert_true(field_ok, "exported ABI must mark field unknown=false")
+  assert_true(has_both_ok, "exported ABI must mark has_both unknown=false")
+  assert_true(has_set_ok, "exported ABI must mark has_set unknown=false")
+  assert_true(nested_ok, "exported ABI must mark nested_bool unknown=false")
+
+  // Downstream package importing `dep` ABI: `find_first`, `any`, `search_by`, and `filter_map` all pass!
+  let dep_abi = PackageAbi::{
+    package_name: "dep",
+    enums: [],
+    struct_val_fields: [],
+    structs: None,
+    companion_files: [],
+    op_impls: [],
+    reexports: [],
+    values: [],
+    raising_fns: [],
+    fn_mutation_summaries: up_res.abi.fn_mutation_summaries,
+    ffi_shim_prefix: "",
+    publishable: true,
+    empty_target_pkg: false,
+    empty_target: "",
+  }
+  let ctx = CrossPkgMutationContext::{
+    dep_abis: [("dep", dep_abi)],
+    using_values: Map(),
+    using_types: Map(),
+    pkg_aliases: Map(),
+  }
+  let down_src = "pub fn use_find_first(xs : Array[Option[mbt_compat::MbtJson]]) -> Option[Option[mbt_compat::MbtJson]] {\n" +
+  "  xs.iter().find_first(fn(v) { match dep::field(v, \"id\") { Some(_) => true, None => false } })\n" +
+  "}\n" +
+  "pub fn use_any(xs : Array[Option[mbt_compat::MbtJson]]) -> Bool {\n" +
+  "  xs.iter().any(fn(v) { match dep::field(v, \"id\") { Some(_) => true, None => false } })\n" +
+  "}\n" +
+  "pub fn use_search_by(xs : Array[Option[mbt_compat::MbtJson]]) -> Option[Int] {\n" +
+  "  xs.search_by(fn(v) { match dep::field(v, \"id\") { Some(_) => true, None => false } })\n" +
+  "}\n" +
+  "pub fn use_filter_map(xs : Array[Option[mbt_compat::MbtJson]]) -> Array[mbt_compat::MbtJson] {\n" +
+  "  xs.filter_map(fn(v) { dep::field(v, \"id\") })\n" +
+  "}\n"
+  let down_toks = lex_moonbit(down_src)
+  let down_ms = collect_pkg_mutation_summary_with_cross_pkg([down_toks], ["down.pion"], [down_src], empty_pkg_query_types(), Map(), Map(), ctx)
+
+  // Gate C: `find_first` and `any`
+  let mut iter_dots : Array[Int] = []
+  let mut ti = 1
+  while ti + 2 < down_toks.length() {
+    if down_toks[ti].kind == TokenKind::Dot && down_toks[ti + 1].raw == "iter" && down_toks[ti + 2].kind == TokenKind::LParen {
+      iter_dots.push(ti)
+    }
+    ti = ti + 1
+  }
+  assert_true(iter_dots.length() == 2, "expected 2 .iter() sites")
+  assert_true(
+    immediate_iter_consumer_allow_with_summary(down_toks, iter_dots[0], down_ms, down_src, None, "Option[mbt_compat::MbtJson]") != None,
+    "xs.iter().find_first calling dep::field must pass Gate C",
+  )
+  assert_true(
+    immediate_iter_consumer_allow_with_summary(down_toks, iter_dots[1], down_ms, down_src, None, "Option[mbt_compat::MbtJson]") != None,
+    "xs.iter().any calling dep::field must pass Gate C",
+  )
+
+  // Gate B: `search_by` and `filter_map`
+  let mut sb_line = 0
+  let mut sb_col = 0
+  let mut fm_line = 0
+  let mut fm_col = 0
+  for tk in down_toks {
+    if tk.raw == "search_by" { sb_line = tk.line; sb_col = tk.col }
+    if tk.raw == "filter_map" { fm_line = tk.line; fm_col = tk.col }
+  }
+  assert_true(
+    stage_b_check_array_cb_with_summary(down_toks, down_ms, "down.pion", down_src, None, "Option[mbt_compat::MbtJson]", "search_by", "mbt_compat::arr_search_by", sb_line, sb_col, true, []),
+    "xs.search_by calling dep::field must pass Gate B",
+  )
+  assert_true(
+    stage_b_check_array_cb_with_summary(down_toks, down_ms, "down.pion", down_src, None, "Option[mbt_compat::MbtJson]", "filter_map", "mbt_compat::arr_filter_map", fm_line, fm_col, true, []),
+    "xs.filter_map calling dep::field must pass Gate B",
+  )
+}
+
+test "mapkey_pure_lookup: negative adversaries fail closed (raw param, generic/BadKey, arg side effects, new_by, filter_map mutation)" {
+  // Negative 1: raw unlowered param OrderedMap::contains still fails closed (`unknown: true`).
+  let raw_src = "pub fn raw_param(m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson]) -> Bool {\n  m.contains(\"k\")\n}\n"
+  let raw_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(raw_src)])
+  assert_true(
+    match lookup_fn_mutation_summary(raw_ms, "raw_param") { Some(s) => s.unknown, None => false },
+    "raw unlowered param OrderedMap::contains must stay unknown=true",
+  )
+
+  // Negative 2: `ordered_map_get_mapkey` on generic key `K : MapKey` or user `struct BadKey` stays `unknown: true`.
+  let bad_key_src = "struct BadKey { xs : Array[Int] }\n" +
+  "impl mbt_compat::MapKey for BadKey {\n" +
+  "  fn key_hash(self : BadKey) -> Int { self.xs.push(1); 0 }\n" +
+  "  fn key_eq(self : BadKey, _other : BadKey) -> Bool { true }\n" +
+  "}\n" +
+  "pub fn generic_get[K : mbt_compat::MapKey](m : mbt_compat::OrderedMap[K, Int], k : K) -> Option[Int] {\n" +
+  "  mbt_compat::ordered_map_get_mapkey(m, k)\n" +
+  "}\n" +
+  "pub fn bad_struct_get(m : mbt_compat::OrderedMap[BadKey, Int], k : BadKey) -> Option[Int] {\n" +
+  "  mbt_compat::ordered_map_get_mapkey(m, k)\n" +
+  "}\n"
+  let bk_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(bad_key_src)])
+  assert_true(
+    match lookup_fn_mutation_summary(bk_ms, "generic_get") { Some(s) => s.unknown, None => false },
+    "ordered_map_get_mapkey with generic key K must stay unknown=true",
+  )
+  assert_true(
+    match lookup_fn_mutation_summary(bk_ms, "bad_struct_get") { Some(s) => s.unknown, None => false },
+    "ordered_map_get_mapkey with user struct BadKey must stay unknown=true",
+  )
+
+  // Negative 3: argument side effects inside `ordered_map_get_mapkey(mutate_map(xs), mutate_key(xs))` are preserved.
+  let side_eff_src = "fn mutate_and_return_map(xs : Array[Int]) -> mbt_compat::OrderedMap[String, Int] {\n" +
+  "  xs.push(1)\n" +
+  "  mbt_compat::ordered_map_new()\n" +
+  "}\n" +
+  "fn mutate_key(ys : Array[String]) -> String {\n" +
+  "  ys.push(\"x\")\n" +
+  "  \"k\"\n" +
+  "}\n" +
+  "pub fn call_with_effects(xs : Array[Int], ys : Array[String]) -> Option[Int] {\n" +
+  "  mbt_compat::ordered_map_get_mapkey(mutate_and_return_map(xs), mutate_key(ys))\n" +
+  "}\n"
+  let se_ms = collect_pkg_mutation_summary_tokens([lex_moonbit(side_eff_src)])
+  match lookup_fn_mutation_summary(se_ms, "call_with_effects") {
+    Some(s) => {
+      assert_true(summary_may_mutate_array(s, "Int"), "arg 0 side effect on Array[Int] must be reported")
+      assert_true(summary_may_mutate_array(s, "String"), "arg 1 side effect on Array[String] must be reported")
+    }
+    None => assert_true(false, "expected call_with_effects summary")
+  }
+
+  // Negative 4: `OrderedMap::new_by` local construction (and helper) is NOT lowered to `ordered_map_get_mapkey`.
+  let new_by_src = "pub fn local_custom() -> Option[Int] {\n" +
+  "  let m : mbt_compat::OrderedMap[String, Int] = mbt_compat::OrderedMap::new_by(fn(s) { s.length() }, fn(a, b) { a == b })\n" +
+  "  m.get(\"k\")\n" +
+  "}\n"
+  let nb_idx = new_by_src.index_of("m.get(\"k\")")
+  let nb_qt = parse_pkg_query_types_json(
+    mk_qt_json_for_file(
+      "nb.pion",
+      mk_qt_expr_entry(nb_idx + 2, nb_idx, nb_idx + 10, "mbt_compat::OrderedMap[String, Int]"),
+    ),
+  )
+  assert_true(nb_qt.ok, "nb_qt must parse cleanly")
+  let (nb_out, nb_changed) = stage_b_lower_pure_mapkey_lookups(
+    [GeneratedFile::{ rel_path: "nb.pion", content: new_by_src, source_file: "nb.mbt", anchors: [] }],
+    nb_qt,
+    Map(),
+    Map(),
+    CrossPkgMutationContext::empty(),
+  )
+  assert_true(!nb_changed, "function with OrderedMap::new_by must NOT be lowered")
+  assert_true(!str_has(nb_out[0].content, "ordered_map_get_mapkey"), "new_by lookup must remain .get")
+
+  // Negative 5: `Array::filter_map` callback mutating same element type fails closed in Gate B.
+  let fm_bad_src = "pub fn bad_fm(xs : Array[Int], ys : Array[Int]) -> Array[Int] {\n" +
+  "  xs.filter_map(fn(x) { ys.push(x); Some(x) })\n" +
+  "}\n"
+  let fm_toks = lex_moonbit(fm_bad_src)
+  let fm_ms = collect_pkg_mutation_summary_tokens([fm_toks])
+  let mut bfm_line = 0
+  let mut bfm_col = 0
+  for tk in fm_toks {
+    if tk.raw == "filter_map" { bfm_line = tk.line; bfm_col = tk.col }
+  }
+  assert_true(
+    !stage_b_check_array_cb_with_summary(fm_toks, fm_ms, "fm.pion", fm_bad_src, None, "Int", "filter_map", "mbt_compat::arr_filter_map", bfm_line, bfm_col, true, []),
+    "filter_map callback mutating Array[Int] must fail closed",
+  )
+}
+
+test "push_iter: non-bare-ident array expressions pass while mapped and opaque iterators fail closed" {
+  // Positive 1: `items.push_iter((get_arr)().iter())` and `items.push_iter((x.1)().iter())`
+  let ok1_src = "pub fn f(items : Array[Int], get_arr : () -> Array[Int]) -> Unit {\n  items.push_iter((get_arr)().iter())\n}\n"
+  let ok1_toks = lex_moonbit(ok1_src)
+  let mut dot1 = -1
+  let mut i1 = 1
+  while i1 + 2 < ok1_toks.length() {
+    if ok1_toks[i1].kind == TokenKind::Dot && ok1_toks[i1 + 1].raw == "iter" && ok1_toks[i1 + 2].kind == TokenKind::LParen {
+      dot1 = i1
+      break
+    }
+    i1 = i1 + 1
+  }
+  assert_true(dot1 > 0, "expected .iter() in ok1_src")
+  assert_true(kept_iter_hazard_with_qt(ok1_toks, dot1, ok1_src, None, Map()) == "", "items.push_iter((get_arr)().iter()) must have 0 kept_iter_hazard")
+
+  let ok2_src = "pub fn g(items : Array[Int], x : (Int, () -> Array[Int])) -> Unit {\n  items.push_iter((x.1)().iter())\n}\n"
+  let ok2_toks = lex_moonbit(ok2_src)
+  let mut dot2 = -1
+  let mut i2 = 1
+  while i2 + 2 < ok2_toks.length() {
+    if ok2_toks[i2].kind == TokenKind::Dot && ok2_toks[i2 + 1].raw == "iter" && ok2_toks[i2 + 2].kind == TokenKind::LParen {
+      dot2 = i2
+      break
+    }
+    i2 = i2 + 1
+  }
+  assert_true(dot2 > 0, "expected .iter() in ok2_src")
+  assert_true(kept_iter_hazard_with_qt(ok2_toks, dot2, ok2_src, None, Map()) == "", "items.push_iter((x.1)().iter()) must have 0 kept_iter_hazard")
+
+  // Post-rewrite `mbt_compat::arr_push_iter(items, mbt_compat::arr_iter((x.1)()))` passes final audit.
+  let ok_post = "pub fn g(items : Array[Int], x : (Int, () -> Array[Int])) -> Unit {\n  mbt_compat::arr_push_iter(items, mbt_compat::arr_iter((x.1)()))\n}\n"
+  let ok_diags : Array[Diag] = []
+  stage_b_audit_final_push_iter_calls([GeneratedFile::{ rel_path: "ok.pion", content: ok_post, source_file: "ok.mbt", anchors: [] }], ok_diags)
+  assert_true(ok_diags.length() == 0, "post-rewrite arr_push_iter with arr_iter((x.1)()) must pass final audit")
+
+  // Negative 1: `push_iter(xs.iter().map(...))` MUST still fail closed.
+  let bad_map = "pub fn bm(xs : Array[Int]) -> Unit {\n  xs.push_iter(xs.iter().map(fn(v) { xs.push(v); v }))\n}\n"
+  let bm_diags : Array[Diag] = []
+  let bm_ft : Map[String, Array[Token]] = Map()
+  assert_true(stage_b_check_push_iter_arg(bm_ft, "bm.pion", bad_map, 2, 6, true, bm_diags) == -1, "push_iter(xs.iter().map(...)) must fail closed")
+  assert_true(bm_diags.length() > 0 && bm_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  // Negative 2: `push_iter(custom_it)` MUST still fail closed.
+  let bad_it = "pub fn bi(xs : Array[Int], custom_it : mbt_compat::MbtIter[Int]) -> Unit {\n  xs.push_iter(custom_it)\n}\n"
+  let bi_diags : Array[Diag] = []
+  let bi_ft : Map[String, Array[Token]] = Map()
+  assert_true(stage_b_check_push_iter_arg(bi_ft, "bi.pion", bad_it, 2, 6, false, bi_diags) == -1, "push_iter(custom_it) must fail closed")
+  assert_true(bi_diags.length() > 0 && bi_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "must emit MBT2PION_ARRAY_ITER_MUTATION")
+}
