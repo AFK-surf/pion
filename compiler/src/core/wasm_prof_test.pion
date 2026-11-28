@@ -1,0 +1,366 @@
+///| Tests for Wasm32 profiler full-closure hooks, name section, window controls, and black_box lowering.
+
+///|
+fn wp_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    abort(msg)
+  }
+}
+
+///|
+fn wp_bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn wp_read_u32(bs : Bytes, pos : Int) -> (Int, Int) {
+  let mut res = 0
+  let mut shift = 0
+  let mut p = pos
+  while p < bs.length() {
+    let b = bs[p].to_int()
+    p = p + 1
+    res = res | ((b & 0x7F) << shift)
+    if (b & 0x80) == 0 {
+      return (res, p)
+    }
+    shift = shift + 7
+  }
+  (res, p)
+}
+
+///|
+fn wp_read_str(bs : Bytes, pos : Int) -> (String, Int) {
+  let (slen, p0) = wp_read_u32(bs, pos)
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < slen && p0 + i < bs.length() {
+    sb.write_byte(bs[p0 + i])
+    i = i + 1
+  }
+  (sb.to_string(), p0 + slen)
+}
+
+///|
+/// Parse Import Section (id=2) function import names from a Wasm32 binary.
+fn wp_parse_import_names(bs : Bytes) -> Array[String] {
+  let out : Array[String] = []
+  let mut pos = 8
+  while pos < bs.length() {
+    let sec_id = bs[pos].to_int()
+    pos = pos + 1
+    let (sec_len, p0) = wp_read_u32(bs, pos)
+    let sec_end = p0 + sec_len
+    if sec_id == 2 {
+      let (cnt, p1) = wp_read_u32(bs, p0)
+      let mut p = p1
+      let mut i = 0
+      while i < cnt && p < sec_end {
+        let (_mod_name, p2) = wp_read_str(bs, p)
+        let (field_name, p3) = wp_read_str(bs, p2)
+        let kind = bs[p3].to_int()
+        let (_idx, p4) = wp_read_u32(bs, p3 + 1)
+        if kind == 0 {
+          out.push(field_name)
+        }
+        p = p4
+        i = i + 1
+      }
+    }
+    pos = sec_end
+  }
+  out
+}
+
+///|
+/// Parse Custom Section "name" subsection 1 (function names) -> Array[(idx, name)].
+fn wp_parse_name_section(bs : Bytes) -> Array[(Int, String)] {
+  let out : Array[(Int, String)] = []
+  let mut pos = 8
+  while pos < bs.length() {
+    let sec_id = bs[pos].to_int()
+    pos = pos + 1
+    let (sec_len, p0) = wp_read_u32(bs, pos)
+    let sec_end = p0 + sec_len
+    if sec_id == 0 {
+      let (sec_name, p1) = wp_read_str(bs, p0)
+      if sec_name == "name" {
+        let mut p = p1
+        while p < sec_end {
+          let sub_id = bs[p].to_int()
+          p = p + 1
+          let (sub_len, p2) = wp_read_u32(bs, p)
+          let sub_end = p2 + sub_len
+          if sub_id == 1 {
+            let (cnt, p3) = wp_read_u32(bs, p2)
+            let mut q = p3
+            let mut i = 0
+            while i < cnt && q < sub_end {
+              let (fn_idx, q1) = wp_read_u32(bs, q)
+              let (fn_name, q2) = wp_read_str(bs, q1)
+              out.push((fn_idx, fn_name))
+              q = q2
+              i = i + 1
+            }
+          }
+          p = sub_end
+        }
+      }
+    }
+    pos = sec_end
+  }
+  out
+}
+
+///|
+fn wp_has_str(arr : Array[String], needle : String) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == needle {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn wp_has_defined_name(
+  names : Array[(Int, String)],
+  num_imports : Int,
+  needle : String,
+) -> Bool {
+  let mut i = 0
+  while i < names.length() {
+    let (idx, nm) = names[i]
+    if idx >= num_imports && nm == needle {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn wp_rich_alloc_rc_ssa() -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("data $s_csv = { b \"a,b,c\\000\" }\n")
+  sb.write_string("data $s_sep = { b \",\\000\" }\n")
+  sb.write_string("export function w $main(w %argc, l %argv) {\n")
+  sb.write_string("@start\n")
+  sb.write_string("  %s0 =l call $pion_str_from_cstr(l $s_csv, l 5)\n")
+  sb.write_string("  %sep =l call $pion_str_from_cstr(l $s_sep, l 1)\n")
+  sb.write_string("  %parts =l call $pion_str_split(l %s0, l %sep)\n")
+  sb.write_string("  %sl =l call $pion_str_slice(l %s0, l 0, l 3)\n")
+  sb.write_string("  %ns =l call $pion_int_to_str(l 42)\n")
+  sb.write_string("  %cat =l call $pion_str_concat(l %sl, l %ns)\n")
+  sb.write_string("  %arr =l call $pion_arr_new(l 0, w 1)\n")
+  sb.write_string("  call $pion_arr_push(l %arr, l %cat)\n")
+  sb.write_string("  call $pion_rc_inc(l %ns)\n")
+  sb.write_string("  call $pion_arr_push_owned(l %arr, l %ns)\n")
+  sb.write_string("  %bs =l call $pion_bytes_new(l 8)\n")
+  sb.write_string("  %bsl =l call $pion_bytes_slice(l %bs, l 0, l 4)\n")
+  sb.write_string("  %b2s =l call $pion_bytes_to_str(l %bsl)\n")
+  sb.write_string("  %s2b =l call $pion_str_to_bytes(l %b2s)\n")
+  sb.write_string("  %sb =l call $pion_strbuf_new(l 16)\n")
+  sb.write_string("  call $pion_strbuf_push_str(l %sb, l %cat)\n")
+  sb.write_string("  %sb_s =l call $pion_strbuf_to_str(l %sb)\n")
+  sb.write_string("  %m =l call $pion_map_new(w 1)\n")
+  sb.write_string("  call $pion_map_set(l %m, l %sl, l %sb_s)\n")
+  sb.write_string("  %ks =l call $pion_map_keys(l %m)\n")
+  sb.write_string("  %obj =l call $pion_alloc(w 16, w 4, l 0)\n")
+  sb.write_string("  %obju =l call $pion_alloc_uninit(w 16, w 4, l 0)\n")
+  sb.write_string("  call $pion_rc_dec(l %obju)\n")
+  sb.write_string("  call $pion_rc_dec(l %obj)\n")
+  sb.write_string("  call $pion_rc_dec(l %ks)\n")
+  sb.write_string("  call $pion_rc_dec(l %m)\n")
+  sb.write_string("  call $pion_rc_dec(l %sb_s)\n")
+  sb.write_string("  call $pion_rc_dec(l %sb)\n")
+  sb.write_string("  call $pion_rc_dec(l %s2b)\n")
+  sb.write_string("  call $pion_rc_dec(l %b2s)\n")
+  sb.write_string("  call $pion_rc_dec(l %bsl)\n")
+  sb.write_string("  call $pion_rc_dec(l %bs)\n")
+  sb.write_string("  call $pion_rc_dec(l %arr)\n")
+  sb.write_string("  call $pion_rc_dec(l %cat)\n")
+  sb.write_string("  call $pion_rc_dec(l %ns)\n")
+  sb.write_string("  call $pion_rc_dec(l %sl)\n")
+  sb.write_string("  call $pion_rc_dec(l %parts)\n")
+  sb.write_string("  call $pion_rc_dec(l %sep)\n")
+  sb.write_string("  call $pion_rc_dec(l %s0)\n")
+  sb.write_string("  ret 0\n")
+  sb.write_string("}\n")
+  sb.to_string()
+}
+
+///|
+test "wasm_prof_zero_mask_byte_identical" {
+  let ssa = wp_rich_alloc_rc_ssa()
+  let base_no_names = emit_wasm_from_ssa_opts(ssa, false)
+  let prof0_no_names = emit_wasm_from_ssa_prof(ssa, false, 0)
+  wp_assert(
+    wp_bytes_eq(base_no_names, prof0_no_names),
+    "prof_mask=0 without names must be byte-for-byte identical to emit_wasm_from_ssa_opts",
+  )
+  let base_names = emit_wasm_from_ssa_opts(ssa, true)
+  let prof0_names = emit_wasm_from_ssa_prof(ssa, true, 0)
+  wp_assert(
+    wp_bytes_eq(base_names, prof0_names),
+    "prof_mask=0 with names must be byte-for-byte identical to emit_wasm_from_ssa_opts",
+  )
+}
+
+///|
+test "wasm_prof_modes_closure_and_names" {
+  let ssa = wp_rich_alloc_rc_ssa()
+
+  // CPU-only (mask=1): preserves production fast paths, forces name section
+  let w_cpu = emit_wasm_from_ssa_prof(ssa, false, WASM_PROF_CPU)
+  let imp_cpu = wp_parse_import_names(w_cpu)
+  let names_cpu = wp_parse_name_section(w_cpu)
+  wp_assert(names_cpu.length() > 0, "PROF_CPU must force name section")
+  wp_assert(!wp_has_str(imp_cpu, "pion_rc_inc"), "PROF_CPU keeps internal pion_rc_inc")
+  wp_assert(!wp_has_str(imp_cpu, "pion_rc_dec"), "PROF_CPU keeps internal pion_rc_dec")
+  wp_assert(
+    wp_has_defined_name(names_cpu, imp_cpu.length(), "pion_alloc_uninit"),
+    "PROF_CPU keeps internal pion_alloc_uninit fast path",
+  )
+
+  // ALLOC (mask=2): disables entire alloc+free slab closure, keeps pion_rc_dec fast path
+  let w_alloc = emit_wasm_from_ssa_prof(ssa, false, WASM_PROF_ALLOC)
+  let imp_alloc = wp_parse_import_names(w_alloc)
+  let names_alloc = wp_parse_name_section(w_alloc)
+  wp_assert(names_alloc.length() > 0, "PROF_ALLOC must force name section")
+  let suppressed_alloc = [
+    "pion_alloc",
+    "pion_alloc_uninit",
+    "pion_rc_dec_slow",
+    "__pion_raw_free_slab",
+    "__pion_rc_dec_slow_inner",
+    "pion_str_slice",
+    "pion_str_split",
+    "pion_arr_new",
+    "pion_arr_push",
+    "pion_arr_push_owned",
+    "pion_bytes_new",
+    "pion_bytes_slice",
+    "pion_bytes_to_str",
+    "pion_str_to_bytes",
+    "pion_str_concat",
+    "pion_int_to_str",
+    "pion_strbuf_to_str",
+    "pion_map_keys",
+  ]
+  let mut i = 0
+  while i < suppressed_alloc.length() {
+    let nm = suppressed_alloc[i]
+    wp_assert(
+      !wp_has_defined_name(names_alloc, imp_alloc.length(), nm),
+      "PROF_ALLOC must not emit internal " + nm,
+    )
+    i = i + 1
+  }
+  wp_assert(wp_has_str(imp_alloc, "pion_alloc"), "PROF_ALLOC must import pion_alloc")
+  wp_assert(wp_has_str(imp_alloc, "pion_alloc_uninit"), "PROF_ALLOC must import pion_alloc_uninit")
+  wp_assert(wp_has_str(imp_alloc, "pion_rc_dec_slow"), "PROF_ALLOC must import pion_rc_dec_slow")
+  wp_assert(wp_has_str(imp_alloc, "pion_str_split"), "PROF_ALLOC must import pion_str_split")
+  wp_assert(wp_has_str(imp_alloc, "pion_str_slice"), "PROF_ALLOC must import pion_str_slice")
+  wp_assert(wp_has_str(imp_alloc, "pion_arr_new"), "PROF_ALLOC must import pion_arr_new")
+  wp_assert(wp_has_str(imp_alloc, "pion_bytes_new"), "PROF_ALLOC must import pion_bytes_new")
+  wp_assert(
+    wp_has_defined_name(names_alloc, imp_alloc.length(), "pion_rc_dec"),
+    "PROF_ALLOC without PROF_RC keeps internal pion_rc_dec fast path",
+  )
+
+  // RC (mask=4): routes pion_rc_inc and pion_rc_dec through imports
+  let w_rc = emit_wasm_from_ssa_prof(ssa, false, WASM_PROF_RC)
+  let imp_rc = wp_parse_import_names(w_rc)
+  let names_rc = wp_parse_name_section(w_rc)
+  wp_assert(names_rc.length() > 0, "PROF_RC must force name section")
+  wp_assert(wp_has_str(imp_rc, "pion_rc_inc"), "PROF_RC must import pion_rc_inc")
+  wp_assert(wp_has_str(imp_rc, "pion_rc_dec"), "PROF_RC must import pion_rc_dec")
+  wp_assert(!wp_has_defined_name(names_rc, imp_rc.length(), "pion_rc_inc"), "PROF_RC must not define internal pion_rc_inc")
+  wp_assert(!wp_has_defined_name(names_rc, imp_rc.length(), "pion_rc_dec"), "PROF_RC must not define internal pion_rc_dec")
+
+  // ALL (mask=7): both alloc closure and RC closure go through imports
+  let w_all = emit_wasm_from_ssa_prof(ssa, false, WASM_PROF_CPU | WASM_PROF_ALLOC | WASM_PROF_RC)
+  let imp_all = wp_parse_import_names(w_all)
+  let names_all = wp_parse_name_section(w_all)
+  wp_assert(names_all.length() > 0, "PROF_ALL must force name section")
+  wp_assert(wp_has_str(imp_all, "pion_rc_inc"), "PROF_ALL must import pion_rc_inc")
+  wp_assert(wp_has_str(imp_all, "pion_rc_dec"), "PROF_ALL must import pion_rc_dec")
+  wp_assert(wp_has_str(imp_all, "pion_alloc_uninit"), "PROF_ALL must import pion_alloc_uninit")
+  wp_assert(!wp_has_defined_name(names_all, imp_all.length(), "pion_rc_inc"), "PROF_ALL must not define internal pion_rc_inc")
+  wp_assert(!wp_has_defined_name(names_all, imp_all.length(), "pion_rc_dec"), "PROF_ALL must not define internal pion_rc_dec")
+  wp_assert(!wp_has_defined_name(names_all, imp_all.length(), "pion_alloc_uninit"), "PROF_ALL must not define internal pion_alloc_uninit")
+}
+
+///|
+test "wasm_prof_black_box_opaque_sink" {
+  let sb = StringBuilder::new()
+  sb.write_string("function w $__pion_bb_w(w %x) {\n@start\n  ret %x\n}\n")
+  sb.write_string("function l $__pion_bb_l(l %x) {\n@start\n  ret %x\n}\n")
+  sb.write_string("function s $__pion_bb_s(s %x) {\n@start\n  ret %x\n}\n")
+  sb.write_string("function d $__pion_bb_d(d %x) {\n@start\n  ret %x\n}\n")
+  sb.write_string("export function w $main(w %argc, l %argv) {\n")
+  sb.write_string("@start\n")
+  sb.write_string("  %a =w call $__pion_bb_w(w 123)\n")
+  sb.write_string("  %b =l call $__pion_bb_l(l 456)\n")
+  sb.write_string("  %c =s call $__pion_bb_s(s s_1.5)\n")
+  sb.write_string("  %d =d call $__pion_bb_d(d d_2.5)\n")
+  sb.write_string("  ret %a\n")
+  sb.write_string("}\n")
+  let wasm = emit_wasm_from_ssa_opts(sb.to_string(), true)
+  let imps = wp_parse_import_names(wasm)
+  wp_assert(!wp_has_str(imps, "__pion_bb_w"), "black_box must not import __pion_bb_w")
+  wp_assert(!wp_has_str(imps, "__pion_bb_l"), "black_box must not import __pion_bb_l")
+  wp_assert(!wp_has_str(imps, "__pion_bb_s"), "black_box must not import __pion_bb_s")
+  wp_assert(!wp_has_str(imps, "__pion_bb_d"), "black_box must not import __pion_bb_d")
+  // Verify the opaque store+load sequence (global.get 2 = 0x23 0x02, ..., offset 88 = 0x58) is present
+  let mut found_sink = false
+  let mut i = 0
+  while i + 6 < wasm.length() {
+    if wasm[i].to_int() == 0x23 &&
+    wasm[i + 1].to_int() == 0x02 &&
+    wasm[i + 2].to_int() == 0x20 &&
+    wasm[i + 3].to_int() == 0x00 &&
+    wasm[i + 4].to_int() == 0x36 &&
+    wasm[i + 6].to_int() == 88 {
+      found_sink = true
+      break
+    }
+    i = i + 1
+  }
+  wp_assert(found_sink, "black_box __pion_bb_w must emit opaque i32.store to slab_ctl+88")
+}
+
+///|
+test "wasm_prof_window_controls_optional" {
+  let ssa_plain = "export function w $main(w %argc, l %argv) {\n@start\n  ret 0\n}\n"
+  let w_plain = emit_wasm_from_ssa_prof(ssa_plain, false, 0)
+  let imp_plain = wp_parse_import_names(w_plain)
+  wp_assert(!wp_has_str(imp_plain, "pion_prof_pause"), "plain module must not import pion_prof_pause")
+
+  let sb = StringBuilder::new()
+  sb.write_string("export function w $main(w %argc, l %argv) {\n")
+  sb.write_string("@start\n")
+  sb.write_string("  call $pion_prof_pause()\n")
+  sb.write_string("  call $pion_prof_reset()\n")
+  sb.write_string("  call $pion_prof_resume()\n")
+  sb.write_string("  ret 0\n")
+  sb.write_string("}\n")
+  let w_ctrl = emit_wasm_from_ssa_prof(sb.to_string(), false, WASM_PROF_ALLOC)
+  let imp_ctrl = wp_parse_import_names(w_ctrl)
+  wp_assert(wp_has_str(imp_ctrl, "pion_prof_pause"), "module calling pause must import pion_prof_pause")
+  wp_assert(wp_has_str(imp_ctrl, "pion_prof_resume"), "module calling resume must import pion_prof_resume")
+  wp_assert(wp_has_str(imp_ctrl, "pion_prof_reset"), "module calling reset must import pion_prof_reset")
+}

@@ -275,6 +275,23 @@ trap 'exit 143' TERM
 if [ "$MODE" != "e2e" ]; then
 echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench; TSan + ASan + QBE smoke overlapped with Stage 0) ==="
 sh "$ROOT_DIR/scripts/test-runtime.sh" --prep-only
+PROF_CC="${CC:-cc}"
+PROF_FP_FLAGS="-fno-omit-frame-pointer"
+if "$PROF_CC" -mno-omit-leaf-frame-pointer -x c -c /dev/null -o /dev/null 2>/dev/null; then
+  PROF_FP_FLAGS="$PROF_FP_FLAGS -mno-omit-leaf-frame-pointer"
+fi
+"$PROF_CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+  -c "$ROOT_DIR/runtime/pion_rt.c" -o "$OUT_DIR/pion_rt_prof.o"
+"$PROF_CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+  -c "$ROOT_DIR/runtime/pion_prof.c" -o "$OUT_DIR/pion_prof.o"
+rm -f "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/libpionrt_cli_prof.a"
+ar rcs "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o"
+if [ -f "$OUT_DIR/pion_cli.o" ]; then
+  ar rcs "$OUT_DIR/libpionrt_cli_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o" "$OUT_DIR/pion_cli.o"
+fi
+"$PROF_CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -Wall -Wextra -Werror -I"$ROOT_DIR/runtime" \
+  "$ROOT_DIR/runtime/test_prof.c" "$OUT_DIR/libpionrt_prof.a" -lm -lpthread -o "$OUT_DIR/test_prof"
+"$OUT_DIR/test_prof"
 bg_start "$RT_LOG_DIR/tsan.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step tsan
 TSAN_PID="$BG_PID"
 bg_start "$RT_LOG_DIR/asan.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step asan
@@ -318,6 +335,12 @@ PION_STAGE0_ONLY=0 PION_STAGE0_BIN="$OUT_DIR/pionc0" PION_SKIP_RT_TEST=1 PION_SK
 PIONC2="$OUT_DIR/pionc2"
 export PION_QBE="$OUT_DIR/qbe"
 export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+if [ -s "$OUT_DIR/libpionrt_prof.a" ]; then
+  export PION_RT_PROF_LIB="$OUT_DIR/libpionrt_prof.a"
+fi
+if [ -s "$OUT_DIR/libpionrt_cli_prof.a" ]; then
+  export PION_RT_CLI_PROF_LIB="$OUT_DIR/libpionrt_cli_prof.a"
+fi
 
 echo "=== [3/6] Standalone pionc2 Formatter Check ==="
 FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" \
@@ -381,6 +404,12 @@ else
   fi
   if [ -s "$OUT_DIR/libpionrt_tsan.a" ]; then
     export PION_TSAN_RT_LIB="$OUT_DIR/libpionrt_tsan.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_prof.a" ]; then
+    export PION_RT_PROF_LIB="$OUT_DIR/libpionrt_prof.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_cli_prof.a" ]; then
+    export PION_RT_CLI_PROF_LIB="$OUT_DIR/libpionrt_cli_prof.a"
   fi
   if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
     export PION_QBE_SAN_DIR="$OUT_DIR/qbe-san"
@@ -595,6 +624,8 @@ sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC2"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC2"
+# Built-in profiler (`--profile`, `pionc profile summary|diff`) and benchmark harness (`pionc bench`).
+sh "$ROOT_DIR/tests/e2e/test_prof_bench.sh" "$PIONC2"
 # PR-3: multi-package workspace topological parallel build (Contract A parity & Contract B FIFO race / SIGKILL barrier).
 sh "$ROOT_DIR/tests/e2e/ws_parallel_build/run_e2e.sh" "$PIONC2"
 # CAS runtime pinning + post-run eviction + cstub Direct Mode header deps & compiler version fingerprint.

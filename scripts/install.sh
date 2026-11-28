@@ -95,9 +95,52 @@ if [ "$NEED_BOOTSTRAP" -eq 1 ]; then
       -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
     rm -f "$OUT_DIR/libpionrt_cli.a"
     ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+    PROF_FP_FLAGS="-fno-omit-frame-pointer"
+    if "$CC_BIN" -mno-omit-leaf-frame-pointer -x c -c /dev/null -o /dev/null 2>/dev/null; then
+      PROF_FP_FLAGS="$PROF_FP_FLAGS -mno-omit-leaf-frame-pointer"
+    fi
+    if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+      if [ "$(uname -s)" = "Linux" ]; then
+        PROF_FP_FLAGS="$PROF_FP_FLAGS -mbranch-protection=none"
+      fi
+    fi
+    if "$CC_BIN" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+        -c "$ROOT_DIR/runtime/pion_rt.c" -o "$OUT_DIR/pion_rt_prof.o" && \
+       "$CC_BIN" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+        -c "$ROOT_DIR/runtime/pion_prof.c" -o "$OUT_DIR/pion_prof.o"; then
+      rm -f "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/libpionrt_cli_prof.a"
+      ar rcs "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o"
+      ar rcs "$OUT_DIR/libpionrt_cli_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o" "$OUT_DIR/pion_cli.o"
+    else
+      echo "warning: optional libpionrt_prof.a build failed; --profile will build on demand" >&2
+    fi
     PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh" --no-bench
   else
     sh "$ROOT_DIR/scripts/bootstrap.sh" --no-bench
+    if [ "$EXE_EXT" = "" ]; then
+      CC_BIN="${CC:-cc}"
+      PROF_FP_FLAGS="-fno-omit-frame-pointer"
+      if "$CC_BIN" -mno-omit-leaf-frame-pointer -x c -c /dev/null -o /dev/null 2>/dev/null; then
+        PROF_FP_FLAGS="$PROF_FP_FLAGS -mno-omit-leaf-frame-pointer"
+      fi
+      if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+        if [ "$(uname -s)" = "Linux" ]; then
+          PROF_FP_FLAGS="$PROF_FP_FLAGS -mbranch-protection=none"
+        fi
+      fi
+      if "$CC_BIN" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+          -c "$ROOT_DIR/runtime/pion_rt.c" -o "$OUT_DIR/pion_rt_prof.o" && \
+         "$CC_BIN" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror \
+          -c "$ROOT_DIR/runtime/pion_prof.c" -o "$OUT_DIR/pion_prof.o"; then
+        rm -f "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/libpionrt_cli_prof.a"
+        ar rcs "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o"
+        if [ -f "$OUT_DIR/pion_cli.o" ]; then
+          ar rcs "$OUT_DIR/libpionrt_cli_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o" "$OUT_DIR/pion_cli.o"
+        fi
+      else
+        echo "warning: optional libpionrt_prof.a build failed; --profile will build on demand" >&2
+      fi
+    fi
   fi
   PIONC_BIN=$(find_pionc)
 fi
@@ -110,7 +153,9 @@ for req in "$PIONC_BIN" "$QBE_BIN" "$RT_LIB" \
   "$ROOT_DIR/runtime/pion_wasm_rt.mjs" \
   "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" \
   "$ROOT_DIR/runtime/pion_rt.c" \
-  "$ROOT_DIR/runtime/pion_rt.h"; do
+  "$ROOT_DIR/runtime/pion_rt.h" \
+  "$ROOT_DIR/runtime/pion_prof.c" \
+  "$ROOT_DIR/runtime/pion_prof.h"; do
   if [ ! -f "$req" ]; then
     echo "FAIL: missing required artifact: $req" >&2
     exit 1
@@ -122,10 +167,15 @@ cp "$PIONC_BIN" "$PREFIX/bin/pionc${EXE_EXT}"
 cp "$QBE_BIN" "$PREFIX/bin/qbe${EXE_EXT}"
 chmod +x "$PREFIX/bin/pionc${EXE_EXT}" "$PREFIX/bin/qbe${EXE_EXT}"
 cp "$RT_LIB" "$PREFIX/lib/libpionrt.a"
+if [ -s "$OUT_DIR/libpionrt_prof.a" ]; then
+  cp "$OUT_DIR/libpionrt_prof.a" "$PREFIX/lib/libpionrt_prof.a"
+fi
 cp "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$PREFIX/share/pion/pion_wasm_rt.mjs"
 cp "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" "$PREFIX/share/pion/pion_wasm_rt_web.mjs"
 cp "$ROOT_DIR/runtime/pion_rt.c" "$PREFIX/share/pion/runtime/pion_rt.c"
 cp "$ROOT_DIR/runtime/pion_rt.h" "$PREFIX/share/pion/runtime/pion_rt.h"
+cp "$ROOT_DIR/runtime/pion_prof.c" "$PREFIX/share/pion/runtime/pion_prof.c"
+cp "$ROOT_DIR/runtime/pion_prof.h" "$PREFIX/share/pion/runtime/pion_prof.h"
 
 echo "Installed Pion toolchain to $PREFIX"
 (

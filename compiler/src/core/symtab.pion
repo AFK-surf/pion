@@ -1,0 +1,565 @@
+///| Pure-Pion offline executable symbol table parser (ELF64 & Mach-O 64-bit).
+///  Supports local + global symbols, ASLR anchor slide computation, and PC resolution.
+
+///|
+pub struct SymEntry {
+  addr : Int64
+  end_addr : Int64
+  name : String
+  is_local : Bool
+}
+
+///|
+pub struct SymTab {
+  format : String
+  entries : Array[SymEntry]
+  by_name : Map[String, Int64]
+  has_local_syms : Bool
+  text_start : Int64
+  text_end : Int64
+  has_text_bounds : Bool
+}
+
+///|
+pub struct SymMatch {
+  name : String
+  offset : Int64
+  sym_addr : Int64
+  is_external : Bool
+}
+
+///|
+fn sym_u8(data : Bytes, off : Int) -> Int {
+  data[off].to_int() & 0xFF
+}
+
+///|
+fn sym_u16_le(data : Bytes, off : Int) -> Int {
+  sym_u8(data, off) | (sym_u8(data, off + 1) << 8)
+}
+
+///|
+fn sym_u32_le(data : Bytes, off : Int) -> Int64 {
+  let b0 = sym_u8(data, off).to_int64()
+  let b1 = sym_u8(data, off + 1).to_int64()
+  let b2 = sym_u8(data, off + 2).to_int64()
+  let b3 = sym_u8(data, off + 3).to_int64()
+  b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+///|
+fn sym_u64_le(data : Bytes, off : Int) -> Int64 {
+  let lo = sym_u32_le(data, off)
+  let hi = sym_u32_le(data, off + 4)
+  lo | (hi << 32)
+}
+
+///|
+fn sym_range_ok(data_len : Int64, off : Int64, size : Int64) -> Bool {
+  if off < 0L || size < 0L || off > data_len {
+    return false
+  }
+  size <= data_len - off
+}
+
+///|
+fn sym_read_cstr(data : Bytes, off : Int, max_end : Int) -> String {
+  if off < 0 || off >= max_end {
+    return ""
+  }
+  let mut end = off
+  while end < max_end && sym_u8(data, end) != 0 {
+    end = end + 1
+  }
+  if end == off {
+    return ""
+  }
+  let sb = StringBuilder()
+  let mut i = off
+  while i < end {
+    sb.write_byte(data[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn sym_read_fixed_cstr(data : Bytes, off : Int, max_len : Int) -> String {
+  let mut end = off
+  let lim = off + max_len
+  while end < lim && sym_u8(data, end) != 0 {
+    end = end + 1
+  }
+  if end == off {
+    return ""
+  }
+  let sb = StringBuilder()
+  let mut i = off
+  while i < end {
+    sb.write_byte(data[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn sym_entry_less(a : SymEntry, b : SymEntry) -> Bool {
+  if a.addr != b.addr {
+    a.addr < b.addr
+  } else if a.end_addr != b.end_addr {
+    a.end_addr < b.end_addr
+  } else {
+    a.name < b.name
+  }
+}
+
+///|
+fn sym_sort_entries(entries : Array[SymEntry]) -> Array[SymEntry] {
+  let n = entries.length()
+  if n <= 1 {
+    return entries
+  }
+  let mut src = entries
+  let mut dst : Array[SymEntry] = []
+  let mut k = 0
+  while k < n {
+    dst.push(entries[k])
+    k = k + 1
+  }
+  let mut width = 1
+  while width < n {
+    let mut left = 0
+    while left < n {
+      let mut mid = left + width
+      if mid > n {
+        mid = n
+      }
+      let mut right = left + width * 2
+      if right > n {
+        right = n
+      }
+      let mut i = left
+      let mut j = mid
+      let mut out = left
+      while i < mid && j < right {
+        if sym_entry_less(src[i], src[j]) {
+          dst[out] = src[i]
+          i = i + 1
+        } else {
+          dst[out] = src[j]
+          j = j + 1
+        }
+        out = out + 1
+      }
+      while i < mid {
+        dst[out] = src[i]
+        i = i + 1
+        out = out + 1
+      }
+      while j < right {
+        dst[out] = src[j]
+        j = j + 1
+        out = out + 1
+      }
+      left = left + width * 2
+    }
+    let tmp = src
+    src = dst
+    dst = tmp
+    width = width * 2
+  }
+  src
+}
+
+///|
+fn sym_strip_macho_underscore(name : String) -> String {
+  if name.length() > 0 && str_code_at(name, 0) == 95 {
+    slice_str(name, 1, name.length())
+  } else {
+    name
+  }
+}
+
+///|
+pub fn symtab_parse_elf64(data : Bytes) -> Result[SymTab, String] {
+  let n = data.length().to_int64()
+  if n < 64L {
+    return Err("truncated ELF64 header")
+  }
+  if sym_u8(data, 0) != 0x7F ||
+  sym_u8(data, 1) != 0x45 ||
+  sym_u8(data, 2) != 0x4C ||
+  sym_u8(data, 3) != 0x46 {
+    return Err("invalid ELF magic")
+  }
+  if sym_u8(data, 4) != 2 {
+    return Err("unsupported ELF class (expected ELF64)")
+  }
+  if sym_u8(data, 5) != 1 {
+    return Err("unsupported ELF endianness (expected little-endian)")
+  }
+  let e_shoff = sym_u64_le(data, 40)
+  let e_shentsize = sym_u16_le(data, 58).to_int64()
+  let e_shnum = sym_u16_le(data, 60).to_int64()
+  if e_shoff <= 0L || e_shnum <= 0L {
+    return Err("ELF64 binary has no section header table")
+  }
+  if e_shentsize < 64L {
+    return Err("invalid ELF64 section header entry size")
+  }
+  if e_shnum > 65536L || !sym_range_ok(n, e_shoff, e_shnum * e_shentsize) {
+    return Err("ELF64 section header table out of bounds")
+  }
+  let mut symtab_idx = -1
+  let mut si = 0L
+  while si < e_shnum {
+    let sh_off = (e_shoff + si * e_shentsize).to_int()
+    let sh_type = sym_u32_le(data, sh_off + 4)
+    if sh_type == 2L {
+      symtab_idx = si.to_int()
+      break
+    }
+    si = si + 1L
+  }
+  if symtab_idx < 0 {
+    return Err("ELF64 binary has no .symtab section (stripped?)")
+  }
+  let st_sh_off = (e_shoff + symtab_idx.to_int64() * e_shentsize).to_int()
+  let st_off = sym_u64_le(data, st_sh_off + 24)
+  let st_size = sym_u64_le(data, st_sh_off + 32)
+  let st_link = sym_u32_le(data, st_sh_off + 40)
+  let st_entsize = sym_u64_le(data, st_sh_off + 56)
+  if st_entsize < 24L {
+    return Err("invalid ELF64 .symtab entry size")
+  }
+  if !sym_range_ok(n, st_off, st_size) {
+    return Err("ELF64 .symtab section out of bounds")
+  }
+  if st_link < 0L || st_link >= e_shnum {
+    return Err("ELF64 .symtab sh_link out of bounds")
+  }
+  let str_sh_off = (e_shoff + st_link * e_shentsize).to_int()
+  let str_off = sym_u64_le(data, str_sh_off + 24)
+  let str_size = sym_u64_le(data, str_sh_off + 32)
+  if !sym_range_ok(n, str_off, str_size) {
+    return Err("ELF64 .strtab section out of bounds")
+  }
+  let str_off_i = str_off.to_int()
+  let str_end_i = (str_off + str_size).to_int()
+  let count = st_size / st_entsize
+  let entries : Array[SymEntry] = []
+  let by_name : Map[String, Int64] = Map([])
+  let mut has_local = false
+  let mut i = 0L
+  while i < count {
+    let e_off = (st_off + i * st_entsize).to_int()
+    let st_name = sym_u32_le(data, e_off)
+    let st_info = sym_u8(data, e_off + 4)
+    let st_shndx = sym_u16_le(data, e_off + 6)
+    let st_value = sym_u64_le(data, e_off + 8)
+    let sym_sz = sym_u64_le(data, e_off + 16)
+    let st_bind = (st_info >> 4) & 0xF
+    let st_type = st_info & 0xF
+    if st_type == 2 && st_shndx != 0 && st_name < str_size {
+      let name = sym_read_cstr(data, str_off_i + st_name.to_int(), str_end_i)
+      if name.length() > 0 {
+        let is_local = st_bind == 0
+        if is_local {
+          has_local = true
+        }
+        let end_addr = if sym_sz > 0L && st_value >= 0L && sym_sz <= 0x7FFFFFFFFFFFFFFFL - st_value {
+          st_value + sym_sz
+        } else {
+          st_value
+        }
+        entries.push(SymEntry::{ addr: st_value, end_addr: end_addr, name: name, is_local: is_local })
+        if !by_name.contains(name) || !is_local {
+          by_name.set(name, st_value)
+        }
+      }
+    }
+    i = i + 1L
+  }
+  let sorted = sym_sort_entries(entries)
+  Ok(SymTab::{
+    format: "elf64",
+    entries: sorted,
+    by_name: by_name,
+    has_local_syms: has_local,
+    text_start: 0L,
+    text_end: 0L,
+    has_text_bounds: false,
+  })
+}
+
+///|
+pub fn symtab_parse_macho64(data : Bytes) -> Result[SymTab, String] {
+  let n = data.length().to_int64()
+  if n < 32L {
+    return Err("truncated Mach-O 64-bit header")
+  }
+  let magic = sym_u32_le(data, 0)
+  if magic != 0xFEEDFACFL {
+    return Err("invalid Mach-O 64-bit magic")
+  }
+  let ncmds = sym_u32_le(data, 16)
+  let sizeofcmds = sym_u32_le(data, 20)
+  if !sym_range_ok(n, 32L, sizeofcmds) {
+    return Err("Mach-O load commands out of bounds")
+  }
+  let cmds_end = 32L + sizeofcmds
+  let mut off = 32L
+  let mut sect_idx = 0
+  let mut text_sect_idx = -1
+  let mut text_start = 0L
+  let mut text_end = 0L
+  let mut found_text = false
+  let mut found_symtab = false
+  let mut symoff = 0L
+  let mut nsyms = 0L
+  let mut stroff = 0L
+  let mut strsize = 0L
+  let mut ci = 0L
+  while ci < ncmds {
+    if off + 8L > cmds_end {
+      return Err("truncated Mach-O load command header")
+    }
+    let off_i = off.to_int()
+    let cmd = sym_u32_le(data, off_i)
+    let cmdsize = sym_u32_le(data, off_i + 4)
+    if cmdsize < 8L || !sym_range_ok(cmds_end, off, cmdsize) {
+      return Err("Mach-O load command size out of bounds")
+    }
+    if cmd == 0x19L {
+      // LC_SEGMENT_64
+      if cmdsize < 72L {
+        return Err("truncated LC_SEGMENT_64 command")
+      }
+      let segname = sym_read_fixed_cstr(data, off_i + 8, 16)
+      let nsects = sym_u32_le(data, off_i + 64)
+      if nsects > 65536L || 72L + nsects * 80L > cmdsize {
+        return Err("LC_SEGMENT_64 sections out of bounds")
+      }
+      let mut si = 0L
+      while si < nsects {
+        sect_idx = sect_idx + 1
+        let sec_off = (off + 72L + si * 80L).to_int()
+        let sectname = sym_read_fixed_cstr(data, sec_off, 16)
+        let sec_segname = sym_read_fixed_cstr(data, sec_off + 16, 16)
+        if (segname == "__TEXT" || sec_segname == "__TEXT") && sectname == "__text" {
+          let sec_addr = sym_u64_le(data, sec_off + 32)
+          let sec_size = sym_u64_le(data, sec_off + 40)
+          if sec_addr < 0L || sec_size < 0L || sec_size > 0x7FFFFFFFFFFFFFFFL - sec_addr {
+            return Err("Mach-O __text address range overflow")
+          }
+          text_sect_idx = sect_idx
+          text_start = sec_addr
+          text_end = sec_addr + sec_size
+          found_text = true
+        }
+        si = si + 1L
+      }
+    } else if cmd == 0x02L {
+      // LC_SYMTAB
+      if cmdsize < 24L {
+        return Err("truncated LC_SYMTAB command")
+      }
+      symoff = sym_u32_le(data, off_i + 8)
+      nsyms = sym_u32_le(data, off_i + 12)
+      stroff = sym_u32_le(data, off_i + 16)
+      strsize = sym_u32_le(data, off_i + 20)
+      found_symtab = true
+    }
+    off = off + cmdsize
+    ci = ci + 1L
+  }
+  if !found_text {
+    return Err("Mach-O binary has no __TEXT,__text section")
+  }
+  if !found_symtab {
+    return Err("Mach-O binary has no LC_SYMTAB command (stripped?)")
+  }
+  if nsyms > 16777216L || !sym_range_ok(n, symoff, nsyms * 16L) {
+    return Err("Mach-O nlist_64 table out of bounds")
+  }
+  if !sym_range_ok(n, stroff, strsize) {
+    return Err("Mach-O string table out of bounds")
+  }
+  let str_off_i = stroff.to_int()
+  let str_end_i = (stroff + strsize).to_int()
+  let raw_entries : Array[SymEntry] = []
+  let by_name : Map[String, Int64] = Map([])
+  let mut has_local = false
+  let mut i = 0L
+  while i < nsyms {
+    let e_off = (symoff + i * 16L).to_int()
+    let n_strx = sym_u32_le(data, e_off)
+    let n_type = sym_u8(data, e_off + 4)
+    let n_sect = sym_u8(data, e_off + 5)
+    let n_value = sym_u64_le(data, e_off + 8)
+    // N_SECT = 0x0e, N_STAB mask = 0xe0, N_EXT = 0x01
+    if (n_type & 0x0E) == 0x0E &&
+    n_sect == text_sect_idx &&
+    (n_type & 0xE0) == 0 &&
+    n_strx < strsize {
+      let raw_name = sym_read_cstr(data, str_off_i + n_strx.to_int(), str_end_i)
+      let name = sym_strip_macho_underscore(raw_name)
+      if name.length() > 0 && n_value >= text_start && n_value < text_end {
+        let is_local = (n_type & 0x01) == 0
+        if is_local {
+          has_local = true
+        }
+        raw_entries.push(SymEntry::{ addr: n_value, end_addr: text_end, name: name, is_local: is_local })
+        if !by_name.contains(name) || !is_local {
+          by_name.set(name, n_value)
+        }
+      }
+    }
+    i = i + 1L
+  }
+  let sorted = sym_sort_entries(raw_entries)
+  let m = sorted.length()
+  let next_addrs : Array[Int64] = []
+  let mut j = 0
+  while j < m {
+    next_addrs.push(text_end)
+    j = j + 1
+  }
+  // O(N) reverse pass: every symbol shares the next strictly greater address (clamped to text_end)
+  let mut next_distinct = text_end
+  let mut r = m - 1
+  while r >= 0 {
+    if r + 1 < m && sorted[r + 1].addr > sorted[r].addr {
+      next_distinct = sorted[r + 1].addr
+    }
+    let na = if next_distinct > text_end { text_end } else { next_distinct }
+    next_addrs[r] = na
+    r = r - 1
+  }
+  let bounded : Array[SymEntry] = []
+  j = 0
+  while j < m {
+    let cur = sorted[j]
+    bounded.push(SymEntry::{
+      addr: cur.addr,
+      end_addr: next_addrs[j],
+      name: cur.name,
+      is_local: cur.is_local,
+    })
+    j = j + 1
+  }
+  Ok(SymTab::{
+    format: "macho64",
+    entries: bounded,
+    by_name: by_name,
+    has_local_syms: has_local,
+    text_start: text_start,
+    text_end: text_end,
+    has_text_bounds: true,
+  })
+}
+
+///|
+pub fn symtab_parse(data : Bytes) -> Result[SymTab, String] {
+  if data.length() < 4 {
+    return Err("binary too small to identify format")
+  }
+  let b0 = sym_u8(data, 0)
+  let b1 = sym_u8(data, 1)
+  let b2 = sym_u8(data, 2)
+  let b3 = sym_u8(data, 3)
+  if b0 == 0x7F && b1 == 0x45 && b2 == 0x4C && b3 == 0x46 {
+    return symtab_parse_elf64(data)
+  }
+  if b0 == 0xCF && b1 == 0xFA && b2 == 0xED && b3 == 0xFE {
+    return symtab_parse_macho64(data)
+  }
+  if (b0 == 0xCA && b1 == 0xFE && b2 == 0xBA && (b3 == 0xBE || b3 == 0xBF)) ||
+  ((b0 == 0xBE || b0 == 0xBF) && b1 == 0xBA && b2 == 0xFE && b3 == 0xCA) {
+    return Err("fat Mach-O binary is not supported; extract a single architecture slice first")
+  }
+  Err("unsupported executable format (expected ELF64 or Mach-O 64-bit)")
+}
+
+///|
+pub fn symtab_compute_slide(
+  st : SymTab,
+  anchor_sym : String,
+  runtime_anchor_addr : Int64,
+) -> Result[Int64, String] {
+  match st.by_name.get(anchor_sym) {
+    Some(vaddr) => Ok(runtime_anchor_addr - vaddr)
+    None => {
+      let stripped = sym_strip_macho_underscore(anchor_sym)
+      if stripped != anchor_sym {
+        match st.by_name.get(stripped) {
+          Some(vaddr) => return Ok(runtime_anchor_addr - vaddr)
+          None => ()
+        }
+      }
+      Err("anchor symbol not found in symbol table: " + anchor_sym)
+    }
+  }
+}
+
+///|
+pub fn symtab_resolve(
+  st : SymTab,
+  runtime_pc : Int64,
+  slide : Int64,
+) -> Option[SymMatch] {
+  let vaddr = runtime_pc - slide
+  if st.has_text_bounds && (vaddr < st.text_start || vaddr >= st.text_end) {
+    return Some(SymMatch::{
+      name: "[external]",
+      offset: 0L,
+      sym_addr: 0L,
+      is_external: true,
+    })
+  }
+  let n = st.entries.length()
+  if n == 0 {
+    return None
+  }
+  let mut lo = 0
+  let mut hi = n - 1
+  let mut best = -1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    if st.entries[mid].addr <= vaddr {
+      best = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  if best < 0 {
+    if st.has_text_bounds {
+      return Some(SymMatch::{
+        name: "[external]",
+        offset: 0L,
+        sym_addr: 0L,
+        is_external: true,
+      })
+    }
+    return None
+  }
+  let e = st.entries[best]
+  if vaddr >= e.addr && vaddr < e.end_addr {
+    return Some(SymMatch::{
+      name: e.name,
+      offset: vaddr - e.addr,
+      sym_addr: e.addr,
+      is_external: false,
+    })
+  }
+  if st.has_text_bounds {
+    return Some(SymMatch::{
+      name: "[external]",
+      offset: 0L,
+      sym_addr: 0L,
+      is_external: true,
+    })
+  }
+  None
+}

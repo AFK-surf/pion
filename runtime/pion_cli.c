@@ -1961,3 +1961,21 @@ int32_t pion_cli_write_line_fp(FILE *fp, const char *data, int64_t len) {
 int32_t pion_cli_write_line(const char *data, int64_t len) {
     return pion_cli_write_line_fp(stdout, data, len);
 }
+
+int32_t pion_cli_setenv(const char *name, const char *val) {
+    if (!name || !name[0]) return -1;
+#ifdef _WIN32
+    return _putenv_s(name, val ? val : "") == 0 ? 0 : -1;
+#else
+    return setenv(name, val ? val : "", 1) == 0 ? 0 : -1;
+#endif
+}
+
+int32_t pion_cli_unsetenv(const char *name) {
+    if (!name || !name[0]) return -1;
+#ifdef _WIN32
+    return _putenv_s(name, "") == 0 ? 0 : -1;
+#else
+    return unsetenv(name) == 0 ? 0 : -1;
+#endif
+}

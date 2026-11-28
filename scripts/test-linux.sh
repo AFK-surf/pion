@@ -250,7 +250,25 @@ fi
 rm -f "$OUT_DIR/libpionrt_cli.a"
 ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
 
-echo "=== [3/6] Runtime Unit + MT + 4-Core Speedup + P6-A Stdlib (test_rt.c) ==="
+PROF_FP_FLAGS="-fno-omit-frame-pointer"
+if "$CC" -mno-omit-leaf-frame-pointer -x c -c /dev/null -o /dev/null 2>/dev/null; then
+  PROF_FP_FLAGS="$PROF_FP_FLAGS -mno-omit-leaf-frame-pointer"
+fi
+if [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; then
+  PROF_FP_FLAGS="$PROF_FP_FLAGS -mbranch-protection=none"
+fi
+"$CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt_prof.o"
+"$CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -fPIC -Wall -Wextra -Werror -c "$RT_DIR/pion_prof.c" -o "$OUT_DIR/pion_prof.o"
+rm -f "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/libpionrt_cli_prof.a"
+ar rcs "$OUT_DIR/libpionrt_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o"
+ar rcs "$OUT_DIR/libpionrt_cli_prof.a" "$OUT_DIR/pion_rt_prof.o" "$OUT_DIR/pion_prof.o" "$OUT_DIR/pion_cli.o"
+export PION_RT_PROF_LIB="$OUT_DIR/libpionrt_prof.a"
+export PION_RT_CLI_PROF_LIB="$OUT_DIR/libpionrt_cli_prof.a"
+
+echo "=== [3/6] Runtime Unit + MT + 4-Core Speedup + P6-A Stdlib (test_rt.c + test_prof.c) ==="
+"$CC" -std=c11 -O2 -DPION_PROF=1 $PROF_FP_FLAGS -Wall -Wextra -Werror -I"$RT_DIR" \
+  "$RT_DIR/test_prof.c" "$OUT_DIR/libpionrt_prof.a" -lm -lpthread -o "$OUT_DIR/test_prof_linux"
+"$OUT_DIR/test_prof_linux"
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
   "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/test_rt_linux"
 if ! "$OUT_DIR/test_rt_linux" > "$TMP_DIR/test_rt.out" 2>&1; then
@@ -636,6 +654,12 @@ else
   if [ -s "$OUT_DIR/libpionrt_tsan.a" ]; then
     export PION_TSAN_RT_LIB="$OUT_DIR/libpionrt_tsan.a"
   fi
+  if [ -s "$OUT_DIR/libpionrt_prof.a" ]; then
+    export PION_RT_PROF_LIB="$OUT_DIR/libpionrt_prof.a"
+  fi
+  if [ -s "$OUT_DIR/libpionrt_cli_prof.a" ]; then
+    export PION_RT_CLI_PROF_LIB="$OUT_DIR/libpionrt_cli_prof.a"
+  fi
   if [ -x "$OUT_DIR/qbe-san/qbe" ]; then
     export PION_QBE_SAN_DIR="$OUT_DIR/qbe-san"
     export PION_QBE_SAN="$OUT_DIR/qbe-san/qbe"
@@ -864,6 +888,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/testmeta_cas/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/extern_fn_value/run_e2e.sh" "$PIONC"
 # Built-in independent linter (`pionc lint` + transactional `--fix`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/pionc_lint/run_e2e.sh" "$PIONC"
+# Built-in profiler (`--profile`, `pionc profile summary|diff`) and benchmark harness (`pionc bench`).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/test_prof_bench.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
 # Real `as`: its [5/5] builds the tests/tv/qbe_bugs reproducers through QBE text
 # assembly (and cc compiles their C driver) besides `--obj`.

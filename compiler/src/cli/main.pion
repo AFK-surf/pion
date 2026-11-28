@@ -968,6 +968,338 @@ fn drv_resolve_rt_lib_for_pinned(
 }
 
 ///|
+/// Builds `libpionrt_prof.a` on demand into `$PION_CACHE_DIR/rt/` when no
+/// prebuilt profiled runtime archive is installed alongside `pionc`.
+fn drv_ensure_prof_rt_lib(
+  world : World,
+  qbe_target : String,
+  sysroot : String,
+  quiet : Bool,
+  pin : DrvCasPinSession,
+) -> Result[Option[String], String] {
+  let rt_c = drv_find_pion_rt_c(world)
+  if rt_c.length() == 0 {
+    return Ok(None)
+  }
+  let rt_dir = drv_parent_dir(rt_c)
+  let prof_c = drv_join_path(rt_dir, "pion_prof.c")
+  let prof_h = drv_join_path(rt_dir, "pion_prof.h")
+  let rt_h = drv_join_path(rt_dir, "pion_rt.h")
+  if !fs_exists(world, prof_c) {
+    return Ok(None)
+  }
+  let rt_c_txt = match fs_read(world, rt_c) {
+    Ok(t) => t
+    Err(_) => return Ok(None)
+  }
+  let prof_c_txt = match fs_read(world, prof_c) {
+    Ok(t) => t
+    Err(_) => return Ok(None)
+  }
+  let rt_h_hash = if fs_exists(world, rt_h) {
+    match fs_read(world, rt_h) {
+      Ok(t) => sha256_hex(t)
+      Err(_) => ""
+    }
+  } else {
+    ""
+  }
+  let prof_h_hash = if fs_exists(world, prof_h) {
+    match fs_read(world, prof_h) {
+      Ok(t) => sha256_hex(t)
+      Err(_) => ""
+    }
+  } else {
+    ""
+  }
+  let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+  let tflags = drv_target_cc_flags(world, qbe_target, sysroot)
+  let tflags_str = drv_join_char(tflags, "\n")
+  let key = sha256_hex(
+    "rt_prof_v1|" +
+    qbe_target +
+    "|" +
+    cc_bin +
+    "|" +
+    sysroot +
+    "|" +
+    tflags_str +
+    "|" +
+    sha256_hex(rt_c_txt) +
+    "|" +
+    rt_h_hash +
+    "|" +
+    sha256_hex(prof_c_txt) +
+    "|" +
+    prof_h_hash,
+  )
+  let cas_key = "pion_rt_prof_" + qbe_target + "_" + key
+  let cache_dir = drv_resolve_cache_dir(world)
+  let rt_cache_dir = cache_dir + "/rt"
+  let _ = fs_mkdir_p(world, rt_cache_dir)
+  let ar_path = rt_cache_dir + "/" + cas_key + ".a"
+  if drv_is_nonempty_regular_file(world, ar_path) &&
+    drv_cas_pin_and_verify(world, cache_dir, pin, [cas_key], [ar_path]) {
+    return Ok(Some(ar_path))
+  }
+  let stamp = drv_tmp_tag(world, ar_path)
+  let tmp_dir = match drv_make_out_stage(world, rt_cache_dir) {
+    Err(e) => return Err(e)
+    Ok(d) => d
+  }
+  let obj_rt = tmp_dir + "/pion_rt_prof.o"
+  let obj_prof = tmp_dir + "/pion_prof.o"
+  let ar_tmp = ar_path + ".tmp." + stamp
+  let compile_one = fn(src : String, dst : String) -> Int {
+    let argv : Array[String] = [cc_bin]
+    let mut fi = 0
+    while fi < tflags.length() {
+      argv.push(tflags[fi])
+      fi = fi + 1
+    }
+    argv.push("-std=c11")
+    argv.push("-O2")
+    argv.push("-DPION_PROF=1")
+    argv.push("-fno-omit-frame-pointer")
+    argv.push("-mno-omit-leaf-frame-pointer")
+    if qbe_target == "arm64" {
+      argv.push("-mbranch-protection=none")
+    }
+    if !drv_target_is_windows(qbe_target) {
+      argv.push("-fPIC")
+    }
+    argv.push("-I" + rt_dir)
+    argv.push("-c")
+    argv.push(src)
+    argv.push("-o")
+    argv.push(dst)
+    drv_exec_quiet(world, argv, quiet)
+  }
+  if compile_one(rt_c, obj_rt) != 0 || compile_one(prof_c, obj_prof) != 0 {
+    match drv_drop_out_stage(world, tmp_dir) {
+      Err(e) => return Err(e)
+      Ok(_) => return Err("failed to compile profiled runtime library (libpionrt_prof.a)")
+    }
+  }
+  let archived = drv_archive_static_lib(world, qbe_target, [obj_rt, obj_prof], ar_tmp, quiet)
+  match drv_drop_out_stage(world, tmp_dir) {
+    Err(e) => {
+      let _ = fs_remove(world, ar_tmp)
+      return Err(e)
+    }
+    Ok(_) => ()
+  }
+  match archived {
+    Err(e) => {
+      let _ = fs_remove(world, ar_tmp)
+      return Err(e)
+    }
+    Ok(_) => ()
+  }
+  if drv_cas_publish_file_pinned(world, cache_dir, pin, [cas_key], ar_tmp, ar_path) {
+    let sz = fs_size(world, ar_path)
+    drv_cas_record_and_evict_pinned(
+      world,
+      cache_dir,
+      cas_key,
+      if sz > 0L { sz } else { 0L },
+      pin,
+    )
+    Ok(Some(ar_path))
+  } else {
+    pin.temp_files.push(ar_tmp)
+    Ok(Some(ar_tmp))
+  }
+}
+
+///|
+/// Resolves `libpionrt_prof.a` (or `libpionrt_cli_prof.a` when building CLI
+/// targets) according to RFC v2 §1.2. Rejects manual `PION_RT_LIB` without
+/// `PION_RT_PROF_LIB` so uninstrumented runtimes are never silently linked.
+fn drv_resolve_prof_rt_lib_pinned(
+  world : World,
+  qbe_target : String,
+  sysroot : String,
+  quiet : Bool,
+  pin : DrvCasPinSession,
+) -> Result[String, String] {
+  let env_prof = drv_env_str(world, "PION_RT_PROF_LIB")
+  let env_cli_prof = drv_env_str(world, "PION_RT_CLI_PROF_LIB")
+  let env_rt = drv_env_str(world, "PION_RT_LIB")
+  if env_rt.length() > 0 && env_prof.length() == 0 && env_cli_prof.length() == 0 {
+    return Err(
+      "E_PROFILE_RT_CONFLICT: PION_RT_LIB is set (" +
+      env_rt +
+      ") while --profile is requested without PION_RT_PROF_LIB; unset PION_RT_LIB or set PION_RT_PROF_LIB to a profiled runtime library",
+    )
+  }
+  if env_rt.length() > 0 &&
+    drv_find_substr(env_rt, "libpionrt_cli", 0) >= 0 &&
+    env_cli_prof.length() > 0 {
+    return Ok(env_cli_prof)
+  }
+  if env_prof.length() > 0 {
+    return Ok(env_prof)
+  }
+  if env_cli_prof.length() > 0 && env_rt.length() > 0 {
+    return Ok(env_cli_prof)
+  }
+  let is_host = qbe_target == drv_resolve_qbe_target(world)
+  if is_host {
+    let exe_dir = drv_self_exe_dir(world)
+    if exe_dir.length() > 0 {
+      let r1 = drv_parent_rel(exe_dir, "lib/libpionrt_prof.a")
+      if fs_exists(world, r1) {
+        return Ok(r1)
+      }
+      let r2 = drv_join_path(exe_dir, "libpionrt_prof.a")
+      if fs_exists(world, r2) {
+        return Ok(r2)
+      }
+    }
+    if fs_exists(world, "out/libpionrt_prof.a") {
+      return Ok("out/libpionrt_prof.a")
+    }
+    if fs_exists(world, "../out/libpionrt_prof.a") {
+      return Ok("../out/libpionrt_prof.a")
+    }
+  }
+  match drv_ensure_prof_rt_lib(world, qbe_target, sysroot, quiet, pin) {
+    Err(e) => Err(e)
+    Ok(Some(p)) => Ok(p)
+    Ok(None) =>
+      Err("E_PROFILE_RT_MISSING: could not locate libpionrt_prof.a or runtime/pion_prof.c")
+  }
+}
+
+///|
+/// Ensures a `.syms` sidecar exists for a cached compilation unit (for example
+/// when `--release` populated the CAS `.o` earlier and a subsequent
+/// `--profile=alloc` hits the same `.o` key). Pure syntax scan: < 1 ms, zero
+/// codegen, exact `raw_sym\tpretty\tkind\tpkg\tfile\tline` format.
+fn drv_ensure_syms_from_sources(
+  world : World,
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+  syms_path : String,
+  multi_pkg : Bool,
+) -> Unit {
+  if syms_path.length() == 0 || fs_exists(world, syms_path) {
+    return
+  }
+  let pkg_pfx = if multi_pkg && pkg_name.length() > 0 {
+    qbe_pkg_prefix_for(pkg_name, true)
+  } else {
+    ""
+  }
+  let sb = StringBuilder()
+  let mut fi = 0
+  while fi < paths.length() && fi < sources.length() {
+    let pr = parse_source(paths[fi], sources[fi])
+    let f = pr.file
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) => {
+          let (raw, pretty, kind) = if fd.receiver_type.length() > 0 {
+            (
+              "pion_" + pkg_pfx + "m_" + qbe_mangle_pair(fd.receiver_type, fd.name),
+              fd.receiver_type + "::" + fd.name,
+              "method",
+            )
+          } else {
+            ("pion_" + pkg_pfx + "fn_" + fd.name, fd.name, "fn")
+          }
+          sb.write_string(raw)
+          sb.write_char('\t')
+          sb.write_string(pretty)
+          sb.write_char('\t')
+          sb.write_string(kind)
+          sb.write_char('\t')
+          sb.write_string(pkg_name)
+          sb.write_char('\t')
+          sb.write_string(fd.span.file)
+          sb.write_char('\t')
+          sb.write_string(fd.span.line.to_string())
+          sb.write_char('\n')
+          if fd.receiver_type.length() == 0 && fd.name == "main" {
+            sb.write_string("main\tmain\tfn\t")
+            sb.write_string(pkg_name)
+            sb.write_char('\t')
+            sb.write_string(fd.span.file)
+            sb.write_char('\t')
+            sb.write_string(fd.span.line.to_string())
+            sb.write_char('\n')
+          }
+        }
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            let m = id.methods[mi]
+            let pretty = id.target_type + "::" + m.name
+            let raw = "pion_" + pkg_pfx + "m_" + qbe_mangle_pair(id.target_type, m.name)
+            sb.write_string(raw)
+            sb.write_char('\t')
+            sb.write_string(pretty)
+            sb.write_string("\tmethod\t")
+            sb.write_string(pkg_name)
+            sb.write_char('\t')
+            sb.write_string(m.span.file)
+            sb.write_char('\t')
+            sb.write_string(m.span.line.to_string())
+            sb.write_char('\n')
+            mi = mi + 1
+          }
+        }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  let txt = sb.to_string()
+  if txt.length() > 0 {
+    let _ = drv_write_cas_text_atomic(world, syms_path, txt)
+  }
+}
+
+///|
+/// Concatenates available per-package/unit `.syms` sidecar files into
+/// `<bin_path>.syms` alongside a profiled binary (best-effort; never fails build).
+fn drv_write_merged_syms_sidecar(
+  world : World,
+  bin_path : String,
+  syms_paths : Array[String],
+) -> Unit {
+  if bin_path.length() == 0 || syms_paths.length() == 0 {
+    return
+  }
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < syms_paths.length() {
+    let p = syms_paths[i]
+    if p.length() > 0 && fs_exists(world, p) {
+      match fs_read(world, p) {
+        Ok(txt) =>
+          if txt.length() > 0 {
+            sb.write_string(txt)
+            if str_code_at(txt, txt.length() - 1) != 10 {
+              sb.write_char('\n')
+            }
+          }
+        Err(_) => ()
+      }
+    }
+    i = i + 1
+  }
+  let merged = sb.to_string()
+  if merged.length() > 0 {
+    let _ = drv_write_text_atomic(world, bin_path + ".syms", merged)
+  }
+}
+
+///|
 fn drv_target_is_valid(t : String) -> Bool {
   t == "arm64_apple" ||
   t == "amd64_apple" ||
@@ -1228,6 +1560,23 @@ extern "C" fn c_cli_is_native_exe(path : Ptr) -> Int = "pion_cli_is_native_exe"
 
 ///|
 extern "C" fn c_fs_readlink(path : Ptr) -> Ptr = "pion_fs_readlink"
+
+extern "C" fn c_cli_setenv(name : Ptr, value : Ptr) -> Int = "pion_cli_setenv"
+
+extern "C" fn c_cli_unsetenv(name : Ptr) -> Int = "pion_cli_unsetenv"
+
+///|
+fn drv_setenv(name : String, value : String) -> Unit {
+  let n = name
+  let v = value
+  let _ = c_cli_setenv(drv_cpath(n), drv_cpath(v))
+}
+
+///|
+fn drv_unsetenv(name : String) -> Unit {
+  let n = name
+  let _ = c_cli_unsetenv(drv_cpath(n))
+}
 
 ///|
 fn drv_cli_lpath_identity(path : String) -> Option[String] {
@@ -7473,6 +7822,7 @@ struct DrvWsBuilt {
   root_pkg_name : String
   root_checked : Option[CheckedPackage]
   obj_paths : Array[String]
+  syms_paths : Array[String]
   dep_pkg_names : Array[String]
   link_key : String
   link_opts : DrvLinkOpts
@@ -9715,6 +10065,8 @@ fn drv_ws_write_pkg_spec(
   entry_symbol : String,
   no_main : Bool,
   j2_mask : Int,
+  no_inline_rc : Bool,
+  syms_path : String,
   pkg_cwd : String,
   sig_path : String,
   stub_path : String,
@@ -9775,6 +10127,14 @@ fn drv_ws_write_pkg_spec(
   sb.write_string("J2_MASK\t")
   sb.write_string(j2_mask.to_string())
   sb.write_char('\n')
+  if no_inline_rc {
+    sb.write_string("NO_INLINE_RC\t1\n")
+  }
+  if syms_path.length() > 0 {
+    sb.write_string("SYMS_PATH\t")
+    sb.write_string(drv_ws_spec_escape(syms_path))
+    sb.write_char('\n')
+  }
   sb.write_string("PKG_CWD\t")
   sb.write_string(drv_ws_spec_escape(pkg_cwd))
   sb.write_char('\n')
@@ -9904,6 +10264,8 @@ fn drv_run_ws_pkg_worker(world : World, args : Array[String]) -> Int {
   let mut entry_symbol = "main"
   let mut no_main = false
   let mut j2_mask = 0
+  let mut no_inline_rc = false
+  let mut syms_path = ""
   let mut pkg_cwd = ""
   let mut sig_path = ""
   let mut stub_path = ""
@@ -9948,6 +10310,10 @@ fn drv_run_ws_pkg_worker(world : World, args : Array[String]) -> Int {
         no_main = parts[1] == "1"
       } else if tag == "J2_MASK" && parts.length() >= 2 {
         j2_mask = drv_parse_nonneg_int64(parts[1], 0L).to_int()
+      } else if tag == "NO_INLINE_RC" && parts.length() >= 2 {
+        no_inline_rc = parts[1] == "1"
+      } else if tag == "SYMS_PATH" && parts.length() >= 2 {
+        syms_path = drv_ws_spec_unescape(parts[1])
       } else if tag == "PKG_CWD" && parts.length() >= 2 {
         pkg_cwd = drv_ws_spec_unescape(parts[1])
       } else if tag == "SIG_PATH" && parts.length() >= 2 {
@@ -10072,7 +10438,8 @@ fn drv_run_ws_pkg_worker(world : World, args : Array[String]) -> Int {
     let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
     wasm_namespace_local_ssa(res.ssa, ns_prefix)
   } else {
-    let res = emit_qbe_package_multi_entry_target_opts(
+    let want_syms = syms_path.length() > 0
+    let res = emit_qbe_package_multi_entry_target_opts_syms(
       cr.pkg,
       cr.tc,
       release,
@@ -10083,8 +10450,12 @@ fn drv_run_ws_pkg_worker(world : World, args : Array[String]) -> Int {
       entry_symbol,
       no_main,
       j2_mask,
+      want_syms,
     )
-    if release {
+    if want_syms && res.syms_sidecar.length() > 0 {
+      let _ = drv_write_cas_text_atomic(world, syms_path, res.syms_sidecar)
+    }
+    if release && !no_inline_rc {
       inline_native_rc_ssa_opts(res.ssa, j2_mask)
     } else {
       // Worker always uses jobs = 1 to avoid N x 16 thread oversubscription.
@@ -10349,6 +10720,8 @@ fn drv_ws_run_dag(
   trace_cas : Bool,
   pin : DrvCasPinSession,
   ssa_stage_dir : String,
+  no_inline_rc : Bool,
+  emit_syms : Bool,
 ) -> Result[DrvWsDagOut, String] {
   let stage_root = cache_dir + "/ws_stage"
   drv_cleanup_stale_ws_stages(world, stage_root)
@@ -10506,6 +10879,9 @@ fn drv_ws_run_dag(
         } else if entry_symbol.length() > 0 && entry_symbol != "main" {
           upstream_sigs.push("__pion_entry__:" + entry_symbol)
         }
+      }
+      if no_inline_rc {
+        upstream_sigs.push("__pion_no_inline_rc__:1")
       }
       qbe_target
     }
@@ -10691,7 +11067,7 @@ fn drv_ws_run_dag(
       let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
       wasm_namespace_local_ssa(res.ssa, ns_prefix)
     } else {
-      let res = emit_qbe_package_multi_entry_target_opts(
+      let res = emit_qbe_package_multi_entry_target_opts_syms(
         cr.pkg,
         cr.tc,
         release,
@@ -10702,8 +11078,12 @@ fn drv_ws_run_dag(
         entry_symbol,
         no_main,
         j2_mask,
+        emit_syms,
       )
-      if release {
+      if emit_syms && res.syms_sidecar.length() > 0 {
+        let _ = drv_write_cas_text_atomic(world, cache_dir + "/ssa/" + key + ".syms", res.syms_sidecar)
+      }
+      if release && !no_inline_rc {
         inline_native_rc_ssa_opts(res.ssa, j2_mask)
       } else {
         // Keep parent process in ST biased-RC mode (spawning threads here would
@@ -10859,6 +11239,11 @@ fn drv_ws_run_dag(
           let ssa_path = pkg_ssa_paths[idx]
           let spec_path = stage_dir + "/spec_" + idx.to_string() + ".txt"
           let res_path = stage_dir + "/res_" + idx.to_string() + ".txt"
+          let syms_path = if !is_wasm && emit_syms {
+            cache_dir + "/ssa/" + key + ".syms"
+          } else {
+            ""
+          }
           match drv_ws_write_pkg_spec(
             world,
             stage_dir,
@@ -10870,6 +11255,8 @@ fn drv_ws_run_dag(
             entry_symbol,
             no_main,
             j2_mask,
+            no_inline_rc,
+            syms_path,
             pkg_cwd,
             sig_path,
             stub_path,
@@ -11184,6 +11571,8 @@ fn drv_build_workspace_objects_entry(
   locked : Bool,
   offline : Bool,
   pin : DrvCasPinSession,
+  no_inline_rc : Bool,
+  emit_syms : Bool,
 ) -> Result[DrvWsBuilt, String] {
   let ws = match drv_load_workspace_opts_target(
     world,
@@ -11209,6 +11598,8 @@ fn drv_build_workspace_objects_entry(
     entry_symbol,
     no_main,
     pin,
+    no_inline_rc,
+    emit_syms,
   )
 }
 
@@ -11617,6 +12008,8 @@ fn drv_build_nodes_objects_entry(
   entry_symbol : String,
   no_main : Bool,
   pin : DrvCasPinSession,
+  no_inline_rc : Bool,
+  emit_syms : Bool,
 ) -> Result[DrvWsBuilt, String] {
   if root_tests && nodes.length() > 0 {
     // The root package is pushed last by the DFS; it is never CAS-cached here.
@@ -11698,6 +12091,8 @@ fn drv_build_nodes_objects_entry(
     trace_cas,
     pin,
     ssa_stage.dir,
+    no_inline_rc,
+    emit_syms,
   ) {
     Err(e) => {
       drv_close_temp_ssa_stage(world, cache_dir, ssa_stage)
@@ -11872,10 +12267,21 @@ fn drv_build_nodes_objects_entry(
       pin,
     )
   }
+  let syms_paths : Array[String] = []
+  if emit_syms {
+    let mut ski = 0
+    while ski < dag.pkg_keys.length() {
+      if dag.pkg_keys[ski].length() > 0 {
+        syms_paths.push(cache_dir + "/ssa/" + dag.pkg_keys[ski] + ".syms")
+      }
+      ski = ski + 1
+    }
+  }
   Ok(DrvWsBuilt::{
     root_pkg_name: root_pkg_name,
     root_checked: root_checked,
     obj_paths: obj_paths,
+    syms_paths: syms_paths,
     dep_pkg_names: dep_pkg_names,
     link_key: sha256_hex(link_key_sb.to_string()),
     link_opts: ws_link_opts,
@@ -12064,7 +12470,9 @@ fn drv_build_wasm_targets(
   web_rt_dst : String,
   locked : Bool,
   offline : Bool,
+  prof_mask : Int,
 ) -> Result[String, String] {
+  let effective_wasm_names = wasm_names || prof_mask != 0
   let cache_dir = drv_resolve_cache_dir(world)
   let _ = fs_mkdir_p(world, cache_dir + "/sig")
   let _ = fs_mkdir_p(world, cache_dir + "/ssa")
@@ -12137,6 +12545,8 @@ fn drv_build_wasm_targets(
           trace_cas,
           pin,
           "",
+          false,
+          false,
         ) {
           Err(e) => {
             drv_cas_pin_close(world, pin)
@@ -12166,7 +12576,8 @@ fn drv_build_wasm_targets(
           "|" +
           (if release { "rel" } else { "dbg" }) +
           "|" +
-          (if wasm_names { "names" } else { "nonames" }) +
+          (if effective_wasm_names { "names" } else { "nonames" }) +
+          (if prof_mask != 0 { "|prof:" + prof_mask.to_string() } else { "" }) +
           "|" +
           wopt_tag +
           "|" +
@@ -12265,13 +12676,13 @@ fn drv_build_wasm_targets(
         }
         let t_stage : Array[Int64] = [if trace_time { clock_now_ms(world) } else { 0L }]
         let wasm_bytes = if trace_time {
-          emit_wasm_from_ssa_units_opts(pkg_ssas, wasm_names, fn(label : String) -> Unit {
+          emit_wasm_from_ssa_units_prof(pkg_ssas, effective_wasm_names, prof_mask, fn(label : String) -> Unit {
             let now = clock_now_ms(world)
             io_eprintln(world, "[wasm-time] " + label + "=" + (now - t_stage[0]).to_string() + "ms")
             t_stage[0] = now
           })
         } else {
-          emit_wasm_from_ssa_units_opts(pkg_ssas, wasm_names, fn(_s : String) -> Unit { () })
+          emit_wasm_from_ssa_units_prof(pkg_ssas, effective_wasm_names, prof_mask, fn(_s : String) -> Unit { () })
         }
         let wasm_tag = drv_tmp_tag(world, cached_wasm)
         let tmp_bin = cached_wasm + ".tmp." + wasm_tag
@@ -12293,7 +12704,7 @@ fn drv_build_wasm_targets(
             "--enable-mutable-globals",
             "--enable-nontrapping-float-to-int",
           ]
-          if wasm_names {
+          if effective_wasm_names {
             wopt_args.push("-g")
           }
           wopt_args.push(tmp_raw)
@@ -12384,12 +12795,16 @@ fn drv_build_wasm_targets(
     }
   }
 
-  let wasm_bytes = emit_wasm_from_ssa_opts(all_ssa, wasm_names)
+  let wasm_bytes = emit_wasm_from_ssa_prof(all_ssa, effective_wasm_names, prof_mask)
   // `wopt_tag` (wasm-opt on/off and which binary) is part of the key, as in
   // the workspace path: an optimized and a raw module never share a CAS file.
   let ssa_key = drv_prefix16(
     sha256_hex(
-      (if wasm_names { "names|" } else { "" }) + wopt_tag + "|" + all_ssa,
+      (if effective_wasm_names { "names|" } else { "" }) +
+      (if prof_mask != 0 { "prof:" + prof_mask.to_string() + "|" } else { "" }) +
+      wopt_tag +
+      "|" +
+      all_ssa,
     ),
   )
   let final_wasm = if out_bin_arg != "" {
@@ -12405,7 +12820,7 @@ fn drv_build_wasm_targets(
     final_wasm,
     wasm_bytes,
     wopt_bin,
-    wasm_names,
+    effective_wasm_names,
     out_bin_arg == "",
   )
 }
@@ -12496,8 +12911,8 @@ fn drv_run_wasm_opt(
 }
 
 ///| The RC pass depends only on the emitted text and the build options.
-fn drv_finish_unit_ssa(raw : String, release : Bool, mask : Int) -> String {
-  if release {
+fn drv_finish_unit_ssa(raw : String, release : Bool, mask : Int, no_inline_rc : Bool) -> String {
+  if release && !no_inline_rc {
     inline_native_rc_ssa_opts(raw, mask)
   } else {
     cleanup_native_rc_ssa_opts(raw, mask)
@@ -12514,20 +12929,36 @@ fn drv_emit_unit_file(
   target : String,
   entry_symbol : String,
   no_main : Bool,
+  no_inline_rc : Bool,
+  syms_output : String,
 ) -> Bool {
   let mask = drv_j2_disable_mask(world)
-  let raw = emit_qbe_unit_entry_target_opts(prep, idx, release, target, entry_symbol, no_main, mask)
-  drv_write_cas_text_atomic(world, output, drv_finish_unit_ssa(raw, release, mask))
+  let want_syms = syms_output.length() > 0
+  let res = emit_qbe_unit_entry_target_opts_syms(
+    prep,
+    idx,
+    release,
+    target,
+    entry_symbol,
+    no_main,
+    mask,
+    want_syms,
+  )
+  if want_syms && res.syms_sidecar.length() > 0 {
+    let _ = drv_write_cas_text_atomic(world, syms_output, res.syms_sidecar)
+  }
+  drv_write_cas_text_atomic(world, output, drv_finish_unit_ssa(res.ssa, release, mask, no_inline_rc))
 }
 
 ///|
 fn drv_emit_isolated_unit(
   prep : PreparedPackage, idx : Int, release : Bool, target : String,
   entry_symbol : String, no_main : Bool, mask : Int,
-) -> String {
+  emit_syms : Bool,
+) -> QbeUnitEmitResult {
   let tc = TypeChecker::{ ..prep.tc, diagnostics: [], edit_keys: Map([]) }
   let local = PreparedPackage::{ ..prep, tc: tc }
-  emit_qbe_unit_entry_target_opts(local, idx, release, target, entry_symbol, no_main, mask)
+  emit_qbe_unit_entry_target_opts_syms(local, idx, release, target, entry_symbol, no_main, mask, emit_syms)
 }
 
 ///|
@@ -12551,6 +12982,7 @@ fn drv_build_targets(
   web_rt_dst : String,
   locked : Bool,
   offline : Bool,
+  prof_mask : Int,
 ) -> Result[String, String] {
   if drv_target_is_wasm(picked_target) {
     return drv_build_wasm_targets(
@@ -12564,8 +12996,21 @@ fn drv_build_targets(
       web_rt_dst,
       locked,
       offline,
+      prof_mask,
     )
   }
+  if prof_mask != 0 {
+    match drv_validate_profile_target(picked_target, prof_mask) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    match drv_check_profile_strip_flags(world, [], prof_mask) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+  }
+  let no_inline_rc = (prof_mask & 4) != 0
+  let emit_syms = prof_mask != 0
   let only_text_emit = (emit_ssa_path != "" || emit_asm_path != "") &&
     out_bin_arg == "" &&
     emit_obj_path == "" &&
@@ -12597,6 +13042,8 @@ fn drv_build_targets(
           locked,
           offline,
           pin,
+          no_inline_rc,
+          emit_syms,
         ) {
           Err(e) => {
             drv_cas_pin_close(world, pin)
@@ -12624,6 +13071,15 @@ fn drv_build_targets(
           return res
         }
         let link_opts = built.link_opts
+        if prof_mask != 0 {
+          match drv_check_profile_strip_flags(world, link_opts.flags, prof_mask) {
+            Err(e) => {
+              drv_cas_pin_close(world, pin)
+              return Err(e)
+            }
+            Ok(_) => ()
+          }
+        }
         let mut li = 0
         while li < cli_libs.length() {
           push_unique_lib(link_opts.libs, cli_libs[li])
@@ -12632,12 +13088,22 @@ fn drv_build_targets(
           }
           li = li + 1
         }
-        let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
-          Err(e) => {
-            drv_cas_pin_close(world, pin)
-            return Err(e)
+        let rt_lib = if prof_mask != 0 {
+          match drv_resolve_prof_rt_lib_pinned(world, qbe_target, sysroot, false, pin) {
+            Err(e) => {
+              drv_cas_pin_close(world, pin)
+              return Err(e)
+            }
+            Ok(p) => p
           }
-          Ok(p) => p
+        } else {
+          match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
+            Err(e) => {
+              drv_cas_pin_close(world, pin)
+              return Err(e)
+            }
+            Ok(p) => p
+          }
         }
         if emit_cdylib_path != "" {
           let res = drv_link_shared_lib(
@@ -12660,7 +13126,19 @@ fn drv_build_targets(
           "15.0"
         }
         let ld_ver = qbe_macos_ver + ".0"
-        return drv_link_native_bin_cached(
+        let ws_link_key = if prof_mask != 0 {
+          built.link_key + "|prof:" + prof_mask.to_string()
+        } else {
+          built.link_key
+        }
+        let ws_objs = match drv_append_prof_bm_obj(world, cache_dir, qbe_target, apple_tools, sysroot, prof_mask, built.obj_paths) {
+          Err(e) => {
+            drv_cas_pin_close(world, pin)
+            return Err(e)
+          }
+          Ok(v) => v
+        }
+        let linked_res = drv_link_native_bin_cached(
           world,
           cache_dir,
           qbe_target,
@@ -12668,8 +13146,8 @@ fn drv_build_targets(
           ld_ver,
           sysroot,
           root_pkg,
-          built.link_key,
-          built.obj_paths,
+          ws_link_key,
+          ws_objs,
           rt_lib,
           link_opts,
           out_bin_arg,
@@ -12678,6 +13156,15 @@ fn drv_build_targets(
           built.file_hash_memo,
           pin,
         )
+        match linked_res {
+          Ok(bin_path) => {
+            if prof_mask != 0 {
+              drv_write_merged_syms_sidecar(world, bin_path, built.syms_paths)
+            }
+            return Ok(bin_path)
+          }
+          Err(e) => return Err(e)
+        }
       }
       None => ()
     }
@@ -12836,12 +13323,17 @@ fn drv_build_targets(
       }
     }
 
-    let entry_tag = if no_main {
+    let entry_tag_base = if no_main {
       ":no_main"
     } else if entry_symbol.length() > 0 && entry_symbol != "main" {
       ":entry:" + entry_symbol
     } else {
       ""
+    }
+    let entry_tag = if no_inline_rc {
+      entry_tag_base + ":no_inline_rc"
+    } else {
+      entry_tag_base
     }
     let unit_sigs_hash = if entry_tag.length() > 0 {
       sha256_hex(sigs_hash + entry_tag)
@@ -12915,6 +13407,35 @@ fn drv_build_targets(
         drv_close_temp_ssa_stage(world, cache_dir, unit_ssa_stage)
       }
     }
+    let unit_syms_paths : Array[String] = []
+    if emit_syms {
+      let mut usi = 0
+      while usi < unit_keys.length() {
+        let usp = cache_dir + "/ssa/" + unit_keys[usi] + ".syms"
+        if !is_miss[usi] && !fs_exists(world, usp) && usi < paths.length() && usi < sources.length() {
+          drv_ensure_syms_from_sources(world, pkg_name, [paths[usi]], [sources[usi]], usp, false)
+        }
+        unit_syms_paths.push(usp)
+        usi = usi + 1
+      }
+    }
+    let pkg_link_key = if prof_mask != 0 {
+      pkg_key + "|prof:" + prof_mask.to_string()
+    } else {
+      pkg_key
+    }
+    let unit_link_rt_lib = if prof_mask != 0 {
+      match drv_resolve_prof_rt_lib_pinned(world, qbe_target, sysroot, false, pin) {
+        Err(e) => {
+          cleanup_unit_ssas()
+          drv_cas_pin_close(world, pin)
+          return Err(e)
+        }
+        Ok(p) => p
+      }
+    } else {
+      rt_lib_fp
+    }
     if miss_indices.length() == 0 {
       match
         drv_try_hit_native_bin(
@@ -12923,8 +13444,8 @@ fn drv_build_targets(
           qbe_target,
           sysroot,
           pkg_name,
-          pkg_key,
-          rt_lib_fp,
+          pkg_link_key,
+          unit_link_rt_lib,
           link_opts,
           out_bin_arg,
           false,
@@ -12933,7 +13454,16 @@ fn drv_build_targets(
           pin,
         )
       {
-        Some(res) => return res
+        Some(res) => {
+          match res {
+            Ok(bin_path) =>
+              if prof_mask != 0 {
+                drv_write_merged_syms_sidecar(world, bin_path, unit_syms_paths)
+              }
+            Err(_) => ()
+          }
+          return res
+        }
         None => ()
       }
     }
@@ -13036,7 +13566,8 @@ fn drv_build_targets(
         while mi < miss_indices.length() {
           let idx = miss_indices[mi]
           let path = unit_ssa_paths[idx]
-          if !drv_emit_unit_file(world, prep, idx, path, release, qbe_target, entry_symbol, no_main) {
+          let syms_out = if emit_syms { cache_dir + "/ssa/" + unit_keys[idx] + ".syms" } else { "" }
+          if !drv_emit_unit_file(world, prep, idx, path, release, qbe_target, entry_symbol, no_main, no_inline_rc, syms_out) {
             cleanup_unit_ssas()
             return Err("failed to write CAS unit ssa: " + path)
           }
@@ -13164,7 +13695,11 @@ fn drv_build_targets(
         }
         let largest = drv_find_batch_for(heavy, n_miss, nw)
         let first = drv_batch_start(largest, n_miss, nw)
-        let first_text = drv_emit_isolated_unit(prep, miss_indices[first], release, qt, entry_symbol, no_main, mask)
+        let first_res = drv_emit_isolated_unit(prep, miss_indices[first], release, qt, entry_symbol, no_main, mask, emit_syms)
+        if emit_syms && first_res.syms_sidecar.length() > 0 {
+          let _ = drv_write_cas_text_atomic(world, cache_dir + "/ssa/" + unit_keys[miss_indices[first]] + ".syms", first_res.syms_sidecar)
+        }
+        let first_text = first_res.ssa
         scope(world, fn(s : Scope) -> Unit {
           let mut turn : Channel[Bool] = Channel::new(1)
           let _ = turn.send(true)
@@ -13198,10 +13733,10 @@ fn drv_build_targets(
               while true {
                 match inbox.recv() {
                   Some(raw) => {
-                    if !release && texts.length() == heavy_offset {
+                    if (!release || no_inline_rc) && texts.length() == heavy_offset {
                       texts.push(drv_cleanup_ssa(world, raw, mask, nw))
                     } else {
-                      texts.push(drv_finish_unit_ssa(raw, release, mask))
+                      texts.push(drv_finish_unit_ssa(raw, release, mask, no_inline_rc))
                     }
                   }
                   None => break
@@ -13244,7 +13779,11 @@ fn drv_build_targets(
               let raw = if k == first {
                 first_text
               } else {
-                drv_emit_isolated_unit(prep, miss_indices[k], release, qt, entry_symbol, no_main, mask)
+                let ures = drv_emit_isolated_unit(prep, miss_indices[k], release, qt, entry_symbol, no_main, mask, emit_syms)
+                if emit_syms && ures.syms_sidecar.length() > 0 {
+                  let _ = drv_write_cas_text_atomic(world, cache_dir + "/ssa/" + unit_keys[miss_indices[k]] + ".syms", ures.syms_sidecar)
+                }
+                ures.ssa
               }
               let _ = inbox.send(raw)
               k = k + 1
@@ -13382,14 +13921,14 @@ fn drv_build_targets(
       return Ok(obj_paths[0])
     }
 
-    let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
+    let unit_objs_link = match drv_append_prof_bm_obj(world, cache_dir, qbe_target, apple_tools, sysroot, prof_mask, obj_paths) {
       Err(e) => {
         drv_cas_pin_close(world, pin)
         return Err(e)
       }
-      Ok(p) => p
+      Ok(v) => v
     }
-    return drv_link_native_bin_cached(
+    let unit_linked = drv_link_native_bin_cached(
       world,
       cache_dir,
       qbe_target,
@@ -13397,9 +13936,9 @@ fn drv_build_targets(
       ld_ver,
       sysroot,
       pkg_name,
-      pkg_key,
-      obj_paths,
-      rt_lib,
+      pkg_link_key,
+      unit_objs_link,
+      unit_link_rt_lib,
       link_opts,
       out_bin_arg,
       false,
@@ -13407,12 +13946,24 @@ fn drv_build_targets(
       single_file_hash_memo,
       pin,
     )
+    match unit_linked {
+      Ok(bin_path) => {
+        if prof_mask != 0 {
+          drv_write_merged_syms_sidecar(world, bin_path, unit_syms_paths)
+        }
+        return Ok(bin_path)
+      }
+      Err(e) => return Err(e)
+    }
   }
   let single_upstream : Array[String] = []
   if no_main {
     single_upstream.push("__pion_entry__:no_main")
   } else if entry_symbol.length() > 0 && entry_symbol != "main" {
     single_upstream.push("__pion_entry__:" + entry_symbol)
+  }
+  if no_inline_rc {
+    single_upstream.push("__pion_no_inline_rc__:1")
   }
   let key = cas_compute_key(
     pkg_name,
@@ -13425,7 +13976,13 @@ fn drv_build_targets(
   )
   let sig_path = cache_dir + "/sig/" + key + ".pionsig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+  let syms_path = cache_dir + "/ssa/" + key + ".syms"
   let obj_path = cache_dir + "/obj/" + key + ".o"
+  let single_link_key = if prof_mask != 0 {
+    key + "|prof:" + prof_mask.to_string()
+  } else {
+    key
+  }
 
   let keep_single_ssa = drv_keep_native_ssa(world) || emit_ssa_path != "" || emit_asm_path != ""
   let asm_only = emit_asm_path != "" &&
@@ -13519,6 +14076,17 @@ fn drv_build_targets(
         drv_cas_post_run_evict(world, cache_dir, pin, [key])
         return Ok(obj_path)
       }
+      let hit_rt_lib = if prof_mask != 0 {
+        match drv_resolve_prof_rt_lib_pinned(world, qbe_target, sysroot, false, pin) {
+          Err(e) => {
+            drv_cas_pin_close(world, pin)
+            return Err(e)
+          }
+          Ok(p) => p
+        }
+      } else {
+        rt_lib_fp
+      }
       match
         drv_try_hit_native_bin(
           world,
@@ -13526,8 +14094,8 @@ fn drv_build_targets(
           qbe_target,
           sysroot,
           pkg_name,
-          key,
-          rt_lib_fp,
+          single_link_key,
+          hit_rt_lib,
           link_opts,
           out_bin_arg,
           false,
@@ -13536,34 +14104,76 @@ fn drv_build_targets(
           pin,
         )
       {
-        Some(res) => return res
+        Some(res) => {
+          match res {
+            Ok(bin_path) =>
+              if prof_mask != 0 {
+                drv_ensure_syms_from_sources(world, pkg_name, paths, sources, syms_path, false)
+                drv_write_merged_syms_sidecar(world, bin_path, [syms_path])
+              }
+            Err(_) => ()
+          }
+          return res
+        }
         None => ()
       }
     }
   } else {
     let j2_mask = drv_j2_disable_mask(world)
-    let compiled = match cli_compile_qbe_entry_opts(
-      pkg_name,
-      paths,
-      sources,
-      release,
-      false,
-      entry_symbol,
-      no_main,
-      j2_mask,
-      // Other single-package targets retain their portable lowering.
-      native_target=if qbe_target == "amd64_sysv" { qbe_target } else { "" },
-    ) {
-      Err(diag_json) => return Err(diag_json)
-      Ok(c) => c
-    }
-    let final_ssa = if release {
-      inline_native_rc_ssa_opts(compiled.ssa, j2_mask)
+    let mut compiled_sig = ""
+    let mut compiled_ssa = ""
+    let mut compiled_has_main = false
+    if emit_syms {
+      let checked = check_source_files_full(pkg_name, paths, sources)
+      if checked.diagnostics.length() > 0 {
+        return Err(check_result_to_json(checked.diagnostics))
+      }
+      compiled_sig = emit_pionsig(checked.pkg)
+      let res = emit_qbe_package_multi_entry_target_opts_syms(
+        checked.pkg,
+        checked.tc,
+        release,
+        true,
+        [],
+        false,
+        if qbe_target == "amd64_sysv" { qbe_target } else { "" },
+        entry_symbol,
+        no_main,
+        j2_mask,
+        true,
+      )
+      compiled_ssa = res.ssa
+      compiled_has_main = res.has_main
+      if res.syms_sidecar.length() > 0 {
+        let _ = drv_write_cas_text_atomic(world, syms_path, res.syms_sidecar)
+      }
     } else {
-      drv_cleanup_ssa(world, compiled.ssa, j2_mask, jobs)
+      let compiled = match cli_compile_qbe_entry_opts(
+        pkg_name,
+        paths,
+        sources,
+        release,
+        false,
+        entry_symbol,
+        no_main,
+        j2_mask,
+        // Other single-package targets retain their portable lowering.
+        native_target=if qbe_target == "amd64_sysv" { qbe_target } else { "" },
+      ) {
+        Err(diag_json) => return Err(diag_json)
+        Ok(c) => c
+      }
+      compiled_sig = compiled.sig
+      compiled_ssa = compiled.ssa
+      compiled_has_main = compiled.has_main
     }
-    has_main = compiled.has_main
-    if !drv_write_cas_text_atomic(world, sig_path, compiled.sig) {
+    let final_ssa = if release && !no_inline_rc {
+      inline_native_rc_ssa_opts(compiled_ssa, j2_mask)
+    } else {
+      drv_cleanup_ssa(world, compiled_ssa, j2_mask, jobs)
+    }
+    has_main = compiled_has_main
+    if !drv_write_cas_text_atomic(world, sig_path, compiled_sig) {
       return Err("failed to write CAS sig: " + sig_path)
     }
     let stamp = drv_tmp_tag(world, obj_path)
@@ -13728,12 +14338,22 @@ fn drv_build_targets(
     drv_cas_post_run_evict(world, cache_dir, pin, [])
     return res
   }
-  let rt_lib = match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
-    Err(e) => {
-      drv_cas_pin_close(world, pin)
-      return Err(e)
+  let rt_lib = if prof_mask != 0 {
+    match drv_resolve_prof_rt_lib_pinned(world, qbe_target, sysroot, false, pin) {
+      Err(e) => {
+        drv_cas_pin_close(world, pin)
+        return Err(e)
+      }
+      Ok(p) => p
     }
-    Ok(p) => p
+  } else {
+    match drv_resolve_rt_lib_for_pinned(world, qbe_target, sysroot, false, pin) {
+      Err(e) => {
+        drv_cas_pin_close(world, pin)
+        return Err(e)
+      }
+      Ok(p) => p
+    }
   }
   if emit_cdylib_path != "" {
     let res = drv_link_shared_lib(
@@ -13754,7 +14374,14 @@ fn drv_build_targets(
     return Ok(active_obj_path)
   }
 
-  drv_link_native_bin_cached(
+  let single_objs_link = match drv_append_prof_bm_obj(world, cache_dir, qbe_target, apple_tools, sysroot, prof_mask, [active_obj_path]) {
+    Err(e) => {
+      drv_cas_pin_close(world, pin)
+      return Err(e)
+    }
+    Ok(v) => v
+  }
+  let single_linked = drv_link_native_bin_cached(
     world,
     cache_dir,
     qbe_target,
@@ -13762,8 +14389,8 @@ fn drv_build_targets(
     ld_ver,
     sysroot,
     pkg_name,
-    key,
-    [active_obj_path],
+    single_link_key,
+    single_objs_link,
     rt_lib,
     link_opts,
     out_bin_arg,
@@ -13772,6 +14399,16 @@ fn drv_build_targets(
     single_file_hash_memo,
     pin,
   )
+  match single_linked {
+    Ok(bin_path) => {
+      if prof_mask != 0 {
+        drv_ensure_syms_from_sources(world, pkg_name, paths, sources, syms_path, false)
+        drv_write_merged_syms_sidecar(world, bin_path, [syms_path])
+      }
+      Ok(bin_path)
+    }
+    Err(e) => Err(e)
+  }
 }
 
 ///|
@@ -14185,7 +14822,10 @@ fn drv_test_names(pkg : Package) -> Array[String] {
     let mut di = 0
     while di < f.decls.length() {
       match f.decls[di] {
-        DTest(td) => out.push(td.name)
+        DTest(td) =>
+          if !td.is_bench {
+            out.push(td.name)
+          }
         _ => ()
       }
       di = di + 1
@@ -19723,13 +20363,19 @@ fn drv_pkg_write_json(sb : StringBuilder, p : DrvPkgInfo, installable : Bool) ->
 /// Failure with a stable error `code`: `{"ok":false,"code":"...","error":"..."}`
 /// with `--json`, else `error[CODE]: ...` on stderr; exit code 1.
 fn drv_cmd_fail_code(world : World, as_json : Bool, code : String, msg : String) -> Int {
+  let pfx = code + ": "
+  let clean_msg = if drv_starts_with(msg, pfx) {
+    slice_str(msg, pfx.length(), msg.length())
+  } else {
+    msg
+  }
   if as_json {
     io_println(
       world,
-      "{\"ok\":false,\"code\":" + drv_json_q(code) + ",\"error\":" + drv_json_q(msg) + "}",
+      "{\"ok\":false,\"code\":" + drv_json_q(code) + ",\"error\":" + drv_json_q(clean_msg) + "}",
     )
   } else {
-    io_eprintln(world, "error[" + code + "]: " + drv_term_safe(msg))
+    io_eprintln(world, "error[" + code + "]: " + drv_term_safe(clean_msg))
   }
   1
 }
@@ -23589,8 +24235,10 @@ fn drv_usage_text() -> String {
   "  pionc lint [--fix] [--locked] [--offline] [--target <target>] [--json] [input1 ...]\n" +
   "  pionc query defs|sig|callers|deps|analyze [--locked] [--offline] [--target <target>] [--json] [input1 ...]\n" +
   "  pionc emit-sig <input1> [input2 ...]\n" +
-  "  pionc build [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--emit-web-rt [path]] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
-  "  pionc run [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
+  "  pionc build [--package <name>|-p <name>] [--release|--dev] [--profile[=cpu|alloc|rc|all]] [--locked] [--offline] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--emit-web-rt [path]] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
+  "  pionc run [--package <name>|-p <name>] [--release|--dev] [--profile[=cpu|alloc|rc|all]] [--profile-out <path>] [--sample-rate <N>] [--profile-hz <Hz>] [--retained] [--json] [--locked] [--offline] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
+  "  pionc profile summary|diff [options] <file> [<patched>]\n" +
+  "  pionc bench [--json] [--package <name>|-p <name>] [--filter <substr>] [--target <target>] [--iters <N>] [--samples <K>] [--warmup-ms <ms>] [--time-ms <ms>] [--save <path>] [--compare <base.json>] [--profile[=cpu|alloc|rc|all]] [--profile-out <path>] [--sample-rate <N>] [--retained] [path]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
   "  pionc test [--json] [--locked] [--offline] [--target <target>] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [--isolate] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--target <target>] [--json] [input1 ...]\n" +
@@ -24313,6 +24961,8 @@ fn drv_main_dispatch(world : World) -> Int {
     }
   } else if cmd == "build" {
     let mut release = false
+    let mut explicit_dev = false
+    let mut prof_mask = 0
     let mut emit_ssa = ""
     let mut emit_asm = ""
     let mut out_bin = ""
@@ -24331,6 +24981,7 @@ fn drv_main_dispatch(world : World) -> Int {
     let mut locked = false
     let mut offline = false
     let libs : Array[String] = []
+    let strip_seen : Array[String] = []
     let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
@@ -24342,6 +24993,20 @@ fn drv_main_dispatch(world : World) -> Int {
       }
       if a == "--release" {
         release = true
+      } else if a == "--dev" {
+        explicit_dev = true
+      } else if a == "--profile" {
+        prof_mask = 3
+      } else if drv_starts_with(a, "--profile=") {
+        match drv_parse_profile_mask(slice_str(a, 10, a.length())) {
+          Ok(m) => prof_mask = m
+          Err(msg) => {
+            io_eprintln(world, "error: " + msg)
+            return 1
+          }
+        }
+      } else if drv_is_strip_flag(a) {
+        strip_seen.push(a)
       } else if a == "--locked" {
         locked = true
       } else if a == "--offline" {
@@ -24375,6 +25040,8 @@ fn drv_main_dispatch(world : World) -> Int {
       } else if a == "--target" && i + 1 < args.length() {
         target_override = args[i + 1]
         i = i + 1
+      } else if drv_starts_with(a, "--target=") {
+        target_override = slice_str(a, 9, a.length())
       } else if a == "--emit-obj" && i + 1 < args.length() {
         emit_obj = args[i + 1]
         i = i + 1
@@ -24403,6 +25070,24 @@ fn drv_main_dispatch(world : World) -> Int {
         targets.push(a)
       }
       i = i + 1
+    }
+    if prof_mask != 0 && !explicit_dev {
+      release = true
+    }
+    if prof_mask != 0 {
+      match drv_check_profile_strip_flags(world, strip_seen, prof_mask) {
+        Err(msg) => {
+          io_eprintln(world, "error: " + msg)
+          return 1
+        }
+        Ok(_) => ()
+      }
+    } else if strip_seen.length() > 0 {
+      let mut si = 0
+      while si < strip_seen.length() {
+        targets.push(strip_seen[si])
+        si = si + 1
+      }
     }
     if targets.length() == 0 {
       if drv_has_default_project(world) {
@@ -24516,6 +25201,7 @@ fn drv_main_dispatch(world : World) -> Int {
       web_rt_dst,
       locked,
       offline,
+      prof_mask,
     ) {
       Ok(_) => {
         if emit_web_rt {
@@ -24536,6 +25222,13 @@ fn drv_main_dispatch(world : World) -> Int {
     }
   } else if cmd == "run" {
     let mut release = false
+    let mut explicit_dev = false
+    let mut prof_mask = 0
+    let mut profile_out = ""
+    let mut sample_rate = 0
+    let mut prof_hz = 997
+    let mut retained = false
+    let mut as_json = false
     let mut wasm_names = false
     let mut locked = false
     let mut offline = false
@@ -24543,6 +25236,7 @@ fn drv_main_dispatch(world : World) -> Int {
     let mut only_pkg = ""
     let mut target = ""
     let libs : Array[String] = []
+    let strip_seen : Array[String] = []
     let prog_args : Array[String] = []
     let mut after_sep = false
     let mut i = 2
@@ -24561,6 +25255,39 @@ fn drv_main_dispatch(world : World) -> Int {
         after_sep = true
       } else if a == "--release" && target == "" {
         release = true
+      } else if a == "--dev" && target == "" {
+        explicit_dev = true
+      } else if a == "--profile" && target == "" {
+        prof_mask = 3
+      } else if drv_starts_with(a, "--profile=") && target == "" {
+        match drv_parse_profile_mask(slice_str(a, 10, a.length())) {
+          Ok(m) => prof_mask = m
+          Err(msg) => {
+            io_eprintln(world, "error: " + msg)
+            return 1
+          }
+        }
+      } else if a == "--profile-out" && target == "" && i + 1 < args.length() {
+        profile_out = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--profile-out=") && target == "" {
+        profile_out = slice_str(a, 14, a.length())
+      } else if a == "--sample-rate" && target == "" && i + 1 < args.length() {
+        sample_rate = drv_parse_pos_int(args[i + 1], 1)
+        i = i + 1
+      } else if drv_starts_with(a, "--sample-rate=") && target == "" {
+        sample_rate = drv_parse_pos_int(slice_str(a, 14, a.length()), 1)
+      } else if a == "--profile-hz" && target == "" && i + 1 < args.length() {
+        prof_hz = drv_parse_pos_int(args[i + 1], 997)
+        i = i + 1
+      } else if drv_starts_with(a, "--profile-hz=") && target == "" {
+        prof_hz = drv_parse_pos_int(slice_str(a, 13, a.length()), 997)
+      } else if a == "--retained" && target == "" {
+        retained = true
+      } else if a == "--json" && target == "" {
+        as_json = true
+      } else if drv_is_strip_flag(a) && target == "" {
+        strip_seen.push(a)
       } else if a == "--locked" && target == "" {
         locked = true
       } else if a == "--offline" && target == "" {
@@ -24577,12 +25304,50 @@ fn drv_main_dispatch(world : World) -> Int {
       } else if a == "--target" && target == "" && i + 1 < args.length() {
         target_override = args[i + 1]
         i = i + 1
+      } else if drv_starts_with(a, "--target=") && target == "" {
+        target_override = slice_str(a, 9, a.length())
       } else if target == "" {
         target = a
       } else {
         prog_args.push(a)
       }
       i = i + 1
+    }
+    if prof_mask != 0 && !explicit_dev {
+      release = true
+    }
+    if prof_mask != 0 {
+      match drv_check_profile_strip_flags(world, strip_seen, prof_mask) {
+        Err(msg) => {
+          return drv_cmd_fail_code(world, as_json, "E_PROFILE_STRIPPED", msg)
+        }
+        Ok(_) => ()
+      }
+    } else if strip_seen.length() > 0 {
+      // Restore baseline positional behavior: the first strip-like token before target
+      // becomes the target path (yielding "path does not exist: -s").
+      let prev_target = target
+      target = strip_seen[0]
+      let new_prog_args : Array[String] = []
+      let mut si = 1
+      while si < strip_seen.length() {
+        new_prog_args.push(strip_seen[si])
+        si = si + 1
+      }
+      if prev_target != "" {
+        new_prog_args.push(prev_target)
+      }
+      let mut pi = 0
+      while pi < prog_args.length() {
+        new_prog_args.push(prog_args[pi])
+        pi = pi + 1
+      }
+      prog_args.clear()
+      let mut ni = 0
+      while ni < new_prog_args.length() {
+        prog_args.push(new_prog_args[ni])
+        ni = ni + 1
+      }
     }
     if target == "" {
       if drv_has_default_project(world) {
@@ -24608,6 +25373,14 @@ fn drv_main_dispatch(world : World) -> Int {
       target_override
     } else {
       drv_resolve_qbe_target(world)
+    }
+    if prof_mask != 0 {
+      match drv_validate_profile_target(run_resolve_target, prof_mask) {
+        Err(msg) => {
+          return drv_cmd_fail_code(world, as_json, "E_PROFILE_UNSUPPORTED_TARGET", msg)
+        }
+        Ok(_) => ()
+      }
     }
     match drv_detect_manifest_dir(world, target) {
       Some(root_dir) =>
@@ -24644,12 +25417,31 @@ fn drv_main_dispatch(world : World) -> Int {
       "",
       locked,
       offline,
+      prof_mask,
     ) {
       Err(msg) => {
         io_eprintln(world, msg)
         return 1
       }
       Ok(bin_path) => {
+        if prof_mask != 0 {
+          return drv_run_profiled_exec(
+            world,
+            bin_path,
+            run_resolve_target,
+            prog_args,
+            prof_mask,
+            sample_rate,
+            prof_hz,
+            retained,
+            profile_out,
+            as_json,
+            bin_path + ".syms",
+            20,
+            "self",
+            false,
+          )
+        }
         if drv_target_is_wasm(run_resolve_target) {
           let rt_mjs = drv_resolve_wasm_rt(world)
           let run_argv : Array[String] = ["node", rt_mjs, bin_path]
@@ -24669,6 +25461,10 @@ fn drv_main_dispatch(world : World) -> Int {
         return proc_exec(world, run_argv)
       }
     }
+  } else if cmd == "profile" {
+    return drv_run_profile_cmd(world, args)
+  } else if cmd == "bench" {
+    return drv_run_bench_cmd(world, args)
   } else if cmd == "fmt" {
     let mut check_only = false
     let mut as_json = false
@@ -26671,4 +27467,1967 @@ fn drv_run_check_server_cmd(
   ptr_free(buf_slot)
   ptr_free(len_slot)
   exit_code
+}
+
+// ============================================================================
+// Profiler & Benchmark CLI (`--profile`, `pionc profile`, `pionc bench`)
+// ============================================================================
+
+///|
+fn drv_prof_split_char(s : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if str_code_at(s, i) == sep {
+      out.push(slice_str(s, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(slice_str(s, start, n))
+  out
+}
+
+///|
+fn drv_prof_trim(s : String) -> String {
+  let n = s.length()
+  let mut a = 0
+  while a < n {
+    let c = str_code_at(s, a)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      a = a + 1
+    } else {
+      break
+    }
+  }
+  let mut b = n
+  while b > a {
+    let c = str_code_at(s, b - 1)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      b = b - 1
+    } else {
+      break
+    }
+  }
+  slice_str(s, a, b)
+}
+
+///|
+fn drv_parse_profile_mask(raw_val : String) -> Result[Int, String] {
+  let trimmed = drv_prof_trim(raw_val)
+  if trimmed.length() == 0 {
+    return Ok(3)
+  }
+  let parts = drv_prof_split_char(trimmed, 44)
+  let mut mask = 0
+  let mut i = 0
+  while i < parts.length() {
+    let p = drv_prof_trim(parts[i])
+    if p == "cpu" {
+      mask = mask | 1
+    } else if p == "alloc" {
+      mask = mask | 2
+    } else if p == "rc" {
+      mask = mask | 4
+    } else if p == "all" {
+      mask = mask | 7
+    } else {
+      return Err("unknown --profile mode `" + p + "` (expected cpu, alloc, rc, or all)")
+    }
+    i = i + 1
+  }
+  if mask == 0 {
+    Ok(3)
+  } else {
+    Ok(mask)
+  }
+}
+
+///|
+/// Builds (and CAS-caches) a tiny `.o` defining strong `pion_prof_build_modes`
+/// so Native profiled binaries record their exact compile-time capabilities
+/// (3 = CPU|ALLOC with inlined RC, 7 = CPU|ALLOC|RC with NO_INLINE_RC) without
+/// splitting user `.o` CAS keys between default and `--profile=alloc` builds.
+fn drv_prof_build_modes_obj(
+  world : World,
+  cache_dir : String,
+  qbe_target : String,
+  apple_tools : AppleTools,
+  sysroot : String,
+  prof_mask : Int,
+) -> Result[String, String] {
+  let bm = if (prof_mask & 4) != 0 { 7 } else { 3 }
+  let bm_dir = cache_dir + "/v1/prof_bm"
+  let _ = fs_mkdir_p(world, bm_dir)
+  let obj_path = bm_dir + "/pion_prof_bm_" + qbe_target + "_" + bm.to_string() + ".o"
+  if drv_is_nonempty_regular_file(world, obj_path) {
+    return Ok(obj_path)
+  }
+  let qbe_bin = drv_resolve_qbe_bin(world)
+  let direct_obj = drv_direct_obj_target(world, qbe_target)
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 { apple_tools.macos_ver } else { "15.0" }
+  let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+  let stamp = drv_tmp_tag(world, obj_path)
+  let ssa_tmp = obj_path + ".ssa." + stamp
+  let ssa = "export data $pion_prof_build_modes = align 4 { w " + bm.to_string() + " }\n"
+  if !drv_write_text_atomic(world, ssa_tmp, ssa) {
+    return Err("failed to write prof_build_modes ssa: " + ssa_tmp)
+  }
+  let res = drv_compile_ssa_to_obj(
+    world,
+    qbe_bin,
+    qbe_target,
+    apple_tools,
+    direct_obj,
+    qbe_macos_ver,
+    cc1as_triple,
+    sysroot,
+    ssa_tmp,
+    obj_path,
+    stamp,
+    true,
+  )
+  let _ = fs_remove(world, ssa_tmp)
+  match res {
+    Err(e) => Err(e)
+    Ok(_) => Ok(obj_path)
+  }
+}
+
+///|
+fn drv_append_prof_bm_obj(
+  world : World,
+  cache_dir : String,
+  qbe_target : String,
+  apple_tools : AppleTools,
+  sysroot : String,
+  prof_mask : Int,
+  objs : Array[String],
+) -> Result[Array[String], String] {
+  if prof_mask == 0 {
+    return Ok(objs)
+  }
+  let bm_obj = match drv_prof_build_modes_obj(world, cache_dir, qbe_target, apple_tools, sysroot, prof_mask) {
+    Err(e) => return Err(e)
+    Ok(p) => p
+  }
+  let out : Array[String] = []
+  let mut i = 0
+  while i < objs.length() {
+    out.push(objs[i])
+    i = i + 1
+  }
+  out.push(bm_obj)
+  Ok(out)
+}
+
+///|
+fn drv_validate_profile_target(qbe_target : String, prof_mask : Int) -> Result[Unit, String] {
+  if prof_mask == 0 {
+    return Ok(())
+  }
+  if qbe_target == "amd64_sysv" ||
+    qbe_target == "arm64" ||
+    qbe_target == "arm64_apple" ||
+    drv_target_is_wasm(qbe_target) {
+    return Ok(())
+  }
+  Err("E_PROFILE_UNSUPPORTED_TARGET: --profile is not supported on target `" + qbe_target + "` (supported: amd64_sysv, arm64, arm64_apple, wasm32)")
+}
+
+///|
+fn drv_is_strip_flag(a : String) -> Bool {
+  if a == "-s" || a == "-S" || a == "-x" || a == "--strip-all" {
+    return true
+  }
+  if drv_starts_with(a, "-Wl,") {
+    let parts = drv_prof_split_char(slice_str(a, 4, a.length()), 44)
+    let mut i = 0
+    while i < parts.length() {
+      let p = parts[i]
+      if p == "-s" || p == "-S" || p == "-x" || p == "--strip-all" {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+///|
+fn drv_check_profile_strip_flags(
+  world : World,
+  flags : Array[String],
+  prof_mask : Int,
+) -> Result[Unit, String] {
+  if prof_mask == 0 {
+    return Ok(())
+  }
+  let mut i = 0
+  while i < flags.length() {
+    if drv_is_strip_flag(flags[i]) {
+      return Err("E_PROFILE_STRIPPED: --profile cannot be used with strip linker flag `" + flags[i] + "`")
+    }
+    i = i + 1
+  }
+  let env_ld = drv_env_str(world, "PION_LDFLAGS")
+  if env_ld.length() > 0 {
+    let parts = drv_prof_split_char(env_ld, 32)
+    let mut pi = 0
+    while pi < parts.length() {
+      let p = drv_prof_trim(parts[pi])
+      if p.length() > 0 && drv_is_strip_flag(p) {
+        return Err("E_PROFILE_STRIPPED: --profile cannot be used with PION_LDFLAGS strip flag `" + p + "`")
+      }
+      pi = pi + 1
+    }
+  }
+  Ok(())
+}
+
+///|
+/// Pure-Pion Wasm `.wasm` Custom Section `"name"` (subsection 1: function names) parser.
+fn drv_parse_wasm_name_section(data : Bytes) -> Map[Int, String] {
+  let names : Map[Int, String] = Map([])
+  let n = data.length()
+  if n < 8 {
+    return names
+  }
+  if data[0].to_int() != 0 || data[1].to_int() != 97 || data[2].to_int() != 115 || data[3].to_int() != 109 {
+    return names
+  }
+  let pos : Array[Int] = [8]
+  let read_u32 = fn(limit : Int) -> Int {
+    let mut res = 0
+    let mut shift = 0
+    while pos[0] < limit {
+      let b = data[pos[0]].to_int() & 255
+      pos[0] = pos[0] + 1
+      if shift == 28 && (b & 240) != 0 {
+        return -1
+      }
+      res = res | ((b & 127) << shift)
+      if (b & 128) == 0 {
+        if res < 0 {
+          return -1
+        }
+        return res
+      }
+      shift = shift + 7
+      if shift > 28 {
+        return -1
+      }
+    }
+    -1
+  }
+  let read_str = fn(len : Int, limit : Int) -> Option[String] {
+    if len < 0 || len > limit - pos[0] {
+      return None
+    }
+    let start = pos[0]
+    pos[0] = start + len
+    let sb = StringBuilder()
+    let mut i = start
+    while i < start + len {
+      let b = data[i].to_int() & 255
+      if b < 128 {
+        sb.write_char(b.unsafe_to_char())
+      } else {
+        sb.write_char('?')
+      }
+      i = i + 1
+    }
+    Some(sb.to_string())
+  }
+  while pos[0] < n {
+    let sec_id = data[pos[0]].to_int() & 255
+    pos[0] = pos[0] + 1
+    let sec_len = read_u32(n)
+    if sec_len < 0 || sec_len > n - pos[0] {
+      break
+    }
+    let sec_end = pos[0] + sec_len
+    if sec_id == 0 {
+      let sname_len = read_u32(sec_end)
+      match read_str(sname_len, sec_end) {
+        Some(sname) =>
+          if sname == "name" {
+            while pos[0] < sec_end {
+              let sub_id = data[pos[0]].to_int() & 255
+              pos[0] = pos[0] + 1
+              let sub_len = read_u32(sec_end)
+              if sub_len < 0 || sub_len > sec_end - pos[0] {
+                break
+              }
+              let sub_end = pos[0] + sub_len
+              if sub_id == 1 {
+                let count = read_u32(sub_end)
+                if count < 0 {
+                  break
+                }
+                let mut ci = 0
+                while ci < count && pos[0] < sub_end {
+                  let fn_idx = read_u32(sub_end)
+                  let fn_len = read_u32(sub_end)
+                  if fn_idx < 0 || fn_len < 0 {
+                    break
+                  }
+                  match read_str(fn_len, sub_end) {
+                    Some(fn_name) => names.set(fn_idx, fn_name)
+                    None => break
+                  }
+                  ci = ci + 1
+                }
+              }
+              pos[0] = sub_end
+            }
+          }
+        None => ()
+      }
+    }
+    pos[0] = sec_end
+  }
+  names
+}
+
+///|
+fn drv_remove_dir_recursive(world : World, dir : String) -> Unit {
+  let entries = fs_list_dir(world, dir)
+  let mut i = 0
+  while i < entries.length() {
+    let p = drv_join_path(dir, entries[i])
+    let _ = fs_remove(world, p)
+    i = i + 1
+  }
+  let _ = c_fs_rmdir(drv_cpath(dir))
+}
+
+///|
+fn drv_clear_prof_env() -> Unit {
+  drv_unsetenv("PION_PROF_OUT")
+  drv_unsetenv("PION_PROF_MODES")
+  drv_unsetenv("PION_PROF_BUILD_MODES")
+  drv_unsetenv("PION_PROF_HZ")
+  drv_unsetenv("PION_PROF_SAMPLE_RATE")
+  drv_unsetenv("PION_PROF_RETAINED")
+  drv_unsetenv("PION_PROF_CPU_OUT")
+  drv_unsetenv("PION_PROF_CPU_INTERVAL")
+}
+
+///|
+fn drv_run_profiled_exec(
+  world : World,
+  bin_path : String,
+  qbe_target : String,
+  prog_args : Array[String],
+  prof_mask : Int,
+  sample_rate_opt : Int,
+  prof_hz : Int,
+  retained : Bool,
+  profile_out : String,
+  as_json : Bool,
+  syms_path : String,
+  top_n : Int,
+  sort_by : String,
+  is_bench_window : Bool,
+) -> Int {
+  let is_wasm = drv_target_is_wasm(qbe_target)
+  let eff_sample_rate = if sample_rate_opt > 0 {
+    sample_rate_opt
+  } else if is_wasm {
+    64
+  } else {
+    1
+  }
+  let tmp_base = drv_temp_dir(world)
+  let _ = fs_mkdir_p(world, tmp_base)
+  let tmp_dir = match drv_mktemp_dir_near(world, drv_join_path(tmp_base, "pion_prof")) {
+    Ok(d) => d
+    Err(e) => return drv_cmd_fail(world, as_json, "failed to create profile temp dir: " + e)
+  }
+  let raw_path = drv_join_path(tmp_dir, "out.pionprof.raw")
+  drv_setenv("PION_PROF_OUT", raw_path)
+  drv_setenv("PION_PROF_MODES", prof_mask.to_string())
+  drv_unsetenv("PION_PROF_BUILD_MODES")
+  drv_setenv("PION_PROF_HZ", prof_hz.to_string())
+  drv_setenv("PION_PROF_SAMPLE_RATE", eff_sample_rate.to_string())
+  drv_setenv("PION_PROF_RETAINED", if retained { "1" } else { "0" })
+
+  let run_argv : Array[String] = []
+  if is_wasm {
+    let rt_mjs = drv_resolve_wasm_rt(world)
+    run_argv.push("node")
+    if (prof_mask & 1) != 0 {
+      let hz_safe = if prof_hz > 0 { prof_hz } else { 997 }
+      let raw_iv = 1000000 / hz_safe
+      let iv = if raw_iv < 100 { 100 } else { raw_iv }
+      if is_bench_window {
+        drv_setenv("PION_PROF_CPU_OUT", drv_join_path(tmp_dir, "bench.cpuprofile"))
+        drv_setenv("PION_PROF_CPU_INTERVAL", iv.to_string())
+      } else {
+        run_argv.push("--cpu-prof")
+        run_argv.push("--cpu-prof-dir=" + tmp_dir)
+        run_argv.push("--cpu-prof-interval=" + iv.to_string())
+      }
+    }
+    run_argv.push(rt_mjs)
+    run_argv.push(bin_path)
+  } else {
+    run_argv.push(bin_path)
+  }
+  let mut j = 0
+  while j < prog_args.length() {
+    run_argv.push(prog_args[j])
+    j = j + 1
+  }
+
+  let mut child_rc = 0
+  if as_json {
+    match proc_exec_capture(world, run_argv) {
+      Ok(_) => child_rc = 0
+      Err(e) => {
+        drv_clear_prof_env()
+        drv_remove_dir_recursive(world, tmp_dir)
+        return drv_cmd_fail(world, true, "profiled target failed: " + e)
+      }
+    }
+  } else {
+    child_rc = proc_exec(world, run_argv)
+  }
+  drv_clear_prof_env()
+
+  let raw_txt = match fs_read(world, raw_path) {
+    Ok(t) => t
+    Err(e) => {
+      drv_remove_dir_recursive(world, tmp_dir)
+      return drv_cmd_fail(world, as_json, "failed to read raw profile output (" + raw_path + "): " + e)
+    }
+  }
+  let raw = match prof_parse_raw(raw_txt) {
+    Ok(r) => r
+    Err(e) => {
+      drv_remove_dir_recursive(world, tmp_dir)
+      return drv_cmd_fail(world, as_json, "failed to parse raw profile: " + e)
+    }
+  }
+  let st : Option[SymTab] = if !is_wasm {
+    match fs_read_bytes(world, bin_path) {
+      Ok(b) =>
+        match symtab_parse(b) {
+          Ok(t) => Some(t)
+          Err(_) => None
+        }
+      Err(_) => None
+    }
+  } else {
+    None
+  }
+  let sidecar : Map[String, ProfSidecarSym] = if !is_wasm && syms_path.length() > 0 && fs_exists(world, syms_path) {
+    match fs_read(world, syms_path) {
+      Ok(t) => prof_parse_sidecar_syms(t)
+      Err(_) => Map([])
+    }
+  } else {
+    Map([])
+  }
+  let mut v8_cpu : Option[ProfCpuData] = None
+  if is_wasm && (prof_mask & 1) != 0 {
+    let entries = fs_list_dir(world, tmp_dir)
+    let mut found_cp = false
+    let mut cp_err = ""
+    let mut ei = 0
+    while ei < entries.length() {
+      if drv_ends_with(entries[ei], ".cpuprofile") {
+        found_cp = true
+        let cp_path = drv_join_path(tmp_dir, entries[ei])
+        match fs_read(world, cp_path) {
+          Ok(cp_json) => {
+            let wasm_names : Map[Int, String] = match fs_read_bytes(world, bin_path) {
+              Ok(wb) => drv_parse_wasm_name_section(wb)
+              Err(_) => Map([])
+            }
+            match prof_parse_v8_cpuprofile(cp_json, wasm_names) {
+              Ok(cd) => v8_cpu = Some(cd)
+              Err(pe) => cp_err = "failed to parse V8 .cpuprofile: " + pe
+            }
+          }
+          Err(re) => cp_err = "failed to read V8 .cpuprofile: " + re
+        }
+        break
+      }
+      ei = ei + 1
+    }
+    if !found_cp {
+      drv_remove_dir_recursive(world, tmp_dir)
+      return drv_cmd_fail(world, as_json, "Wasm32 CPU profiling requested but Node produced no .cpuprofile output")
+    }
+    if cp_err.length() > 0 {
+      drv_remove_dir_recursive(world, tmp_dir)
+      return drv_cmd_fail(world, as_json, cp_err)
+    }
+  }
+  drv_remove_dir_recursive(world, tmp_dir)
+
+  let rep = prof_build_report(raw, st, sidecar, v8_cpu)
+  if profile_out.length() > 0 {
+    drv_ensure_parent_dir(world, profile_out)
+    let full_json = prof_report_to_json(rep, 200, "self")
+    if !drv_write_text_atomic(world, profile_out, full_json + "\n") {
+      return drv_cmd_fail(world, as_json, "failed to write --profile-out: " + profile_out)
+    }
+  }
+  if as_json {
+    io_println(world, prof_report_to_json(rep, top_n, sort_by))
+  } else {
+    io_println(world, prof_report_to_text(rep, top_n, sort_by))
+  }
+  child_rc
+}
+
+///|
+fn drv_load_prof_report(
+  world : World,
+  path : String,
+  bin_override : String,
+  syms_override : String,
+) -> Result[ProfReport, String] {
+  let txt = match fs_read(world, path) {
+    Ok(t) => t
+    Err(e) => return Err("failed to read profile file `" + path + "`: " + e)
+  }
+  let trimmed = drv_prof_trim(txt)
+  if drv_starts_with(trimmed, "{") {
+    return prof_parse_report_json(trimmed)
+  }
+  if drv_starts_with(trimmed, "PIONPROF ") {
+    let raw = match prof_parse_raw(txt) {
+      Ok(r) => r
+      Err(e) => return Err(e)
+    }
+    let bin_path = if bin_override.length() > 0 { bin_override } else { raw.bin_path }
+    let st : Option[SymTab] = if bin_path.length() > 0 && fs_exists(world, bin_path) {
+      match fs_read_bytes(world, bin_path) {
+        Ok(b) =>
+          match symtab_parse(b) {
+            Ok(t) => Some(t)
+            Err(_) => None
+          }
+        Err(_) => None
+      }
+    } else {
+      None
+    }
+    let sp = if syms_override.length() > 0 {
+      syms_override
+    } else if bin_path.length() > 0 {
+      bin_path + ".syms"
+    } else {
+      ""
+    }
+    let sidecar : Map[String, ProfSidecarSym] = if sp.length() > 0 && fs_exists(world, sp) {
+      match fs_read(world, sp) {
+        Ok(t) => prof_parse_sidecar_syms(t)
+        Err(_) => Map([])
+      }
+    } else {
+      Map([])
+    }
+    return Ok(prof_build_report(raw, st, sidecar, None))
+  }
+  Err("unrecognized profile format in `" + path + "` (expected schema_version:1 JSON or PIONPROF 1 raw file)")
+}
+
+///|
+fn drv_parse_double_simple(s : String, fallback : Double) -> Double {
+  let t = drv_prof_trim(s)
+  let n = t.length()
+  if n == 0 {
+    return fallback
+  }
+  let mut i = 0
+  let mut neg = false
+  if str_code_at(t, 0) == 45 {
+    neg = true
+    i = 1
+  } else if str_code_at(t, 0) == 43 {
+    i = 1
+  }
+  let mut whole = 0.0
+  let mut has_digit = false
+  while i < n {
+    let c = str_code_at(t, i)
+    if c >= 48 && c <= 57 {
+      whole = whole * 10.0 + (c - 48).to_double()
+      has_digit = true
+      i = i + 1
+    } else {
+      break
+    }
+  }
+  let mut frac = 0.0
+  let mut scale = 0.1
+  if i < n && str_code_at(t, i) == 46 {
+    i = i + 1
+    while i < n {
+      let c = str_code_at(t, i)
+      if c >= 48 && c <= 57 {
+        frac = frac + (c - 48).to_double() * scale
+        scale = scale * 0.1
+        has_digit = true
+        i = i + 1
+      } else {
+        break
+      }
+    }
+  }
+  if !has_digit || i != n {
+    return fallback
+  }
+  let v = whole + frac
+  if neg { -v } else { v }
+}
+
+///|
+fn drv_profile_help_text() -> String {
+  "usage:\n" +
+  "  pionc profile summary <file> [--top <N>] [--sort self|cum|alloc_bytes|alloc_count|inuse_bytes|rc] [--bin <path>] [--syms <path>] [--json]\n" +
+  "  pionc profile diff <base> <patched> [--top <N>] [--min-delta-pct <f>] [--json]\n" +
+  "\nexamples:\n" +
+  "  pionc run --profile=cpu,alloc --profile-out base.json --json app.pion\n" +
+  "  pionc profile summary base.json --top 10 --sort alloc_bytes --json\n" +
+  "  pionc profile diff base.json patched.json --json"
+}
+
+///|
+fn drv_run_profile_cmd(world : World, args : Array[String]) -> Int {
+  if args.length() < 3 || args[2] == "--help" || args[2] == "-h" || args[2] == "help" {
+    io_println(world, drv_profile_help_text())
+    return 0
+  }
+  let sub = args[2]
+  if sub == "summary" {
+    let mut as_json = false
+    let mut top_n = 20
+    let mut sort_by = "self"
+    let mut bin_path = ""
+    let mut syms_path = ""
+    let files : Array[String] = []
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--help" || a == "-h" {
+        io_println(world, drv_profile_help_text())
+        return 0
+      } else if a == "--json" {
+        as_json = true
+      } else if a == "--top" && i + 1 < args.length() {
+        top_n = drv_parse_pos_int(args[i + 1], 20)
+        i = i + 1
+      } else if drv_starts_with(a, "--top=") {
+        top_n = drv_parse_pos_int(slice_str(a, 6, a.length()), 20)
+      } else if a == "--sort" && i + 1 < args.length() {
+        sort_by = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--sort=") {
+        sort_by = slice_str(a, 7, a.length())
+      } else if a == "--bin" && i + 1 < args.length() {
+        bin_path = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--bin=") {
+        bin_path = slice_str(a, 6, a.length())
+      } else if a == "--syms" && i + 1 < args.length() {
+        syms_path = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--syms=") {
+        syms_path = slice_str(a, 7, a.length())
+      } else if drv_starts_with(a, "-") {
+        return drv_cmd_fail(world, as_json, "unknown option for `pionc profile summary`: " + a)
+      } else {
+        files.push(a)
+      }
+      i = i + 1
+    }
+    if files.length() != 1 {
+      return drv_cmd_fail(world, as_json, "usage: pionc profile summary <file> [--top <N>] [--sort ...] [--json]")
+    }
+    match drv_load_prof_report(world, files[0], bin_path, syms_path) {
+      Err(e) => return drv_cmd_fail(world, as_json, e)
+      Ok(rep) => {
+        if as_json {
+          io_println(world, prof_report_to_json(rep, top_n, sort_by))
+        } else {
+          io_println(world, prof_report_to_text(rep, top_n, sort_by))
+        }
+        return 0
+      }
+    }
+  } else if sub == "diff" {
+    let mut as_json = false
+    let mut top_n = 20
+    let mut min_delta_pct = 3.0
+    let files : Array[String] = []
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--help" || a == "-h" {
+        io_println(world, drv_profile_help_text())
+        return 0
+      } else if a == "--json" {
+        as_json = true
+      } else if a == "--top" && i + 1 < args.length() {
+        top_n = drv_parse_pos_int(args[i + 1], 20)
+        i = i + 1
+      } else if drv_starts_with(a, "--top=") {
+        top_n = drv_parse_pos_int(slice_str(a, 6, a.length()), 20)
+      } else if a == "--min-delta-pct" && i + 1 < args.length() {
+        min_delta_pct = drv_parse_double_simple(args[i + 1], 3.0)
+        i = i + 1
+      } else if drv_starts_with(a, "--min-delta-pct=") {
+        min_delta_pct = drv_parse_double_simple(slice_str(a, 16, a.length()), 3.0)
+      } else if drv_starts_with(a, "-") {
+        return drv_cmd_fail(world, as_json, "unknown option for `pionc profile diff`: " + a)
+      } else {
+        files.push(a)
+      }
+      i = i + 1
+    }
+    if files.length() != 2 {
+      return drv_cmd_fail(world, as_json, "usage: pionc profile diff <base> <patched> [--top <N>] [--min-delta-pct <f>] [--json]")
+    }
+    let base_rep = match drv_load_prof_report(world, files[0], "", "") {
+      Err(e) => return drv_cmd_fail(world, as_json, e)
+      Ok(r) => r
+    }
+    let patched_rep = match drv_load_prof_report(world, files[1], "", "") {
+      Err(e) => return drv_cmd_fail(world, as_json, e)
+      Ok(r) => r
+    }
+    let diff = prof_diff_reports(base_rep, patched_rep, top_n, min_delta_pct)
+    if as_json {
+      io_println(world, prof_diff_to_json(diff))
+    } else {
+      io_println(world, prof_diff_to_text(diff))
+    }
+    return 0
+  }
+  drv_cmd_fail(world, false, "unknown `pionc profile` subcommand `" + sub + "` (expected summary or diff)")
+}
+
+// ============================================================================
+// Benchmark Harness Driver (`pionc bench`)
+// ============================================================================
+
+///|
+struct DrvBenchEntry {
+  idx : Int
+  name : String
+}
+
+///|
+struct DrvBenchResult {
+  name : String
+  iters : Int64
+  samples : Int
+  median_ns : Double
+  min_ns : Double
+  max_ns : Double
+  p95_ns : Double
+  mad_ns : Double
+  cv_pct : Double
+  ops_per_sec : Double
+  samples_us : Array[Int64]
+}
+
+///|
+struct DrvBenchSaved {
+  target : String
+  cpu_count : Int
+  pionc_id : String
+  medians : Map[String, Double]
+  order : Array[String]
+}
+
+///|
+fn drv_bench_sqrt(x : Double) -> Double {
+  if x <= 0.0 {
+    return 0.0
+  }
+  let mut g = x
+  if g < 1.0 {
+    g = 1.0
+  }
+  let mut it = 0
+  while it < 32 {
+    let next = 0.5 * (g + x / g)
+    if next == g {
+      break
+    }
+    g = next
+    it = it + 1
+  }
+  g
+}
+
+///|
+fn drv_bench_sort_doubles(xs : Array[Double]) -> Array[Double] {
+  let out : Array[Double] = []
+  let mut i = 0
+  while i < xs.length() {
+    out.push(xs[i])
+    i = i + 1
+  }
+  let n = out.length()
+  let mut a = 1
+  while a < n {
+    let v = out[a]
+    let mut b = a - 1
+    while b >= 0 && out[b] > v {
+      out[b + 1] = out[b]
+      b = b - 1
+    }
+    out[b + 1] = v
+    a = a + 1
+  }
+  out
+}
+
+///|
+fn drv_bench_median(sorted : Array[Double]) -> Double {
+  let n = sorted.length()
+  if n == 0 {
+    return 0.0
+  }
+  if n % 2 == 1 {
+    sorted[n / 2]
+  } else {
+    (sorted[n / 2 - 1] + sorted[n / 2]) * 0.5
+  }
+}
+
+///|
+fn drv_bench_parse_us(output : String) -> Result[Int64, String] {
+  let lines = drv_split_lines(output)
+  let mut i = lines.length() - 1
+  while i >= 0 {
+    let line = drv_prof_trim(lines[i])
+    if drv_starts_with(line, "PION_BENCH_US ") {
+      let raw = drv_prof_trim(slice_str(line, 14, line.length()))
+      let v = drv_parse_nonneg_int64(raw, -1L)
+      if v >= 0L {
+        return Ok(v)
+      }
+    }
+    i = i - 1
+  }
+  Err("bench runner did not emit `PION_BENCH_US <us>`")
+}
+
+///|
+fn drv_bench_exec_once(
+  world : World,
+  bin_path : String,
+  is_wasm : Bool,
+  rt_mjs : String,
+  idx : Int,
+  iters : Int64,
+) -> Result[Int64, String] {
+  let argv : Array[String] = if is_wasm {
+    ["node", rt_mjs, bin_path, "--run", idx.to_string(), iters.to_string()]
+  } else {
+    [bin_path, "--run", idx.to_string(), iters.to_string()]
+  }
+  match proc_exec_capture(world, argv) {
+    Err(e) => Err("bench execution failed: " + e)
+    Ok(out) => drv_bench_parse_us(out)
+  }
+}
+
+///|
+fn drv_bench_json_str(
+  target : String,
+  cpu_count : Int,
+  pionc_id : String,
+  results : Array[DrvBenchResult],
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"schema_version\":1,\"machine_fp\":{\"target\":")
+  sb.write_string(json_quote(target))
+  sb.write_string(",\"cpu_count\":")
+  sb.write_string(cpu_count.to_string())
+  sb.write_string(",\"pionc_id\":")
+  sb.write_string(json_quote(pionc_id))
+  sb.write_string("},\"benchmarks\":[")
+  let mut i = 0
+  while i < results.length() {
+    if i > 0 {
+      sb.write_char(',')
+    }
+    let r = results[i]
+    sb.write_string("{\"name\":")
+    sb.write_string(json_quote(r.name))
+    sb.write_string(",\"iters\":")
+    sb.write_string(r.iters.to_string())
+    sb.write_string(",\"samples\":")
+    sb.write_string(r.samples.to_string())
+    sb.write_string(",\"median_ns\":")
+    sb.write_string(r.median_ns.to_string())
+    sb.write_string(",\"min_ns\":")
+    sb.write_string(r.min_ns.to_string())
+    sb.write_string(",\"max_ns\":")
+    sb.write_string(r.max_ns.to_string())
+    sb.write_string(",\"p95_ns\":")
+    sb.write_string(r.p95_ns.to_string())
+    sb.write_string(",\"mad_ns\":")
+    sb.write_string(r.mad_ns.to_string())
+    sb.write_string(",\"cv_pct\":")
+    sb.write_string(r.cv_pct.to_string())
+    sb.write_string(",\"ops_per_sec\":")
+    sb.write_string(r.ops_per_sec.to_string())
+    sb.write_string(",\"samples_us\":[")
+    let mut si = 0
+    while si < r.samples_us.length() {
+      if si > 0 {
+        sb.write_char(',')
+      }
+      sb.write_string(r.samples_us[si].to_string())
+      si = si + 1
+    }
+    sb.write_string("]}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// Lightweight parser for a saved `pionc bench --save` JSON file.
+fn drv_bench_parse_saved_json(txt : String) -> Result[DrvBenchSaved, String] {
+  let n = txt.length()
+  let mut target = ""
+  let mut cpu_count = 0
+  let mut pionc_id = ""
+  let medians : Map[String, Double] = Map([])
+  let order : Array[String] = []
+  let extract_str_after = fn(key : String, start : Int) -> (String, Int) {
+    let idx = drv_find_substr(txt, key, start)
+    if idx < 0 {
+      return ("", -1)
+    }
+    let mut p = idx + key.length()
+    while p < n && (str_code_at(txt, p) == 32 || str_code_at(txt, p) == 58) {
+      p = p + 1
+    }
+    if p >= n || str_code_at(txt, p) != 34 {
+      return ("", -1)
+    }
+    p = p + 1
+    let sb = StringBuilder()
+    while p < n {
+      let c = str_code_at(txt, p)
+      if c == 92 && p + 1 < n {
+        let nc = str_code_at(txt, p + 1)
+        if nc == 110 {
+          sb.write_char('\n')
+        } else if nc == 116 {
+          sb.write_char('\t')
+        } else {
+          sb.write_string(slice_str(txt, p + 1, p + 2))
+        }
+        p = p + 2
+      } else if c == 34 {
+        return (sb.to_string(), p + 1)
+      } else {
+        sb.write_string(slice_str(txt, p, p + 1))
+        p = p + 1
+      }
+    }
+    ("", -1)
+  }
+  let extract_num_after = fn(key : String, start : Int) -> (String, Int) {
+    let idx = drv_find_substr(txt, key, start)
+    if idx < 0 {
+      return ("", -1)
+    }
+    let mut p = idx + key.length()
+    while p < n && (str_code_at(txt, p) == 32 || str_code_at(txt, p) == 58) {
+      p = p + 1
+    }
+    let s0 = p
+    while p < n {
+      let c = str_code_at(txt, p)
+      if (c >= 48 && c <= 57) || c == 46 || c == 45 || c == 43 || c == 101 || c == 69 {
+        p = p + 1
+      } else {
+        break
+      }
+    }
+    (slice_str(txt, s0, p), p)
+  }
+  let (t_val, _) = extract_str_after("\"target\"", 0)
+  target = t_val
+  let (c_val, _) = extract_num_after("\"cpu_count\"", 0)
+  cpu_count = drv_parse_pos_int(c_val, 0)
+  let (id_val, _) = extract_str_after("\"pionc_id\"", 0)
+  pionc_id = id_val
+  let b_start = drv_find_substr(txt, "\"benchmarks\"", 0)
+  if b_start < 0 {
+    return Err("invalid bench baseline JSON: missing `benchmarks`")
+  }
+  let mut cur = b_start
+  while cur < n {
+    let (bname, next_p) = extract_str_after("\"name\"", cur)
+    if next_p < 0 {
+      break
+    }
+    let (m_str, m_end) = extract_num_after("\"median_ns\"", next_p)
+    if m_end < 0 {
+      break
+    }
+    let mv = drv_parse_double_simple(m_str, 0.0)
+    medians.set(bname, mv)
+    order.push(bname)
+    cur = m_end
+  }
+  Ok(DrvBenchSaved::{
+    target: target,
+    cpu_count: cpu_count,
+    pionc_id: pionc_id,
+    medians: medians,
+    order: order,
+  })
+}
+
+///|
+fn drv_bench_help_text() -> String {
+  "usage:\n" +
+  "  pionc bench [--json] [--package|-p <name>] [--filter <substr>] [--target <t>]\n" +
+  "              [--iters <N>] [--samples <K>] [--warmup-ms <ms>] [--time-ms <ms>]\n" +
+  "              [--save <path>] [--compare <base.json>]\n" +
+  "              [--profile[=cpu|alloc|rc|all]] [--profile-out <path>] [--sample-rate <N>] [--retained]\n" +
+  "              [path]\n" +
+  "\nexamples:\n" +
+  "  pionc bench --json --save base.json\n" +
+  "  pionc bench --json --compare base.json\n" +
+  "  pionc bench --profile=alloc --iters 100 --json"
+}
+
+///|
+fn drv_run_bench_cmd(world : World, args : Array[String]) -> Int {
+  let mut as_json = false
+  let mut ji = 2
+  while ji < args.length() {
+    if args[ji] == "--json" {
+      as_json = true
+    }
+    ji = ji + 1
+  }
+  let mut only_pkg = ""
+  let mut filter = ""
+  let mut target_override = ""
+  let mut iters_opt : Int64 = 0L
+  let mut samples = 7
+  let mut warmup_ms = -1
+  let mut time_ms = 500
+  let mut save_path = ""
+  let mut compare_path = ""
+  let mut prof_mask = 0
+  let mut profile_out = ""
+  let mut sample_rate = 0
+  let mut prof_hz = 997
+  let mut retained = false
+  let mut locked = false
+  let mut offline = false
+  let mut jobs = drv_default_jobs(world)
+  let libs : Array[String] = []
+  let strip_seen : Array[String] = []
+  let targets : Array[String] = []
+  let mut i = 2
+  while i < args.length() {
+    let a = args[i]
+    let nl = drv_parse_link_flag(args, i, libs)
+    if nl > 0 {
+      i = i + nl
+      continue
+    }
+    if a == "--help" || a == "-h" {
+      io_println(world, drv_bench_help_text())
+      return 0
+    } else if a == "--json" {
+      as_json = true
+    } else if a == "--locked" {
+      locked = true
+    } else if a == "--offline" {
+      offline = true
+    } else if a == "--retained" {
+      retained = true
+    } else if a == "--profile" {
+      prof_mask = 3
+    } else if drv_starts_with(a, "--profile=") {
+      match drv_parse_profile_mask(slice_str(a, 10, a.length())) {
+        Ok(m) => prof_mask = m
+        Err(msg) => return drv_cmd_fail(world, as_json, msg)
+      }
+    } else if a == "--profile-out" && i + 1 < args.length() {
+      profile_out = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--profile-out=") {
+      profile_out = slice_str(a, 14, a.length())
+    } else if a == "--sample-rate" && i + 1 < args.length() {
+      sample_rate = drv_parse_pos_int(args[i + 1], 1)
+      i = i + 1
+    } else if drv_starts_with(a, "--sample-rate=") {
+      sample_rate = drv_parse_pos_int(slice_str(a, 14, a.length()), 1)
+    } else if a == "--profile-hz" && i + 1 < args.length() {
+      prof_hz = drv_parse_pos_int(args[i + 1], 997)
+      i = i + 1
+    } else if drv_starts_with(a, "--profile-hz=") {
+      prof_hz = drv_parse_pos_int(slice_str(a, 13, a.length()), 997)
+    } else if drv_is_strip_flag(a) {
+      strip_seen.push(a)
+    } else if (a == "--package" || a == "-p") && i + 1 < args.length() {
+      only_pkg = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--package=") {
+      only_pkg = slice_str(a, 10, a.length())
+    } else if a == "--filter" && i + 1 < args.length() {
+      filter = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--filter=") {
+      filter = slice_str(a, 9, a.length())
+    } else if a == "--target" && i + 1 < args.length() {
+      target_override = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--target=") {
+      target_override = slice_str(a, 9, a.length())
+    } else if a == "--iters" && i + 1 < args.length() {
+      iters_opt = drv_parse_pos_int64(args[i + 1], 1L)
+      i = i + 1
+    } else if drv_starts_with(a, "--iters=") {
+      iters_opt = drv_parse_pos_int64(slice_str(a, 8, a.length()), 1L)
+    } else if a == "--samples" && i + 1 < args.length() {
+      samples = drv_parse_pos_int(args[i + 1], 7)
+      i = i + 1
+    } else if drv_starts_with(a, "--samples=") {
+      samples = drv_parse_pos_int(slice_str(a, 10, a.length()), 7)
+    } else if a == "--warmup-ms" && i + 1 < args.length() {
+      warmup_ms = drv_parse_nonneg_int64(args[i + 1], 0L).to_int()
+      i = i + 1
+    } else if drv_starts_with(a, "--warmup-ms=") {
+      warmup_ms = drv_parse_nonneg_int64(slice_str(a, 12, a.length()), 0L).to_int()
+    } else if a == "--time-ms" && i + 1 < args.length() {
+      time_ms = drv_parse_pos_int(args[i + 1], 500)
+      i = i + 1
+    } else if drv_starts_with(a, "--time-ms=") {
+      time_ms = drv_parse_pos_int(slice_str(a, 10, a.length()), 500)
+    } else if a == "--save" && i + 1 < args.length() {
+      save_path = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--save=") {
+      save_path = slice_str(a, 7, a.length())
+    } else if a == "--compare" && i + 1 < args.length() {
+      compare_path = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--compare=") {
+      compare_path = slice_str(a, 10, a.length())
+    } else if a == "--jobs" && i + 1 < args.length() {
+      jobs = drv_parse_pos_int(args[i + 1], jobs)
+      i = i + 1
+    } else if drv_starts_with(a, "--jobs=") {
+      jobs = drv_parse_pos_int(slice_str(a, 7, a.length()), jobs)
+    } else if drv_starts_with(a, "-") {
+      return drv_cmd_fail(world, as_json, "unknown option for `pionc bench`: " + a)
+    } else {
+      targets.push(a)
+    }
+    i = i + 1
+  }
+  if targets.length() == 0 {
+    if drv_has_default_project(world) {
+      targets.push(".")
+    } else {
+      return drv_cmd_fail(world, as_json, "no target specified and no pion.toml in current directory")
+    }
+  }
+  if target_override != "" && !drv_target_is_valid(target_override) {
+    return drv_cmd_fail(world, as_json, "unsupported --target `" + target_override + "`")
+  }
+  let qbe_target = if target_override != "" {
+    target_override
+  } else {
+    drv_resolve_qbe_target(world)
+  }
+  if prof_mask != 0 {
+    match drv_validate_profile_target(qbe_target, prof_mask) {
+      Err(e) => return drv_cmd_fail_code(world, as_json, "E_PROFILE_UNSUPPORTED_TARGET", e)
+      Ok(_) => ()
+    }
+    match drv_check_profile_strip_flags(world, strip_seen, prof_mask) {
+      Err(e) => return drv_cmd_fail_code(world, as_json, "E_PROFILE_STRIPPED", e)
+      Ok(_) => ()
+    }
+  }
+  let is_wasm = drv_target_is_wasm(qbe_target)
+  let no_inline_rc = (prof_mask & 4) != 0
+  let cache_dir = drv_resolve_cache_dir(world)
+  let bb_dir = cache_dir + "/benchbin"
+  let _ = fs_mkdir_p(world, bb_dir)
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let _ = fs_mkdir_p(world, cache_dir + "/ssa")
+  let pin = drv_cas_pin_open(world, cache_dir)
+
+  // Resolve target path (workspace package or single file/dir)
+  let mut target_arg = targets[0]
+  let mut is_ws = false
+  let mut ws_root = ""
+  match drv_detect_manifest_dir(world, target_arg) {
+    Some(root_dir) =>
+      match drv_resolve_build_pkg_dir(world, root_dir, only_pkg, qbe_target) {
+        Err(msg) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, msg)
+        }
+        Ok(pkg_dir) => {
+          target_arg = pkg_dir
+          is_ws = true
+          ws_root = pkg_dir
+        }
+      }
+    None =>
+      if only_pkg.length() > 0 {
+        drv_cas_pin_close(world, pin)
+        return drv_cmd_fail(world, as_json, "--package needs a pion.toml workspace")
+      }
+  }
+
+  let mut bench_bin_path = ""
+  let mut bench_syms_path = ""
+  let j2_mask = drv_j2_disable_mask(world)
+  let file_hash_memo : Map[String, String] = Map([])
+
+  if is_wasm {
+    let wopt_bin = match drv_resolve_wasm_opt(world) {
+      Ok(p) => p
+      Err(_) => ""
+    }
+    let wopt_tag = drv_wasm_opt_cas_tag(world, wopt_bin)
+    let pkg_ssas : Array[String] = []
+    let mut bench_res = qbe_bench_emit_empty()
+    let mut pkg_name = "bench"
+    if is_ws {
+      let ws = match drv_load_workspace_opts_target(world, ws_root, locked, offline, "", "wasm32") {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(v) => v
+      }
+      let nodes = ws.nodes
+      let names : Array[String] = []
+      let dep_lists : Array[Array[String]] = []
+      let mut ni = 0
+      while ni < nodes.length() {
+        names.push(nodes[ni].name)
+        dep_lists.push(nodes[ni].deps)
+        ni = ni + 1
+      }
+      let topo = topo_sort_packages(names, dep_lists)
+      if topo.diagnostics.length() > 0 {
+        drv_cas_pin_close(world, pin)
+        return drv_cmd_fail(world, as_json, check_result_to_json(topo.diagnostics))
+      }
+      let n = topo.order.length()
+      let trans = drv_trans_deps(nodes, topo.order)
+      let loaded_imported : Array[Option[ImportedPkg]] = []
+      let mut k = 0
+      while k < n {
+        loaded_imported.push(None)
+        k = k + 1
+      }
+      k = 0
+      while k < n {
+        let node = nodes[topo.order[k]]
+        let k_imports : Array[ImportedPkg] = []
+        let deps_t = trans.topo[k]
+        let mut di = 0
+        while di < deps_t.length() {
+          match loaded_imported[deps_t[di]] {
+            Some(ip) => k_imports.push(ip)
+            None => ()
+          }
+          di = di + 1
+        }
+        let cr = check_source_files_with_imports_mapped(
+          node.name,
+          node.paths,
+          node.sources,
+          k_imports,
+          node.dep_aliases,
+          node.deps,
+          true,
+          false,
+        )
+        if cr.diagnostics.length() > 0 {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, check_result_to_json(cr.diagnostics))
+        }
+        loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
+        if k < n - 1 {
+          let r = emit_qbe_package_multi_entry_target_opts(
+            cr.pkg,
+            cr.tc,
+            true,
+            false,
+            trans.topo_names[k],
+            true,
+            "wasm32",
+            "main",
+            false,
+            j2_mask,
+          )
+          let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
+          pkg_ssas.push(wasm_namespace_local_ssa(r.ssa, ns_prefix))
+        } else {
+          pkg_name = node.name
+          bench_res = emit_qbe_benches_target(
+            cr.pkg,
+            cr.tc,
+            trans.topo_names[k],
+            "wasm32",
+            true,
+            prof_mask != 0,
+            false,
+          )
+          let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
+          pkg_ssas.push(wasm_namespace_local_ssa(bench_res.ssa, ns_prefix))
+        }
+        k = k + 1
+      }
+    } else {
+      let loaded = match drv_load_targets(world, targets) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(v) => v
+      }
+      pkg_name = loaded.pkg_name
+      let checked = check_source_files_full(loaded.pkg_name, loaded.paths, loaded.sources)
+      if checked.diagnostics.length() > 0 {
+        drv_cas_pin_close(world, pin)
+        return drv_cmd_fail(world, as_json, check_result_to_json(checked.diagnostics))
+      }
+      bench_res = emit_qbe_benches_target(
+        checked.pkg,
+        checked.tc,
+        [],
+        "wasm32",
+        true,
+        prof_mask != 0,
+        false,
+      )
+      pkg_ssas.push(bench_res.ssa)
+    }
+    let key_sb = StringBuilder()
+    key_sb.write_string("benchwasm_v1|prof:")
+    key_sb.write_string(prof_mask.to_string())
+    key_sb.write_string("|")
+    key_sb.write_string(wopt_tag)
+    let mut si = 0
+    while si < pkg_ssas.length() {
+      key_sb.write_string("|")
+      key_sb.write_string(sha256_hex(pkg_ssas[si]))
+      si = si + 1
+    }
+    let wkey = drv_prefix16(sha256_hex(key_sb.to_string()))
+    let cached_wasm = bb_dir + "/" + pkg_name + "_" + wkey + ".wasm"
+    if !drv_is_nonempty_regular_file(world, cached_wasm) {
+      let eff_names = prof_mask != 0
+      let wasm_bytes = emit_wasm_from_ssa_units_prof(
+        pkg_ssas,
+        eff_names,
+        prof_mask,
+        fn(_s : String) -> Unit { () },
+      )
+      match drv_write_wasm_out(world, cached_wasm, wasm_bytes, wopt_bin, eff_names, true) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(_) => ()
+      }
+    }
+    bench_bin_path = cached_wasm
+  } else {
+    // Native bench compilation
+    let qbe_bin = drv_resolve_qbe_bin(world)
+    let rt_lib = if prof_mask != 0 {
+      match drv_resolve_prof_rt_lib_pinned(world, qbe_target, "", false, pin) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(p) => p
+      }
+    } else {
+      match drv_resolve_rt_lib_for_pinned(world, qbe_target, "", false, pin) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(p) => p
+      }
+    }
+    let rt_hash = match drv_sha256_file(rt_lib, file_hash_memo) {
+      Some(h) => h
+      None => "missing:" + rt_lib
+    }
+    let apple_tools = drv_probe_apple_tools(world, qbe_target)
+    let direct_obj = drv_direct_obj_target(world, qbe_target)
+    let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 { apple_tools.macos_ver } else { "15.0" }
+    let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+
+    let mut dep_objs : Array[String] = []
+    let mut dep_syms : Array[String] = []
+    let mut link_opts = drv_link_opts_from_libs(libs)
+    let mut dep_key = ""
+    let mut pkg_name = "bench"
+    let mut bench_res = qbe_bench_emit_empty()
+
+    if is_ws {
+      let built = match drv_build_workspace_objects_entry(
+        world,
+        ws_root,
+        true,
+        false,
+        jobs,
+        qbe_target,
+        "",
+        false,
+        false,
+        "main",
+        false,
+        locked,
+        offline,
+        pin,
+        no_inline_rc,
+        prof_mask != 0,
+      ) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(v) => v
+      }
+      dep_objs = built.obj_paths
+      dep_syms = built.syms_paths
+      dep_key = built.link_key
+      link_opts = built.link_opts
+      let mut li = 0
+      while li < libs.length() {
+        push_unique_lib(link_opts.libs, libs[li])
+        if drv_is_cxx_lib(libs[li]) {
+          link_opts.has_cxx = true
+        }
+        li = li + 1
+      }
+      if prof_mask != 0 {
+        match drv_check_profile_strip_flags(world, link_opts.flags, prof_mask) {
+          Err(e) => {
+            drv_cas_pin_close(world, pin)
+            return drv_cmd_fail_code(world, as_json, "E_PROFILE_STRIPPED", e)
+          }
+          Ok(_) => ()
+        }
+      }
+      pkg_name = built.root_pkg_name
+      match built.root_checked {
+        Some(cr) =>
+          bench_res = emit_qbe_benches_target(
+            cr.pkg,
+            cr.tc,
+            built.dep_pkg_names,
+            qbe_target,
+            true,
+            prof_mask != 0,
+            prof_mask != 0,
+          )
+        None => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, "failed to type-check root package for bench")
+        }
+      }
+    } else {
+      let loaded = match drv_load_targets(world, targets) {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(v) => v
+      }
+      pkg_name = loaded.pkg_name
+      let checked = check_source_files_full(loaded.pkg_name, loaded.paths, loaded.sources)
+      if checked.diagnostics.length() > 0 {
+        drv_cas_pin_close(world, pin)
+        return drv_cmd_fail(world, as_json, check_result_to_json(checked.diagnostics))
+      }
+      bench_res = emit_qbe_benches_target(
+        checked.pkg,
+        checked.tc,
+        [],
+        qbe_target,
+        true,
+        prof_mask != 0,
+        prof_mask != 0,
+      )
+    }
+
+    let base_final_ssa = if !no_inline_rc {
+      inline_native_rc_ssa_opts(bench_res.ssa, j2_mask)
+    } else {
+      drv_cleanup_ssa(world, bench_res.ssa, j2_mask, jobs)
+    }
+    let final_ssa = if prof_mask != 0 {
+      let bm = if (prof_mask & 4) != 0 { 7 } else { 3 }
+      base_final_ssa + "\nexport data $pion_prof_build_modes = align 4 { w " + bm.to_string() + " }\n"
+    } else {
+      base_final_ssa
+    }
+    let ssa_hash = sha256_hex(final_ssa)
+    let bkey = drv_prefix16(
+      sha256_hex(
+        "benchbin_v1|" +
+        qbe_target +
+        "|prof:" +
+        prof_mask.to_string() +
+        "|rt:" +
+        rt_hash +
+        "|link:" +
+        drv_join_char(link_opts.flags, ",") +
+        "|" +
+        drv_join_char(link_opts.libs, ",") +
+        "|dep:" +
+        dep_key +
+        "|ssa:" +
+        ssa_hash,
+      ),
+    )
+    let bin_name = drv_linked_exe_path(qbe_target, pkg_name + "_" + bkey)
+    let cached_bin = bb_dir + "/" + bin_name
+    let obj_path = bb_dir + "/" + pkg_name + "_" + bkey + ".o"
+    if !drv_is_nonempty_regular_file(world, cached_bin) {
+      let stamp = drv_tmp_tag(world, cached_bin)
+      let ssa_tmp = bb_dir + "/" + pkg_name + "_" + bkey + ".ssa." + stamp
+      if !drv_write_text_atomic(world, ssa_tmp, final_ssa) {
+        drv_cas_pin_close(world, pin)
+        return drv_cmd_fail(world, as_json, "failed to write bench ssa: " + ssa_tmp)
+      }
+      let built_res = drv_build_test_bin(
+        world,
+        apple_tools,
+        qbe_bin,
+        qbe_target,
+        direct_obj,
+        qbe_macos_ver,
+        cc1as_triple,
+        rt_lib,
+        ssa_tmp,
+        obj_path,
+        cached_bin,
+        true,
+        link_opts,
+        dep_objs,
+        stamp,
+        as_json,
+      )
+      let _ = fs_remove(world, ssa_tmp)
+      match built_res {
+        Err(e) => {
+          drv_cas_pin_close(world, pin)
+          return drv_cmd_fail(world, as_json, e)
+        }
+        Ok(_) => ()
+      }
+    }
+    bench_bin_path = cached_bin
+    if prof_mask != 0 {
+      let root_syms_p = cached_bin + ".root.syms"
+      if bench_res.syms_sidecar.length() > 0 {
+        let _ = drv_write_text_atomic(world, root_syms_p, bench_res.syms_sidecar)
+      }
+      let all_syms : Array[String] = []
+      let mut dsi = 0
+      while dsi < dep_syms.length() {
+        all_syms.push(dep_syms[dsi])
+        dsi = dsi + 1
+      }
+      if bench_res.syms_sidecar.length() > 0 {
+        all_syms.push(root_syms_p)
+      }
+      drv_write_merged_syms_sidecar(world, cached_bin, all_syms)
+      bench_syms_path = cached_bin + ".syms"
+    }
+  }
+  drv_cas_pin_close(world, pin)
+
+  // Discover benches via `--list`
+  let rt_mjs = if is_wasm { drv_resolve_wasm_rt(world) } else { "" }
+  let list_argv : Array[String] = if is_wasm {
+    ["node", rt_mjs, bench_bin_path, "--list"]
+  } else {
+    [bench_bin_path, "--list"]
+  }
+  let list_out = match proc_exec_capture(world, list_argv) {
+    Err(e) => return drv_cmd_fail(world, as_json, "failed to list benchmarks: " + e)
+    Ok(s) => s
+  }
+  let matched : Array[DrvBenchEntry] = []
+  let list_lines = drv_split_lines(list_out)
+  let mut li = 0
+  while li < list_lines.length() {
+    let line = drv_prof_trim(list_lines[li])
+    let tab = drv_msg_tab(line)
+    if tab > 0 {
+      let bidx = drv_parse_nonneg_int64(slice_str(line, 0, tab), -1L).to_int()
+      let bname = slice_str(line, tab + 1, line.length())
+      if bidx >= 0 && (filter.length() == 0 || drv_find_substr(bname, filter, 0) >= 0) {
+        matched.push(DrvBenchEntry::{ idx: bidx, name: bname })
+      }
+    }
+    li = li + 1
+  }
+
+  let cpu_count = c_cli_cpu_count()
+  let pionc_id = drv_self_image_id()
+
+  if matched.length() == 0 {
+    if as_json {
+      io_println(world, drv_bench_json_str(qbe_target, cpu_count, pionc_id, []))
+    } else {
+      io_println(world, "no benchmarks matched")
+    }
+    return 0
+  }
+
+  // Profiled bench mode: run with `--prof-win` so only `bench_loop` is measured!
+  if prof_mask != 0 {
+    let mut picked = matched[0]
+    if matched.length() > 1 {
+      let exact : Array[DrvBenchEntry] = []
+      if filter.length() > 0 {
+        let mut ei = 0
+        while ei < matched.length() {
+          if matched[ei].name == filter {
+            exact.push(matched[ei])
+          }
+          ei = ei + 1
+        }
+      }
+      if exact.length() == 1 {
+        picked = exact[0]
+      } else {
+        return drv_cmd_fail(
+          world,
+          as_json,
+          "bench --profile requires a single matched benchmark (matched " +
+            matched.length().to_string() +
+            "); pass --filter <pattern> to select one",
+        )
+      }
+    }
+    let entry = picked
+    let run_iters = if iters_opt > 0L { iters_opt } else { 100L }
+    return drv_run_profiled_exec(
+      world,
+      bench_bin_path,
+      qbe_target,
+      ["--run", entry.idx.to_string(), run_iters.to_string(), "--prof-win"],
+      prof_mask,
+      sample_rate,
+      prof_hz,
+      retained,
+      profile_out,
+      as_json,
+      bench_syms_path,
+      20,
+      "self",
+      true,
+    )
+  }
+
+  // Clean timing mode
+  let eff_warmup_ms = if warmup_ms >= 0 {
+    warmup_ms
+  } else if iters_opt > 0L {
+    0
+  } else {
+    50
+  }
+  let target_batch_us : Int64 = {
+    let raw_t = (time_ms.to_int64() * 1000L) / samples.to_int64()
+    if raw_t < 10000L { 10000L } else { raw_t }
+  }
+  let results : Array[DrvBenchResult] = []
+  let mut bi = 0
+  while bi < matched.length() {
+    let entry = matched[bi]
+    let mut iters : Int64 = iters_opt
+    if iters <= 0L {
+      iters = 1L
+      let mut cal_round = 0
+      while cal_round < 16 {
+        let us = match drv_bench_exec_once(world, bench_bin_path, is_wasm, rt_mjs, entry.idx, iters) {
+          Err(e) => return drv_cmd_fail(world, as_json, e)
+          Ok(v) => v
+        }
+        if us >= target_batch_us || iters >= 1000000000L {
+          break
+        }
+        let next_iters = if us <= 0L {
+          iters * 10L
+        } else {
+          let mut mult = (target_batch_us / us) + 1L
+          if mult < 2L {
+            mult = 2L
+          }
+          if mult > 10L {
+            mult = 10L
+          }
+          iters * mult
+        }
+        iters = if next_iters > 1000000000L { 1000000000L } else { next_iters }
+        cal_round = cal_round + 1
+      }
+    }
+    if eff_warmup_ms > 0 {
+      let w0 = clock_now_ms(world)
+      let mut wi = 0
+      while wi < 16 && (clock_now_ms(world) - w0) < eff_warmup_ms.to_int64() {
+        let _ = drv_bench_exec_once(world, bench_bin_path, is_wasm, rt_mjs, entry.idx, iters)
+        wi = wi + 1
+      }
+    }
+    let samples_us : Array[Int64] = []
+    let per_iter_ns : Array[Double] = []
+    let mut si = 0
+    while si < samples {
+      let us = match drv_bench_exec_once(world, bench_bin_path, is_wasm, rt_mjs, entry.idx, iters) {
+        Err(e) => return drv_cmd_fail(world, as_json, e)
+        Ok(v) => v
+      }
+      samples_us.push(us)
+      per_iter_ns.push((us.to_double() * 1000.0) / iters.to_double())
+      si = si + 1
+    }
+    let sorted = drv_bench_sort_doubles(per_iter_ns)
+    let k = sorted.length()
+    let min_ns = sorted[0]
+    let max_ns = sorted[k - 1]
+    let median_ns = drv_bench_median(sorted)
+    let p95_idx = ((k - 1) * 95 + 50) / 100
+    let p95_ns = sorted[if p95_idx < k { p95_idx } else { k - 1 }]
+    let abs_devs : Array[Double] = []
+    let mut sum_ns = 0.0
+    si = 0
+    while si < k {
+      let d = sorted[si] - median_ns
+      abs_devs.push(if d < 0.0 { -d } else { d })
+      sum_ns = sum_ns + sorted[si]
+      si = si + 1
+    }
+    let mad_ns = drv_bench_median(drv_bench_sort_doubles(abs_devs))
+    let mean_ns = sum_ns / k.to_double()
+    let mut var_sum = 0.0
+    si = 0
+    while si < k {
+      let d = sorted[si] - mean_ns
+      var_sum = var_sum + d * d
+      si = si + 1
+    }
+    let stddev_ns = drv_bench_sqrt(var_sum / k.to_double())
+    let cv_pct = if mean_ns > 0.0 { (stddev_ns / mean_ns) * 100.0 } else { 0.0 }
+    let ops_per_sec = if median_ns > 0.0 { 1000000000.0 / median_ns } else { 0.0 }
+    results.push(DrvBenchResult::{
+      name: entry.name,
+      iters: iters,
+      samples: samples,
+      median_ns: median_ns,
+      min_ns: min_ns,
+      max_ns: max_ns,
+      p95_ns: p95_ns,
+      mad_ns: mad_ns,
+      cv_pct: cv_pct,
+      ops_per_sec: ops_per_sec,
+      samples_us: samples_us,
+    })
+    bi = bi + 1
+  }
+
+  let report_json = drv_bench_json_str(qbe_target, cpu_count, pionc_id, results)
+  if save_path.length() > 0 {
+    drv_ensure_parent_dir(world, save_path)
+    if !drv_write_text_atomic(world, save_path, report_json + "\n") {
+      return drv_cmd_fail(world, as_json, "failed to write --save file: " + save_path)
+    }
+  }
+
+  if compare_path.length() > 0 {
+    let base_txt = match fs_read(world, compare_path) {
+      Err(e) => return drv_cmd_fail(world, as_json, "failed to read --compare file `" + compare_path + "`: " + e)
+      Ok(t) => t
+    }
+    let base = match drv_bench_parse_saved_json(base_txt) {
+      Err(e) => return drv_cmd_fail(world, as_json, e)
+      Ok(b) => b
+    }
+    let incomparable = base.target != qbe_target || base.cpu_count != cpu_count || base.pionc_id != pionc_id
+    let cur_map : Map[String, DrvBenchResult] = Map([])
+    let mut ri = 0
+    while ri < results.length() {
+      cur_map.set(results[ri].name, results[ri])
+      ri = ri + 1
+    }
+    let sb = StringBuilder()
+    if as_json {
+      sb.write_string("{\"schema_version\":1,\"incomparable\":")
+      sb.write_string(if incomparable { "true" } else { "false" })
+      sb.write_string(",\"machine_fp\":{\"target\":")
+      sb.write_string(json_quote(qbe_target))
+      sb.write_string(",\"cpu_count\":")
+      sb.write_string(cpu_count.to_string())
+      sb.write_string(",\"pionc_id\":")
+      sb.write_string(json_quote(pionc_id))
+      sb.write_string("},\"comparisons\":[")
+      let mut first_c = true
+      ri = 0
+      while ri < results.length() {
+        let r = results[ri]
+        if !first_c {
+          sb.write_char(',')
+        }
+        first_c = false
+        match base.medians.get(r.name) {
+          Some(bm) => {
+            let delta = r.median_ns - bm
+            let delta_pct = if bm > 0.0 { (delta / bm) * 100.0 } else { 0.0 }
+            let status = if delta_pct <= -3.0 {
+              "improved"
+            } else if delta_pct >= 3.0 {
+              "regressed"
+            } else {
+              "noise"
+            }
+            sb.write_string("{\"name\":")
+            sb.write_string(json_quote(r.name))
+            sb.write_string(",\"status\":")
+            sb.write_string(json_quote(status))
+            sb.write_string(",\"base_median_ns\":")
+            sb.write_string(bm.to_string())
+            sb.write_string(",\"patched_median_ns\":")
+            sb.write_string(r.median_ns.to_string())
+            sb.write_string(",\"delta_ns\":")
+            sb.write_string(delta.to_string())
+            sb.write_string(",\"delta_pct\":")
+            sb.write_string(delta_pct.to_string())
+            sb.write_string("}")
+          }
+          None => {
+            sb.write_string("{\"name\":")
+            sb.write_string(json_quote(r.name))
+            sb.write_string(",\"status\":\"added\",\"base_median_ns\":null,\"patched_median_ns\":")
+            sb.write_string(r.median_ns.to_string())
+            sb.write_string(",\"delta_ns\":null,\"delta_pct\":null}")
+          }
+        }
+        ri = ri + 1
+      }
+      let mut oi = 0
+      while oi < base.order.length() {
+        let bname = base.order[oi]
+        match cur_map.get(bname) {
+          Some(_) => ()
+          None => {
+            if !first_c {
+              sb.write_char(',')
+            }
+            first_c = false
+            let bm = match base.medians.get(bname) {
+              Some(v) => v
+              None => 0.0
+            }
+            sb.write_string("{\"name\":")
+            sb.write_string(json_quote(bname))
+            sb.write_string(",\"status\":\"removed\",\"base_median_ns\":")
+            sb.write_string(bm.to_string())
+            sb.write_string(",\"patched_median_ns\":null,\"delta_ns\":null,\"delta_pct\":null}")
+          }
+        }
+        oi = oi + 1
+      }
+      sb.write_string("]}")
+      io_println(world, sb.to_string())
+    } else {
+      if incomparable {
+        sb.write_string("WARNING: machine_fp mismatch (incomparable)\n")
+      }
+      ri = 0
+      while ri < results.length() {
+        let r = results[ri]
+        match base.medians.get(r.name) {
+          Some(bm) => {
+            let delta = r.median_ns - bm
+            let delta_pct = if bm > 0.0 { (delta / bm) * 100.0 } else { 0.0 }
+            let status = if delta_pct <= -3.0 {
+              "improved"
+            } else if delta_pct >= 3.0 {
+              "regressed"
+            } else {
+              "noise"
+            }
+            sb.write_string(r.name + ": " + bm.to_string() + " ns -> " + r.median_ns.to_string() + " ns (" + delta_pct.to_string() + "%, " + status + ")\n")
+          }
+          None =>
+            sb.write_string(r.name + ": added (" + r.median_ns.to_string() + " ns)\n")
+        }
+        ri = ri + 1
+      }
+      let mut oi = 0
+      while oi < base.order.length() {
+        let bname = base.order[oi]
+        match cur_map.get(bname) {
+          Some(_) => ()
+          None => sb.write_string(bname + ": removed\n")
+        }
+        oi = oi + 1
+      }
+      io_print(world, sb.to_string())
+    }
+    return 0
+  }
+
+  if as_json {
+    io_println(world, report_json)
+  } else {
+    let mut ri = 0
+    while ri < results.length() {
+      let r = results[ri]
+      io_println(
+        world,
+        r.name +
+        ": median=" +
+        r.median_ns.to_string() +
+        " ns  min=" +
+        r.min_ns.to_string() +
+        " ns  p95=" +
+        r.p95_ns.to_string() +
+        " ns  cv=" +
+        r.cv_pct.to_string() +
+        "%  iters=" +
+        r.iters.to_string(),
+      )
+      ri = ri + 1
+    }
+  }
+  0
 }

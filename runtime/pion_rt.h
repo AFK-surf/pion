@@ -303,6 +303,8 @@ char    *pion_cli_lpath_identity(const char *path);
 int32_t  pion_cli_lpath_is_coarse(const char *path);
 int32_t  pion_cli_is_native_exe(const char *path);
 int32_t  pion_cli_is_exec_file(const char *path);
+int32_t  pion_cli_setenv(const char *name, const char *val);
+int32_t  pion_cli_unsetenv(const char *name);
 char    *pion_fs_readlink(const char *path);
 void*    pion_world_fs_list_dir(void *w, void *path_str);
 int32_t  pion_world_fs_remove(void *w, void *path_str);
@@ -370,6 +372,13 @@ void     pion_simd_i8_mv(void *out, int32_t out_off, void *w, int32_t w_is_bytes
                          float x_scale, int32_t rows, int32_t cols);
 float    pion_simd_f32(int32_t op, void *dst, int32_t d_off, void *a, int32_t a_off,
                        void *b, int32_t b_off, float alpha, int32_t len);
+
+#ifdef PION_PROF
+#include "pion_prof.h"
+#define PION_PROF_PANIC_FLUSH() pion_prof_flush()
+#else
+#define PION_PROF_PANIC_FLUSH() ((void)0)
+#endif
 
 #ifdef __cplusplus
 }

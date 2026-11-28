@@ -549,6 +549,12 @@ pub struct Env {
   mut closure_scope_floor : Int
   /// Active enclosing loop depth inside the current function/closure (0 outside loops).
   mut in_loop_depth : Int
+  /// True only for a direct top-level statement of a `bench` block.
+  mut in_bench_top : Bool
+  /// Number of `bench_loop` statements seen in the current `bench` block.
+  mut bench_loop_count : Int
+  /// True while checking the body of a `bench_loop` (cleared inside closures).
+  mut in_bench_loop : Bool
   /// Return type inferred from `return expr` statements inside an unannotated closure.
   mut inferred_ret : Option[Ty]
   /// True while checking a callee's default parameter expression (allows transitive/package-private symbols).
@@ -857,6 +863,9 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     fn_has_params: false,
     closure_scope_floor: 0,
     in_loop_depth: 0,
+    in_bench_top: false,
+    bench_loop_count: 0,
+    in_bench_loop: false,
     inferred_ret: None,
     in_default_arg: false,
     in_default_expr: false,
@@ -1926,6 +1935,11 @@ fn qualify_imported_stmts(
         let qc = qualify_imported_cond(ipkg, c, wb, tparams)
         let qbody = qualify_imported_stmts(ipkg, body, wb, tparams)
         out.push(SWhile(qc, qbody, sp))
+      }
+      SBenchLoop(body, sp) => {
+        let wb = str_arr_clone(lb)
+        let qbody = qualify_imported_stmts(ipkg, body, wb, tparams)
+        out.push(SBenchLoop(qbody, sp))
       }
       SFor(init, c, step, body, sp) => {
         let fb = str_arr_clone(lb)
@@ -7909,6 +7923,10 @@ fn collect_stmts_captures(
         collect_cond_captures_with_is(cond, body_locals, out)
         collect_stmts_captures(body, body_locals, out)
       }
+      SBenchLoop(body, _) => {
+        let body_locals = locals.copy()
+        collect_stmts_captures(body, body_locals, out)
+      }
       SFor(init_s, cond, step_s, body, _) => {
         collect_stmts_captures([init_s], locals, out)
         collect_expr_captures(cond, locals, out)
@@ -9292,8 +9310,11 @@ fn check_stmts_ex(
   tail_used : Bool,
 ) -> Ty {
   if stmts.length() == 0 {
+    env.in_bench_top = false
     return TUnit
   }
+  let is_bench_top_list = env.in_bench_top
+  env.in_bench_top = false
   let mut i = 0
   let mut last_ty = TUnit
   let pending_keys : Array[String] = []
@@ -9304,6 +9325,7 @@ fn check_stmts_ex(
     match stmts[i] {
       SLet(name, is_mut, TyMissing(tsp), init, sp) =>
         if name != "_" {
+          env.in_bench_top = false
           let hint = infer_let_hint(tc, env, stmts, i, name, expected, tail_used)
           last_ty = check_let(tc, env, name, is_mut, TyMissing(tsp), init, sp, hint)
           if tc.infer_pending.contains(span_key(sp)) {
@@ -9311,9 +9333,13 @@ fn check_stmts_ex(
             pending_lets.push(stmts[i])
           }
         } else {
+          env.in_bench_top = is_bench_top_list
           last_ty = check_stmt(tc, env, stmts[i], exp)
         }
-      _ => last_ty = check_stmt(tc, env, stmts[i], exp)
+      _ => {
+        env.in_bench_top = is_bench_top_list
+        last_ty = check_stmt(tc, env, stmts[i], exp)
+      }
     }
     if !is_last || !tail_used {
       check_unhandled_result(tc, stmts[i], last_ty)
@@ -10264,6 +10290,11 @@ fn infer_stmts_return_hint(
           None => ()
         }
       }
+      SBenchLoop(body, _) =>
+        match infer_stmts_return_hint(tc, body, 0, name, ret_ty) {
+          Some(h) => return Some(h)
+          None => ()
+        }
       SWhile(c, body, _) => {
         match infer_expr_return_hint(tc, c, name, ret_ty) {
           Some(h) => return Some(h)
@@ -11521,6 +11552,8 @@ fn stmt_has_reachable_break(
       expr_has_reachable_break(tc, env, cond, target_depth + 1) ||
       (!expr_diverge(tc, env, cond, 0, true) &&
         stmts_has_reachable_break(tc, env, body, target_depth + 1))
+    SBenchLoop(body, _) =>
+      stmts_has_reachable_break(tc, env, body, target_depth + 1)
     SFor(init_s, cond, step_s, body, _) =>
       stmt_has_reachable_break(tc, env, init_s, target_depth) ||
       (!stmt_diverge(tc, env, init_s, 0, true) &&
@@ -11596,6 +11629,7 @@ fn stmt_diverge(
         _ => false
       }
     }
+    SBenchLoop(_, _) => false
     SFor(init_s, cond, _, _, _) =>
       stmt_diverge(tc, env, init_s, loop_depth, allow_return) ||
       expr_diverge(tc, env, cond, loop_depth, allow_return)
@@ -11631,6 +11665,8 @@ fn check_stmt(
   stmt : Stmt,
   expected : Option[Ty],
 ) -> Ty {
+  let is_direct_bench_stmt = env.in_bench_top
+  env.in_bench_top = false
   match stmt {
     SLet(name, is_mut, ty_expr, init, sp) =>
       check_let(tc, env, name, is_mut, ty_expr, init, sp, None)
@@ -12361,6 +12397,40 @@ fn check_stmt(
       env_pop(env)
       TUnit
     }
+    SBenchLoop(body, sp) => {
+      if !is_direct_bench_stmt {
+        tc_err(
+          tc,
+          sp,
+          "E_BENCH_LOOP_CONTEXT",
+          "`bench_loop` is only allowed as a direct statement inside a `bench` block",
+          "statement inside `bench \"name\" { ... }`",
+          "`bench_loop`",
+          "move `bench_loop { ... }` directly into the top level of a `bench` block",
+        )
+      } else if env.bench_loop_count >= 1 {
+        tc_err(
+          tc,
+          sp,
+          "E_BENCH_LOOP_DUPLICATE",
+          "at most one `bench_loop` block is allowed per `bench` declaration",
+          "single `bench_loop` block",
+          "duplicate `bench_loop`",
+          "combine timed work into a single `bench_loop { ... }` or split into separate `bench` blocks",
+        )
+      }
+      env.bench_loop_count = env.bench_loop_count + 1
+      let saved_in_bench_loop = env.in_bench_loop
+      let saved_loop_depth = env.in_loop_depth
+      env.in_bench_loop = true
+      env.in_loop_depth = 0
+      env_push(env)
+      let _ = check_stmts_ex(tc, env, body, None, false)
+      env_pop(env)
+      env.in_bench_loop = saved_in_bench_loop
+      env.in_loop_depth = saved_loop_depth
+      TUnit
+    }
     SFor(init_s, cond, step_s, body, sp) => {
       env_push(env)
       // `init` runs in the enclosing loop body; the condition and the step are
@@ -12470,6 +12540,18 @@ fn check_stmt(
       TUnit
     }
     SReturn(opt, sp) => {
+      if env.in_bench_loop {
+        tc_err(
+          tc,
+          sp,
+          "E_BENCH_LOOP_CONTROL_FLOW",
+          "cannot use `return` inside `bench_loop`",
+          "statement completing the iteration",
+          "`return`",
+          "remove `return` from `bench_loop` (early return skips timing and teardown)",
+        )
+        return TNever
+      }
       if env.in_default_expr {
         tc_err(
           tc,
@@ -12533,7 +12615,17 @@ fn check_stmt(
       TNever
     }
     SBreak(sp) => {
-      if env.in_default_expr && env.in_loop_depth == 0 {
+      if env.in_bench_loop && env.in_loop_depth == 0 {
+        tc_err(
+          tc,
+          sp,
+          "E_BENCH_LOOP_CONTROL_FLOW",
+          "cannot use `break` to exit `bench_loop`",
+          "statement inside `bench_loop`",
+          "`break`",
+          "remove `break` from `bench_loop` (or place it inside an inner `while`/`for` loop)",
+        )
+      } else if env.in_default_expr && env.in_loop_depth == 0 {
         tc_err(
           tc,
           sp,
@@ -12559,7 +12651,17 @@ fn check_stmt(
       TNever
     }
     SContinue(sp) => {
-      if env.in_default_expr && env.in_loop_depth == 0 {
+      if env.in_bench_loop && env.in_loop_depth == 0 {
+        tc_err(
+          tc,
+          sp,
+          "E_BENCH_LOOP_CONTROL_FLOW",
+          "cannot use `continue` in `bench_loop`",
+          "statement inside `bench_loop`",
+          "`continue`",
+          "remove `continue` from `bench_loop` (or place it inside an inner `while`/`for` loop)",
+        )
+      } else if env.in_default_expr && env.in_loop_depth == 0 {
         tc_err(
           tc,
           sp,
@@ -16249,6 +16351,9 @@ fn make_default_arg_env(
     fn_has_params: env.fn_has_params,
     closure_scope_floor: 0,
     in_loop_depth: 0,
+    in_bench_top: false,
+    bench_loop_count: 0,
+    in_bench_loop: false,
     inferred_ret: None,
     in_default_arg: true,
     in_default_expr: true,
@@ -17745,6 +17850,23 @@ fn tc_check_moves_in_stmts(
         } else {
           ms.diverged = true
         }
+      }
+      SBenchLoop(body, _) => {
+        let m_entry = moved_clone(ms.env.moved)
+        env_push(ms.env)
+        tc_check_moves_in_stmts(tc, ms, body)
+        let end0_div = ms.diverged
+        env_pop(ms.env)
+        let end0_m = moved_clone(ms.env.moved)
+        if !end0_div && moved_has_new_key(m_entry, end0_m) {
+          moved_set_from(ms.env.moved, moved_union_maps(m_entry, end0_m))
+          ms.diverged = false
+          env_push(ms.env)
+          tc_check_moves_in_stmts(tc, ms, body)
+          env_pop(ms.env)
+        }
+        moved_set_from(ms.env.moved, moved_union_maps(m_entry, end0_m))
+        ms.diverged = false
       }
       SFor(init, cond, step, body, _) => {
         let is_inf_true = match cond {
@@ -23476,6 +23598,44 @@ fn check_expr_inner(
             }
             return TUnit
           }
+          if name == "black_box" {
+            if env.in_verify || tc.record_analyze {
+              tc.call_targets.set(span_key(sp), "builtin::black_box")
+            }
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`black_box` expects 1 argument",
+                "1 argument",
+                args.length().to_string() + " arguments",
+                "pass 1 positional argument to `black_box(x)`",
+              )
+              let mut ai = 0
+              while ai < args.length() {
+                let _ = check_expr(tc, env, args[ai], None)
+                ai = ai + 1
+              }
+              return TError
+            }
+            let a0 = match args[0] {
+              ENamedArg(label, _, inner, asp) => {
+                tc_err(
+                  tc,
+                  asp,
+                  "E_TYPE_MISMATCH",
+                  "`black_box` does not accept named argument `" + label + "`",
+                  "positional argument",
+                  "named argument `" + label + "`",
+                  "pass a positional argument to `black_box(x)`",
+                )
+                inner
+              }
+              _ => args[0]
+            }
+            return check_expr(tc, env, a0, expected)
+          }
           if name == "physical_equal" {
             if env.in_verify || tc.record_analyze {
               tc.call_targets.set(span_key(sp), "builtin::physical_equal")
@@ -25806,6 +25966,8 @@ fn check_expr_inner(
       let saved_inferred_ret = env.inferred_ret
       let saved_closure_floor = env.closure_scope_floor
       let saved_loop_depth = env.in_loop_depth
+      let saved_in_bench_top = env.in_bench_top
+      let saved_in_bench_loop = env.in_bench_loop
       let saved_in_def_expr = env.in_default_expr
       env.ret_ty = match ret_opt {
         Some(r) => r
@@ -25814,6 +25976,8 @@ fn check_expr_inner(
       env.inferred_ret = None
       env.closure_scope_floor = env.scopes.length()
       env.in_loop_depth = 0
+      env.in_bench_top = false
+      env.in_bench_loop = false
       env.in_default_expr = false
       env_push(env)
       let mut j = 0
@@ -25912,6 +26076,8 @@ fn check_expr_inner(
       }
       env.closure_scope_floor = saved_closure_floor
       env.in_loop_depth = saved_loop_depth
+      env.in_bench_top = saved_in_bench_top
+      env.in_bench_loop = saved_in_bench_loop
       env.in_default_expr = saved_in_def_expr
       env.ret_ty = saved_ret_ty
       env.inferred_ret = saved_inferred_ret
@@ -28334,6 +28500,9 @@ fn check_package_with_imports_mapped_plan_qt(
         }
         DTest(td) => {
           let env = env_new(TUnit, [])
+          if td.is_bench {
+            env.in_bench_top = true
+          }
           let _ = check_stmts_ex(tc, env, td.body, None, false)
           let tms = move_state_new()
           tc_check_moves_in_stmts(tc, tms, td.body)
