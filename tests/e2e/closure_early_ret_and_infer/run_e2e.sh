@@ -311,6 +311,34 @@ fn check_deferred_infer_e2e() -> String {
   out.length().to_string() + ":" + out[2] + ":" + fb.ran.to_string() + ":" + t1 + ":" + t2
 }
 
+fn next_frame_k(cb : (ForkExit[Int]) -> Unit) -> Unit {
+  cb(ForkExit::Done(5))
+}
+
+fn check_cps_direct_call_e2e() -> String {
+  let s = ForkScope::{ base: 2 }
+  let log = [0]
+  let fa = s.fork(fn(k) { k(ForkExit::Done(())) })
+  let fb = s.fork(
+    fn(k) {
+      next_frame_k(fn(ex) {
+        match ex {
+          ForkExit::Done(v) => {
+            log[0] = log[0] + v
+            k(ForkExit::Done(v * 2))
+          }
+        }
+      })
+    },
+    name="cps",
+  )
+  let item = match fb.item {
+    Some(v) => v + 1
+    None => -1
+  }
+  fa.ran.to_string() + ":" + fb.ran.to_string() + ":" + log[0].to_string() + ":" + item.to_string()
+}
+
 pub fn main(w : World) -> Unit {
   let u = check_unit_pat(true) * 100 + check_unit_pat(false)
   let c1 = wrap_computed(
@@ -342,6 +370,7 @@ pub fn main(w : World) -> Unit {
   let fl = (check_float_clo(true) + check_float_clo(false)).to_double()
   let nf = check_nested_fix_cache_e2e()
   let di = check_deferred_infer_e2e()
+  let cps = check_cps_direct_call_e2e()
   let out = "u=" + u.to_string() +
     " c1=" + c1.item.0.to_string() + ":" + c1.item.1.to_string() +
     " c2=" + c2.item.0.to_string() + ":" + c2.item.1.to_string() +
@@ -349,12 +378,13 @@ pub fn main(w : World) -> Unit {
     " o=" + o1 + "|" + o2 + "|" + o3 +
     " f=" + d.to_string() + ":" + fl.to_string() +
     " nf=" + nf.to_string() +
-    " di=" + di
+    " di=" + di +
+    " cps=" + cps
   io_println(w, out)
 }
 EOF
 
-EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4 nf=145 di=3:ccc:20:a name wanted:4:5"
+EXPECTED="u=1307 c1=1:15 c2=3:27 r=423:425:115 o=hi/none|yes/no|var/vnone f=4:4 nf=145 di=3:ccc:20:a name wanted:4:5 cps=12:15:5:-1"
 
 "$PIONC" build -o "$TMP_DIR/app_dev" "$TMP_DIR/main.pion"
 "$PIONC" build --release -o "$TMP_DIR/app_rel" "$TMP_DIR/main.pion"
